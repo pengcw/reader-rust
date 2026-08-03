@@ -1,0 +1,42 @@
+name: Build FFI Library
+
+on:
+  push:
+    branches:
+      - feature/ffi-lua-parser
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            artifact_name: libreader_parser.so
+            asset_name: libreader_parser-linux-x86_64.so
+          - os: windows-latest
+            artifact_name: reader_parser.dll
+            asset_name: reader_parser-windows-x86_64.dll
+          - os: macos-latest
+            artifact_name: libreader_parser.dylib
+            asset_name: libreader_parser-macos-x86_64.dylib
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Library
+        run: cargo build --release
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reader-parser-ffi-${{ matrix.os }}
+          path: target/release/${{ matrix.artifact_name }}
+          if-no-files-found: error
