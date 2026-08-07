@@ -9,40 +9,189 @@ pub fn reader_free_string(s: Option<char_p::Box>) {
     drop(s);
 }
 
-/// 执行通用解析逻辑的内部助手
-fn execute_parse<F, T>(
-    source_json: char_p::Ref<'_>,
-    html_body: char_p::Ref<'_>,
-    base_url: char_p::Ref<'_>,
-    parse_fn: F,
-) -> char_p::Box
-where
-    F: FnOnce(&BookSource, &RuleEngine, &str, &str) -> T,
-    T: serde::Serialize,
-{
-    let source_str = source_json.to_str();
-    let body_str = html_body.to_str();
-    let url_str = base_url.to_str();
+/// 终极双核 API 入口一：reader_eval (统一规则/求值/清洗/微指令)
+#[ffi_export]
+pub fn reader_eval(
+    input: char_p::Ref<'_>,
+    rule: char_p::Ref<'_>,
+) -> char_p::Box {
+    let input_str = input.to_str();
+    let rule_str = rule.to_str().trim();
 
-    let source: BookSource = match serde_json::from_str(source_str) {
-        Ok(s) => s,
-        Err(e) => return char_p::Box::try_from(format!("{{\"error\":\"Invalid Source: {}\"}}", e)).unwrap(),
-    };
+    // 1. 微指令：@uuid
+    if rule_str == "@uuid" {
+        let uuid = uuid::Uuid::new_v4().to_string();
+        return char_p::Box::try_from(uuid).unwrap();
+    }
 
-    let engine = match RuleEngine::new() {
-        Ok(e) => e,
-        Err(e) => return char_p::Box::try_from(format!("{{\"error\":\"Engine Init: {}\"}}", e)).unwrap(),
-    };
+    // 2. 微指令：@android_id
+    if rule_str == "@android_id" {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let android_id: String = (0..16).map(|_| {
+            let idx = rng.gen_range(0..16);
+            format!("{:x}", idx)
+        }).collect();
+        return char_p::Box::try_from(android_id).unwrap();
+    }
 
-    let result = parse_fn(&source, &engine, body_str, url_str);
-    let result_json = serde_json::to_string(&result)
-        .unwrap_or_else(|e| format!("{{\"error\":\"Serialize Failed: {}\"}}", e));
-    
-    char_p::Box::try_from(result_json).unwrap()
+    // 3. 微指令：URL 编解码 (@encode, @decode)
+    if rule_str == "@encode" {
+        let encoded = urlencoding::encode(input_str).into_owned();
+        return char_p::Box::try_from(encoded).unwrap();
+    }
+    if rule_str == "@decode" {
+        let decoded = urlencoding::decode(input_str).map(|s| s.into_owned()).unwrap_or_default();
+        return char_p::Box::try_from(decoded).unwrap();
+    }
+
+    // 4. 微指令：@clean (E-ink 样式与脱壳极速净化)
+    if rule_str == "@clean" {
+        return format_html(input);
+    }
+
+    // 5. 微指令：@text (HTML 剥离标签转纯文本)
+    if rule_str == "@text" {
+        return html_to_text(input);
+    }
+
+    // 6. 微指令：@merge (合并多源搜索结果)
+    if rule_str == "@merge" {
+        return merge_search_results(input);
+    }
+
+    // 7. 微指令：@validate (校验书源 JSON)
+    if rule_str == "@validate" {
+        return validate_source(input);
+    }
+
+    // 8. 减法过滤 (包含 " -" 说明是 Legado 减法过滤规则: "容器规则 - 剔除规则1 - 剔除规则2")
+    if rule_str.contains(" -") || rule_str.starts_with('-') {
+        let parts: Vec<&str> = rule_str.split(" -").collect();
+        let target_rule = parts[0].trim();
+
+        let mut doc_html = if !target_rule.is_empty() && !target_rule.starts_with('-') {
+            let doc = crate::parser::html::parse_document(input_str);
+            crate::parser::html::select_text(&doc, &format!("{}@outerHtml", target_rule))
+                .unwrap_or_else(|| input_str.to_string())
+        } else {
+            input_str.to_string()
+        };
+
+        for &exclude in parts.iter().skip(if target_rule.starts_with('-') { 0 } else { 1 }) {
+            let clean_ex = exclude.trim().trim_start_matches('-').trim();
+            if !clean_ex.is_empty() {
+                // TODO: 完整的 DOM 节点剔除逻辑
+                doc_html = crate::parser::rule_engine::apply_legado_regex(&doc_html, clean_ex);
+            }
+        }
+        return char_p::Box::try_from(doc_html).unwrap();
+    }
+
+    // 9. 正则替换：以 "##" 开头 (Legado 原生正则语法 ##pattern##replacement)
+    if rule_str.starts_with("##") {
+        let text = crate::parser::rule_engine::apply_legado_regex(input_str, rule_str);
+        return char_p::Box::try_from(text).unwrap();
+    }
+
+    // 10. 批量规则替换：如果 rule_str 是 JSON 数组字符串
+    if rule_str.starts_with('[') {
+        return apply_replace_rules(input, rule);
+    }
+
+    // 11. JS 脚本评估：如果以 @js: 或 <js> 开头
+    if rule_str.starts_with("@js:") || rule_str.starts_with("<js>") || rule_str.starts_with("js:") {
+        let script = rule_str.replace("<js>", "").replace("@js:", "").replace("js:", "");
+        let res = eval_js(&script, input_str, "").unwrap_or_else(|e| format!("{{\"error\":\"JS Eval Failed: {}\"}}", e));
+        return char_p::Box::try_from(res).unwrap();
+    }
+
+    // 12. XPath 提取：如果以 // 开头
+    if rule_str.starts_with("//") {
+        let results = crate::parser::html::select_xpath(input_str, rule_str);
+        let res = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
+        return char_p::Box::try_from(res).unwrap();
+    }
+
+    // 13. 标准 Legado CSS/链式/JSONPath 语法解析提取
+    let doc = crate::parser::html::parse_document(input_str);
+    let results = crate::parser::html::select_text_list(&doc, rule_str);
+    let res_json = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
+    char_p::Box::try_from(res_json).unwrap()
 }
 
-/// 暴露给 Lua/C: 搜索解析
+/// 终极双核 API 入口二：reader_source (极简书源业务处理分发)
 #[ffi_export]
+pub fn reader_source(
+    source_json: char_p::Ref<'_>,
+    action: char_p::Ref<'_>,
+    payload: char_p::Ref<'_>,
+) -> char_p::Box {
+    let action_str = action.to_str();
+    let source_str = source_json.to_str();
+    let payload_str = payload.to_str();
+
+    match action_str {
+        "search" => {
+            let empty = char_p::Box::try_from("".to_string()).unwrap();
+            parse_search_books(source_json, payload, empty.as_ref())
+        },
+        "explore" => {
+            let empty = char_p::Box::try_from("".to_string()).unwrap();
+            parse_explore_books(source_json, payload, empty.as_ref())
+        },
+        "toc" | "chapter" => {
+            let empty = char_p::Box::try_from("".to_string()).unwrap();
+            parse_chapter_list(source_json, payload, empty.as_ref())
+        },
+        "content" => {
+            let empty = char_p::Box::try_from("".to_string()).unwrap();
+            parse_content(source_json, payload, empty.as_ref())
+        },
+        "validate" => validate_source(source_json),
+        "build_search_url" => {
+            // payload 预计包含关键词与页码的 JSON {"key":"...", "page":1}
+            let (key, page) = if let Ok(json) = serde_json::from_str::<serde_json::Value>(payload_str) {
+                let k = json.get("key").and_then(|v| v.as_str()).unwrap_or(payload_str).to_string();
+                let p = json.get("page").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+                (k, p)
+            } else {
+                (payload_str.to_string(), 1)
+            };
+            let key_c = char_p::Box::try_from(key).unwrap();
+            build_search_url(source_json, key_c.as_ref(), page)
+        },
+        "info" => {
+            let (body, url) = if let Ok(json) = serde_json::from_str::<serde_json::Value>(payload_str) {
+                let h = json.get("html").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let u = json.get("bookUrl").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                (h, u)
+            } else {
+                (payload_str.to_string(), "".to_string())
+            };
+            let body_c = char_p::Box::try_from(body).unwrap();
+            let url_c = char_p::Box::try_from(url).unwrap();
+            let empty = char_p::Box::try_from("".to_string()).unwrap();
+            parse_book_info(source_json, body_c.as_ref(), empty.as_ref(), url_c.as_ref())
+        },
+        "build_explore_url" => {
+            let (url, page) = if let Ok(json) = serde_json::from_str::<serde_json::Value>(payload_str) {
+                let u = json.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let p = json.get("page").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+                (u, p)
+            } else {
+                (payload_str.to_string(), 1)
+            };
+            let url_c = char_p::Box::try_from(url).unwrap();
+            build_explore_url(source_json, url_c.as_ref(), page)
+        },
+        _ => char_p::Box::try_from(format!("{{\"error\":\"Unknown action: {}\"}}", action_str)).unwrap(),
+    }
+}
+
+
+// 保留向下兼容的离散 FFI 导出来适配现有测试和旧模块
+
 pub fn parse_search_books(
     source_json: char_p::Ref<'_>,
     html_body: char_p::Ref<'_>,
@@ -53,8 +202,6 @@ pub fn parse_search_books(
     })
 }
 
-/// 暴露给 Lua/C: 发现书籍解析
-#[ffi_export]
 pub fn parse_explore_books(
     source_json: char_p::Ref<'_>,
     html_body: char_p::Ref<'_>,
@@ -65,8 +212,6 @@ pub fn parse_explore_books(
     })
 }
 
-/// 暴露给 Lua/C: 书籍详情解析
-#[ffi_export]
 pub fn parse_book_info(
     source_json: char_p::Ref<'_>,
     html_body: char_p::Ref<'_>,
@@ -79,8 +224,6 @@ pub fn parse_book_info(
     })
 }
 
-/// 暴露给 Lua/C: 目录解析
-#[ffi_export]
 pub fn parse_chapter_list(
     source_json: char_p::Ref<'_>,
     html_body: char_p::Ref<'_>,
@@ -95,8 +238,6 @@ pub fn parse_chapter_list(
     })
 }
 
-/// 暴露给 Lua/C: 正文解析
-#[ffi_export]
 pub fn parse_content(
     source_json: char_p::Ref<'_>,
     html_body: char_p::Ref<'_>,
@@ -112,8 +253,6 @@ pub fn parse_content(
     })
 }
 
-/// 暴露给 Lua/C: 编译搜索 URL
-#[ffi_export]
 pub fn build_search_url(
     source_json: char_p::Ref<'_>,
     keyword: char_p::Ref<'_>,
@@ -146,8 +285,6 @@ pub fn build_search_url(
     char_p::Box::try_from(result_json).unwrap()
 }
 
-/// 暴露给 Lua/C: 编译发现 URL
-#[ffi_export]
 pub fn build_explore_url(
     source_json: char_p::Ref<'_>,
     explore_url: char_p::Ref<'_>,
@@ -175,8 +312,6 @@ pub fn build_explore_url(
     char_p::Box::try_from(result_json).unwrap()
 }
 
-/// 暴露给 Lua/C: 独立的 JS 规则求值 (例如 loginCheckJs, coverDecodeJs)
-#[ffi_export]
 pub fn parse_rule_eval(
     rule: char_p::Ref<'_>,
     content: char_p::Ref<'_>,
@@ -196,22 +331,16 @@ pub fn parse_rule_eval(
     char_p::Box::try_from(res).unwrap()
 }
 
-/// 暴露给 Lua/C: URL 编码
-#[ffi_export]
 pub fn url_encode(input: char_p::Ref<'_>) -> char_p::Box {
     let encoded = urlencoding::encode(input.to_str()).into_owned();
     char_p::Box::try_from(encoded).unwrap()
 }
 
-/// 暴露给 Lua/C: URL 解码
-#[ffi_export]
 pub fn url_decode(input: char_p::Ref<'_>) -> char_p::Box {
     let decoded = urlencoding::decode(input.to_str()).map(|s| s.into_owned()).unwrap_or_default();
     char_p::Box::try_from(decoded).unwrap()
 }
 
-/// 暴露给 Lua/C: 内容替换 (应用 Legado Replace Rules)
-#[ffi_export]
 pub fn apply_replace_rules(
     content: char_p::Ref<'_>,
     rules_json: char_p::Ref<'_>,
@@ -242,8 +371,6 @@ pub fn apply_replace_rules(
     char_p::Box::try_from(text).unwrap()
 }
 
-/// 暴露给 Lua/C: 合并搜索结果
-#[ffi_export]
 pub fn merge_search_results(books_json: char_p::Ref<'_>) -> char_p::Box {
     let books_str = books_json.to_str();
     if let Ok(books) = serde_json::from_str::<Vec<crate::model::search::SearchBook>>(books_str) {
@@ -269,8 +396,6 @@ pub fn merge_search_results(books_json: char_p::Ref<'_>) -> char_p::Box {
     }
 }
 
-/// 暴露给 Lua/C: 验证书源
-#[ffi_export]
 pub fn validate_source(source_json: char_p::Ref<'_>) -> char_p::Box {
     let source_str = source_json.to_str();
     let mut errors = Vec::new();
@@ -296,8 +421,6 @@ pub fn validate_source(source_json: char_p::Ref<'_>) -> char_p::Box {
     char_p::Box::try_from(res).unwrap()
 }
 
-/// 暴露给 Lua/C: HTML 转纯文本
-#[ffi_export]
 pub fn html_to_text(html: char_p::Ref<'_>) -> char_p::Box {
     let text = html.to_str();
     let replaced = text.replace("<br/>", "\n")
@@ -309,7 +432,6 @@ pub fn html_to_text(html: char_p::Ref<'_>) -> char_p::Box {
     char_p::Box::try_from(res.trim().to_string()).unwrap()
 }
 
-/// 暴露给 Lua/C: 调试解析模式
 #[ffi_export]
 pub fn debug_parse(
     source_json: char_p::Ref<'_>,
@@ -358,31 +480,22 @@ pub fn debug_parse(
     char_p::Box::try_from(res).unwrap()
 }
 
-/// 暴露给 Lua/C: 净化 HTML（提取出适合 E-ink 阅读的纯净 HTML，剥离所有属性与 CSS，保留基础排版）
-#[ffi_export]
 pub fn format_html(html: char_p::Ref<'_>) -> char_p::Box {
     use regex::Regex;
     let mut text = html.to_str().to_string();
     
-    // 1. Remove script and style tags with content
     if let Ok(re) = Regex::new(r"(?is)<script[^>]*>.*?</script>") {
         text = re.replace_all(&text, "").to_string();
     }
     if let Ok(re) = Regex::new(r"(?is)<style[^>]*>.*?</style>") {
         text = re.replace_all(&text, "").to_string();
     }
-    
-    // 2. Remove comments
     if let Ok(re) = Regex::new(r"(?s)<!--.*?-->") {
         text = re.replace_all(&text, "").to_string();
     }
-    
-    // 3. Normalize kept tags (strip attributes)
     if let Ok(re) = Regex::new(r"(?i)<(/?)(p|br|b|strong|i|em|u|h[1-6])(?:\s+[^>]*)?/?>") {
         text = re.replace_all(&text, "<$1$2>").to_string();
     }
-    
-    // 4. Remove all remaining tags except our normalized ones
     if let Ok(re) = Regex::new(r"<[^>]+>") {
         let mut final_text = String::new();
         let mut last_end = 0;
@@ -398,7 +511,7 @@ pub fn format_html(html: char_p::Ref<'_>) -> char_p::Box {
                 "<h5>" | "</h5>" | "<h6>" | "</h6>" => {
                     final_text.push_str(tag);
                 }
-                _ => {} // remove
+                _ => {}
             }
             last_end = m.end();
         }
@@ -409,15 +522,11 @@ pub fn format_html(html: char_p::Ref<'_>) -> char_p::Box {
     char_p::Box::try_from(text).unwrap()
 }
 
-/// 暴露给 Lua/C: 生成 UUID
-#[ffi_export]
 pub fn generate_uuid() -> char_p::Box {
     let uuid = uuid::Uuid::new_v4().to_string();
     char_p::Box::try_from(uuid).unwrap()
 }
 
-/// 暴露给 Lua/C: 获取随机 Android ID (16 字符 HEX)
-#[ffi_export]
 pub fn get_android_id() -> char_p::Box {
     use rand::Rng;
     let mut rng = rand::thread_rng();
@@ -426,4 +535,35 @@ pub fn get_android_id() -> char_p::Box {
         format!("{:x}", idx)
     }).collect();
     char_p::Box::try_from(android_id).unwrap()
+}
+
+fn execute_parse<F, T>(
+    source_json: char_p::Ref<'_>,
+    html_body: char_p::Ref<'_>,
+    base_url: char_p::Ref<'_>,
+    parse_fn: F,
+) -> char_p::Box
+where
+    F: FnOnce(&BookSource, &RuleEngine, &str, &str) -> T,
+    T: serde::Serialize,
+{
+    let source_str = source_json.to_str();
+    let body_str = html_body.to_str();
+    let url_str = base_url.to_str();
+
+    let source: BookSource = match serde_json::from_str(source_str) {
+        Ok(s) => s,
+        Err(e) => return char_p::Box::try_from(format!("{{\"error\":\"Invalid Source: {}\"}}", e)).unwrap(),
+    };
+
+    let engine = match RuleEngine::new() {
+        Ok(e) => e,
+        Err(e) => return char_p::Box::try_from(format!("{{\"error\":\"Engine Init: {}\"}}", e)).unwrap(),
+    };
+
+    let result = parse_fn(&source, &engine, body_str, url_str);
+    let result_json = serde_json::to_string(&result)
+        .unwrap_or_else(|e| format!("{{\"error\":\"Serialize Failed: {}\"}}", e));
+    
+    char_p::Box::try_from(result_json).unwrap()
 }

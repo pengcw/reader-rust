@@ -498,9 +498,9 @@ impl RuleEngine {
             .strip_mode_prefix(list_rule)
             .trim_start_matches(':')
             .trim();
-        let re = match regex::Regex::new(pattern) {
-            Ok(re) => re,
-            Err(_) => return vec![],
+        let re = match crate::util::text::get_cached_regex(pattern) {
+            Some(r) => r,
+            None => return vec![],
         };
 
         let mut out = Vec::new();
@@ -636,9 +636,9 @@ impl RuleEngine {
             .strip_mode_prefix(list_rule)
             .trim_start_matches(':')
             .trim();
-        let re = match regex::Regex::new(pattern) {
-            Ok(re) => re,
-            Err(_) => return (vec![], vec![]),
+        let re = match crate::util::text::get_cached_regex(pattern) {
+            Some(r) => r,
+            None => return (vec![], vec![]),
         };
 
         let mut out = Vec::new();
@@ -1974,11 +1974,10 @@ pub fn apply_legado_regex(text: &str, regex_part: &str) -> String {
     out
 }
 
-/// Apply regex replacement to first match only
 fn apply_regex_replace_first(text: &str, pattern: &str, replacement: &str) -> String {
-    let re = match regex::Regex::new(pattern) {
-        Ok(r) => r,
-        Err(_) => return text.to_string(),
+    let re = match crate::util::text::get_cached_regex(pattern) {
+        Some(r) => r,
+        None => return text.to_string(),
     };
     re.replace(text, replacement).to_string()
 }

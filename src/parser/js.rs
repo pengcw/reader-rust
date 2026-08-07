@@ -15,6 +15,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use uuid::Uuid;
 use std::io::{Read, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -42,8 +45,41 @@ static JS_DEVICE_ID: Lazy<String> = Lazy::new(|| {
 });
 type Aes128CbcDecryptor = cbc::Decryptor<Aes128>;
 type Aes128CbcEncryptor = cbc::Encryptor<Aes128>;
+
+struct TimerGuard(Arc<AtomicU64>);
+impl Drop for TimerGuard {
+    fn drop(&mut self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
+}
+
 thread_local! {
     static ACTIVE_JS_LIB: RefCell<Option<String>> = const { RefCell::new(None) };
+    
+    static JS_ENV: (Runtime, Context, Arc<AtomicU64>) = {
+        let rt = Runtime::new().expect("Failed to create JS Runtime");
+        rt.set_max_stack_size(512 * 1024);
+        rt.set_memory_limit(30 * 1024 * 1024);
+        
+        let start_time = Arc::new(AtomicU64::new(0));
+        let st_clone = start_time.clone();
+        
+        rt.set_interrupt_handler(Some(Box::new(move || {
+            let st = st_clone.load(Ordering::Relaxed);
+            if st == 0 {
+                return false;
+            }
+            if let Ok(elapsed) = SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                if elapsed.as_secs() > st + 4 {
+                    return true;
+                }
+            }
+            false
+        })));
+        
+        let ctx = Context::full(&rt).expect("Failed to create JS Context");
+        (rt, ctx, start_time)
+    };
 }
 
 pub fn with_js_lib<T>(js_lib: Option<&str>, f: impl FnOnce() -> T) -> T {
@@ -131,19 +167,14 @@ fn eval_js_inner_with_source(
     source_key: Option<&str>,
     bindings: Option<&HashMap<String, JsonValue>>,
 ) -> anyhow::Result<String> {
-    let rt = Runtime::new()?;
-    rt.set_max_stack_size(512 * 1024);
-    rt.set_memory_limit(30 * 1024 * 1024);
-    
-    let start_time = std::time::Instant::now();
-    rt.set_interrupt_handler(Some(Box::new(move || {
-        start_time.elapsed().as_secs() >= 4
-    })));
+    JS_ENV.with(|(_, ctx, start_time)| {
+        let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        start_time.store(now, Ordering::Relaxed);
+        let _guard = TimerGuard(start_time.clone());
 
-    let ctx = Context::full(&rt)?;
-    ctx.with(|ctx| {
-        let globals = ctx.globals();
-        let input_value = input.unwrap_or("");
+        ctx.with(|ctx| {
+            let globals = ctx.globals();
+            let input_value = input.unwrap_or("");
         let base_url_value = base_url.unwrap_or("");
         let shared_js = active_js_lib_script()?;
 
@@ -460,8 +491,10 @@ fn eval_js_inner_with_source(
                 _ => String::new(),
             }
         };
+        
         Ok(result)
-    })
+    }) // closes ctx.with
+    }) // closes JS_ENV.with
 }
 
 fn java_aes_base64_decode_to_string(input: &str, key: &str, algorithm: &str, iv: &str) -> String {
