@@ -9,7 +9,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest, macos-13]
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest]
         include:
           - os: ubuntu-latest
             artifact_name: libreader_parser.so
@@ -19,35 +19,30 @@ jobs:
             asset_name: libreader_parser-linux-aarch64.so
           - os: windows-latest
             artifact_name: reader_parser.dll
-            asset_name: reader_parser-windows-x86_64.dll
+            asset_name: libreader_parser-windows-x86_64.dll
           - os: macos-latest
             artifact_name: libreader_parser.dylib
             asset_name: libreader_parser-macos-aarch64.dylib
-          - os: macos-13
-            artifact_name: libreader_parser.dylib
-            asset_name: libreader_parser-macos-x86_64.dylib
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # For Nix-capable systems (Ubuntu and macOS)
-      - name: Install Nix
-        if: matrix.os != 'windows-latest'
-        uses: DeterminateSystems/determinate-nix-action@v3
-
-      - name: Build Library with Nix (Linux/macOS)
-        if: matrix.os != 'windows-latest'
-        run: nix develop --command cargo build --release
-
-      # Fallback for Windows
-      - name: Setup Rust (Windows)
-        if: matrix.os == 'windows-latest'
+      - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build Library (Windows)
-        if: matrix.os == 'windows-latest'
+      # rquickjs 在 aarch64-linux 上使用 bindgen 生成 FFI，需要 libclang
+      - name: Install libclang (ARM64 Linux)
+        if: matrix.os == 'ubuntu-24.04-arm'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev
+
+      - name: Build Library
         run: cargo build --release
+        env:
+          # 仅 aarch64-linux 的 bindgen 会读取；其他平台不受影响
+          LIBCLANG_PATH: /usr/lib/llvm-18/lib
 
       - name: Rename Artifact
         shell: bash
