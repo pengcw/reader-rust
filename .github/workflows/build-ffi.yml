@@ -16,8 +16,6 @@ jobs:
           - aarch64-unknown-linux-gnu
           - x86_64-unknown-linux-gnu
           - x86_64-pc-windows-msvc
-          - x86_64-apple-darwin
-          - aarch64-apple-darwin
         include:
           - target: armv7-linux-androideabi
             os: ubuntu-latest
@@ -32,9 +30,9 @@ jobs:
             asset_name: libreader_parser-linux-armv7sf.so
             use_cross: true
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
             asset_name: libreader_parser-linux-aarch64.so
-            use_cross: true
+            use_cross: false
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             asset_name: libreader_parser-linux-x86_64.so
@@ -42,14 +40,6 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             asset_name: reader_parser-windows-x86_64.dll
-            use_cross: false
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            asset_name: libreader_parser-macos-x86_64.dylib
-            use_cross: false
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            asset_name: libreader_parser-macos-aarch64.dylib
             use_cross: false
 
     steps:
@@ -61,6 +51,12 @@ jobs:
         with:
           toolchain: stable
           target: ${{ matrix.target }}
+
+      - name: Install libclang (ARM64 Linux)
+        if: matrix.os == 'ubuntu-24.04-arm'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev
 
       - name: Install Cross
         if: matrix.use_cross == true
@@ -75,18 +71,14 @@ jobs:
       - name: Build Library (Cargo)
         if: matrix.use_cross == false
         run: cargo build --target ${{ matrix.target }} --release
+        env:
+          LIBCLANG_PATH: /usr/lib/llvm-18/lib
 
       - name: Rename Artifact (Linux/Android)
         if: runner.os == 'Linux'
         shell: bash
         run: |
           mv target/${{ matrix.target }}/release/libreader_parser.so target/${{ matrix.target }}/release/${{ matrix.asset_name }}
-
-      - name: Rename Artifact (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          mv target/${{ matrix.target }}/release/libreader_parser.dylib target/${{ matrix.target }}/release/${{ matrix.asset_name }}
 
       - name: Rename Artifact (Windows)
         if: runner.os == 'Windows'
