@@ -513,7 +513,9 @@ pub fn extract_text(el: &ElementRef, extractor: &str) -> Option<String> {
                 Some(text)
             }
         }
-        "html" | "@html" => Some(el.html()),
+        // @html 语义为 innerHTML（不含元素自身标签）；el.html() 是 outerHTML，
+        // 会把容器开标签（如 <div id="clickeye_content">）带入正文导致"没清理干净"。
+        "html" | "@html" => Some(el.inner_html()),
         "all" | "@all" => Some(el.html()),
         _ => {
             if let Some(attr_name) = parse_attr_extractor(extractor) {

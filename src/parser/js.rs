@@ -552,16 +552,38 @@ fn java_aes_encode(input: &str, key: &str, algorithm: &str, iv: &str) -> String 
     }
 }
 
+// 修复：sloppy 全局模式（见下）
 fn eval_script<'js>(ctx: rquickjs::Ctx<'js>, script: &str) -> anyhow::Result<Value<'js>> {
-    match ctx.eval(script) {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            if let Some(exception) = ctx.catch().into_exception() {
-                return Err(anyhow::anyhow!("JS Exception: {:?}", exception));
-            }
-            Err(e.into())
+    use std::ffi::{CStr, CString};
+    // Legado 规则普遍使用隐式全局变量（如 `time=...;t=...` 不带 var 声明），
+    // 必须用 sloppy（JS_EVAL_TYPE_GLOBAL=0）模式求值；module/strict 模式会抛
+    // ReferenceError，导致规则走 catch 降级分支（如 qmbook 目录 URL 退化为
+    // 无签名 COS 地址而 403）。
+    // 注：rquickjs 的 EvalOptions 为 #[non_exhaustive] 且 Ctx::eval 默认 Module
+    // （strict）模式，无法在外部构造/修改，故直接调用 qjs::JS_Eval 显式指定
+    // JS_EVAL_TYPE_GLOBAL。
+    let src = CString::new(script)?;
+    let file_name = CStr::from_bytes_with_nul(b"eval_script\0").unwrap();
+    let val = unsafe {
+        rquickjs::qjs::JS_Eval(
+            ctx.as_raw().as_ptr(),
+            src.as_ptr(),
+            src.as_bytes().len() as _,
+            file_name.as_ptr(),
+            rquickjs::qjs::JS_EVAL_TYPE_GLOBAL as i32,
+        )
+    };
+    // 与 rquickjs Ctx::handle_exception 等价：JS_TAG_EXCEPTION 时取异常信息
+    unsafe {
+        if rquickjs::qjs::JS_VALUE_GET_NORM_TAG(val) != (rquickjs::qjs::JS_TAG_EXCEPTION as i32) {
+            let v = Value::from_raw(ctx.clone(), val);
+            return Ok(v);
         }
     }
+    if let Some(exception) = ctx.catch().into_exception() {
+        return Err(anyhow::anyhow!("JS Exception: {:?}", exception));
+    }
+    Err(anyhow::anyhow!("JS Exception"))
 }
 
 fn active_js_lib_script() -> anyhow::Result<String> {
