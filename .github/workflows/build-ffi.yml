@@ -34,11 +34,7 @@ jobs:
       # For Nix-capable systems (Ubuntu and macOS)
       - name: Install Nix
         if: matrix.os != 'windows-latest'
-        uses: determinate-systems/nix-installer-action@v16
-
-      - name: Magic Nix Cache
-        if: matrix.os != 'windows-latest'
-        uses: determinate-systems/magic-nix-cache-action@v8
+        uses: DeterminateSystems/determinate-nix-action@v3
 
       - name: Build Library with Nix (Linux/macOS)
         if: matrix.os != 'windows-latest'
