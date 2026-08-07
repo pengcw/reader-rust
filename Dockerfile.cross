@@ -1,0 +1,7 @@
+ARG CROSS_BASE_IMAGE
+FROM $CROSS_BASE_IMAGE
+
+RUN dpkg --add-architecture armhf || true && \
+    dpkg --add-architecture arm64 || true && \
+    apt-get update && \
+    apt-get install -y libclang-dev clang llvm-dev

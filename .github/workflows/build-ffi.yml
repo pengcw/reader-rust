@@ -6,7 +6,7 @@ on:
 jobs:
   build:
     name: Build for ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         target:
@@ -15,17 +15,42 @@ jobs:
           - armv7-unknown-linux-gnueabi
           - aarch64-unknown-linux-gnu
           - x86_64-unknown-linux-gnu
+          - x86_64-pc-windows-msvc
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
         include:
           - target: armv7-linux-androideabi
+            os: ubuntu-latest
             asset_name: libreader_parser-android-armv7.so
+            use_cross: true
           - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-latest
             asset_name: libreader_parser-linux-armv7hf.so
+            use_cross: true
           - target: armv7-unknown-linux-gnueabi
+            os: ubuntu-latest
             asset_name: libreader_parser-linux-armv7sf.so
+            use_cross: true
           - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
             asset_name: libreader_parser-linux-aarch64.so
+            use_cross: true
           - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
             asset_name: libreader_parser-linux-x86_64.so
+            use_cross: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            asset_name: reader_parser-windows-x86_64.dll
+            use_cross: false
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            asset_name: libreader_parser-macos-x86_64.dylib
+            use_cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            asset_name: libreader_parser-macos-aarch64.dylib
+            use_cross: false
 
     steps:
       - name: Checkout repository
@@ -33,18 +58,41 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
 
       - name: Install Cross
+        if: matrix.use_cross == true
         run: |
+          mkdir -p ~/.cargo/bin
           curl -L https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-musl.tar.gz | tar xz -C ~/.cargo/bin
 
-      - name: Build Library
+      - name: Build Library (Cross)
+        if: matrix.use_cross == true
         run: cross build --target ${{ matrix.target }} --release
 
-      - name: Rename Artifact
+      - name: Build Library (Cargo)
+        if: matrix.use_cross == false
+        run: cargo build --target ${{ matrix.target }} --release
+
+      - name: Rename Artifact (Linux/Android)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           mv target/${{ matrix.target }}/release/libreader_parser.so target/${{ matrix.target }}/release/${{ matrix.asset_name }}
+
+      - name: Rename Artifact (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mv target/${{ matrix.target }}/release/libreader_parser.dylib target/${{ matrix.target }}/release/${{ matrix.asset_name }}
+
+      - name: Rename Artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mv target/${{ matrix.target }}/release/reader_parser.dll target/${{ matrix.target }}/release/${{ matrix.asset_name }}
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
