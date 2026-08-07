@@ -24,11 +24,11 @@ jobs:
           - target: armv7-unknown-linux-gnueabihf
             os: ubuntu-latest
             asset_name: libreader_parser-linux-armv7hf.so
-            use_cross: true
+            use_cross: false
           - target: armv7-unknown-linux-gnueabi
             os: ubuntu-latest
             asset_name: libreader_parser-linux-armv7sf.so
-            use_cross: true
+            use_cross: false
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             asset_name: libreader_parser-linux-aarch64.so
@@ -58,6 +58,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libclang-dev
 
+      - name: Install ARM cross compiler (Linux)
+        if: matrix.use_cross == false && startsWith(matrix.target, 'armv7-unknown-linux')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf gcc-arm-linux-gnueabi libclang-dev
+
       - name: Install Cross
         if: matrix.use_cross == true
         run: |
@@ -73,6 +79,8 @@ jobs:
         run: cargo build --target ${{ matrix.target }} --release
         env:
           LIBCLANG_PATH: /usr/lib/llvm-18/lib
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABI_LINKER: arm-linux-gnueabi-gcc
 
       - name: Rename Artifact (Linux/Android)
         if: runner.os == 'Linux'

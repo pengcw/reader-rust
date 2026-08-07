@@ -33,10 +33,10 @@ quick-xml = "0.31"
 safer-ffi = { version = "0.1", features = ["headers"] }
 flate2 = "1.0"
 
-[target.'cfg(any(all(target_arch = "aarch64", target_os = "linux"), target_os = "android"))'.dependencies]
+[target.'cfg(any(all(target_arch = "aarch64", target_os = "linux"), all(target_arch = "arm", target_os = "linux"), target_os = "android"))'.dependencies]
 rquickjs = { version = "0.7", features = ["bindgen"] }
 
-[target.'cfg(not(any(all(target_arch = "aarch64", target_os = "linux"), target_os = "android")))'.dependencies]
+[target.'cfg(not(any(all(target_arch = "aarch64", target_os = "linux"), all(target_arch = "arm", target_os = "linux"), target_os = "android")))'.dependencies]
 rquickjs = { version = "0.7" }
 
 [profile.release]
