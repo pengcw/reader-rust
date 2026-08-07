@@ -29,11 +29,11 @@
 
         buildInputs = with pkgs; [
           openssl
-        ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin (with pkgs.darwin.apple_sdk.frameworks; [
-          Security
-          SystemConfiguration
-          libiconv
-        ]);
+        ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+          pkgs.darwin.apple_sdk.frameworks.Security
+          pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
+          pkgs.libiconv
+        ];
       in
       {
         devShells.default = pkgs.mkShell {
