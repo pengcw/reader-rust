@@ -2,7 +2,7 @@ use crate::util::hash::md5_hex;
 use crate::util::text::{apply_regex_replace, strip_whitespace};
 use aes::Aes128;
 use base64::Engine;
-use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use chrono::{Local, TimeZone};
 use once_cell::sync::Lazy;
 use reqwest::blocking::Client;
@@ -14,6 +14,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use uuid::Uuid;
+use std::io::{Read, Write};
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 
 static JS_KV: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static JS_LIB_CACHE: Lazy<Mutex<HashMap<String, String>>> =
@@ -37,6 +41,7 @@ static JS_DEVICE_ID: Lazy<String> = Lazy::new(|| {
     generated
 });
 type Aes128CbcDecryptor = cbc::Decryptor<Aes128>;
+type Aes128CbcEncryptor = cbc::Encryptor<Aes128>;
 thread_local! {
     static ACTIVE_JS_LIB: RefCell<Option<String>> = const { RefCell::new(None) };
 }
@@ -127,6 +132,14 @@ fn eval_js_inner_with_source(
     bindings: Option<&HashMap<String, JsonValue>>,
 ) -> anyhow::Result<String> {
     let rt = Runtime::new()?;
+    rt.set_max_stack_size(512 * 1024);
+    rt.set_memory_limit(30 * 1024 * 1024);
+    
+    let start_time = std::time::Instant::now();
+    rt.set_interrupt_handler(Some(Box::new(move || {
+        start_time.elapsed().as_secs() >= 4
+    })));
+
     let ctx = Context::full(&rt)?;
     ctx.with(|ctx| {
         let globals = ctx.globals();
@@ -192,6 +205,17 @@ fn eval_js_inner_with_source(
             Func::new(|input: String| -> String { md5_hex(&input) }),
         )?;
         java_obj.set(
+            "md5To16",
+            Func::new(|input: String| -> String { 
+                let md5 = md5_hex(&input);
+                if md5.len() >= 16 {
+                    md5[8..24].to_string()
+                } else {
+                    md5
+                }
+            }),
+        )?;
+        java_obj.set(
             "timeFormat",
             Func::new(|timestamp: i64| -> String { java_time_format(timestamp) }),
         )?;
@@ -241,6 +265,106 @@ fn eval_js_inner_with_source(
                     java_aes_base64_decode_to_string(&input, &key, &algorithm, &iv)
                 },
             ),
+        )?;
+        java_obj.set(
+            "aesBase64Encode",
+            Func::new(
+                |input: String, key: String, algorithm: String, iv: String| -> String {
+                    java_aes_base64_encode(&input, &key, &algorithm, &iv)
+                },
+            ),
+        )?;
+        java_obj.set(
+            "aesEncode",
+            Func::new(
+                |input: String, key: String, algorithm: String, iv: String| -> String {
+                    java_aes_encode(&input, &key, &algorithm, &iv)
+                },
+            ),
+        )?;
+        java_obj.set(
+            "escape",
+            Func::new(|input: String| -> String {
+                input.chars().map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '*' || c == '+' || c == '-' || c == '.' || c == '/' || c == '@' || c == '_' {
+                        c.to_string()
+                    } else if (c as u32) < 256 {
+                        format!("%{:02X}", c as u32)
+                    } else {
+                        format!("%u{:04X}", c as u32)
+                    }
+                }).collect()
+            }),
+        )?;
+        java_obj.set(
+            "unescape",
+            Func::new(|input: String| -> String {
+                // simple unescape implementation
+                let mut res = String::new();
+                let mut chars = input.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if c == '%' {
+                        if let Some('u') = chars.peek() {
+                            chars.next();
+                            let mut hex = String::new();
+                            for _ in 0..4 {
+                                if let Some(hc) = chars.next() {
+                                    hex.push(hc);
+                                }
+                            }
+                            if let Ok(val) = u32::from_str_radix(&hex, 16) {
+                                if let Some(char_val) = char::from_u32(val) {
+                                    res.push(char_val);
+                                    continue;
+                                }
+                            }
+                            res.push_str("%u");
+                            res.push_str(&hex);
+                        } else {
+                            let mut hex = String::new();
+                            for _ in 0..2 {
+                                if let Some(hc) = chars.next() {
+                                    hex.push(hc);
+                                }
+                            }
+                            if let Ok(val) = u8::from_str_radix(&hex, 16) {
+                                res.push(val as char);
+                                continue;
+                            }
+                            res.push('%');
+                            res.push_str(&hex);
+                        }
+                    } else {
+                        res.push(c);
+                    }
+                }
+                res
+            }),
+        )?;
+        java_obj.set(
+            "gzip",
+            Func::new(|input: String| -> String {
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                let _ = encoder.write_all(input.as_bytes());
+                if let Ok(compressed) = encoder.finish() {
+                    base64::engine::general_purpose::STANDARD.encode(compressed)
+                } else {
+                    String::new()
+                }
+            }),
+        )?;
+        java_obj.set(
+            "ungzip",
+            Func::new(|input: String| -> String {
+                if let Ok(compressed) = base64::engine::general_purpose::STANDARD.decode(input.trim()) {
+                    let mut decoder = GzDecoder::new(&compressed[..]);
+                    let mut s = String::new();
+                    if decoder.read_to_string(&mut s).is_ok() {
+                        return s;
+                    }
+                }
+                String::new()
+            }),
         )?;
         java_obj.set(
             "encodeURIComponent",
@@ -359,6 +483,40 @@ fn java_aes_base64_decode_to_string(input: &str, key: &str, algorithm: &str, iv:
         .ok()
         .and_then(|bytes| String::from_utf8(bytes.to_vec()).ok())
         .unwrap_or_default()
+}
+
+fn java_aes_base64_encode(input: &str, key: &str, algorithm: &str, iv: &str) -> String {
+    let algorithm = algorithm.to_ascii_uppercase();
+    if algorithm != "AES/CBC/PKCS5PADDING" && algorithm != "AES/CBC/PKCS7PADDING" {
+        return String::new();
+    }
+    let Ok(cipher) = Aes128CbcEncryptor::new_from_slices(key.as_bytes(), iv.as_bytes()) else {
+        return String::new();
+    };
+    let mut buf = vec![0u8; input.len() + 16];
+    buf[..input.len()].copy_from_slice(input.as_bytes());
+    if let Ok(encrypted) = cipher.encrypt_padded_mut::<Pkcs7>(&mut buf, input.len()) {
+        base64::engine::general_purpose::STANDARD.encode(encrypted)
+    } else {
+        String::new()
+    }
+}
+
+fn java_aes_encode(input: &str, key: &str, algorithm: &str, iv: &str) -> String {
+    let algorithm = algorithm.to_ascii_uppercase();
+    if algorithm != "AES/CBC/PKCS5PADDING" && algorithm != "AES/CBC/PKCS7PADDING" {
+        return String::new();
+    }
+    let Ok(cipher) = Aes128CbcEncryptor::new_from_slices(key.as_bytes(), iv.as_bytes()) else {
+        return String::new();
+    };
+    let mut buf = vec![0u8; input.len() + 16];
+    buf[..input.len()].copy_from_slice(input.as_bytes());
+    if let Ok(encrypted) = cipher.encrypt_padded_mut::<Pkcs7>(&mut buf, input.len()) {
+        hex::encode(encrypted)
+    } else {
+        String::new()
+    }
 }
 
 fn eval_script<'js>(ctx: rquickjs::Ctx<'js>, script: &str) -> anyhow::Result<Value<'js>> {

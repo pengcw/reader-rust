@@ -1934,7 +1934,7 @@ fn split_legado_regex(rule: &str) -> (String, Option<&str>) {
     (rule.to_string(), None)
 }
 
-fn apply_legado_regex(text: &str, regex_part: &str) -> String {
+pub fn apply_legado_regex(text: &str, regex_part: &str) -> String {
     if regex_part.trim().is_empty() {
         return text.to_string();
     }
@@ -1953,16 +1953,17 @@ fn apply_legado_regex(text: &str, regex_part: &str) -> String {
 
     let mut out = text.to_string();
     let mut i = start_idx;
-    while i + 1 < parts.len() {
+    while i < parts.len() {
         let regex = parts[i];
         if regex.is_empty() {
             i += 1;
             continue;
         }
 
-        let replace = parts[i + 1];
+        let replace = if i + 1 < parts.len() { parts[i + 1] } else { "" };
+        let is_last = (i + 1 >= parts.len()) || (i + 2 >= parts.len());
 
-        if first_only && i + 2 >= parts.len() {
+        if first_only && is_last {
             // Last replacement with ### suffix - first match only
             out = apply_regex_replace_first(&out, regex, replace);
         } else {
