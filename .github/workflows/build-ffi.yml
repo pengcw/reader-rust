@@ -5,24 +5,27 @@ on:
 
 jobs:
   build:
-    name: Build on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: Build for ${{ matrix.target }}
+    runs-on: ubuntu-latest
     strategy:
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest]
+        target:
+          - armv7-linux-androideabi
+          - armv7-unknown-linux-gnueabihf
+          - armv7-unknown-linux-gnueabi
+          - aarch64-unknown-linux-gnu
+          - x86_64-unknown-linux-gnu
         include:
-          - os: ubuntu-latest
-            artifact_name: libreader_parser.so
-            asset_name: libreader_parser-linux-x86_64.so
-          - os: ubuntu-24.04-arm
-            artifact_name: libreader_parser.so
+          - target: armv7-linux-androideabi
+            asset_name: libreader_parser-android-armv7.so
+          - target: armv7-unknown-linux-gnueabihf
+            asset_name: libreader_parser-linux-armv7hf.so
+          - target: armv7-unknown-linux-gnueabi
+            asset_name: libreader_parser-linux-armv7sf.so
+          - target: aarch64-unknown-linux-gnu
             asset_name: libreader_parser-linux-aarch64.so
-          - os: windows-latest
-            artifact_name: reader_parser.dll
-            asset_name: libreader_parser-windows-x86_64.dll
-          - os: macos-latest
-            artifact_name: libreader_parser.dylib
-            asset_name: libreader_parser-macos-aarch64.dylib
+          - target: x86_64-unknown-linux-gnu
+            asset_name: libreader_parser-linux-x86_64.so
 
     steps:
       - name: Checkout repository
@@ -31,26 +34,21 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # rquickjs 在 aarch64-linux 上使用 bindgen 生成 FFI，需要 libclang
-      - name: Install libclang (ARM64 Linux)
-        if: matrix.os == 'ubuntu-24.04-arm'
+      - name: Install Cross
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libclang-dev
+          curl -L https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-musl.tar.gz | tar xz -C ~/.cargo/bin
 
       - name: Build Library
-        run: cargo build --release
-        env:
-          # 仅 aarch64-linux 的 bindgen 会读取；其他平台不受影响
-          LIBCLANG_PATH: /usr/lib/llvm-18/lib
+        run: cross build --target ${{ matrix.target }} --release
 
       - name: Rename Artifact
         shell: bash
-        run: mv target/release/${{ matrix.artifact_name }} target/release/${{ matrix.asset_name }}
+        run: |
+          mv target/${{ matrix.target }}/release/libreader_parser.so target/${{ matrix.target }}/release/${{ matrix.asset_name }}
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: reader-parser-ffi-${{ matrix.os }}
-          path: target/release/${{ matrix.asset_name }}
+          name: reader-parser-ffi-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.asset_name }}
           if-no-files-found: error

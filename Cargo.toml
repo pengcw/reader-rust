@@ -38,3 +38,11 @@ rquickjs = { version = "0.7", features = ["bindgen"] }
 
 [target.'cfg(not(any(all(target_arch = "aarch64", target_os = "linux"), target_os = "android")))'.dependencies]
 rquickjs = { version = "0.7" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
