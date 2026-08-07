@@ -13,7 +13,7 @@
   outputs = { self, nixpkgs, flake-utils, rust-overlay }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        overlays = [ (import rust-overlay) ];
+        overlays = [ rust-overlay.overlays.default ];
         pkgs = import nixpkgs {
           inherit system overlays;
         };
@@ -29,17 +29,17 @@
 
         buildInputs = with pkgs; [
           openssl
-          libiconv
         ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin (with pkgs.darwin.apple_sdk.frameworks; [
           Security
           SystemConfiguration
+          libiconv
         ]);
       in
       {
         devShells.default = pkgs.mkShell {
           inherit nativeBuildInputs buildInputs;
 
-          LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
+          LIBCLANG_PATH = "${pkgs.lib.getLib pkgs.libclang}/lib";
 
           shellHook = ''
             export LIBCLANG_PATH="${pkgs.libclang.lib}/lib"
