@@ -26,22 +26,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: 'npm'
-          cache-dependency-path: docs/package-lock.json
+      - name: Install Nix
+        uses: determinate-systems/nix-installer-action@v16
 
-      - name: Install dependencies
-        run: |
-          cd docs
-          npm ci
+      - name: Magic Nix Cache
+        uses: determinate-systems/magic-nix-cache-action@v8
 
-      - name: Build docs
-        run: |
-          cd docs
-          npm run docs:build
+      - name: Build docs with Nix
+        run: nix develop --command bash -c "cd docs && npm ci && npm run docs:build"
 
       - name: Setup Pages
         uses: actions/configure-pages@v4

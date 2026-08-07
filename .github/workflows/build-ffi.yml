@@ -9,15 +9,21 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm64, windows-latest, macos-latest, macos-13]
         include:
           - os: ubuntu-latest
             artifact_name: libreader_parser.so
             asset_name: libreader_parser-linux-x86_64.so
+          - os: ubuntu-24.04-arm64
+            artifact_name: libreader_parser.so
+            asset_name: libreader_parser-linux-aarch64.so
           - os: windows-latest
             artifact_name: reader_parser.dll
             asset_name: reader_parser-windows-x86_64.dll
           - os: macos-latest
+            artifact_name: libreader_parser.dylib
+            asset_name: libreader_parser-macos-aarch64.dylib
+          - os: macos-13
             artifact_name: libreader_parser.dylib
             asset_name: libreader_parser-macos-x86_64.dylib
 
@@ -25,15 +31,35 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Rust
+      # For Nix-capable systems (Ubuntu and macOS)
+      - name: Install Nix
+        if: matrix.os != 'windows-latest'
+        uses: determinate-systems/nix-installer-action@v16
+
+      - name: Magic Nix Cache
+        if: matrix.os != 'windows-latest'
+        uses: determinate-systems/magic-nix-cache-action@v8
+
+      - name: Build Library with Nix (Linux/macOS)
+        if: matrix.os != 'windows-latest'
+        run: nix develop --command cargo build --release
+
+      # Fallback for Windows
+      - name: Setup Rust (Windows)
+        if: matrix.os == 'windows-latest'
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build Library
+      - name: Build Library (Windows)
+        if: matrix.os == 'windows-latest'
         run: cargo build --release
+
+      - name: Rename Artifact
+        shell: bash
+        run: mv target/release/${{ matrix.artifact_name }} target/release/${{ matrix.asset_name }}
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: reader-parser-ffi-${{ matrix.os }}
-          path: target/release/${{ matrix.artifact_name }}
+          path: target/release/${{ matrix.asset_name }}
           if-no-files-found: error
