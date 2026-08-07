@@ -1,9 +1,6 @@
 name: Build FFI Library
 
 on:
-  push:
-    branches:
-      - feature/ffi-lua-parser
   workflow_dispatch:
 
 jobs:
