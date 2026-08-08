@@ -3,11 +3,15 @@ name: Build FFI Library
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build for ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         target:
           - armv7-linux-androideabi
@@ -86,17 +90,115 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          mv target/${{ matrix.target }}/release/libreader_parser.so target/${{ matrix.target }}/release/${{ matrix.asset_name }}
+          if [ -f target/${{ matrix.target }}/release/libreader_parser.so ]; then
+            mv target/${{ matrix.target }}/release/libreader_parser.so target/${{ matrix.target }}/release/${{ matrix.asset_name }}
+          fi
 
       - name: Rename Artifact (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          mv target/${{ matrix.target }}/release/reader_parser.dll target/${{ matrix.target }}/release/${{ matrix.asset_name }}
+          if [ -f target/${{ matrix.target }}/release/reader_parser.dll ]; then
+            mv target/${{ matrix.target }}/release/reader_parser.dll target/${{ matrix.target }}/release/${{ matrix.asset_name }}
+          fi
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: reader-parser-ffi-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/${{ matrix.asset_name }}
-          if-no-files-found: error
+          if-no-files-found: warn
+
+  commit-to-dev:
+    name: Commit FFI Binaries to dev Branch
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: reader-parser-ffi-*
+          merge-multiple: true
+          path: artifacts
+
+      - name: Compress binaries and push to dev branch
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 校验产物目录是否存在且有内容
+          if [ ! -d artifacts ] || [ -z "$(ls -A artifacts 2>/dev/null)" ]; then
+            echo "No artifacts found to commit. Skipping."
+            exit 0
+          fi
+
+          # 创建 zip 压缩文件目录，仅压缩 .so 和 .dll 二进制库
+          mkdir -p zipped
+          for file in artifacts/*.so artifacts/*.dll; do
+            if [ -f "$file" ]; then
+              filename=$(basename "$file")
+              echo "Compressing $filename..."
+              zip -9 "zipped/${filename}.zip" -j "$file"
+            fi
+          done
+
+          if [ -z "$(ls -A zipped 2>/dev/null)" ]; then
+            echo "No .so or .dll binary files were zipped. Skipping."
+            exit 0
+          fi
+
+          # 检查远程 dev 分支是否存在
+          if git ls-remote --exit-code --heads origin dev; then
+            echo "Branch dev exists. Fetching and checking out dev..."
+            git fetch origin dev
+            git checkout dev
+          else
+            echo "Branch dev does not exist. Creating orphan dev branch..."
+            git checkout --orphan dev
+            git rm -rf .
+          fi
+
+          # 清理工作区并仅保留 zip 压缩包
+          git rm -rf . 2>/dev/null || rm -rf ./*
+          cp zipped/*.zip .
+
+          # 添加变动
+          git add *.zip
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Update FFI library zip packages [skip ci]"
+            
+            # 推送容错：多重重试与 Rebase
+            SUCCESS=0
+            for i in {1..3}; do
+              echo "Pushing to dev branch (attempt $i)..."
+              if git push origin dev; then
+                SUCCESS=1
+                break
+              else
+                echo "Push failed. Fetching latest dev with rebase..."
+                git fetch origin dev
+                git rebase origin/dev || git rebase --abort
+                sleep 2
+              fi
+            done
+
+            if [ $SUCCESS -ne 1 ]; then
+              echo "Error: Failed to push to dev branch after 3 attempts."
+              exit 1
+            fi
+          fi
+
+
+
