@@ -137,11 +137,12 @@ jobs:
           merge-multiple: true
           path: artifacts
 
-      - name: Create or Update GitHub Release
+      - name: Create or Update Single GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'test' }}
-          name: ${{ github.ref_type == 'tag' && github.ref_name || 'Test Release' }}
+          tag_name: latest
+          name: Latest Release
+          body: "Automated rolling release containing pre-compiled FFI parser binaries for all supported platforms."
           draft: false
           prerelease: false
           files: artifacts/*.zip
