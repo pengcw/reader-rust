@@ -1,7 +1,11 @@
-name: Build FFI Library
+name: Build & Release FFI Libraries
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+      - 'test*'
 
 permissions:
   contents: write
@@ -86,20 +90,24 @@ jobs:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABI_LINKER: arm-linux-gnueabi-gcc
 
-      - name: Rename Artifact (Linux/Android)
+      - name: Zip Artifact (Linux/Android)
         if: runner.os == 'Linux'
         shell: bash
         run: |
           if [ -f target/${{ matrix.target }}/release/libreader_parser.so ]; then
             mv target/${{ matrix.target }}/release/libreader_parser.so target/${{ matrix.target }}/release/${{ matrix.asset_name }}
+            cd target/${{ matrix.target }}/release
+            zip -9 "${{ matrix.asset_name }}.zip" "${{ matrix.asset_name }}"
           fi
 
-      - name: Rename Artifact (Windows)
+      - name: Zip Artifact (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
           if [ -f target/${{ matrix.target }}/release/reader_parser.dll ]; then
             mv target/${{ matrix.target }}/release/reader_parser.dll target/${{ matrix.target }}/release/${{ matrix.asset_name }}
+            cd target/${{ matrix.target }}/release
+            zip -9 "${{ matrix.asset_name }}.zip" "${{ matrix.asset_name }}"
           fi
 
       - name: Upload Artifact
@@ -107,11 +115,11 @@ jobs:
         continue-on-error: true
         with:
           name: reader-parser-ffi-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ matrix.asset_name }}
+          path: target/${{ matrix.target }}/release/${{ matrix.asset_name }}.zip
           if-no-files-found: warn
 
-  commit-to-dev:
-    name: Commit FFI Binaries to dev Branch
+  publish-release:
+    name: Publish Binaries to GitHub Release
     needs: build
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
@@ -120,8 +128,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -131,78 +137,12 @@ jobs:
           merge-multiple: true
           path: artifacts
 
-      - name: Compress binaries and push to dev branch
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # 校验产物目录是否存在且有内容
-          if [ ! -d artifacts ] || [ -z "$(ls -A artifacts 2>/dev/null)" ]; then
-            echo "No artifacts found to commit. Skipping."
-            exit 0
-          fi
-
-          # 创建全局临时目录，避免后续切换/清理分支时被 git rm -rf . 删除
-          ZIPPED_DIR=$(mktemp -d)
-
-          for file in artifacts/*.so artifacts/*.dll; do
-            if [ -f "$file" ]; then
-              filename=$(basename "$file")
-              echo "Compressing $filename..."
-              zip -9 "$ZIPPED_DIR/${filename}.zip" -j "$file"
-            fi
-          done
-
-          if [ -z "$(ls -A "$ZIPPED_DIR" 2>/dev/null)" ]; then
-            echo "No .so or .dll binary files were zipped. Skipping."
-            rm -rf "$ZIPPED_DIR"
-            exit 0
-          fi
-
-          # 检查远程 dev 分支是否存在
-          if git ls-remote --exit-code --heads origin dev; then
-            echo "Branch dev exists. Fetching and checking out dev..."
-            git fetch origin dev
-            git checkout dev
-          else
-            echo "Branch dev does not exist. Creating orphan dev branch..."
-            git checkout --orphan dev
-            git rm -rf .
-          fi
-
-          # 清理工作区并仅保留 zip 压缩包
-          git rm -rf . 2>/dev/null || rm -rf ./*
-          cp "$ZIPPED_DIR"/*.zip .
-          rm -rf "$ZIPPED_DIR"
-
-
-          # 添加变动
-          git add *.zip
-          if git diff --staged --quiet; then
-            echo "No changes to commit."
-          else
-            git commit -m "Update FFI library zip packages [skip ci]"
-            
-            # 推送容错：多重重试与 Rebase
-            SUCCESS=0
-            for i in {1..3}; do
-              echo "Pushing to dev branch (attempt $i)..."
-              if git push origin dev; then
-                SUCCESS=1
-                break
-              else
-                echo "Push failed. Fetching latest dev with rebase..."
-                git fetch origin dev
-                git rebase origin/dev || git rebase --abort
-                sleep 2
-              fi
-            done
-
-            if [ $SUCCESS -ne 1 ]; then
-              echo "Error: Failed to push to dev branch after 3 attempts."
-              exit 1
-            fi
-          fi
-
-
-
+      - name: Create or Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'test' }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || 'Test Release' }}
+          draft: false
+          prerelease: false
+          files: artifacts/*.zip
+          fail_on_unmatched_files: false
