@@ -2,10 +2,6 @@ name: Build & Release FFI Libraries
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - 'v*'
-      - 'test*'
 
 permissions:
   contents: write
@@ -90,24 +86,20 @@ jobs:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABI_LINKER: arm-linux-gnueabi-gcc
 
-      - name: Zip Artifact (Linux/Android)
+      - name: Rename Artifact (Linux/Android)
         if: runner.os == 'Linux'
         shell: bash
         run: |
           if [ -f target/${{ matrix.target }}/release/libreader_parser.so ]; then
             mv target/${{ matrix.target }}/release/libreader_parser.so target/${{ matrix.target }}/release/${{ matrix.asset_name }}
-            cd target/${{ matrix.target }}/release
-            zip -9 "${{ matrix.asset_name }}.zip" "${{ matrix.asset_name }}"
           fi
 
-      - name: Zip Artifact (Windows)
+      - name: Rename Artifact (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
           if [ -f target/${{ matrix.target }}/release/reader_parser.dll ]; then
             mv target/${{ matrix.target }}/release/reader_parser.dll target/${{ matrix.target }}/release/${{ matrix.asset_name }}
-            cd target/${{ matrix.target }}/release
-            zip -9 "${{ matrix.asset_name }}.zip" "${{ matrix.asset_name }}"
           fi
 
       - name: Upload Artifact
@@ -115,7 +107,7 @@ jobs:
         continue-on-error: true
         with:
           name: reader-parser-ffi-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ matrix.asset_name }}.zip
+          path: target/${{ matrix.target }}/release/${{ matrix.asset_name }}
           if-no-files-found: warn
 
   publish-release:
@@ -137,6 +129,17 @@ jobs:
           merge-multiple: true
           path: artifacts
 
+      - name: Compress all binaries to zip
+        run: |
+          mkdir -p release_zips
+          for file in artifacts/*.so artifacts/*.dll; do
+            if [ -f "$file" ]; then
+              filename=$(basename "$file")
+              echo "Compressing $filename into release_zips/${filename}.zip..."
+              zip -9 "release_zips/${filename}.zip" -j "$file"
+            fi
+          done
+
       - name: Create or Update Single GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -145,5 +148,5 @@ jobs:
           body: "Automated rolling release containing pre-compiled FFI parser binaries for all supported platforms."
           draft: false
           prerelease: false
-          files: artifacts/*.zip
+          files: release_zips/*.zip
           fail_on_unmatched_files: false
