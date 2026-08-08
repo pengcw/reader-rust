@@ -23,27 +23,27 @@ jobs:
         include:
           - target: armv7-linux-androideabi
             os: ubuntu-latest
-            asset_name: libreader_parser-android-armv7.so
+            asset_name: legado_parser-android-armv7.so
             use_cross: true
           - target: armv7-unknown-linux-gnueabihf
             os: ubuntu-latest
-            asset_name: libreader_parser-linux-armv7hf.so
+            asset_name: legado_parser-linux-armv7hf.so
             use_cross: false
           - target: armv7-unknown-linux-gnueabi
             os: ubuntu-latest
-            asset_name: libreader_parser-linux-armv7sf.so
+            asset_name: legado_parser-linux-armv7sf.so
             use_cross: false
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-            asset_name: libreader_parser-linux-aarch64.so
+            asset_name: legado_parser-linux-aarch64.so
             use_cross: false
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            asset_name: libreader_parser-linux-x86_64.so
+            asset_name: legado_parser-linux-x86_64.so
             use_cross: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            asset_name: reader_parser-windows-x86_64.dll
+            asset_name: legado_parser-windows-x86_64.dll
             use_cross: false
 
     steps:
@@ -142,18 +142,20 @@ jobs:
             exit 0
           fi
 
-          # 创建 zip 压缩文件目录，仅压缩 .so 和 .dll 二进制库
-          mkdir -p zipped
+          # 创建全局临时目录，避免后续切换/清理分支时被 git rm -rf . 删除
+          ZIPPED_DIR=$(mktemp -d)
+
           for file in artifacts/*.so artifacts/*.dll; do
             if [ -f "$file" ]; then
               filename=$(basename "$file")
               echo "Compressing $filename..."
-              zip -9 "zipped/${filename}.zip" -j "$file"
+              zip -9 "$ZIPPED_DIR/${filename}.zip" -j "$file"
             fi
           done
 
-          if [ -z "$(ls -A zipped 2>/dev/null)" ]; then
+          if [ -z "$(ls -A "$ZIPPED_DIR" 2>/dev/null)" ]; then
             echo "No .so or .dll binary files were zipped. Skipping."
+            rm -rf "$ZIPPED_DIR"
             exit 0
           fi
 
@@ -170,7 +172,9 @@ jobs:
 
           # 清理工作区并仅保留 zip 压缩包
           git rm -rf . 2>/dev/null || rm -rf ./*
-          cp zipped/*.zip .
+          cp "$ZIPPED_DIR"/*.zip .
+          rm -rf "$ZIPPED_DIR"
+
 
           # 添加变动
           git add *.zip
