@@ -138,6 +138,33 @@ jobs:
               mv "$file" release_zips/
             fi
           done
+          
+          # Generate manifest.json with SHA256 of the unzipped .so/.dll files
+          cd release_zips
+          echo "{" > manifest.json
+          echo '  "version": "'${GITHUB_REF_NAME:-latest}'",' >> manifest.json
+          echo '  "build_time": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'",' >> manifest.json
+          echo '  "checksums": {' >> manifest.json
+          
+          first=true
+          for zip in *.zip; do
+             unzip -q "$zip" -d temp_extract
+             inner_file=$(ls temp_extract | head -n 1)
+             hash=$(sha256sum "temp_extract/$inner_file" | awk '{print $1}')
+             rm -rf temp_extract
+             
+             if [ "$first" = true ]; then
+                 first=false
+             else
+                 echo ',' >> manifest.json
+             fi
+             echo -n '    "'$zip'": "'$hash'"' >> manifest.json
+          done
+          
+          echo '' >> manifest.json
+          echo '  }' >> manifest.json
+          echo "}" >> manifest.json
+          cd ..
 
       - name: Create or Update Single GitHub Release
         uses: softprops/action-gh-release@v2
@@ -147,5 +174,7 @@ jobs:
           body: "Automated rolling release containing pre-compiled FFI parser binaries for all supported platforms."
           draft: false
           prerelease: false
-          files: release_zips/*.zip
+          files: |
+            release_zips/*.zip
+            release_zips/manifest.json
           fail_on_unmatched_files: false
