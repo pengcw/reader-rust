@@ -147,27 +147,52 @@ jobs:
           merge-multiple: true
           path: artifacts
 
+
       - name: Prepare releases
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p release_zips
           shopt -s nullglob
+
+          # 1) Merge the already-published zips first, then overlay this run's
+          #    binaries so the manifest always covers every asset on the rolling
+          #    release, with same-name assets from this run taking precedence.
+          gh release download latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.zip' \
+            --dir release_zips \
+            --clobber || true
+
+          # 2) Collect the zips built in this run (overwrite same-name ones).
+          local_count=0
           for file in artifacts/*.zip artifacts/*/*.zip; do
             if [ -f "$file" ]; then
               cp -f "$file" release_zips/
+              local_count=$((local_count + 1))
             fi
           done
-          
+
+          # 3) Nothing produced in this run: leave the online release untouched
+          #    (avoids overwriting manifest.json with an empty checksums map).
+          if [ "$local_count" -eq 0 ]; then
+            echo "skip_release=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::No binaries produced in this run, skipping release update."
+            exit 0
+          fi
+
           # Extract version from Cargo.toml
           CARGO_VERSION=$(grep '^version =' Cargo.toml | head -n 1 | cut -d '"' -f 2)
           VERSION="${CARGO_VERSION:-${GITHUB_REF_NAME:-latest}}"
-          
+
           # Generate manifest.json with SHA256 of the unzipped .so/.dll files
           cd release_zips
           echo "{" > manifest.json
           echo '  "version": "'$VERSION'",' >> manifest.json
           echo '  "build_time": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'",' >> manifest.json
           echo '  "checksums": {' >> manifest.json
-          
+
           first=true
           for zip in *.zip; do
              if [ -f "$zip" ]; then
@@ -185,13 +210,14 @@ jobs:
                rm -rf temp_extract
              fi
           done
-          
+
           echo '' >> manifest.json
           echo '  }' >> manifest.json
           echo "}" >> manifest.json
           cd ..
 
       - name: Create or Update Single GitHub Release
+        if: steps.prepare.outputs.skip_release != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest

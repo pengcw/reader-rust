@@ -20,6 +20,8 @@ RUN find / -name "libgcc.a" 2>/dev/null | while read f; do cp "$f" "$(dirname "$
 # rustc armv7-linux-androideabi target, so the .so keeps running on old devices.
 ARG CROSS_BASE_IMAGE
 RUN if echo "$CROSS_BASE_IMAGE" | grep -q "armv7-linux-androideabi"; then \
+      apt-get update && \
+      apt-get install -y --no-install-recommends curl unzip && \
       curl -sSL https://dl.google.com/android/repository/android-ndk-r26d-linux.zip -o /tmp/android-ndk-r26d-linux.zip && \
       unzip -q /tmp/android-ndk-r26d-linux.zip -d /opt && \
       rm /tmp/android-ndk-r26d-linux.zip; \
