@@ -1,3 +1,6 @@
+[target.aarch64-linux-android]
+dockerfile = "Dockerfile.cross"
+
 [target.armv7-linux-androideabi]
 dockerfile = "Dockerfile.cross"
 

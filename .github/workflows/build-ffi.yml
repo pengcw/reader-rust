@@ -95,12 +95,12 @@ jobs:
 
       - name: Zip Artifact (Windows)
         if: runner.os == 'Windows'
-        shell: bash
+        shell: pwsh
         run: |
-          if [ -f target/${{ matrix.target }}/release/reader_parser.dll ]; then
-            cd target/${{ matrix.target }}/release
-            zip -9 legado_parser-${{ matrix.target }}.zip reader_parser.dll
-          fi
+          if (Test-Path "target/${{ matrix.target }}/release/reader_parser.dll") {
+            cd "target/${{ matrix.target }}/release"
+            Compress-Archive -Path "reader_parser.dll" -DestinationPath "legado_parser-${{ matrix.target }}.zip" -Force
+          }
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4

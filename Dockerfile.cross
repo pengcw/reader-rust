@@ -4,4 +4,7 @@ FROM $CROSS_BASE_IMAGE
 RUN dpkg --add-architecture armhf || true && \
     dpkg --add-architecture arm64 || true && \
     apt-get update && \
-    apt-get install -y libclang-dev clang llvm-dev
+    apt-get install -y libclang-dev clang llvm-dev || true
+
+# Fix Android NDK missing -lunwind linker error
+RUN find / -name "libgcc.a" 2>/dev/null | while read f; do cp "$f" "$(dirname "$f")/libunwind.a"; done || true
