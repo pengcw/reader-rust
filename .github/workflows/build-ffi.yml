@@ -92,8 +92,8 @@ jobs:
         run: cross build --target ${{ matrix.target }} --release
         env:
           CARGO_PROFILE_RELEASE_LTO: ${{ matrix.target == 'armv7-linux-androideabi' && 'false' || 'thin' }}
-          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ matrix.target == 'armv7-linux-androideabi' && '16' || '1' }}
-          CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_RUSTFLAGS: "-C link-arg=-Wl,--no-keep-memory"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+          CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_RUSTFLAGS: "-C link-arg=-fuse-ld=gold -C link-arg=-Wl,--no-keep-memory"
 
       - name: Build Library (Cargo)
         if: (github.event.inputs.target == '' || github.event.inputs.target == 'all' || github.event.inputs.target == matrix.target) && matrix.use_cross == false
