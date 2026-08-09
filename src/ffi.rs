@@ -18,6 +18,12 @@ pub fn reader_eval(
     let input_str = input.to_str();
     let rule_str = rule.to_str().trim();
 
+    // 0. 微指令：@version (编译期自动读取 Cargo.toml 中的 version)
+    if rule_str == "@version" {
+        let ver = env!("CARGO_PKG_VERSION");
+        return char_p::Box::try_from(ver.to_string()).unwrap();
+    }
+
     // 1. 微指令：@uuid
     if rule_str == "@uuid" {
         let uuid = uuid::Uuid::new_v4().to_string();

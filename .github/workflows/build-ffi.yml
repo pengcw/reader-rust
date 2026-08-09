@@ -93,6 +93,7 @@ jobs:
         env:
           CARGO_PROFILE_RELEASE_LTO: ${{ matrix.target == 'armv7-linux-androideabi' && 'false' || 'thin' }}
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ matrix.target == 'armv7-linux-androideabi' && '16' || '1' }}
+          CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_RUSTFLAGS: "-C link-arg=-Wl,--no-keep-memory"
 
       - name: Build Library (Cargo)
         if: (github.event.inputs.target == '' || github.event.inputs.target == 'all' || github.event.inputs.target == matrix.target) && matrix.use_cross == false
@@ -150,10 +151,10 @@ jobs:
       - name: Prepare releases
         run: |
           mkdir -p release_zips
-          # The artifacts are already zipped with the correct names
-          for file in artifacts/*.zip; do
+          shopt -s nullglob
+          for file in artifacts/*.zip artifacts/*/*.zip; do
             if [ -f "$file" ]; then
-              mv "$file" release_zips/
+              cp -f "$file" release_zips/
             fi
           done
           
@@ -166,17 +167,20 @@ jobs:
           
           first=true
           for zip in *.zip; do
-             unzip -q "$zip" -d temp_extract
-             inner_file=$(ls temp_extract | head -n 1)
-             hash=$(sha256sum "temp_extract/$inner_file" | awk '{print $1}')
-             rm -rf temp_extract
-             
-             if [ "$first" = true ]; then
-                 first=false
-             else
-                 echo ',' >> manifest.json
+             if [ -f "$zip" ]; then
+               unzip -q "$zip" -d temp_extract
+               inner_file=$(ls temp_extract | head -n 1)
+               if [ -n "$inner_file" ]; then
+                 hash=$(sha256sum "temp_extract/$inner_file" | awk '{print $1}')
+                 if [ "$first" = true ]; then
+                     first=false
+                 else
+                     echo ',' >> manifest.json
+                 fi
+                 echo -n '    "'$zip'": "'$hash'"' >> manifest.json
+               fi
+               rm -rf temp_extract
              fi
-             echo -n '    "'$zip'": "'$hash'"' >> manifest.json
           done
           
           echo '' >> manifest.json
@@ -188,7 +192,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: Latest Release
+          name: Local Parser Extension
           body: "Automated rolling release containing pre-compiled FFI parser binaries for all supported platforms."
           draft: false
           prerelease: false
