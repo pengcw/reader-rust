@@ -2,6 +2,21 @@ name: Build & Release FFI Libraries
 
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target platform to build'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - armv7-linux-androideabi
+          - aarch64-linux-android
+          - armv7-unknown-linux-gnueabihf
+          - armv7-unknown-linux-gnueabi
+          - aarch64-unknown-linux-gnu
+          - x86_64-unknown-linux-gnu
+          - x86_64-pc-windows-msvc
 
 permissions:
   contents: write
@@ -9,6 +24,7 @@ permissions:
 jobs:
   build:
     name: Build for ${{ matrix.target }}
+    if: github.event.inputs.target == '' || github.event.inputs.target == 'all' || github.event.inputs.target == matrix.target
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -77,6 +93,7 @@ jobs:
         run: cross build --target ${{ matrix.target }} --release
         env:
           CARGO_PROFILE_RELEASE_LTO: ${{ matrix.target == 'armv7-linux-androideabi' && 'false' || 'thin' }}
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ matrix.target == 'armv7-linux-androideabi' && '16' || '1' }}
 
       - name: Build Library (Cargo)
         if: matrix.use_cross == false
