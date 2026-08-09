@@ -93,7 +93,7 @@ jobs:
         env:
           CARGO_PROFILE_RELEASE_LTO: ${{ matrix.target == 'armv7-linux-androideabi' && 'false' || 'thin' }}
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
-          CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_RUSTFLAGS: "-C link-arg=-fuse-ld=gold -C link-arg=-Wl,--no-keep-memory"
+          CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_RUSTFLAGS: "-C link-arg=-fuse-ld=lld -C link-arg=-Wl,--no-keep-memory"
 
       - name: Build Library (Cargo)
         if: (github.event.inputs.target == '' || github.event.inputs.target == 'all' || github.event.inputs.target == matrix.target) && matrix.use_cross == false
@@ -158,10 +158,14 @@ jobs:
             fi
           done
           
+          # Extract version from Cargo.toml
+          CARGO_VERSION=$(grep '^version =' Cargo.toml | head -n 1 | cut -d '"' -f 2)
+          VERSION="${CARGO_VERSION:-${GITHUB_REF_NAME:-latest}}"
+          
           # Generate manifest.json with SHA256 of the unzipped .so/.dll files
           cd release_zips
           echo "{" > manifest.json
-          echo '  "version": "'${GITHUB_REF_NAME:-latest}'",' >> manifest.json
+          echo '  "version": "'$VERSION'",' >> manifest.json
           echo '  "build_time": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'",' >> manifest.json
           echo '  "checksums": {' >> manifest.json
           

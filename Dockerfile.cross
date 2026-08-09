@@ -9,9 +9,13 @@ RUN dpkg --add-architecture armhf || true && \
 # Fix Android NDK missing -lunwind linker error
 RUN find / -name "libgcc.a" 2>/dev/null | while read f; do cp "$f" "$(dirname "$f")/libunwind.a"; done || true
 
-# Force Android NDK to use ld.gold instead of ld.bfd to avoid 32-bit linker out of memory (OOM)
-RUN find /android-ndk -name "arm-linux-androideabi-ld" 2>/dev/null | while read f; do \
-      if [ -f "$(dirname "$f")/arm-linux-androideabi-ld.gold" ]; then \
-        cp -f "$(dirname "$f")/arm-linux-androideabi-ld.gold" "$f"; \
+# Force Android NDK to use 64-bit LLVM lld instead of 32-bit ld/ld.gold to avoid out of memory (OOM)
+RUN find /android-ndk -name "*ld*" 2>/dev/null | while read f; do \
+      if [ -f "$f" ] && [ -x "$f" ]; then \
+        case "$(basename "$f")" in \
+          *ld|*ld.gold|*ld.bfd) \
+            ln -sf /usr/bin/ld.lld "$f" || true \
+            ;; \
+        esac \
       fi \
     done || true

@@ -5,4 +5,4 @@ linker = "x86_64-linux-musl-gcc"
 linker = "aarch64-linux-musl-gcc"
 
 [target.armv7-linux-androideabi]
-rustflags = ["-C", "link-arg=-fuse-ld=gold", "-C", "link-arg=-Wl,--no-keep-memory"]
+rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,--no-keep-memory"]
