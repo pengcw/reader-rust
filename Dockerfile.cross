@@ -4,18 +4,28 @@ FROM $CROSS_BASE_IMAGE
 RUN dpkg --add-architecture armhf || true && \
     dpkg --add-architecture arm64 || true && \
     apt-get update && \
-    apt-get install -y libclang-dev clang llvm-dev lld || true
+    apt-get install -y libclang-dev clang llvm-dev || true
 
-# Fix Android NDK missing -lunwind linker error
+# Fix Android NDK missing -lunwind linker error (cross v0.2.5 image ships NDK r21d)
 RUN find / -name "libgcc.a" 2>/dev/null | while read f; do cp "$f" "$(dirname "$f")/libunwind.a"; done || true
 
-# Force Android NDK to use 64-bit LLVM lld instead of 32-bit ld/ld.gold to avoid out of memory (OOM)
-RUN find /android-ndk -name "*ld*" 2>/dev/null | while read f; do \
-      if [ -f "$f" ] && [ -x "$f" ]; then \
-        case "$(basename "$f")" in \
-          *ld|*ld.gold|*ld.bfd) \
-            ln -sf /usr/bin/ld.lld "$f" || true \
-            ;; \
-        esac \
-      fi \
-    done || true
+# The cross v0.2.5 armv7-linux-androideabi image ships NDK r21d (clang 9.0.8).
+# Its 32-bit link driver ("clang90") segfaults when linking Rust cdylibs
+# (e.g. jsonpath_lib, which declares crate-type = ["cdylib", "rlib"]):
+#   clang90: error: unable to execute command: Segmentation fault (core dumped)
+# Switching -fuse-ld between gold/lld/bfd does not help; the driver itself crashes.
+# Install a modern NDK for the armv7 target only (aarch64 keeps the image default,
+# which works). NDK r22+ defaults to lld, so no -fuse-ld flags are needed.
+# Use the API 21 (Android 5.0) clang driver: lowest API level that pairs with the
+# rustc armv7-linux-androideabi target, so the .so keeps running on old devices.
+ARG CROSS_BASE_IMAGE
+RUN if echo "$CROSS_BASE_IMAGE" | grep -q "armv7-linux-androideabi"; then \
+      curl -sSL https://dl.google.com/android/repository/android-ndk-r26d-linux.zip -o /tmp/android-ndk-r26d-linux.zip && \
+      unzip -q /tmp/android-ndk-r26d-linux.zip -d /opt && \
+      rm /tmp/android-ndk-r26d-linux.zip; \
+    fi
+
+ENV CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=/opt/android-ndk-r26d/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang \
+    CC_armv7_linux_androideabi=/opt/android-ndk-r26d/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang \
+    CXX_armv7_linux_androideabi=/opt/android-ndk-r26d/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang++ \
+    AR_armv7_linux_androideabi=/opt/android-ndk-r26d/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar

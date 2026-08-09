@@ -89,15 +89,14 @@ jobs:
 
       - name: Build Library (Cross)
         if: (github.event.inputs.target == '' || github.event.inputs.target == 'all' || github.event.inputs.target == matrix.target) && matrix.use_cross == true
-        run: cross build --target ${{ matrix.target }} --release
+        run: cross build --target ${{ matrix.target }} --release --lib
         env:
           CARGO_PROFILE_RELEASE_LTO: ${{ matrix.target == 'armv7-linux-androideabi' && 'false' || 'thin' }}
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
-          CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_RUSTFLAGS: "-C link-arg=-fuse-ld=lld -C link-arg=-Wl,--no-keep-memory"
 
       - name: Build Library (Cargo)
         if: (github.event.inputs.target == '' || github.event.inputs.target == 'all' || github.event.inputs.target == matrix.target) && matrix.use_cross == false
-        run: cargo build --target ${{ matrix.target }} --release
+        run: cargo build --target ${{ matrix.target }} --release --lib
         env:
           LIBCLANG_PATH: /usr/lib/llvm-18/lib
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
