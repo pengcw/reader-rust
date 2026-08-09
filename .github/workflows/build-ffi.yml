@@ -15,6 +15,7 @@ jobs:
       matrix:
         target:
           - armv7-linux-androideabi
+          - aarch64-linux-android
           - armv7-unknown-linux-gnueabihf
           - armv7-unknown-linux-gnueabi
           - aarch64-unknown-linux-gnu
@@ -23,27 +24,24 @@ jobs:
         include:
           - target: armv7-linux-androideabi
             os: ubuntu-latest
-            asset_name: legado_parser-android-armv7.so
+            use_cross: true
+          - target: aarch64-linux-android
+            os: ubuntu-latest
             use_cross: true
           - target: armv7-unknown-linux-gnueabihf
             os: ubuntu-latest
-            asset_name: legado_parser-linux-armv7hf.so
             use_cross: false
           - target: armv7-unknown-linux-gnueabi
             os: ubuntu-latest
-            asset_name: legado_parser-linux-armv7sf.so
             use_cross: false
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-            asset_name: legado_parser-linux-aarch64.so
             use_cross: false
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            asset_name: legado_parser-linux-x86_64.so
             use_cross: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            asset_name: legado_parser-windows-x86_64.dll
             use_cross: false
 
     steps:
@@ -86,20 +84,22 @@ jobs:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABI_LINKER: arm-linux-gnueabi-gcc
 
-      - name: Rename Artifact (Linux/Android)
+      - name: Zip Artifact (Linux/Android)
         if: runner.os == 'Linux'
         shell: bash
         run: |
           if [ -f target/${{ matrix.target }}/release/libreader_parser.so ]; then
-            mv target/${{ matrix.target }}/release/libreader_parser.so target/${{ matrix.target }}/release/${{ matrix.asset_name }}
+            cd target/${{ matrix.target }}/release
+            zip -9 legado_parser-${{ matrix.target }}.zip libreader_parser.so
           fi
 
-      - name: Rename Artifact (Windows)
+      - name: Zip Artifact (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
           if [ -f target/${{ matrix.target }}/release/reader_parser.dll ]; then
-            mv target/${{ matrix.target }}/release/reader_parser.dll target/${{ matrix.target }}/release/${{ matrix.asset_name }}
+            cd target/${{ matrix.target }}/release
+            zip -9 legado_parser-${{ matrix.target }}.zip reader_parser.dll
           fi
 
       - name: Upload Artifact
@@ -107,7 +107,7 @@ jobs:
         continue-on-error: true
         with:
           name: reader-parser-ffi-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ matrix.asset_name }}
+          path: target/${{ matrix.target }}/release/legado_parser-${{ matrix.target }}.zip
           if-no-files-found: warn
 
   publish-release:
@@ -129,14 +129,13 @@ jobs:
           merge-multiple: true
           path: artifacts
 
-      - name: Compress all binaries to zip
+      - name: Prepare releases
         run: |
           mkdir -p release_zips
-          for file in artifacts/*.so artifacts/*.dll; do
+          # The artifacts are already zipped with the correct names
+          for file in artifacts/*.zip; do
             if [ -f "$file" ]; then
-              filename=$(basename "$file")
-              echo "Compressing $filename into release_zips/${filename}.zip..."
-              zip -9 "release_zips/${filename}.zip" -j "$file"
+              mv "$file" release_zips/
             fi
           done
 
