@@ -187,7 +187,8 @@ jobs:
           CARGO_VERSION=$(grep '^version =' Cargo.toml | head -n 1 | cut -d '"' -f 2)
           VERSION="${CARGO_VERSION:-${GITHUB_REF_NAME:-latest}}"
 
-          # Generate manifest.json with SHA256 of the unzipped .so/.dll files
+          # Generate manifest.json with SHA256 of each downloadable ZIP archive.
+          # Update.lua validates checksums[zip_name] before extraction.
           cd release_zips
           echo "{" > manifest.json
           echo '  "version": "'$VERSION'",' >> manifest.json
@@ -197,18 +198,13 @@ jobs:
           first=true
           for zip in *.zip; do
              if [ -f "$zip" ]; then
-               unzip -q "$zip" -d temp_extract
-               inner_file=$(ls temp_extract | head -n 1)
-               if [ -n "$inner_file" ]; then
-                 hash=$(sha256sum "temp_extract/$inner_file" | awk '{print $1}')
-                 if [ "$first" = true ]; then
-                     first=false
-                 else
-                     echo ',' >> manifest.json
-                 fi
-                 echo -n '    "'$zip'": "'$hash'"' >> manifest.json
+               hash=$(sha256sum "$zip" | awk '{print $1}')
+               if [ "$first" = true ]; then
+                   first=false
+               else
+                   echo ',' >> manifest.json
                fi
-               rm -rf temp_extract
+               echo -n '    "'$zip'": "'$hash'"' >> manifest.json
              fi
           done
 

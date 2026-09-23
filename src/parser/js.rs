@@ -1,9 +1,16 @@
+use crate::parser::html;
+use crate::parser::jsonpath;
+use crate::parser::rule_analyzer;
+use crate::parser::rule_engine;
 use crate::util::hash::md5_hex;
 use crate::util::text::{apply_regex_replace, strip_whitespace};
 use aes::Aes128;
 use base64::Engine;
 use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use chrono::{Local, TimeZone};
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use once_cell::sync::Lazy;
 use reqwest::blocking::Client;
 use reqwest::Method;
@@ -12,15 +19,12 @@ use rquickjs::{Context, Object, Runtime, Value};
 use serde_json::Value as JsonValue;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Mutex;
-use uuid::Uuid;
 use std::io::{Read, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::SystemTime;
-use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
-use flate2::Compression;
+use uuid::Uuid;
 
 static JS_KV: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static JS_LIB_CACHE: Lazy<Mutex<HashMap<String, String>>> =
@@ -55,15 +59,18 @@ impl Drop for TimerGuard {
 
 thread_local! {
     static ACTIVE_JS_LIB: RefCell<Option<String>> = const { RefCell::new(None) };
-    
+    // reader_execute installs its source-bound HTTP session here so JavaScript
+    // java.ajax/get/post shares the same cookies and request policy as Rust HTTP.
+    static ACTIVE_JS_HTTP_CLIENT: RefCell<Option<Client>> = const { RefCell::new(None) };
+
     static JS_ENV: (Runtime, Context, Arc<AtomicU64>) = {
         let rt = Runtime::new().expect("Failed to create JS Runtime");
         rt.set_max_stack_size(512 * 1024);
         rt.set_memory_limit(30 * 1024 * 1024);
-        
+
         let start_time = Arc::new(AtomicU64::new(0));
         let st_clone = start_time.clone();
-        
+
         rt.set_interrupt_handler(Some(Box::new(move || {
             let st = st_clone.load(Ordering::Relaxed);
             if st == 0 {
@@ -76,7 +83,7 @@ thread_local! {
             }
             false
         })));
-        
+
         let ctx = Context::full(&rt).expect("Failed to create JS Context");
         (rt, ctx, start_time)
     };
@@ -89,6 +96,24 @@ pub fn with_js_lib<T>(js_lib: Option<&str>, f: impl FnOnce() -> T) -> T {
         cell.replace(previous);
         result
     })
+}
+
+/// Bind a source-specific synchronous HTTP client for the duration of a rule
+/// execution. Nested calls restore the prior client, so reader_eval keeps its
+/// legacy fallback client.
+pub fn with_js_http_client<T>(client: &Client, f: impl FnOnce() -> T) -> T {
+    ACTIVE_JS_HTTP_CLIENT.with(|cell| {
+        let previous = cell.replace(Some(client.clone()));
+        let result = f();
+        cell.replace(previous);
+        result
+    })
+}
+
+fn active_js_http_client() -> Client {
+    ACTIVE_JS_HTTP_CLIENT
+        .with(|cell| cell.borrow().clone())
+        .unwrap_or_else(|| JS_HTTP_CLIENT.clone())
 }
 
 pub fn eval_js(script: &str, input: &str, base_url: &str) -> anyhow::Result<String> {
@@ -168,333 +193,945 @@ fn eval_js_inner_with_source(
     bindings: Option<&HashMap<String, JsonValue>>,
 ) -> anyhow::Result<String> {
     JS_ENV.with(|(_, ctx, start_time)| {
-        let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         start_time.store(now, Ordering::Relaxed);
         let _guard = TimerGuard(start_time.clone());
 
         ctx.with(|ctx| {
             let globals = ctx.globals();
             let input_value = input.unwrap_or("");
-        let base_url_value = base_url.unwrap_or("");
-        let shared_js = active_js_lib_script()?;
+            let base_url_value = base_url.unwrap_or("");
+            let shared_js = active_js_lib_script()?;
 
-        globals.set("input", input_value)?;
-        globals.set("result", input_value)?;
-        globals.set("src", input_value)?;
-        globals.set("base_url", base_url_value)?;
-        globals.set("baseUrl", base_url_value)?;
-        if let Some(key) = key {
-            globals.set("key", key)?;
-        }
-        if let Some(page) = page {
-            globals.set("page", page)?;
-        }
+            globals.set("input", input_value)?;
+            globals.set("result", input_value)?;
+            globals.set("src", input_value)?;
+            globals.set("loginInfo", ctx.json_parse("{}")?)?;
+            globals.set("base_url", base_url_value)?;
+            globals.set("baseUrl", base_url_value)?;
+            if let Some(key) = key {
+                globals.set("key", key)?;
+            }
+            if let Some(page) = page {
+                globals.set("page", page)?;
+            }
 
-        // Default url variable for Legado compatibility
-        globals.set("url", base_url_value)?;
+            // Default url variable for Legado compatibility
+            globals.set("url", base_url_value)?;
 
-        // Stubs for Legado compatibility
-        let source_key_val = source_key.unwrap_or("").to_string();
-        let source_obj = Object::new(ctx.clone())?;
-        let sk_clone = source_key_val.clone();
-        source_obj.set("key", source_key_val)?;
-        source_obj.set("getKey", Func::new(move || sk_clone.clone()))?;
-        globals.set("source", source_obj)?;
+            // Stubs for Legado compatibility
+            let source_key_val = source_key.unwrap_or("").to_string();
+            let source_obj = Object::new(ctx.clone())?;
+            let sk_clone = source_key_val.clone();
+            source_obj.set("key", source_key_val.clone())?;
+            source_obj.set("getKey", Func::new(move || sk_clone.clone()))?;
 
-        let cookie_obj = Object::new(ctx.clone())?;
-        cookie_obj.set(
-            "removeCookie",
-            Func::new(|_key: String| -> String { "".to_string() }),
-        )?;
-        globals.set("cookie", cookie_obj)?;
-
-        let cache_obj = Object::new(ctx.clone())?;
-        cache_obj.set(
-            "get",
-            Func::new(|key: String| -> Option<String> {
-                let map = JS_KV.lock().unwrap_or_else(|e| e.into_inner());
-                map.get(&key).cloned()
-            }),
-        )?;
-        cache_obj.set(
-            "put",
-            Func::new(|key: String, val: String| -> bool {
-                let mut map = JS_KV.lock().unwrap_or_else(|e| e.into_inner());
-                map.insert(key, val);
-                true
-            }),
-        )?;
-        globals.set("cache", cache_obj)?;
-
-        let java_obj = Object::new(ctx.clone())?;
-        java_obj.set(
-            "ajax",
-            Func::new(|spec: String| -> String { java_ajax(&spec).unwrap_or_default() }),
-        )?;
-        java_obj.set(
-            "md5Encode",
-            Func::new(|input: String| -> String { md5_hex(&input) }),
-        )?;
-        java_obj.set(
-            "md5To16",
-            Func::new(|input: String| -> String { 
-                let md5 = md5_hex(&input);
-                if md5.len() >= 16 {
-                    md5[8..24].to_string()
-                } else {
-                    md5
-                }
-            }),
-        )?;
-        java_obj.set(
-            "timeFormat",
-            Func::new(|timestamp: i64| -> String { java_time_format(timestamp) }),
-        )?;
-        java_obj.set(
-            "androidId",
-            Func::new(|| -> String { JS_DEVICE_ID.clone() }),
-        )?;
-        java_obj.set("deviceID", Func::new(|| -> String { JS_DEVICE_ID.clone() }))?;
-        java_obj.set(
-            "get",
-            Func::new(|url: String| -> String {
-                java_request_simple("GET", &url, None).unwrap_or_default()
-            }),
-        )?;
-        java_obj.set(
-            "post",
-            Func::new(|url: String, body: String| -> String {
-                java_request_simple("POST", &url, Some(body)).unwrap_or_default()
-            }),
-        )?;
-        java_obj.set(
-            "put",
-            Func::new(|url: String, body: String| -> String {
-                java_request_simple("PUT", &url, Some(body)).unwrap_or_default()
-            }),
-        )?;
-        java_obj.set(
-            "base64Encode",
-            Func::new(|input: String| -> String {
-                base64::engine::general_purpose::STANDARD.encode(input)
-            }),
-        )?;
-        java_obj.set(
-            "base64Decode",
-            Func::new(|input: String| -> String {
-                base64::engine::general_purpose::STANDARD
-                    .decode(input)
-                    .ok()
-                    .and_then(|bytes| String::from_utf8(bytes).ok())
-                    .unwrap_or_default()
-            }),
-        )?;
-        java_obj.set(
-            "aesBase64DecodeToString",
-            Func::new(
-                |input: String, key: String, algorithm: String, iv: String| -> String {
-                    java_aes_base64_decode_to_string(&input, &key, &algorithm, &iv)
-                },
-            ),
-        )?;
-        java_obj.set(
-            "aesBase64Encode",
-            Func::new(
-                |input: String, key: String, algorithm: String, iv: String| -> String {
-                    java_aes_base64_encode(&input, &key, &algorithm, &iv)
-                },
-            ),
-        )?;
-        java_obj.set(
-            "aesEncode",
-            Func::new(
-                |input: String, key: String, algorithm: String, iv: String| -> String {
-                    java_aes_encode(&input, &key, &algorithm, &iv)
-                },
-            ),
-        )?;
-        java_obj.set(
-            "escape",
-            Func::new(|input: String| -> String {
-                input.chars().map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '*' || c == '+' || c == '-' || c == '.' || c == '/' || c == '@' || c == '_' {
-                        c.to_string()
-                    } else if (c as u32) < 256 {
-                        format!("%{:02X}", c as u32)
-                    } else {
-                        format!("%u{:04X}", c as u32)
+            source_obj.set(
+                "getVariable",
+                Func::new(|key: rquickjs::function::Opt<String>| -> String {
+                    let key_str = key.0.unwrap_or_default();
+                    if let Some(active) = crate::crawler::session::current_active_session() {
+                        if let Some(val) = active.get_variable(&key_str) {
+                            return match val {
+                                serde_json::Value::String(s) => s,
+                                other => other.to_string(),
+                            };
+                        }
                     }
-                }).collect()
-            }),
-        )?;
-        java_obj.set(
-            "unescape",
-            Func::new(|input: String| -> String {
-                // simple unescape implementation
-                let mut res = String::new();
-                let mut chars = input.chars().peekable();
-                while let Some(c) = chars.next() {
-                    if c == '%' {
-                        if let Some('u') = chars.peek() {
-                            chars.next();
-                            let mut hex = String::new();
-                            for _ in 0..4 {
-                                if let Some(hc) = chars.next() {
-                                    hex.push(hc);
-                                }
+                    "".to_string()
+                }),
+            )?;
+
+            source_obj.set(
+                "setVariable",
+                Func::new(
+                    |first: String, second: rquickjs::function::Opt<String>| -> String {
+                        if let Some(active) = crate::crawler::session::current_active_session() {
+                            if let Some(sec) = second.0 {
+                                active.set_variable(&first, serde_json::Value::String(sec.clone()));
+                                sec
+                            } else {
+                                active.set_variable("", serde_json::Value::String(first.clone()));
+                                first
                             }
-                            if let Ok(val) = u32::from_str_radix(&hex, 16) {
-                                if let Some(char_val) = char::from_u32(val) {
-                                    res.push(char_val);
+                        } else {
+                            "".to_string()
+                        }
+                    },
+                ),
+            )?;
+
+            source_obj.set(
+                "getLoginHeader",
+                Func::new(|| -> String {
+                    if let Some(active) = crate::crawler::session::current_active_session() {
+                        if let Some(val) = active.get_login_header() {
+                            return match val {
+                                serde_json::Value::String(s) => s,
+                                other => other.to_string(),
+                            };
+                        }
+                    }
+                    "".to_string()
+                }),
+            )?;
+
+            source_obj.set(
+                "putLoginHeader",
+                Func::new(|val: String| -> String {
+                    if let Some(active) = crate::crawler::session::current_active_session() {
+                        let json_val = serde_json::from_str::<serde_json::Value>(&val)
+                            .unwrap_or_else(|_| serde_json::Value::String(val.clone()));
+                        active.put_login_header(json_val);
+                    }
+                    val
+                }),
+            )?;
+
+            source_obj.set(
+                "removeLoginHeader",
+                Func::new(|| -> String {
+                    if let Some(active) = crate::crawler::session::current_active_session() {
+                        active.remove_login_header();
+                    }
+                    "".to_string()
+                }),
+            )?;
+
+            globals.set("source", source_obj)?;
+
+            let cookie_obj = Object::new(ctx.clone())?;
+            cookie_obj.set(
+                "getCookie",
+                Func::new(|url: String| -> String {
+                    if let Some(active) = crate::crawler::session::current_active_session() {
+                        active.get_cookie(&url).unwrap_or_default()
+                    } else {
+                        "".to_string()
+                    }
+                }),
+            )?;
+            cookie_obj.set(
+                "get",
+                Func::new(|url: String| -> String {
+                    if let Some(active) = crate::crawler::session::current_active_session() {
+                        active.get_cookie(&url).unwrap_or_default()
+                    } else {
+                        "".to_string()
+                    }
+                }),
+            )?;
+            cookie_obj.set(
+                "setCookie",
+                Func::new(|url: String, cookie: String| -> String {
+                    if let Some(active) = crate::crawler::session::current_active_session() {
+                        active.set_cookie(&url, &cookie);
+                    }
+                    cookie
+                }),
+            )?;
+            cookie_obj.set(
+                "set",
+                Func::new(|url: String, cookie: String| -> String {
+                    if let Some(active) = crate::crawler::session::current_active_session() {
+                        active.set_cookie(&url, &cookie);
+                    }
+                    cookie
+                }),
+            )?;
+            cookie_obj.set(
+                "removeCookie",
+                Func::new(|url: String| -> String {
+                    if let Some(active) = crate::crawler::session::current_active_session() {
+                        active.remove_cookie(&url);
+                    }
+                    "".to_string()
+                }),
+            )?;
+            cookie_obj.set(
+                "remove",
+                Func::new(|url: String| -> String {
+                    if let Some(active) = crate::crawler::session::current_active_session() {
+                        active.remove_cookie(&url);
+                    }
+                    "".to_string()
+                }),
+            )?;
+            globals.set("cookie", cookie_obj)?;
+
+            let cache_obj = Object::new(ctx.clone())?;
+            cache_obj.set(
+                "get",
+                Func::new(|key: String| -> Option<String> {
+                    let map = JS_KV.lock().unwrap_or_else(|e| e.into_inner());
+                    map.get(&key).cloned()
+                }),
+            )?;
+            cache_obj.set(
+                "put",
+                Func::new(|key: String, val: String| -> bool {
+                    let mut map = JS_KV.lock().unwrap_or_else(|e| e.into_inner());
+                    map.insert(key, val);
+                    true
+                }),
+            )?;
+            globals.set("cache", cache_obj)?;
+
+            let java_obj = Object::new(ctx.clone())?;
+            java_obj.set(
+                "ajax",
+                Func::new(|spec: String| -> String { java_ajax(&spec).unwrap_or_default() }),
+            )?;
+            java_obj.set(
+                "md5Encode",
+                Func::new(|input: String| -> String { md5_hex(&input) }),
+            )?;
+            java_obj.set(
+                "md5To16",
+                Func::new(|input: String| -> String {
+                    let md5 = md5_hex(&input);
+                    if md5.len() >= 16 {
+                        md5[8..24].to_string()
+                    } else {
+                        md5
+                    }
+                }),
+            )?;
+            java_obj.set(
+                "timeFormat",
+                Func::new(|timestamp: i64| -> String { java_time_format(timestamp) }),
+            )?;
+            java_obj.set(
+                "androidId",
+                Func::new(|| -> String { JS_DEVICE_ID.clone() }),
+            )?;
+            java_obj.set("deviceID", Func::new(|| -> String { JS_DEVICE_ID.clone() }))?;
+            java_obj.set(
+                "get",
+                Func::new(|url: String| -> String {
+                    java_request_simple("GET", &url, None).unwrap_or_default()
+                }),
+            )?;
+            java_obj.set(
+                "post",
+                Func::new(|url: String, body: String| -> String {
+                    java_request_simple("POST", &url, Some(body)).unwrap_or_default()
+                }),
+            )?;
+            java_obj.set(
+                "put",
+                Func::new(|url: String, body: String| -> String {
+                    java_request_simple("PUT", &url, Some(body)).unwrap_or_default()
+                }),
+            )?;
+            java_obj.set(
+                "base64Encode",
+                Func::new(|input: String| -> String {
+                    base64::engine::general_purpose::STANDARD.encode(input)
+                }),
+            )?;
+            java_obj.set(
+                "base64Decode",
+                Func::new(|input: String| -> String {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(input)
+                        .ok()
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                        .unwrap_or_default()
+                }),
+            )?;
+            java_obj.set(
+                "aesBase64DecodeToString",
+                Func::new(
+                    |input: String, key: String, algorithm: String, iv: String| -> String {
+                        java_aes_base64_decode_to_string(&input, &key, &algorithm, &iv)
+                    },
+                ),
+            )?;
+            java_obj.set(
+                "aesBase64Encode",
+                Func::new(
+                    |input: String, key: String, algorithm: String, iv: String| -> String {
+                        java_aes_base64_encode(&input, &key, &algorithm, &iv)
+                    },
+                ),
+            )?;
+            java_obj.set(
+                "aesEncode",
+                Func::new(
+                    |input: String, key: String, algorithm: String, iv: String| -> String {
+                        java_aes_encode(&input, &key, &algorithm, &iv)
+                    },
+                ),
+            )?;
+            java_obj.set(
+                "escape",
+                Func::new(|input: String| -> String {
+                    input
+                        .chars()
+                        .map(|c| {
+                            if c.is_ascii_alphanumeric()
+                                || c == '*'
+                                || c == '+'
+                                || c == '-'
+                                || c == '.'
+                                || c == '/'
+                                || c == '@'
+                                || c == '_'
+                            {
+                                c.to_string()
+                            } else if (c as u32) < 256 {
+                                format!("%{:02X}", c as u32)
+                            } else {
+                                format!("%u{:04X}", c as u32)
+                            }
+                        })
+                        .collect()
+                }),
+            )?;
+            java_obj.set(
+                "unescape",
+                Func::new(|input: String| -> String {
+                    // simple unescape implementation
+                    let mut res = String::new();
+                    let mut chars = input.chars().peekable();
+                    while let Some(c) = chars.next() {
+                        if c == '%' {
+                            if let Some('u') = chars.peek() {
+                                chars.next();
+                                let mut hex = String::new();
+                                for _ in 0..4 {
+                                    if let Some(hc) = chars.next() {
+                                        hex.push(hc);
+                                    }
+                                }
+                                if let Ok(val) = u32::from_str_radix(&hex, 16) {
+                                    if let Some(char_val) = char::from_u32(val) {
+                                        res.push(char_val);
+                                        continue;
+                                    }
+                                }
+                                res.push_str("%u");
+                                res.push_str(&hex);
+                            } else {
+                                let mut hex = String::new();
+                                for _ in 0..2 {
+                                    if let Some(hc) = chars.next() {
+                                        hex.push(hc);
+                                    }
+                                }
+                                if let Ok(val) = u8::from_str_radix(&hex, 16) {
+                                    res.push(val as char);
                                     continue;
                                 }
+                                res.push('%');
+                                res.push_str(&hex);
                             }
-                            res.push_str("%u");
-                            res.push_str(&hex);
                         } else {
-                            let mut hex = String::new();
-                            for _ in 0..2 {
-                                if let Some(hc) = chars.next() {
-                                    hex.push(hc);
-                                }
+                            res.push(c);
+                        }
+                    }
+                    res
+                }),
+            )?;
+            java_obj.set(
+                "gzip",
+                Func::new(|input: String| -> String {
+                    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                    let _ = encoder.write_all(input.as_bytes());
+                    if let Ok(compressed) = encoder.finish() {
+                        base64::engine::general_purpose::STANDARD.encode(compressed)
+                    } else {
+                        String::new()
+                    }
+                }),
+            )?;
+            java_obj.set(
+                "ungzip",
+                Func::new(|input: String| -> String {
+                    if let Ok(compressed) =
+                        base64::engine::general_purpose::STANDARD.decode(input.trim())
+                    {
+                        let mut decoder = GzDecoder::new(&compressed[..]);
+                        let mut s = String::new();
+                        if decoder.read_to_string(&mut s).is_ok() {
+                            return s;
+                        }
+                    }
+                    String::new()
+                }),
+            )?;
+            java_obj.set(
+                "encodeURIComponent",
+                Func::new(|input: String| -> String { urlencoding::encode(&input).into_owned() }),
+            )?;
+            java_obj.set(
+                "decodeURIComponent",
+                Func::new(|input: String| -> String {
+                    urlencoding::decode(&input)
+                        .map(|s| s.into_owned())
+                        .unwrap_or_default()
+                }),
+            )?;
+            java_obj.set(
+                "encodeURI",
+                Func::new(|input: String| -> String { urlencoding::encode(&input).into_owned() }),
+            )?;
+            java_obj.set(
+                "decodeURI",
+                Func::new(|input: String| -> String {
+                    urlencoding::decode(&input)
+                        .map(|s| s.into_owned())
+                        .unwrap_or_default()
+                }),
+            )?;
+            java_obj.set(
+                "now",
+                Func::new(|| -> i64 { chrono::Utc::now().timestamp_millis() }),
+            )?;
+            java_obj.set(
+                "uuid",
+                Func::new(|| -> String { Uuid::new_v4().to_string() }),
+            )?;
+
+            let default_content_for_get_string = input_value.to_string();
+            let base_url_for_get_string = base_url_value.to_string();
+            java_obj.set(
+                "getString",
+                Func::new(
+                    move |rule: Option<String>,
+                          content: Option<String>,
+                          is_url: Option<bool>,
+                          unescape: Option<bool>|
+                          -> String {
+                        java_get_string(
+                            rule.as_deref(),
+                            content.as_deref(),
+                            &default_content_for_get_string,
+                            &base_url_for_get_string,
+                            is_url.unwrap_or(false),
+                            unescape.unwrap_or(true),
+                        )
+                    },
+                ),
+            )?;
+
+            let default_content_for_get_string_list = input_value.to_string();
+            let base_url_for_get_string_list = base_url_value.to_string();
+            java_obj.set(
+                "getStringList",
+                Func::new(
+                    move |rule: Option<String>,
+                          content: Option<String>,
+                          is_url: Option<bool>|
+                          -> Vec<String> {
+                        java_get_string_list(
+                            rule.as_deref(),
+                            content.as_deref(),
+                            &default_content_for_get_string_list,
+                            &base_url_for_get_string_list,
+                            is_url.unwrap_or(false),
+                        )
+                    },
+                ),
+            )?;
+
+            java_obj.set(
+                "put",
+                Func::new(|key: String, val: String| -> bool {
+                    let mut map = JS_KV.lock().unwrap_or_else(|e| e.into_inner());
+                    map.insert(key, val);
+                    true
+                }),
+            )?;
+            java_obj.set(
+                "get",
+                Func::new(|key: String| -> Option<String> {
+                    let map = JS_KV.lock().unwrap_or_else(|e| e.into_inner());
+                    map.get(&key).cloned()
+                }),
+            )?;
+            java_obj.set(
+                "log",
+                Func::new(|msg: rquickjs::function::Opt<String>| {
+                    if let Some(m) = msg.0 {
+                        eprintln!("[legado::js] {}", m);
+                    }
+                }),
+            )?;
+            java_obj.set(
+                "toast",
+                Func::new(|_msg: rquickjs::function::Opt<String>| {}),
+            )?;
+            java_obj.set(
+                "longToast",
+                Func::new(|_msg: rquickjs::function::Opt<String>| {}),
+            )?;
+            let base_url_for_html_format = base_url_value.to_string();
+            java_obj.set(
+                "htmlFormat",
+                Func::new(move |html: String| -> String {
+                    crate::parser::html::format_keep_img(&html, &base_url_for_html_format)
+                }),
+            )?;
+
+            globals.set("java", java_obj)?;
+
+            globals.set(
+                "kv_get",
+                Func::new(|key: String| -> Option<String> {
+                    let map = JS_KV.lock().unwrap_or_else(|e| e.into_inner());
+                    map.get(&key).cloned()
+                }),
+            )?;
+            globals.set(
+                "kv_put",
+                Func::new(|key: String, val: String| -> bool {
+                    let mut map = JS_KV.lock().unwrap_or_else(|e| e.into_inner());
+                    map.insert(key, val);
+                    true
+                }),
+            )?;
+            globals.set(
+                "regex_replace",
+                Func::new(
+                    |input: String, pattern: String, replace: String| -> String {
+                        apply_regex_replace(&input, &pattern, &replace)
+                    },
+                ),
+            )?;
+            globals.set(
+                "strip_ws",
+                Func::new(|input: String| -> String { strip_whitespace(&input) }),
+            )?;
+
+            globals.set("book", Object::new(ctx.clone())?)?;
+            globals.set("chapter", Object::new(ctx.clone())?)?;
+            globals.set("title", "")?;
+            globals.set("nextChapterUrl", "")?;
+            globals.set("rssArticle", Object::new(ctx.clone())?)?;
+
+            if let Some(bindings) = bindings {
+                for (key, value) in bindings {
+                    let js_value = ctx.json_parse(value.to_string())?;
+                    globals.set(key.as_str(), js_value)?;
+                }
+            }
+            eval_script(
+                ctx.clone(),
+                "source.getLoginInfo = function() { return globalThis.loginInfo || {}; }; source.getLoginInfoMap = function() { return new Map(Object.entries(globalThis.loginInfo || {}).map(([key, value]) => [key, String(value)])); };",
+            )?;
+
+            eval_script(
+                ctx.clone(),
+                r#"if (globalThis.java && globalThis.java.getString) {
+                    const _orig_getString = globalThis.java.getString;
+                    globalThis.java.getString = function(rule, content, isUrl, unescape) {
+                        if (typeof content === 'object' && content !== null) {
+                            try { content = JSON.stringify(content); } catch (e) {}
+                        }
+                        const r = (rule !== undefined && rule !== null) ? String(rule) : undefined;
+                        const c = (content !== undefined && content !== null) ? String(content) : undefined;
+                        return _orig_getString(r, c, isUrl, unescape);
+                    };
+                    const _orig_getStringList = globalThis.java.getStringList;
+                    globalThis.java.getStringList = function(rule, content, isUrl) {
+                        if (typeof content === 'object' && content !== null) {
+                            try { content = JSON.stringify(content); } catch (e) {}
+                        }
+                        const r = (rule !== undefined && rule !== null) ? String(rule) : undefined;
+                        const c = (content !== undefined && content !== null) ? String(content) : undefined;
+                        return _orig_getStringList(r, c, isUrl);
+                    };
+                }"#,
+            )?;
+
+            if !shared_js.trim().is_empty() {
+                eval_script(ctx.clone(), &shared_js)?;
+            }
+
+            eval_script(
+                ctx.clone(),
+                r#"if (globalThis.result && globalThis.result.__ffiStrResponse === true) {
+                    const raw = globalThis.result;
+                    const responseHeaders = Object.assign({}, raw.headers || {});
+                    responseHeaders.get = function(name) {
+                        const key = Object.keys(raw.headers || {}).find(k => k.toLowerCase() === String(name).toLowerCase());
+                        return key === undefined ? null : raw.headers[key];
+                    };
+                    responseHeaders.names = function() { return Object.keys(raw.headers || {}); };
+                    responseHeaders.toMultimap = function() { return Object.assign({}, raw.headers || {}); };
+                    const bodyText = String(raw.body == null ? "" : raw.body);
+                    const statusCode = Number(raw.code || raw.status || 0);
+                    const strResponse = {
+                        __ffiStrResponse: true,
+                        raw: raw.raw || null,
+                        body: function() { return { string: function() { return bodyText; }, toString: function() { return bodyText; } }; },
+                        url: function() { return String(raw.url || ""); },
+                        code: function() { return statusCode; },
+                        headers: function() { return responseHeaders; },
+                        isSuccessful: function() { return raw.isSuccessful == null ? statusCode >= 200 && statusCode < 300 : !!raw.isSuccessful; },
+                        toJSON: function() { return {
+                            __ffiStrResponse: true,
+                            raw: raw.raw || null,
+                            body: bodyText,
+                            url: String(raw.url || ""),
+                            code: statusCode,
+                            headers: raw.headers || {},
+                            isSuccessful: raw.isSuccessful == null ? statusCode >= 200 && statusCode < 300 : !!raw.isSuccessful
+                        }; }
+                    };
+                    globalThis.result = strResponse;
+                }"#,
+            )?;
+
+            let v = eval_script(ctx.clone(), script)?;
+
+            let result = if v.is_null() || v.is_undefined() {
+                if let Ok(res_val) = globals.get::<_, rquickjs::Value<'_>>("result") {
+                    if !res_val.is_null() && !res_val.is_undefined() {
+                        if let Some(s) = res_val.clone().into_string() {
+                            let s: rquickjs::String<'_> = s;
+                            s.to_string()
+                                .map(|value| value.to_string())
+                                .unwrap_or_default()
+                        } else {
+                            match ctx.json_stringify(res_val) {
+                                Ok(Some(json)) => json.to_string().unwrap_or_default(),
+                                _ => String::new(),
                             }
-                            if let Ok(val) = u8::from_str_radix(&hex, 16) {
-                                res.push(val as char);
-                                continue;
-                            }
-                            res.push('%');
-                            res.push_str(&hex);
                         }
                     } else {
-                        res.push(c);
+                        String::new()
                     }
-                }
-                res
-            }),
-        )?;
-        java_obj.set(
-            "gzip",
-            Func::new(|input: String| -> String {
-                let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-                let _ = encoder.write_all(input.as_bytes());
-                if let Ok(compressed) = encoder.finish() {
-                    base64::engine::general_purpose::STANDARD.encode(compressed)
                 } else {
                     String::new()
                 }
-            }),
-        )?;
-        java_obj.set(
-            "ungzip",
-            Func::new(|input: String| -> String {
-                if let Ok(compressed) = base64::engine::general_purpose::STANDARD.decode(input.trim()) {
-                    let mut decoder = GzDecoder::new(&compressed[..]);
-                    let mut s = String::new();
-                    if decoder.read_to_string(&mut s).is_ok() {
-                        return s;
-                    }
+            } else if let Some(s) = v.clone().into_string() {
+                let s: rquickjs::String<'_> = s;
+                s.to_string()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default()
+            } else {
+                match ctx.json_stringify(v) {
+                    Ok(Some(json)) => json.to_string().unwrap_or_default(),
+                    _ => String::new(),
                 }
-                String::new()
-            }),
-        )?;
-        java_obj.set(
-            "encodeURIComponent",
-            Func::new(|input: String| -> String { urlencoding::encode(&input).into_owned() }),
-        )?;
-        java_obj.set(
-            "decodeURIComponent",
-            Func::new(|input: String| -> String {
-                urlencoding::decode(&input)
-                    .map(|s| s.into_owned())
-                    .unwrap_or_default()
-            }),
-        )?;
-        java_obj.set(
-            "encodeURI",
-            Func::new(|input: String| -> String { urlencoding::encode(&input).into_owned() }),
-        )?;
-        java_obj.set(
-            "decodeURI",
-            Func::new(|input: String| -> String {
-                urlencoding::decode(&input)
-                    .map(|s| s.into_owned())
-                    .unwrap_or_default()
-            }),
-        )?;
-        java_obj.set(
-            "now",
-            Func::new(|| -> i64 { chrono::Utc::now().timestamp_millis() }),
-        )?;
-        java_obj.set(
-            "uuid",
-            Func::new(|| -> String { Uuid::new_v4().to_string() }),
-        )?;
-        globals.set("java", java_obj)?;
+            };
 
-        globals.set(
-            "kv_get",
-            Func::new(|key: String| -> Option<String> {
-                let map = JS_KV.lock().unwrap_or_else(|e| e.into_inner());
-                map.get(&key).cloned()
-            }),
-        )?;
-        globals.set(
-            "kv_put",
-            Func::new(|key: String, val: String| -> bool {
-                let mut map = JS_KV.lock().unwrap_or_else(|e| e.into_inner());
-                map.insert(key, val);
-                true
-            }),
-        )?;
-        globals.set(
-            "regex_replace",
-            Func::new(
-                |input: String, pattern: String, replace: String| -> String {
-                    apply_regex_replace(&input, &pattern, &replace)
-                },
-            ),
-        )?;
-        globals.set(
-            "strip_ws",
-            Func::new(|input: String| -> String { strip_whitespace(&input) }),
-        )?;
-
-        globals.set("book", Object::new(ctx.clone())?)?;
-        globals.set("chapter", Object::new(ctx.clone())?)?;
-        globals.set("title", "")?;
-        globals.set("nextChapterUrl", "")?;
-        globals.set("rssArticle", Object::new(ctx.clone())?)?;
-
-        if let Some(bindings) = bindings {
-            for (key, value) in bindings {
-                let js_value = ctx.json_parse(value.to_string())?;
-                globals.set(key.as_str(), js_value)?;
-            }
-        }
-
-        if !shared_js.trim().is_empty() {
-            eval_script(ctx.clone(), &shared_js)?;
-        }
-
-        let v = eval_script(ctx.clone(), script)?;
-
-        let result = if v.is_null() || v.is_undefined() {
-            String::new()
-        } else if let Some(s) = v.clone().into_string() {
-            let s: rquickjs::String<'_> = s;
-            s.to_string()
-                .map(|value| value.to_string())
-                .unwrap_or_default()
-        } else {
-            match ctx.json_stringify(v) {
-                Ok(Some(json)) => json.to_string().unwrap_or_default(),
-                _ => String::new(),
-            }
-        };
-        
-        Ok(result)
-    }) // closes ctx.with
+            Ok(result)
+        }) // closes ctx.with
     }) // closes JS_ENV.with
+}
+
+
+pub(crate) fn java_get_string(
+    rule: Option<&str>,
+    content: Option<&str>,
+    default_content: &str,
+    base_url: &str,
+    is_url: bool,
+    unescape: bool,
+) -> String {
+    let Some(rule) = rule.map(str::trim).filter(|s| !s.is_empty()) else {
+        return String::new();
+    };
+
+    let target_content = content.unwrap_or(default_content).trim();
+    if target_content.is_empty() {
+        return String::new();
+    }
+
+    // 支持 || 与 && 组合符 (规范 6.8 & 8.2)
+    let split = rule_analyzer::split_top_level(rule, &["||", "&&"]);
+    if let Some(delim) = split.delimiter.as_deref() {
+        if delim == "||" {
+            for part in split.parts {
+                let res = java_get_string(Some(&part), content, default_content, base_url, is_url, unescape);
+                if !res.is_empty() {
+                    return res;
+                }
+            }
+            return String::new();
+        } else if delim == "&&" {
+            let mut results = Vec::new();
+            for part in split.parts {
+                let res = java_get_string(Some(&part), content, default_content, base_url, is_url, unescape);
+                if !res.is_empty() {
+                    results.push(res);
+                }
+            }
+            return results.join("\n");
+        }
+    }
+
+    // 分离 ## 替换正则 (规范 6.7)
+    let (main_rule, regex_part) = rule_engine::split_legado_regex(rule);
+    let main_rule = main_rule.trim();
+
+    let mut res = if main_rule.is_empty() {
+        target_content.to_string()
+    } else if main_rule.starts_with("<js>") || main_rule.starts_with("@js:") || main_rule.starts_with("js:") {
+        let script = rule_engine::strip_js_rule(main_rule);
+        eval_js(script, target_content, base_url).unwrap_or_default()
+    } else if main_rule.starts_with("@json:")
+        || main_rule.starts_with("@Json:")
+        || main_rule.starts_with("@JSON:")
+        || main_rule.starts_with("$.")
+        || main_rule.starts_with("$[")
+        || (target_content.starts_with('{') || target_content.starts_with('['))
+    {
+        // JSON 模式
+        let pure = if let Some(stripped) = main_rule
+            .strip_prefix("@json:")
+            .or_else(|| main_rule.strip_prefix("@Json:"))
+            .or_else(|| main_rule.strip_prefix("@JSON:"))
+        {
+            stripped.trim()
+        } else {
+            main_rule
+        };
+
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(target_content) {
+            if pure.is_empty() {
+                jsonpath::value_to_string(&v).unwrap_or_default()
+            } else if pure.starts_with('$') {
+                jsonpath::jsonpath_first_string(&v, pure).unwrap_or_default()
+            } else if let Some(val) = v.get(pure) {
+                jsonpath::value_to_string(val).unwrap_or_default()
+            } else {
+                jsonpath::jsonpath_first_string(&v, &format!("$.{}", pure)).unwrap_or_default()
+            }
+        } else {
+            String::new()
+        }
+    } else if main_rule.starts_with("@xpath:")
+        || main_rule.starts_with("@XPath:")
+        || main_rule.starts_with("@XPATH:")
+        || main_rule.starts_with('/')
+        || main_rule.starts_with("./")
+    {
+        // XPath 模式
+        let pure = if let Some(stripped) = main_rule
+            .strip_prefix("@xpath:")
+            .or_else(|| main_rule.strip_prefix("@XPath:"))
+            .or_else(|| main_rule.strip_prefix("@XPATH:"))
+        {
+            stripped.trim()
+        } else {
+            main_rule
+        };
+        html::select_xpath(target_content, pure)
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+    } else if main_rule.starts_with("@regex:") || main_rule.starts_with(':') {
+        // Regex 模式
+        let pure = if let Some(stripped) = main_rule.strip_prefix("@regex:") {
+            stripped.trim()
+        } else {
+            &main_rule[1..]
+        };
+        if let Ok(re) = regex::Regex::new(pure) {
+            if let Some(caps) = re.captures(target_content) {
+                if let Some(m) = caps.get(1).or_else(|| caps.get(0)) {
+                    m.as_str().to_string()
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        }
+    } else {
+        // 默认 CSS / HTML 模式
+        let pure = if let Some(stripped) = main_rule
+            .strip_prefix("@css:")
+            .or_else(|| main_rule.strip_prefix("@CSS:"))
+        {
+            stripped.trim()
+        } else {
+            main_rule
+        };
+        let doc = html::parse_document(target_content);
+        html::select_all_text(&doc, pure)
+            .or_else(|| html::select_text(&doc, pure))
+            .unwrap_or_default()
+    };
+
+    if let Some(regex) = regex_part {
+        res = rule_engine::apply_legado_regex(&res, regex);
+    }
+
+    if unescape && res.contains('&') {
+        res = html::html_unescape(&res);
+    }
+
+    if is_url && !res.is_empty() {
+        res = rule_engine::resolve_url(base_url, &res);
+    }
+
+    res
+}
+
+pub(crate) fn java_get_string_list(
+    rule: Option<&str>,
+    content: Option<&str>,
+    default_content: &str,
+    base_url: &str,
+    is_url: bool,
+) -> Vec<String> {
+    let Some(rule) = rule.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Vec::new();
+    };
+
+    let target_content = content.unwrap_or(default_content).trim();
+    if target_content.is_empty() {
+        return Vec::new();
+    }
+
+    // 支持 || 与 && / %% 组合符 (规范 6.9 & 8.2)
+    let split = rule_analyzer::split_top_level(rule, &["||", "&&", "%%"]);
+    if let Some(delim) = split.delimiter.as_deref() {
+        if delim == "||" {
+            for part in split.parts {
+                let res = java_get_string_list(Some(&part), content, default_content, base_url, is_url);
+                if !res.is_empty() {
+                    return res;
+                }
+            }
+            return Vec::new();
+        } else if delim == "&&" || delim == "%%" {
+            let mut results = Vec::new();
+            for part in split.parts {
+                let res = java_get_string_list(Some(&part), content, default_content, base_url, is_url);
+                results.extend(res);
+            }
+            return results;
+        }
+    }
+
+    // 分离 ## 替换正则 (规范 6.7)
+    let (main_rule, regex_part) = rule_engine::split_legado_regex(rule);
+    let main_rule = main_rule.trim();
+
+    let mut list = if main_rule.is_empty() {
+        vec![target_content.to_string()]
+    } else if main_rule.starts_with("<js>") || main_rule.starts_with("@js:") || main_rule.starts_with("js:") {
+        let script = rule_engine::strip_js_rule(main_rule);
+        if let Ok(js_res) = eval_js(script, target_content, base_url) {
+            js_res
+                .lines()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else {
+            Vec::new()
+        }
+    } else if main_rule.starts_with("@json:")
+        || main_rule.starts_with("@Json:")
+        || main_rule.starts_with("@JSON:")
+        || main_rule.starts_with("$.")
+        || main_rule.starts_with("$[")
+        || (target_content.starts_with('{') || target_content.starts_with('['))
+    {
+        let pure = if let Some(stripped) = main_rule
+            .strip_prefix("@json:")
+            .or_else(|| main_rule.strip_prefix("@Json:"))
+            .or_else(|| main_rule.strip_prefix("@JSON:"))
+        {
+            stripped.trim()
+        } else {
+            main_rule
+        };
+
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(target_content) {
+            if pure.starts_with('$') {
+                jsonpath::jsonpath_query(&v, pure)
+                    .iter()
+                    .filter_map(jsonpath::value_to_string)
+                    .collect()
+            } else if let Some(val) = v.get(pure) {
+                match val {
+                    serde_json::Value::Array(arr) => {
+                        arr.iter().filter_map(jsonpath::value_to_string).collect()
+                    }
+                    other => jsonpath::value_to_string(other).into_iter().collect(),
+                }
+            } else {
+                jsonpath::jsonpath_query(&v, &format!("$.{}", pure))
+                    .iter()
+                    .filter_map(jsonpath::value_to_string)
+                    .collect()
+            }
+        } else {
+            Vec::new()
+        }
+    } else if main_rule.starts_with("@xpath:")
+        || main_rule.starts_with("@XPath:")
+        || main_rule.starts_with("@XPATH:")
+        || main_rule.starts_with('/')
+        || main_rule.starts_with("./")
+    {
+        let pure = if let Some(stripped) = main_rule
+            .strip_prefix("@xpath:")
+            .or_else(|| main_rule.strip_prefix("@XPath:"))
+            .or_else(|| main_rule.strip_prefix("@XPATH:"))
+        {
+            stripped.trim()
+        } else {
+            main_rule
+        };
+        html::select_xpath(target_content, pure)
+    } else if main_rule.starts_with("@regex:") || main_rule.starts_with(':') {
+        let pure = if let Some(stripped) = main_rule.strip_prefix("@regex:") {
+            stripped.trim()
+        } else {
+            &main_rule[1..]
+        };
+        if let Ok(re) = regex::Regex::new(pure) {
+            re.captures_iter(target_content)
+                .filter_map(|caps| {
+                    caps.get(1).or_else(|| caps.get(0)).map(|m| m.as_str().to_string())
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    } else {
+        let pure = if let Some(stripped) = main_rule
+            .strip_prefix("@css:")
+            .or_else(|| main_rule.strip_prefix("@CSS:"))
+        {
+            stripped.trim()
+        } else {
+            main_rule
+        };
+        let doc = html::parse_document(target_content);
+        html::select_text_list(&doc, pure)
+    };
+
+    if let Some(regex) = regex_part {
+        list = list
+            .into_iter()
+            .map(|item| rule_engine::apply_legado_regex(&item, regex))
+            .collect();
+    }
+
+    if is_url {
+        list = list
+            .into_iter()
+            .filter(|item| !item.is_empty())
+            .map(|item| rule_engine::resolve_url(base_url, &item))
+            .collect();
+    }
+
+    list
 }
 
 fn java_aes_base64_decode_to_string(input: &str, key: &str, algorithm: &str, iv: &str) -> String {
@@ -554,7 +1191,7 @@ fn java_aes_encode(input: &str, key: &str, algorithm: &str, iv: &str) -> String 
 
 // 修复：sloppy 全局模式（见下）
 fn eval_script<'js>(ctx: rquickjs::Ctx<'js>, script: &str) -> anyhow::Result<Value<'js>> {
-    use std::ffi::{CStr, CString};
+    use std::ffi::CString;
     // Legado 规则普遍使用隐式全局变量（如 `time=...;t=...` 不带 var 声明），
     // 必须用 sloppy（JS_EVAL_TYPE_GLOBAL=0）模式求值；module/strict 模式会抛
     // ReferenceError，导致规则走 catch 降级分支（如 qmbook 目录 URL 退化为
@@ -563,7 +1200,7 @@ fn eval_script<'js>(ctx: rquickjs::Ctx<'js>, script: &str) -> anyhow::Result<Val
     // （strict）模式，无法在外部构造/修改，故直接调用 qjs::JS_Eval 显式指定
     // JS_EVAL_TYPE_GLOBAL。
     let src = CString::new(script)?;
-    let file_name = CStr::from_bytes_with_nul(b"eval_script\0").unwrap();
+    let file_name = c"eval_script";
     let val = unsafe {
         rquickjs::qjs::JS_Eval(
             ctx.as_raw().as_ptr(),
@@ -575,7 +1212,7 @@ fn eval_script<'js>(ctx: rquickjs::Ctx<'js>, script: &str) -> anyhow::Result<Val
     };
     // 与 rquickjs Ctx::handle_exception 等价：JS_TAG_EXCEPTION 时取异常信息
     unsafe {
-        if rquickjs::qjs::JS_VALUE_GET_NORM_TAG(val) != (rquickjs::qjs::JS_TAG_EXCEPTION as i32) {
+        if rquickjs::qjs::JS_VALUE_GET_NORM_TAG(val) != rquickjs::qjs::JS_TAG_EXCEPTION {
             let v = Value::from_raw(ctx.clone(), val);
             return Ok(v);
         }
@@ -633,7 +1270,7 @@ fn compile_js_lib(js_lib: &str) -> anyhow::Result<String> {
 fn resolve_js_lib_entry(entry: &str) -> anyhow::Result<String> {
     let value = entry.trim();
     if value.starts_with("http://") || value.starts_with("https://") {
-        let response = JS_HTTP_CLIENT.get(value).send()?;
+        let response = active_js_http_client().get(value).send()?;
         return Ok(response.text().unwrap_or_default());
     }
     Ok(value.to_string())
@@ -668,7 +1305,7 @@ fn java_ajax(spec: &str) -> anyhow::Result<String> {
         .to_uppercase();
     let method = Method::from_bytes(method.as_bytes()).unwrap_or(Method::GET);
 
-    let mut req = JS_HTTP_CLIENT.request(method, url.trim());
+    let mut req = active_js_http_client().request(method, url.trim());
 
     if let Some(headers) = options_json.get("headers").and_then(|v| v.as_object()) {
         for (key, value) in headers {
@@ -694,7 +1331,7 @@ fn java_ajax(spec: &str) -> anyhow::Result<String> {
 
 fn java_request_simple(method: &str, url: &str, body: Option<String>) -> anyhow::Result<String> {
     let method = Method::from_bytes(method.as_bytes()).unwrap_or(Method::GET);
-    let mut req = JS_HTTP_CLIENT.request(method, url.trim());
+    let mut req = active_js_http_client().request(method, url.trim());
     if let Some(body) = body {
         req = req.body(body);
     }
@@ -738,4 +1375,75 @@ fn split_ajax_spec(spec: &str) -> (&str, Option<&str>) {
     }
 
     (spec, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crawler::session::{with_active_session, ExecuteSession};
+    use serde_json::json;
+
+    #[test]
+    fn test_js_session_bindings() {
+        let initial = ExecuteSession {
+            cookies: Some("sid=initial_token".to_string()),
+            header: Some(json!({"Authorization": "Bearer init_auth"})),
+            variables: Some(
+                [("myVar".to_string(), json!("initial_val"))]
+                    .into_iter()
+                    .collect(),
+            ),
+        };
+
+        let (_, delta) =
+            with_active_session(Some(&initial), "https://example.com/books", |_session| {
+                // Read initial variable
+                let res =
+                    eval_js("source.getVariable('myVar')", "", "https://example.com").unwrap();
+                assert_eq!(res, "initial_val");
+
+                // Write new variable
+                let res = eval_js(
+                    "source.setVariable('myVar', 'updated_val')",
+                    "",
+                    "https://example.com",
+                )
+                .unwrap();
+                assert_eq!(res, "updated_val");
+
+                // Read login header
+                let h = eval_js("source.getLoginHeader()", "", "https://example.com").unwrap();
+                assert!(h.contains("init_auth"));
+
+                // Put new login header with Cookie
+                eval_js(
+                    r#"source.putLoginHeader(JSON.stringify({Cookie: "sid=refreshed_token"}))"#,
+                    "",
+                    "https://example.com",
+                )
+                .unwrap();
+
+                // Cookie get
+                let c = eval_js(
+                    "cookie.getCookie('https://example.com')",
+                    "",
+                    "https://example.com",
+                )
+                .unwrap();
+                assert!(c.contains("sid=refreshed_token"));
+            });
+
+        assert!(delta.is_some());
+        let delta = delta.unwrap();
+        assert_eq!(delta.cookies, Some("sid=refreshed_token".to_string()));
+        assert_eq!(
+            delta
+                .variables
+                .as_ref()
+                .unwrap()
+                .get("myVar")
+                .and_then(JsonValue::as_str),
+            Some("updated_val")
+        );
+    }
 }

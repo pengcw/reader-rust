@@ -286,7 +286,11 @@ impl RuleEngine {
                 ) {
                     let script = self.strip_mode_prefix(&content_rule);
                     if let Ok(res) = eval_js(script, &content_body, base_url) {
-                        return res;
+                        let mut content = html::format_keep_img(&res, base_url);
+                        if let Some(replace) = rule.replace_regex.as_deref() {
+                            content = apply_legado_regex(&content, replace);
+                        }
+                        return content;
                     }
                 }
 
@@ -318,6 +322,8 @@ impl RuleEngine {
                         result.unwrap_or_default()
                     }
                 };
+
+                content = html::format_keep_img(&content, base_url);
 
                 if let Some(replace) = rule.replace_regex.as_deref() {
                     content = apply_legado_regex(&content, replace);
@@ -1404,7 +1410,7 @@ fn pick_json_field(v: &Value, rule: Option<&str>) -> Option<String> {
     None
 }
 
-fn resolve_url(base: &str, url: &str) -> String {
+pub(crate) fn resolve_url(base: &str, url: &str) -> String {
     let base = normalize_source_url(base);
     let url = normalize_source_url(strip_url_config(url));
 
@@ -1465,14 +1471,12 @@ fn interpolate_json_templates(
             return val;
         }
 
-        match eval_js(
+        eval_js(
             expr,
             &serde_json::to_string(v).unwrap_or_default(),
             base_url,
-        ) {
-            Ok(res) => res,
-            Err(_) => String::new(),
-        }
+        )
+        .unwrap_or_default()
     })
     .into_owned()
 }
@@ -1546,8 +1550,7 @@ fn eval_field_html_with_ctx(
 ) -> Option<String> {
     // Handle mode forcing prefixes
     let rule = rule.trim();
-    if rule.starts_with("@css:") {
-        let pure = &rule[5..];
+    if let Some(pure) = rule.strip_prefix("@css:") {
         return eval_field_html_with_ctx(pure, el, base_url, ctx);
     }
     if rule.starts_with("@xpath:") {
@@ -1604,12 +1607,10 @@ fn eval_field_html_doc_with_ctx(
 ) -> Option<String> {
     // Handle mode forcing prefixes
     let rule = rule.trim();
-    if rule.starts_with("@css:") {
-        let pure = &rule[5..];
+    if let Some(pure) = rule.strip_prefix("@css:") {
         return eval_field_html_doc_with_ctx(pure, doc, base_url, ctx);
     }
-    if rule.starts_with("@xpath:") {
-        let pure = &rule[7..];
+    if let Some(pure) = rule.strip_prefix("@xpath:") {
         return html::select_xpath(&doc.html(), pure).first().cloned();
     }
 
@@ -1804,8 +1805,7 @@ fn try_put_get_html(
     base_url: &str,
     ctx: &mut HashMap<String, String>,
 ) -> Option<String> {
-    if rule.starts_with("@put:") {
-        let content = &rule[5..];
+    if let Some(content) = rule.strip_prefix("@put:") {
         if content.starts_with('{') && content.ends_with('}') {
             let inner = &content[1..content.len() - 1];
             for part in inner.split(',') {
@@ -1820,8 +1820,7 @@ fn try_put_get_html(
         }
         return Some("".to_string());
     }
-    if rule.starts_with("@get:") {
-        let content = &rule[5..];
+    if let Some(content) = rule.strip_prefix("@get:") {
         if content.starts_with('{') && content.ends_with('}') {
             let key = &content[1..content.len() - 1].trim();
             return ctx.get(*key).cloned();
@@ -1836,8 +1835,7 @@ fn try_put_get_html_doc(
     base_url: &str,
     ctx: &mut HashMap<String, String>,
 ) -> Option<String> {
-    if rule.starts_with("@put:") {
-        let content = &rule[5..];
+    if let Some(content) = rule.strip_prefix("@put:") {
         if content.starts_with('{') && content.ends_with('}') {
             let inner = &content[1..content.len() - 1];
             for part in inner.split(',') {
@@ -1852,8 +1850,7 @@ fn try_put_get_html_doc(
         }
         return Some("".to_string());
     }
-    if rule.starts_with("@get:") {
-        let content = &rule[5..];
+    if let Some(content) = rule.strip_prefix("@get:") {
         if content.starts_with('{') && content.ends_with('}') {
             let key = &content[1..content.len() - 1].trim();
             return ctx.get(*key).cloned();
@@ -1868,8 +1865,7 @@ fn try_put_get_json(
     base_url: &str,
     ctx: &mut HashMap<String, String>,
 ) -> Option<String> {
-    if rule.starts_with("@put:") {
-        let content = &rule[5..];
+    if let Some(content) = rule.strip_prefix("@put:") {
         if content.starts_with('{') && content.ends_with('}') {
             let inner = &content[1..content.len() - 1];
             for part in inner.split(',') {
@@ -1884,8 +1880,7 @@ fn try_put_get_json(
         }
         return Some("".to_string());
     }
-    if rule.starts_with("@get:") {
-        let content = &rule[5..];
+    if let Some(content) = rule.strip_prefix("@get:") {
         if content.starts_with('{') && content.ends_with('}') {
             let key = &content[1..content.len() - 1].trim();
             return ctx.get(*key).cloned();
@@ -1900,8 +1895,7 @@ fn try_put_get_xpath(
     base_url: &str,
     ctx: &mut HashMap<String, String>,
 ) -> Option<String> {
-    if rule.starts_with("@put:") {
-        let content = &rule[5..];
+    if let Some(content) = rule.strip_prefix("@put:") {
         if content.starts_with('{') && content.ends_with('}') {
             let inner = &content[1..content.len() - 1];
             for part in inner.split(',') {
@@ -1916,8 +1910,7 @@ fn try_put_get_xpath(
         }
         return Some(String::new());
     }
-    if rule.starts_with("@get:") {
-        let content = &rule[5..];
+    if let Some(content) = rule.strip_prefix("@get:") {
         if content.starts_with('{') && content.ends_with('}') {
             let key = &content[1..content.len() - 1].trim();
             return ctx.get(*key).cloned();
@@ -1926,7 +1919,7 @@ fn try_put_get_xpath(
     None
 }
 
-fn split_legado_regex(rule: &str) -> (String, Option<&str>) {
+pub(crate) fn split_legado_regex(rule: &str) -> (String, Option<&str>) {
     if let Some(idx) = rule.find("##") {
         let (pure, reg) = rule.split_at(idx);
         return (pure.trim().to_string(), Some(reg));
@@ -1960,7 +1953,11 @@ pub fn apply_legado_regex(text: &str, regex_part: &str) -> String {
             continue;
         }
 
-        let replace = if i + 1 < parts.len() { parts[i + 1] } else { "" };
+        let replace = if i + 1 < parts.len() {
+            parts[i + 1]
+        } else {
+            ""
+        };
         let is_last = (i + 1 >= parts.len()) || (i + 2 >= parts.len());
 
         if first_only && is_last {
@@ -2012,7 +2009,7 @@ fn strip_mode_prefix(rule: &str) -> &str {
     rule
 }
 
-fn strip_js_rule(rule: &str) -> &str {
+pub(crate) fn strip_js_rule(rule: &str) -> &str {
     let rule = rule.trim();
     if let Some(rest) = rule
         .strip_prefix("<js>")
@@ -2292,7 +2289,7 @@ fn is_truthy(value: String) -> bool {
 mod tests {
     use super::*;
     use crate::model::book_source::BookSource;
-    use crate::model::rule::{BookInfoRule, SearchRule, TocRule};
+    use crate::model::rule::{BookInfoRule, ContentRule, SearchRule, TocRule};
 
     #[test]
     fn test_detect_mode() {
@@ -2505,4 +2502,69 @@ mod tests {
         assert_eq!(book.name, "Book-Alias");
         assert_eq!(book.author, "Tester");
     }
+
+    #[test]
+    fn test_content_format_keep_img_and_double_braces() {
+        let engine = RuleEngine::new().unwrap();
+        let source = BookSource {
+            book_source_name: "起步新榜（优）".to_string(),
+            book_source_url: "DragonQuestQBqqnb".to_string(),
+            rule_content: Some(ContentRule {
+                content: Some("<p>{{$.data.Content[0].Content}}</p>".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let body = r#"{
+            "ret": 0,
+            "data": {
+                "Content": [{
+                    "Content": [
+                        "“李珞！你这也太过分了！赶紧给班长道歉！”\r\n  “就是啊，溪溪好心想要给你最后冲刺一下，你不领情也就算了，推人干嘛？”\r\n  “当然！”"
+                    ]
+                }]
+            }
+        }"#;
+
+        let content = engine.content(&source, body, "https://novel.html5.qq.com");
+        assert_eq!(
+            content,
+            "“李珞！你这也太过分了！赶紧给班长道歉！”\n“就是啊，溪溪好心想要给你最后冲刺一下，你不领情也就算了，推人干嘛？”\n“当然！”"
+        );
+    }
+
+    #[test]
+    fn test_content_comic_js_get_string_and_aes_decode() {
+        let engine = RuleEngine::new().unwrap();
+        let source = BookSource {
+            book_source_name: "全免漫画（优）".to_string(),
+            book_source_url: "https://api-cdn.kaimanhua.com/".to_string(),
+            rule_content: Some(ContentRule {
+                content: Some(
+                    r#"<js>
+result=String(java.getString("$.data")).replace(/arsadata/,"");
+u=java.aesBase64DecodeToString(result,"4548ded8c9e02690","AES/CBC/PKCS5Padding","1992360ee9bc4f8f");
+img=u.match(/\[(.*)\]/)[1].split(",").map(x=>'\n<img src='+x+'>').join("\n")
+</js>"#
+                        .to_string(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let body = r#"{"data":"arsadataI3j2wv8QgjqgVWTZ7b+iuTNgOpkoIWewfuKkbsdwz1TfkSIzFHBDmZs+KQVExU+qxB7UfJf/z38gew7KMuqrwA==","status":0,"message":"ok"}"#;
+
+        let script = r#"
+result=String(java.getString("$.data")).replace(/arsadata/,"");
+u=java.aesBase64DecodeToString(result,"4548ded8c9e02690","AES/CBC/PKCS5Padding","1992360ee9bc4f8f");
+img=u.match(/\[(.*)\]/)[1].split(",").map(x=>'\n<img src='+x+'>').join("\n")
+"#;
+        let js_res = eval_js(script, body, "https://api-cdn.kaimanhua.com");
+        assert!(js_res.is_ok());
+
+        let content = engine.content(&source, body, "https://api-cdn.kaimanhua.com");
+        assert!(content.contains(r#"<img src="https://example.com/1.jpg">"#));
+        assert!(content.contains(r#"<img src="https://example.com/2.jpg">"#));
+    }
 }
+

@@ -49,8 +49,7 @@ fn legado_to_css(selector: &str) -> String {
     let selector = selector.trim();
 
     // Handle special "class." prefix - multiple classes separated by space
-    if selector.starts_with("class.") {
-        let rest = &selector[6..];
+    if let Some(rest) = selector.strip_prefix("class.") {
         let classes: Vec<&str> = rest.split_whitespace().collect();
         if classes.len() > 1 {
             return format!(".{}", classes.join("."));
@@ -763,6 +762,123 @@ pub fn select_xpath(html: &str, xpath: &str) -> Vec<String> {
     }
 }
 
+/// HTML 实体反转义
+pub fn html_unescape(input: &str) -> String {
+    if !input.contains('&') {
+        return input.to_string();
+    }
+    let mut result = input.to_string();
+    result = result
+        .replace("&nbsp;", " ")
+        .replace("&emsp;", "　")
+        .replace("&ensp;", " ")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&copy;", "©")
+        .replace("&reg;", "®")
+        .replace("&trade;", "™")
+        .replace("&mdash;", "—")
+        .replace("&ndash;", "–")
+        .replace("&hellip;", "…")
+        .replace("&amp;", "&");
+
+    if result.contains("&#") {
+        if let Ok(num_re) = regex::Regex::new(r"&#(?:x([0-9a-fA-F]+)|(\d+));") {
+            result = num_re
+                .replace_all(&result, |caps: &regex::Captures| {
+                    if let Some(hex) = caps.get(1) {
+                        if let Ok(code) = u32::from_str_radix(hex.as_str(), 16) {
+                            if let Some(c) = char::from_u32(code) {
+                                return c.to_string();
+                            }
+                        }
+                    } else if let Some(dec) = caps.get(2) {
+                        if let Ok(code) = dec.as_str().parse::<u32>() {
+                            if let Some(c) = char::from_u32(code) {
+                                return c.to_string();
+                            }
+                        }
+                    }
+                    caps.get(0).unwrap().as_str().to_string()
+                })
+                .into_owned();
+        }
+    }
+    result
+}
+
+/// 按照阅读 3.0 规范第 16 节实现 HtmlFormatter.formatKeepImg：
+/// 保留图片并补全 URL，将 <p>/<br> 等块级标签清洗为换行符，剔除其他无意义 HTML 标签。
+pub fn format_keep_img(content: &str, redirect_url: &str) -> String {
+    if content.trim().is_empty() {
+        return String::new();
+    }
+
+    // 1. 移除 script、style 与注释
+    let mut text = content.to_string();
+    if let Ok(re) = regex::Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<!--.*?-->") {
+        text = re.replace_all(&text, "").into_owned();
+    }
+
+    // 2. 提取并保留 <img> 标签，补全相对 URL，使用占位符保护
+    let mut img_placeholders: Vec<String> = Vec::new();
+    if let Ok(img_re) = regex::Regex::new(r"(?i)<img\b[^>]*>") {
+        if let Ok(src_re) = regex::Regex::new(r#"(?i)\b(?:src|data-src|data-original)\s*=\s*["']?([^"'\s>]+)["']?"#) {
+            text = img_re.replace_all(&text, |caps: &regex::Captures| {
+                let img_tag = caps.get(0).unwrap().as_str();
+                let full_img = if let Some(src_caps) = src_re.captures(img_tag) {
+                    let raw_src = src_caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+                    if !raw_src.is_empty() && !redirect_url.is_empty() {
+                        let abs_src = crate::parser::rule_engine::resolve_url(redirect_url, raw_src);
+                        format!(r#"<img src="{}">"#, abs_src)
+                    } else {
+                        format!(r#"<img src="{}">"#, raw_src)
+                    }
+                } else {
+                    img_tag.to_string()
+                };
+                let placeholder = format!("__READER_IMG_PLACEHOLDER_{}__", img_placeholders.len());
+                img_placeholders.push(full_img);
+                format!("\n{}\n", placeholder)
+            }).into_owned();
+        }
+    }
+
+    // 3. 将块级换行标签转换为换行符 \n
+    if let Ok(block_re) = regex::Regex::new(r"(?i)<br\s*/?>|</?p\b[^>]*>|</?div\b[^>]*>|</?h[1-6]\b[^>]*>") {
+        text = block_re.replace_all(&text, "\n").into_owned();
+    }
+
+    // 4. 清理剩余所有 HTML 标签
+    if let Ok(tag_re) = regex::Regex::new(r"<[^>]+>") {
+        text = tag_re.replace_all(&text, "").into_owned();
+    }
+
+    // 5. 还原 <img> 占位符
+    for (i, img_tag) in img_placeholders.into_iter().enumerate() {
+        let placeholder = format!("__READER_IMG_PLACEHOLDER_{}__", i);
+        text = text.replace(&placeholder, &img_tag);
+    }
+
+    // 6. 若含 &，进行 HTML-unescape
+    if text.contains('&') {
+        text = html_unescape(&text);
+    }
+
+    // 7. 规范化空白行与段落：按 \n 切分，每行 trim，去掉连续空行
+    let mut lines = Vec::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if !line.is_empty() {
+            lines.push(line.to_string());
+        }
+    }
+
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -846,4 +962,37 @@ mod tests {
         );
         assert_eq!(select_text(&doc, "a@href"), Some("/book/1".to_string()));
     }
+
+    #[test]
+    fn test_format_keep_img() {
+        // 清洗 <p> 标签并正确分段
+        let html_content = "<p>“第一行文字”</p><p>“第二行文字”</p>";
+        assert_eq!(
+            format_keep_img(html_content, ""),
+            "“第一行文字”\n“第二行文字”"
+        );
+
+        // 保留图片并补全相对 URL
+        let img_html = "<p>前文</p><img src=\"/images/1.jpg\"><p>后文</p>";
+        assert_eq!(
+            format_keep_img(img_html, "https://example.com/chapter/1.html"),
+            "前文\n<img src=\"https://example.com/images/1.jpg\">\n后文"
+        );
+
+        // 清洗无用标签与脚本样式
+        let messy_html = "<div><script>alert(1);</script><p>正文内容<span>注释</span><br>第二行</p></div>";
+        assert_eq!(
+            format_keep_img(messy_html, ""),
+            "正文内容注释\n第二行"
+        );
+    }
+
+    #[test]
+    fn test_html_unescape() {
+        assert_eq!(
+            html_unescape("&nbsp;文字&quot;双引号&quot;&apos;单引号&apos;&amp;和&lt;小于&gt;大于&#160;"),
+            " 文字\"双引号\"'单引号'&和<小于>大于\u{a0}"
+        );
+    }
 }
+
