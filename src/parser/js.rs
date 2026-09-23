@@ -1,3 +1,4 @@
+use crate::crawler::HttpClient;
 use crate::parser::html;
 use crate::parser::jsonpath;
 use crate::parser::rule_analyzer;
@@ -12,8 +13,7 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use once_cell::sync::Lazy;
-use reqwest::blocking::Client;
-use reqwest::Method;
+use ureq::http::Method;
 use rquickjs::function::Func;
 use rquickjs::{Context, Object, Runtime, Value};
 use serde_json::Value as JsonValue;
@@ -29,15 +29,7 @@ use uuid::Uuid;
 static JS_KV: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static JS_LIB_CACHE: Lazy<Mutex<HashMap<String, String>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-static JS_HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
-    Client::builder()
-        .cookie_store(true)
-        .gzip(true)
-        .brotli(true)
-        .deflate(true)
-        .build()
-        .expect("failed to build JS HTTP client")
-});
+static JS_HTTP_CLIENT: Lazy<HttpClient> = Lazy::new(HttpClient::standalone);
 static JS_DEVICE_ID: Lazy<String> = Lazy::new(|| {
     let mut map = JS_KV.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(existing) = map.get("__device_id") {
@@ -61,7 +53,7 @@ thread_local! {
     static ACTIVE_JS_LIB: RefCell<Option<String>> = const { RefCell::new(None) };
     // reader_execute installs its source-bound HTTP session here so JavaScript
     // java.ajax/get/post shares the same cookies and request policy as Rust HTTP.
-    static ACTIVE_JS_HTTP_CLIENT: RefCell<Option<Client>> = const { RefCell::new(None) };
+    static ACTIVE_JS_HTTP_CLIENT: RefCell<Option<HttpClient>> = const { RefCell::new(None) };
 
     static JS_ENV: (Runtime, Context, Arc<AtomicU64>) = {
         let rt = Runtime::new().expect("Failed to create JS Runtime");
@@ -101,7 +93,7 @@ pub fn with_js_lib<T>(js_lib: Option<&str>, f: impl FnOnce() -> T) -> T {
 /// Bind a source-specific synchronous HTTP client for the duration of a rule
 /// execution. Nested calls restore the prior client, so reader_eval keeps its
 /// legacy fallback client.
-pub fn with_js_http_client<T>(client: &Client, f: impl FnOnce() -> T) -> T {
+pub(crate) fn with_js_http_client<T>(client: &HttpClient, f: impl FnOnce() -> T) -> T {
     ACTIVE_JS_HTTP_CLIENT.with(|cell| {
         let previous = cell.replace(Some(client.clone()));
         let result = f();
@@ -110,7 +102,7 @@ pub fn with_js_http_client<T>(client: &Client, f: impl FnOnce() -> T) -> T {
     })
 }
 
-fn active_js_http_client() -> Client {
+fn active_js_http_client() -> HttpClient {
     ACTIVE_JS_HTTP_CLIENT
         .with(|cell| cell.borrow().clone())
         .unwrap_or_else(|| JS_HTTP_CLIENT.clone())
@@ -1270,8 +1262,7 @@ fn compile_js_lib(js_lib: &str) -> anyhow::Result<String> {
 fn resolve_js_lib_entry(entry: &str) -> anyhow::Result<String> {
     let value = entry.trim();
     if value.starts_with("http://") || value.starts_with("https://") {
-        let response = active_js_http_client().get(value).send()?;
-        return Ok(response.text().unwrap_or_default());
+        return Ok(active_js_http_client().request_text(Method::GET, value, &[], None)?);
     }
     Ok(value.to_string())
 }
@@ -1305,38 +1296,46 @@ fn java_ajax(spec: &str) -> anyhow::Result<String> {
         .to_uppercase();
     let method = Method::from_bytes(method.as_bytes()).unwrap_or(Method::GET);
 
-    let mut req = active_js_http_client().request(method, url.trim());
+    let headers = options_json
+        .get("headers")
+        .and_then(|value| value.as_object())
+        .map(|headers| {
+            headers
+                .iter()
+                .filter_map(|(key, value)| {
+                    if let Some(value) = value.as_str() {
+                        Some((key.clone(), value.to_string()))
+                    } else if !value.is_null() {
+                        Some((key.clone(), value.to_string()))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
-    if let Some(headers) = options_json.get("headers").and_then(|v| v.as_object()) {
-        for (key, value) in headers {
-            if let Some(value) = value.as_str() {
-                req = req.header(key, value);
-            } else if !value.is_null() {
-                req = req.header(key, value.to_string());
-            }
+    let body = options_json.get("body").and_then(|value| {
+        if let Some(value) = value.as_str() {
+            Some(value.to_string())
+        } else if !value.is_null() {
+            Some(value.to_string())
+        } else {
+            None
         }
-    }
+    });
 
-    if let Some(body) = options_json.get("body") {
-        if let Some(body) = body.as_str() {
-            req = req.body(body.to_string());
-        } else if !body.is_null() {
-            req = req.body(body.to_string());
-        }
-    }
-
-    let response = req.send()?;
-    Ok(response.text().unwrap_or_default())
+    Ok(active_js_http_client().request_text(
+        method,
+        url.trim(),
+        &headers,
+        body.as_deref(),
+    )?)
 }
 
 fn java_request_simple(method: &str, url: &str, body: Option<String>) -> anyhow::Result<String> {
     let method = Method::from_bytes(method.as_bytes()).unwrap_or(Method::GET);
-    let mut req = active_js_http_client().request(method, url.trim());
-    if let Some(body) = body {
-        req = req.body(body);
-    }
-    let response = req.send()?;
-    Ok(response.text().unwrap_or_default())
+    Ok(active_js_http_client().request_text(method, url.trim(), &[], body.as_deref())?)
 }
 
 fn split_ajax_spec(spec: &str) -> (&str, Option<&str>) {

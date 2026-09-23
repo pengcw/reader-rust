@@ -4,9 +4,9 @@
 //! - `data`、`session`、`meta` 三大正交关注点分离；
 //! - 输入与输出 100% 同构对称（State In, State Out）；
 //! - 若会话状态无变动，输出 `session` 必须为 `None`（JSON 序列化为 `null`），零额外开销；
-//! - 在执行期间与 QuickJS 和 reqwest 同步共享 CookieJar 与私有变量。
+//! - 在执行期间与 QuickJS 和 HTTP 客户端同步共享 Cookie 与私有变量。
 
-use reqwest::cookie::{CookieStore, Jar};
+use crate::crawler::SharedCookieStore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cell::RefCell;
@@ -30,7 +30,7 @@ pub struct ExecuteSession {
 #[derive(Debug)]
 pub struct ActiveSession {
     source_url: String,
-    cookie_jar: Arc<Jar>,
+    cookie_store: SharedCookieStore,
     header: Mutex<Option<Value>>,
     variables: Mutex<HashMap<String, Value>>,
     initial_session: ExecuteSession,
@@ -42,7 +42,7 @@ thread_local! {
 
 impl ActiveSession {
     pub fn new(session_opt: Option<&ExecuteSession>, source_url: &str) -> Self {
-        let cookie_jar = Arc::new(Jar::default());
+        let cookie_store = SharedCookieStore::default();
         let parsed_url = Url::parse(source_url).ok();
 
         let mut initial_cookies = None;
@@ -53,7 +53,7 @@ impl ActiveSession {
             if let Some(ref cookies_str) = session.cookies {
                 if !cookies_str.trim().is_empty() {
                     if let Some(ref url) = parsed_url {
-                        add_cookie_str_to_jar(&cookie_jar, cookies_str, url);
+                        cookie_store.add_cookie_header(cookies_str, url);
                     }
                     initial_cookies = Some(cookies_str.clone());
                 }
@@ -62,7 +62,7 @@ impl ActiveSession {
             if let Some(ref header_val) = session.header {
                 // If header contains cookie, also sync to cookie_jar
                 if let Some(ref url) = parsed_url {
-                    extract_and_sync_cookies_from_header(&cookie_jar, header_val, url);
+                    extract_and_sync_cookies_from_header(&cookie_store, header_val, url);
                 }
                 initial_header = Some(header_val.clone());
             }
@@ -76,7 +76,7 @@ impl ActiveSession {
 
         Self {
             source_url: source_url.to_string(),
-            cookie_jar,
+            cookie_store,
             header: Mutex::new(initial_header.clone()),
             variables: Mutex::new(initial_variables.clone().unwrap_or_default()),
             initial_session: ExecuteSession {
@@ -87,8 +87,8 @@ impl ActiveSession {
         }
     }
 
-    pub fn cookie_jar(&self) -> &Arc<Jar> {
-        &self.cookie_jar
+    pub(crate) fn cookie_store(&self) -> &SharedCookieStore {
+        &self.cookie_store
     }
 
     pub fn source_url(&self) -> &str {
@@ -143,7 +143,7 @@ impl ActiveSession {
 
     pub fn put_login_header(&self, value: Value) {
         if let Some(url) = self.resolve_url("") {
-            extract_and_sync_cookies_from_header(&self.cookie_jar, &value, &url);
+            extract_and_sync_cookies_from_header(&self.cookie_store, &value, &url);
         }
         let mut h = self.header.lock().unwrap_or_else(|e| e.into_inner());
         *h = Some(value);
@@ -157,14 +157,12 @@ impl ActiveSession {
 
     pub fn get_cookie(&self, target_url: &str) -> Option<String> {
         let url = self.resolve_url(target_url)?;
-        self.cookie_jar
-            .cookies(&url)
-            .and_then(|val| val.to_str().ok().map(|s| s.to_string()))
+        self.cookie_store.get_cookie_header(&url)
     }
 
     pub fn set_cookie(&self, target_url: &str, cookie_str: &str) {
         if let Some(url) = self.resolve_url(target_url) {
-            add_cookie_str_to_jar(&self.cookie_jar, cookie_str, &url);
+            self.cookie_store.add_cookie_header(cookie_str, &url);
         }
     }
 
@@ -191,7 +189,7 @@ impl ActiveSession {
             }
             for path in &paths {
                 let expired = format!("{name}=; Max-Age=0; Path={path}");
-                self.cookie_jar.add_cookie_str(&expired, &url);
+                self.cookie_store.add_set_cookie(&expired, &url);
             }
         }
     }
@@ -199,8 +197,7 @@ impl ActiveSession {
     pub fn current_session(&self) -> ExecuteSession {
         let cookies = Url::parse(&self.source_url)
             .ok()
-            .and_then(|url| self.cookie_jar.cookies(&url))
-            .and_then(|v| v.to_str().ok().map(|s| s.to_string()))
+            .and_then(|url| self.cookie_store.get_cookie_header(&url))
             .filter(|s| !s.is_empty());
 
         let header = self
@@ -254,33 +251,17 @@ pub fn current_active_session() -> Option<Arc<ActiveSession>> {
     ACTIVE_SESSION.with(|cell| cell.borrow().clone())
 }
 
-fn add_cookie_str_to_jar(jar: &Jar, cookie_str: &str, url: &Url) {
-    for part in cookie_str.split(';') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        if let Some((name, val)) = part.split_once('=') {
-            let name_lower = name.trim().to_lowercase();
-            if matches!(
-                name_lower.as_str(),
-                "path" | "domain" | "expires" | "max-age" | "samesite" | "httponly" | "secure"
-            ) {
-                continue;
-            }
-            let formatted = format!("{}={}; Path=/", name.trim(), val.trim());
-            jar.add_cookie_str(&formatted, url);
-        }
-    }
-}
-
-fn extract_and_sync_cookies_from_header(jar: &Jar, header_val: &Value, url: &Url) {
+fn extract_and_sync_cookies_from_header(
+    cookies: &SharedCookieStore,
+    header_val: &Value,
+    url: &Url,
+) {
     match header_val {
         Value::Object(map) => {
             for (k, v) in map {
                 if k.eq_ignore_ascii_case("cookie") {
                     if let Some(cookie_str) = v.as_str() {
-                        add_cookie_str_to_jar(jar, cookie_str, url);
+                        cookies.add_cookie_header(cookie_str, url);
                     }
                 }
             }
@@ -290,7 +271,7 @@ fn extract_and_sync_cookies_from_header(jar: &Jar, header_val: &Value, url: &Url
                 for (k, v) in map {
                     if k.eq_ignore_ascii_case("cookie") {
                         if let Some(cookie_str) = v.as_str() {
-                            add_cookie_str_to_jar(jar, cookie_str, url);
+                            cookies.add_cookie_header(cookie_str, url);
                         }
                     }
                 }

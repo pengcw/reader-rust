@@ -7,28 +7,24 @@ use crate::model::book_source::BookSource;
 use crate::parser::js::{eval_js, eval_js_search_with_source, with_js_lib};
 use encoding_rs::Encoding;
 use once_cell::sync::Lazy;
-use reqwest::blocking::Client;
-use reqwest::header::{CONTENT_TYPE, USER_AGENT};
+mod http;
 pub mod session;
+pub(crate) use http::{HttpClient, HttpClientError, SharedCookieStore, DEFAULT_USER_AGENT};
 pub use session::{current_active_session, with_active_session, ActiveSession, ExecuteSession};
 
-use reqwest::cookie::Jar;
-use reqwest::{redirect::Policy, Method, Proxy};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
-use std::io::Read;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
-
-const DEFAULT_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+use ureq::http::header::{CONTENT_TYPE, USER_AGENT};
+use ureq::http::{HeaderMap, Method};
 const SESSION_CACHE_LIMIT: usize = 32;
 const SESSION_CACHE_TTL: Duration = Duration::from_secs(20 * 60);
 
 #[derive(Clone)]
 struct CachedSession {
     key: String,
-    client: Client,
+    client: HttpClient,
     last_used: Instant,
 }
 
@@ -39,7 +35,7 @@ static SESSION_CACHE: Lazy<Mutex<VecDeque<CachedSession>>> =
 /// 有上限、会过期的客户端，借此在 operation 与 operation 之间保持 Cookie。
 #[derive(Clone)]
 pub struct HttpSession {
-    client: Client,
+    client: HttpClient,
 }
 
 #[derive(Debug, Clone)]
@@ -94,12 +90,8 @@ impl HttpSession {
         let timeout_ms = timeout_ms.max(1);
 
         if let Some(active) = current_active_session() {
-            let jar = if cookie_enabled {
-                Some(Arc::clone(active.cookie_jar()))
-            } else {
-                None
-            };
-            let client = build_client(timeout_ms, jar, None)?;
+            let cookies = cookie_enabled.then(|| active.cookie_store().clone());
+            let client = build_client(timeout_ms, cookies, None)?;
             return Ok(Self { client });
         }
 
@@ -120,8 +112,7 @@ impl HttpSession {
                 return Ok(Self { client });
             }
 
-            let jar = Arc::new(Jar::default());
-            let client = build_client(timeout_ms, Some(jar), None)?;
+            let client = build_client(timeout_ms, Some(SharedCookieStore::default()), None)?;
             while cache.len() >= SESSION_CACHE_LIMIT {
                 cache.pop_front();
             }
@@ -138,7 +129,7 @@ impl HttpSession {
         })
     }
 
-    pub fn client(&self) -> &Client {
+    pub(crate) fn client(&self) -> &HttpClient {
         &self.client
     }
 
@@ -157,39 +148,39 @@ impl HttpSession {
             self.client.clone()
         };
 
-        let mut request = client.request(spec.method.clone(), &spec.url);
-        let mut has_content_type = false;
-        for (name, value) in &spec.headers {
-            if name.eq_ignore_ascii_case("content-type") {
-                has_content_type = true;
-            }
-            request = request.header(name, value);
-        }
-        if let Some(body) = &spec.body {
-            if spec.method == Method::POST && !has_content_type {
-                request = request.header(CONTENT_TYPE, "application/x-www-form-urlencoded");
-            }
-            request = request.body(body.clone());
+        let mut headers = spec.headers.clone();
+        if spec.body.is_some()
+            && spec.method == Method::POST
+            && !headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(CONTENT_TYPE.as_str()))
+        {
+            headers.push((
+                CONTENT_TYPE.as_str().to_string(),
+                "application/x-www-form-urlencoded".to_string(),
+            ));
         }
 
         let mut last_error = None;
         for attempt in 0..=spec.retry.min(3) {
-            match request
-                .try_clone()
-                .expect("request builder is cloneable before send")
-                .send()
-            {
-                Ok(mut response) => {
-                    let status = response.status().as_u16();
-                    let url = response.url().to_string();
-
+            match client.execute(
+                spec.method.clone(),
+                &spec.url,
+                &headers,
+                spec.body.as_deref(),
+                Some(max_response_bytes.max(1)),
+            ) {
+                Ok(response) => {
+                    let status = response.status;
+                    let url = response.url;
                     let content_type = response
-                        .headers()
+                        .headers
                         .get(CONTENT_TYPE)
                         .and_then(|value| value.to_str().ok())
                         .map(str::to_owned);
+
                     let mut response_headers = HashMap::new();
-                    for (name, value) in response.headers() {
+                    for (name, value) in &response.headers {
                         if let Ok(value) = value.to_str() {
                             let name = name.as_str().to_ascii_lowercase();
                             response_headers
@@ -201,36 +192,20 @@ impl HttpSession {
                                 .or_insert_with(|| value.to_string());
                         }
                     }
-                    let mut bytes = Vec::new();
-                    let limit = max_response_bytes.max(1);
-                    response
-                        .by_ref()
-                        .take(limit.saturating_add(1) as u64)
-                        .read_to_end(&mut bytes)
-                        .map_err(|error| {
-                            if error.kind() == std::io::ErrorKind::TimedOut {
-                                FetchError::Timeout {
-                                    url: Some(url.clone()),
-                                    message: error.to_string(),
-                                }
-                            } else {
-                                FetchError::Network(error.to_string())
-                            }
-                        })?;
-                    if bytes.len() > limit {
-                        return Err(FetchError::ResponseTooLarge { url, limit });
-                    }
-                    let body =
-                        decode_body(&bytes, spec.charset.as_deref(), content_type.as_deref());
 
+                    let body = decode_body(
+                        &response.body,
+                        spec.charset.as_deref(),
+                        content_type.as_deref(),
+                    );
                     let body_snippet = response_body_snippet(&body);
                     if let Some(challenge) =
-                        detect_auth_challenge(status, response.headers(), body_snippet, &url)
+                        detect_auth_challenge(status, &response.headers, body_snippet, &url)
                     {
                         return Err(challenge);
                     }
 
-                    if !response.status().is_success() {
+                    if !(200..300).contains(&status) {
                         if status >= 500 && attempt < spec.retry.min(3) {
                             continue;
                         }
@@ -244,16 +219,20 @@ impl HttpSession {
                         body,
                     });
                 }
-                Err(error) => {
-                    let fetch_error = if error.is_timeout() {
-                        FetchError::Timeout {
-                            url: Some(spec.url.clone()),
-                            message: error.to_string(),
-                        }
-                    } else {
-                        FetchError::Network(error.to_string())
-                    };
-                    last_error = Some(fetch_error);
+                Err(HttpClientError::ResponseTooLarge { url, limit }) => {
+                    return Err(FetchError::ResponseTooLarge { url, limit });
+                }
+                Err(HttpClientError::InvalidUrl(message)) => {
+                    return Err(FetchError::InvalidUrl(message));
+                }
+                Err(HttpClientError::Timeout(message)) => {
+                    last_error = Some(FetchError::Timeout {
+                        url: Some(spec.url.clone()),
+                        message,
+                    });
+                }
+                Err(HttpClientError::Network(message)) => {
+                    last_error = Some(FetchError::Network(message));
                 }
             }
         }
@@ -272,7 +251,7 @@ fn response_body_snippet(body: &str) -> &str {
 
 fn detect_auth_challenge(
     status: u16,
-    headers: &reqwest::header::HeaderMap,
+    headers: &HeaderMap,
     body_snippet: &str,
     url: &str,
 ) -> Option<FetchError> {
@@ -350,37 +329,28 @@ fn detect_auth_challenge(
 
 fn build_client(
     timeout_ms: u64,
-    cookie_jar: Option<Arc<Jar>>,
+    cookies: Option<SharedCookieStore>,
     proxy: Option<&str>,
-) -> Result<Client, FetchError> {
-    let timeout = Duration::from_millis(timeout_ms);
-    let connect_timeout = timeout.min(Duration::from_secs(5));
-    let mut builder = Client::builder()
-        .timeout(timeout)
-        .connect_timeout(connect_timeout)
-        .redirect(Policy::limited(5))
-        .gzip(true)
-        .brotli(true)
-        .deflate(true)
-        .user_agent(DEFAULT_USER_AGENT);
-    if let Some(jar) = cookie_jar {
-        builder = builder.cookie_provider(jar);
-    }
-    if let Some(proxy) = proxy {
-        builder = builder
-            .proxy(Proxy::all(proxy).map_err(|error| FetchError::InvalidUrl(error.to_string()))?);
-    }
-    builder
-        .build()
-        .map_err(|error| FetchError::Network(error.to_string()))
+) -> Result<HttpClient, FetchError> {
+    HttpClient::new(timeout_ms, cookies, proxy).map_err(|error| match error {
+        HttpClientError::InvalidUrl(message) => FetchError::InvalidUrl(message),
+        HttpClientError::Timeout(message) => FetchError::Timeout {
+            url: None,
+            message,
+        },
+        HttpClientError::Network(message) => FetchError::Network(message),
+        HttpClientError::ResponseTooLarge { url, limit } => {
+            FetchError::ResponseTooLarge { url, limit }
+        }
+    })
 }
 
-// reqwest cannot add a proxy to an existing Client. Proxy URL rules intentionally use an
-// isolated client, so they never contaminate the source cookie session.
+// Proxy URL rules intentionally use an isolated client, so they never contaminate
+// the source cookie session.
 fn build_client_from_existing_policy(
     spec: &RequestSpec,
     proxy: &str,
-) -> Result<Client, FetchError> {
+) -> Result<HttpClient, FetchError> {
     let _ = spec;
     build_client(15_000, None, Some(proxy))
 }
@@ -766,16 +736,15 @@ fn value_to_usize(value: &Value) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reqwest::cookie::CookieStore;
-    use std::sync::Arc;
 
     #[test]
-    fn test_jar_cookies() {
-        let jar = Arc::new(Jar::default());
-        let url: reqwest::Url = "https://example.com".parse().unwrap();
-        jar.add_cookie_str("token=12345; Path=/", &url);
-        let cookies = jar.cookies(&url);
-        assert!(cookies.is_some());
-        assert_eq!(cookies.unwrap().to_str().unwrap(), "token=12345");
+    fn test_cookie_store() {
+        let cookies = SharedCookieStore::default();
+        let url: url::Url = "https://example.com".parse().unwrap();
+        cookies.add_set_cookie("token=12345; Path=/", &url);
+        assert_eq!(
+            cookies.get_cookie_header(&url),
+            Some("token=12345".to_string())
+        );
     }
 }
