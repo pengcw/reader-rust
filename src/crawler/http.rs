@@ -122,7 +122,7 @@ impl HttpClient {
             .timeout_global(Some(timeout))
             .timeout_connect(Some(connect_timeout))
             .user_agent(DEFAULT_USER_AGENT)
-            .accept_encoding("gzip, br, deflate");
+            .accept_encoding("gzip, deflate");
 
         if let Some(proxy) = proxy {
             let proxy = Proxy::new(proxy)
@@ -142,7 +142,7 @@ impl HttpClient {
             .max_redirects(0)
             .max_redirects_will_error(false)
             .user_agent(DEFAULT_USER_AGENT)
-            .accept_encoding("gzip, br, deflate")
+            .accept_encoding("gzip, deflate")
             .build();
         Self {
             agent: Agent::new_with_config(config),
@@ -444,6 +444,50 @@ mod tests {
                 .as_deref(),
             Some("sid=redirect")
         );
+    }
+
+    #[test]
+    fn advertises_only_supported_content_encodings() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            let accept_encoding = request
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("accept-encoding")
+                        .then(|| value.trim().to_ascii_lowercase())
+                })
+                .expect("Accept-Encoding header is present");
+
+            assert!(accept_encoding.contains("gzip"));
+            assert!(accept_encoding.contains("deflate"));
+            assert!(!accept_encoding.split(',').any(|value| value.trim() == "br"));
+
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+            )
+            .unwrap();
+        });
+
+        let client = HttpClient::new(2_000, None, None).unwrap();
+        let response = client
+            .execute(
+                Method::GET,
+                &format!("http://{address}/"),
+                &[],
+                None,
+                Some(1024),
+            )
+            .unwrap();
+
+        assert_eq!(response.body, b"ok");
+        server.join().unwrap();
     }
 
     #[test]
