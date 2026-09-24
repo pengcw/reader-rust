@@ -130,7 +130,7 @@ fn render_embedded_paths(value: &Value, rule: &str) -> Option<String> {
     if replaced_any {
         Some(rendered)
     } else {
-        Some(String::new())
+        None
     }
 }
 
@@ -187,6 +187,11 @@ mod tests {
             jsonpath_first_string(&value, rule_spaces),
             Some("第一行\n第二行".to_string())
         );
+
+        // 包含 $ 与 { 但不含嵌入模板的字符串不应被误判为空字符串
+        let non_template = r#"$.https://example.com/api,{"method":"POST"}"#;
+        assert_eq!(jsonpath_first_string(&value, non_template), None);
+        assert_eq!(render_embedded_paths(&value, non_template), None);
     }
 
     #[test]

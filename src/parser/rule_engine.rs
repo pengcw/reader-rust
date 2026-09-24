@@ -4263,4 +4263,64 @@ img=u.match(/\[(.*)\]/)[1].split(",").map(x=>'\n<img src='+x+'>').join("\n")
         assert!(content.contains(r#"<img src="https://example.com/1.jpg">"#));
         assert!(content.contains(r#"<img src="https://example.com/2.jpg">"#));
     }
+
+    #[test]
+    fn test_qbreader_toc_and_content() {
+        let engine = RuleEngine::new().unwrap();
+        let rule_toc = TocRule {
+            chapter_name: Some("$.serialName".to_string()),
+            chapter_url: Some(
+                r#"https://novel.html5.qq.com/be-api/content/ads-read,{
+	"method": "POST",
+	"body": {
+		"Scene": "chapter",
+		"ContentAnchorBatch": [{
+				"BookID": "{{baseUrl.match(/bookId=(\d+)/)[1]}}",
+				"ChapterSeqNo": [{{$.serialID}}]
+			}]
+	},
+	"headers": {
+		"Q-GUID": "4aa27c7cf2d9aca3359656ea186488cb"
+	}
+}"#
+                .to_string(),
+            ),
+            chapter_list: Some("$.rows".to_string()),
+            ..Default::default()
+        };
+        let source = BookSource {
+            rule_toc: Some(rule_toc.clone()),
+            ..Default::default()
+        };
+        let body = r#"{"ret":0,"rows":[{"serialID":1,"serialName":"第1章 青梅的一巴掌","serialUniqID":"17","isFree":true},{"serialID":2,"serialName":"第2章 算你聪明","serialUniqID":"18","isFree":true}]}"#;
+        let base_url =
+            "https://bookshelf.html5.qq.com/qbread/api/book/all-chapter?bookId=1149058592";
+        let (chapters, _) = engine.chapter_list_with_variable(&source, body, base_url, None, None);
+        assert_eq!(chapters.len(), 2);
+        assert_eq!(chapters[0].title, "第1章 青梅的一巴掌");
+        assert!(chapters[0].url.contains(r#""ChapterSeqNo": [1]"#));
+        assert_eq!(chapters[1].title, "第2章 算你聪明");
+        assert!(chapters[1].url.contains(r#""ChapterSeqNo": [2]"#));
+
+        if let Ok(toc_body) = std::fs::read_to_string("/tmp/book_toc.json") {
+            let (all_chapters, _) =
+                engine.chapter_list_with_variable(&source, &toc_body, base_url, None, None);
+            assert_eq!(all_chapters.len(), 966);
+        }
+
+        let content_source = BookSource {
+            rule_content: Some(ContentRule {
+                content: Some("<p>{{$.data.Content[0].Content}}</p>".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let content_json = r#"{"ret":0,"errMsg":"","data":{"Content":[{"ContentAnchor":{"BookID":"1149058592","ChapterSeqNo":1},"ChapterInfo":{"Title":"第1章 青梅的一巴掌","ChapterID":"17","IsFree":true},"Content":["“李珞！你这也太过分了！赶紧给班长道歉！”\r\n  “就是啊，溪溪好心想要给你最后补习冲刺一下，你不领情也就算了，推人干嘛？”\r\n  “李珞……那个啥，要不别去打球了吧？毕竟你明天还得中考。”\r\n  恍惚之中，李珞听到"]}]}}"#;
+        let content = engine.content(
+            &content_source,
+            content_json,
+            "https://novel.html5.qq.com/be-api/content/ads-read",
+        );
+        assert!(content.contains("李珞！你这也太过分了！"));
+    }
 }
