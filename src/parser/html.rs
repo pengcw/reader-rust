@@ -738,9 +738,81 @@ pub fn select_text_list(doc: &Html, rule: &str) -> Vec<String> {
     results
 }
 
+/// Parse XML/XHTML or HTML-like input for XPath evaluation.
+///
+/// HTML-only named entities are normalized without touching XML entities, and
+/// multiple-root fragments are wrapped only when parsing the original input fails.
+pub(crate) fn parse_xpath_package(
+    input: &str,
+) -> Result<sxd_document::Package, sxd_document::parser::Error> {
+    let normalized = normalize_xpath_entities(input);
+    match sxd_document::parser::parse(normalized.as_ref()) {
+        Ok(package) => Ok(package),
+        Err(_) => {
+            let fragment = format!("<reader-root>{normalized}</reader-root>");
+            sxd_document::parser::parse(&fragment)
+        }
+    }
+}
+
+fn normalize_xpath_entities(input: &str) -> std::borrow::Cow<'_, str> {
+    if !input.contains('&') {
+        return std::borrow::Cow::Borrowed(input);
+    }
+
+    let mut normalized = String::with_capacity(input.len());
+    let mut cursor = 0;
+    let mut changed = false;
+
+    while let Some(relative_ampersand) = input[cursor..].find('&') {
+        let ampersand = cursor + relative_ampersand;
+        normalized.push_str(&input[cursor..ampersand]);
+        let Some(relative_semicolon) = input[ampersand..].find(';') else {
+            normalized.push_str(&input[ampersand..]);
+            cursor = input.len();
+            break;
+        };
+        let semicolon = ampersand + relative_semicolon;
+        let entity = &input[ampersand + 1..semicolon];
+
+        if let Some(replacement) = xpath_html_entity(entity) {
+            normalized.push_str(replacement);
+            changed = true;
+        } else {
+            normalized.push_str(&input[ampersand..=semicolon]);
+        }
+        cursor = semicolon + 1;
+    }
+
+    normalized.push_str(&input[cursor..]);
+    if changed {
+        std::borrow::Cow::Owned(normalized)
+    } else {
+        std::borrow::Cow::Borrowed(input)
+    }
+}
+
+fn xpath_html_entity(entity: &str) -> Option<&'static str> {
+    match entity {
+        "nbsp" => Some("\u{00A0}"),
+        "copy" => Some("©"),
+        "reg" => Some("®"),
+        "trade" => Some("™"),
+        "middot" => Some("·"),
+        "mdash" => Some("—"),
+        "ndash" => Some("–"),
+        "hellip" => Some("…"),
+        "emsp" => Some("\u{2003}"),
+        "ensp" => Some("\u{2002}"),
+        // XML's five predefined entities, numeric entities, and unknown names
+        // stay untouched for the XML parser to interpret or reject.
+        _ => None,
+    }
+}
+
 /// XPath support using sxd-xpath
 pub fn select_xpath(html: &str, xpath: &str) -> Vec<String> {
-    let package = match sxd_document::parser::parse(html) {
+    let package = match parse_xpath_package(html) {
         Ok(p) => p,
         Err(_) => return vec![],
     };
@@ -882,6 +954,71 @@ pub fn format_keep_img(content: &str, redirect_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xpath_parser_normalizes_common_html_entities() {
+        let values = select_xpath(
+            "<p>A&nbsp;&copy;&reg;&trade;&middot;&mdash;&ndash;&hellip;&emsp;&ensp;B</p>",
+            "//p",
+        );
+        assert_eq!(values, vec!["A\u{00a0}©®™·—–…\u{2003}\u{2002}B"]);
+    }
+
+    #[test]
+    fn xpath_parser_preserves_xml_and_numeric_entities() {
+        let values = select_xpath(
+            "<root>&amp;|&lt;|&gt;|&quot;|&apos;|&#65;|&#x42;</root>",
+            "string(/root)",
+        );
+        assert_eq!(values, vec!["&|<|>|\"|'|A|B"]);
+    }
+
+    #[test]
+    fn xpath_parser_wraps_multi_root_fragments_only_as_fallback() {
+        let values = select_xpath("<p>A</p><p>B</p>", "/reader-root/p");
+        assert_eq!(values.len(), 2);
+        assert!(values.contains(&"A".to_string()));
+        assert!(values.contains(&"B".to_string()));
+    }
+
+    #[test]
+    fn xpath_parser_keeps_normal_xhtml_structure() {
+        let values = select_xpath(
+            "<?xml version=\"1.0\"?><html><body><p>Normal</p></body></html>",
+            "/html/body/p",
+        );
+        assert_eq!(values, vec!["Normal"]);
+    }
+
+    #[test]
+    fn compat_default_css_rule_selects_first_item_and_fields() {
+        let doc = parse_document(
+            r#"<ul><li><a href="/b/1">书名</a><span>作者</span></li><li><a href="/b/2">其他</a></li></ul>"#,
+        );
+        let item = select_list(&doc, "tag.li.0").into_iter().next().unwrap();
+
+        assert_eq!(
+            select_text_from_element(&item, "tag.a.0@text"),
+            Some("书名".into())
+        );
+        assert_eq!(
+            select_text_from_element(&item, "tag.a.0@href"),
+            Some("/b/1".into())
+        );
+        assert_eq!(
+            select_text_from_element(&item, "tag.span.0@text"),
+            Some("作者".into())
+        );
+    }
+
+    #[test]
+    fn compat_combination_falls_back_when_first_rule_is_empty() {
+        let doc = parse_document("<h1></h1><div class=\"title\">标题</div>");
+        assert_eq!(
+            select_text(&doc, "h1@text||.title@text"),
+            Some("标题".into())
+        );
+    }
 
     #[test]
     fn test_legado_to_css() {

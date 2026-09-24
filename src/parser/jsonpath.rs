@@ -75,6 +75,19 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn compat_jsonpath_direct_and_embedded_values() {
+        let value = json!({"data":{"name":"书名","author":"作者"}});
+        assert_eq!(
+            jsonpath_first_string(&value, "$.data.name"),
+            Some("书名".into())
+        );
+        assert_eq!(
+            jsonpath_first_string(&value, "作者：{$.data.author}"),
+            Some("作者：作者".into())
+        );
+    }
+
+    #[test]
     fn test_render_embedded_paths_double_and_single_braces() {
         let value = json!({
             "data": {
@@ -107,4 +120,3 @@ mod tests {
         );
     }
 }
-

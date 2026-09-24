@@ -142,6 +142,7 @@ pub fn eval_js_search_with_source(
         Some(page),
         Some(source_key),
         None,
+        false,
     )
 }
 
@@ -161,6 +162,27 @@ pub fn eval_js_url(
         Some(page),
         Some(source_key),
         None,
+        false,
+    )
+}
+
+pub fn eval_js_url_template(
+    script: &str,
+    result: &str,
+    key: &str,
+    page: i32,
+    source_key: &str,
+    base_url: &str,
+) -> anyhow::Result<String> {
+    eval_js_inner_with_source(
+        script,
+        Some(result),
+        Some(base_url),
+        Some(key),
+        Some(page),
+        Some(source_key),
+        None,
+        true,
     )
 }
 
@@ -172,7 +194,7 @@ fn eval_js_inner(
     page: Option<i32>,
     bindings: Option<&HashMap<String, JsonValue>>,
 ) -> anyhow::Result<String> {
-    eval_js_inner_with_source(script, input, base_url, key, page, None, bindings)
+    eval_js_inner_with_source(script, input, base_url, key, page, None, bindings, false)
 }
 
 fn eval_js_inner_with_source(
@@ -183,6 +205,7 @@ fn eval_js_inner_with_source(
     page: Option<i32>,
     source_key: Option<&str>,
     bindings: Option<&HashMap<String, JsonValue>>,
+    template_result: bool,
 ) -> anyhow::Result<String> {
     JS_ENV.with(|(_, ctx, start_time)| {
         let now = SystemTime::now()
@@ -783,18 +806,22 @@ fn eval_js_inner_with_source(
             let v = eval_script(ctx.clone(), script)?;
 
             let result = if v.is_null() || v.is_undefined() {
-                if let Ok(res_val) = globals.get::<_, rquickjs::Value<'_>>("result") {
-                    if !res_val.is_null() && !res_val.is_undefined() {
-                        if let Some(s) = res_val.clone().into_string() {
-                            let s: rquickjs::String<'_> = s;
-                            s.to_string()
-                                .map(|value| value.to_string())
-                                .unwrap_or_default()
-                        } else {
-                            match ctx.json_stringify(res_val) {
-                                Ok(Some(json)) => json.to_string().unwrap_or_default(),
-                                _ => String::new(),
+                if !template_result {
+                    if let Ok(res_val) = globals.get::<_, rquickjs::Value<'_>>("result") {
+                        if !res_val.is_null() && !res_val.is_undefined() {
+                            if let Some(s) = res_val.clone().into_string() {
+                                let s: rquickjs::String<'_> = s;
+                                s.to_string()
+                                    .map(|value| value.to_string())
+                                    .unwrap_or_default()
+                            } else {
+                                match ctx.json_stringify(res_val) {
+                                    Ok(Some(json)) => json.to_string().unwrap_or_default(),
+                                    _ => String::new(),
+                                }
                             }
+                        } else {
+                            String::new()
                         }
                     } else {
                         String::new()
@@ -802,6 +829,10 @@ fn eval_js_inner_with_source(
                 } else {
                     String::new()
                 }
+            } else if template_result {
+                let value: rquickjs::Coerced<std::string::String> =
+                    rquickjs::FromJs::from_js(&ctx, v)?;
+                value.0
             } else if let Some(s) = v.clone().into_string() {
                 let s: rquickjs::String<'_> = s;
                 s.to_string()

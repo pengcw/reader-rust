@@ -767,7 +767,7 @@ impl RuleEngine {
         rule: &SearchRule,
         list_rule: &str,
     ) -> Vec<SearchBook> {
-        let package = match sxd_document::parser::parse(body) {
+        let package = match html::parse_xpath_package(body) {
             Ok(p) => p,
             Err(_) => return vec![],
         };
@@ -858,6 +858,58 @@ impl RuleEngine {
     }
 }
 
+fn prepare_html_init_scope(
+    init: &str,
+    doc: &scraper::Html,
+    base_url: &str,
+    ctx: &mut HashMap<String, String>,
+) -> Option<scraper::Html> {
+    let init = init.trim();
+    if init.is_empty() {
+        return None;
+    }
+
+    if init.starts_with("@put:") || init.starts_with("@get:") {
+        let _ = eval_field_html_doc_with_ctx(init, doc, base_url, ctx);
+        return None;
+    }
+
+    let is_js_rule = init.starts_with("js:") || extract_js(init).1.is_some();
+    if is_js_rule {
+        let result = if init.starts_with("js:") {
+            eval_js(strip_js_rule(init), &doc.html(), base_url).ok()
+        } else {
+            eval_field_html_doc_with_ctx(init, doc, base_url, ctx)
+        }?;
+        return looks_like_html_fragment(&result).then(|| html::parse_document(&result));
+    }
+
+    let selector = if let Some(selector) = init
+        .strip_prefix("@css:")
+        .or_else(|| init.strip_prefix("@CSS:"))
+    {
+        selector
+    } else if init.starts_with('@') {
+        // Preserve existing behavior for non-CSS rules without treating their
+        // scalar result as a new document scope.
+        let _ = eval_field_html_doc_with_ctx(init, doc, base_url, ctx);
+        return None;
+    } else {
+        init
+    };
+
+    let selected = html::select_list(doc, selector).into_iter().next()?;
+    Some(html::parse_document(&selected.html()))
+}
+
+fn looks_like_html_fragment(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with('<')
+        && value
+            .find('>')
+            .is_some_and(|end| end > 1 && value[1..end].chars().any(char::is_alphabetic))
+}
+
 fn parse_book_info_html(
     source: &BookSource,
     body: &str,
@@ -866,12 +918,12 @@ fn parse_book_info_html(
     book_url: &str,
     ctx: &mut HashMap<String, String>,
 ) -> Book {
-    let doc = html::parse_document(body);
-
-    // Execute init rule if present
-    if let Some(init) = &rule.init {
-        let _ = eval_field_html_doc_with_ctx(init, &doc, base_url, ctx);
-    }
+    let original_doc = html::parse_document(body);
+    let scoped_doc = rule
+        .init
+        .as_deref()
+        .and_then(|init| prepare_html_init_scope(init, &original_doc, base_url, ctx));
+    let doc = scoped_doc.unwrap_or(original_doc);
 
     let name = rule
         .name
@@ -953,7 +1005,7 @@ fn parse_book_info_xpath(
     book_url: &str,
     ctx: &mut HashMap<String, String>,
 ) -> Book {
-    let package = match sxd_document::parser::parse(body) {
+    let package = match html::parse_xpath_package(body) {
         Ok(p) => p,
         Err(_) => return parse_book_info_html(source, body, base_url, rule, book_url, ctx),
     };
@@ -1207,7 +1259,7 @@ fn parse_chapter_list_xpath(
     list_rule: &str,
     ctx: &mut HashMap<String, String>,
 ) -> (Vec<BookChapter>, Vec<String>) {
-    let package = match sxd_document::parser::parse(body) {
+    let package = match html::parse_xpath_package(body) {
         Ok(p) => p,
         Err(_) => return parse_chapter_list_html(body, base_url, rule, list_rule, ctx),
     };
@@ -2305,6 +2357,99 @@ mod tests {
     }
 
     #[test]
+    fn xpath_book_info_uses_tolerant_fragment_parser() {
+        let source = BookSource {
+            book_source_name: "XPath".to_string(),
+            book_source_url: "https://source.example".to_string(),
+            ..Default::default()
+        };
+        let rule = BookInfoRule {
+            name: Some("//name/text()".to_string()),
+            author: Some("//author/text()".to_string()),
+            ..Default::default()
+        };
+        let mut ctx = HashMap::new();
+        let book = parse_book_info_xpath(
+            &source,
+            "<name>Book&nbsp;Title</name><author>Writer</author>",
+            "https://books.example/detail/1",
+            &rule,
+            "https://books.example/detail/1",
+            &mut ctx,
+        );
+
+        assert_eq!(book.name, "Book\u{00a0}Title");
+        assert_eq!(book.author, "Writer");
+    }
+
+    #[test]
+    fn xpath_toc_uses_tolerant_fragment_parser() {
+        let rule = TocRule {
+            chapter_list: Some("//chapter".to_string()),
+            chapter_name: Some("./name/text()".to_string()),
+            chapter_url: Some("./url/text()".to_string()),
+            ..Default::default()
+        };
+        let body = "<chapter><name>One&nbsp;Chapter</name><url>/1</url></chapter><chapter><name>Two</name><url>/2</url></chapter>";
+        let (chapters, next_urls) = parse_chapter_list_xpath(
+            body,
+            "https://books.example/toc",
+            &rule,
+            "//chapter",
+            &mut HashMap::new(),
+        );
+
+        assert!(next_urls.is_empty());
+        assert_eq!(chapters.len(), 2);
+        assert_eq!(chapters[0].title, "One\u{00a0}Chapter");
+        assert_eq!(chapters[0].url, "https://books.example/1");
+        assert_eq!(chapters[1].title, "Two");
+    }
+
+    #[test]
+    fn compat_all_in_one_regex_exposes_groups_and_keeps_group_zero_literal() {
+        let source = BookSource {
+            book_source_name: "Regex compatibility".to_string(),
+            book_source_url: "https://regex.example".to_string(),
+            rule_search: Some(SearchRule {
+                book_list: Some(r#":<a href="([^"]+)">([^<]+)</a>"#.to_string()),
+                name: Some("$2".to_string()),
+                book_url: Some("$1".to_string()),
+                author: Some("$0".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let results = RuleEngine::new().unwrap().search_books(
+            &source,
+            r#"<li><a href="/1">第一章</a></li><li><a href="/2">第二章</a></li>"#,
+            "https://regex.example",
+        );
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].name, "第一章");
+        assert_eq!(results[0].book_url, "https://regex.example/1");
+        assert_eq!(results[0].author, "$0");
+        assert_eq!(results[1].name, "第二章");
+    }
+
+    #[test]
+    fn compat_toc_truthiness_matches_standard_values() {
+        for value in ["", "null", "false", "no", "0"] {
+            assert!(!is_truthy(value.to_string()), "{value:?} must be false");
+        }
+        for value in ["true", "1", "VIP"] {
+            assert!(is_truthy(value.to_string()), "{value:?} must be true");
+        }
+    }
+
+    #[test]
+    #[ignore = "known P1-4 gap: `not` is not yet treated as false by is_truthy"]
+    fn compat_toc_truthiness_treats_not_as_false() {
+        assert!(!is_truthy("not".to_string()));
+    }
+
+    #[test]
     fn test_apply_legado_regex() {
         let text = "Hello World 123 456";
 
@@ -2477,6 +2622,133 @@ mod tests {
     }
 
     #[test]
+    fn html_book_info_init_selector_limits_field_scope() {
+        let source = BookSource {
+            book_source_name: "Scoped Info".to_string(),
+            book_source_url: "https://source.example".to_string(),
+            ..Default::default()
+        };
+        let rule = BookInfoRule {
+            init: Some(".book-detail".to_string()),
+            name: Some(".name@text".to_string()),
+            author: Some(".author@text".to_string()),
+            ..Default::default()
+        };
+        let body = r#"<section class="book-detail"><h1 class="name">Scoped</h1><span class="author">Alice</span></section><h1 class="name">Outside</h1>"#;
+        let book = parse_book_info_html(
+            &source,
+            body,
+            "https://books.example/detail/1",
+            &rule,
+            "https://books.example/detail/1",
+            &mut HashMap::new(),
+        );
+
+        assert_eq!(book.name, "Scoped");
+        assert_eq!(book.author, "Alice");
+    }
+
+    #[test]
+    fn html_book_info_init_selector_miss_falls_back_to_document() {
+        let source = BookSource::default();
+        let rule = BookInfoRule {
+            init: Some(".missing".to_string()),
+            name: Some(".name@text".to_string()),
+            ..Default::default()
+        };
+        let book = parse_book_info_html(
+            &source,
+            r#"<div class="name">Original scope</div>"#,
+            "https://books.example/detail/1",
+            &rule,
+            "https://books.example/detail/1",
+            &mut HashMap::new(),
+        );
+
+        assert_eq!(book.name, "Original scope");
+    }
+
+    #[test]
+    fn html_book_info_js_init_uses_returned_html_as_scope() {
+        let source = BookSource::default();
+        let js_init = r#"@js:'<section><h1 class="name">From JS</h1></section>'"#;
+        let rule = BookInfoRule {
+            init: Some(js_init.to_string()),
+            name: Some(".name@text".to_string()),
+            ..Default::default()
+        };
+        let book = parse_book_info_html(
+            &source,
+            r#"<div class="name">Original</div>"#,
+            "https://books.example/detail/1",
+            &rule,
+            "https://books.example/detail/1",
+            &mut HashMap::new(),
+        );
+
+        assert_eq!(book.name, "From JS");
+    }
+
+    #[test]
+    fn html_book_info_js_init_plain_text_keeps_original_scope() {
+        let source = BookSource::default();
+        let rule = BookInfoRule {
+            init: Some("@js:'not HTML'".to_string()),
+            name: Some(".name@text".to_string()),
+            ..Default::default()
+        };
+        let book = parse_book_info_html(
+            &source,
+            r#"<div class="name">Original</div>"#,
+            "https://books.example/detail/1",
+            &rule,
+            "https://books.example/detail/1",
+            &mut HashMap::new(),
+        );
+
+        assert_eq!(book.name, "Original");
+    }
+
+    #[test]
+    fn html_book_info_keeps_json_and_xpath_init_scopes() {
+        let source = BookSource::default();
+        let json_rule = BookInfoRule {
+            init: Some("$.data.book".to_string()),
+            name: Some("$.name".to_string()),
+            ..Default::default()
+        };
+        let json_value = json!({
+            "data": {"book": {"name": "JSON scoped"}},
+            "name": "JSON outer"
+        });
+        let json_book = parse_book_info_json(
+            &source,
+            &json_value,
+            "https://books.example/detail/1",
+            &json_rule,
+            "https://books.example/detail/1",
+            &mut HashMap::new(),
+        );
+
+        let xpath_rule = BookInfoRule {
+            init: Some("//book".to_string()),
+            name: Some("name/text()".to_string()),
+            ..Default::default()
+        };
+        let xpath_book = parse_book_info_xpath(
+            &source,
+            "<root><book><name>XPath scoped</name></book></root>",
+            "https://books.example/detail/1",
+            &xpath_rule,
+            "https://books.example/detail/1",
+            &mut HashMap::new(),
+        );
+
+        assert_eq!(json_book.name, "JSON scoped");
+        assert_eq!(xpath_book.name, "XPath scoped");
+    }
+
+    #[test]
     fn test_book_info_html_interpolates_get_template() {
         let source = BookSource {
             book_source_name: "Info".to_string(),
@@ -2567,4 +2839,3 @@ img=u.match(/\[(.*)\]/)[1].split(",").map(x=>'\n<img src='+x+'>').join("\n")
         assert!(content.contains(r#"<img src="https://example.com/2.jpg">"#));
     }
 }
-

@@ -4,8 +4,9 @@
 //! 执行引擎需要的同步路径，避免为 `cdylib` 引入异步 runtime。
 
 use crate::model::book_source::BookSource;
-use crate::parser::js::{eval_js, eval_js_search_with_source, with_js_lib};
-use encoding_rs::Encoding;
+use crate::parser::js::{eval_js, eval_js_url, eval_js_url_template, with_js_lib};
+use chardetng::EncodingDetector;
+use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8};
 use once_cell::sync::Lazy;
 mod http;
 pub mod session;
@@ -47,6 +48,7 @@ pub struct RequestSpec {
     pub charset: Option<String>,
     pub retry: usize,
     pub proxy: Option<String>,
+    pub response_type: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -148,18 +150,7 @@ impl HttpSession {
             self.client.clone()
         };
 
-        let mut headers = spec.headers.clone();
-        if spec.body.is_some()
-            && spec.method == Method::POST
-            && !headers
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case(CONTENT_TYPE.as_str()))
-        {
-            headers.push((
-                CONTENT_TYPE.as_str().to_string(),
-                "application/x-www-form-urlencoded".to_string(),
-            ));
-        }
+        let headers = spec.headers.clone();
 
         let mut last_error = None;
         for attempt in 0..=spec.retry.min(3) {
@@ -193,12 +184,12 @@ impl HttpSession {
                         }
                     }
 
-                    let body = decode_body(
+                    let decoded_body = decode_body(
                         &response.body,
                         spec.charset.as_deref(),
                         content_type.as_deref(),
                     );
-                    let body_snippet = response_body_snippet(&body);
+                    let body_snippet = response_body_snippet(&decoded_body);
                     if let Some(challenge) =
                         detect_auth_challenge(status, &response.headers, body_snippet, &url)
                     {
@@ -212,6 +203,12 @@ impl HttpSession {
                         return Err(FetchError::HttpStatus { status, url });
                     }
 
+                    let body = format_response_body(
+                        &response.body,
+                        decoded_body,
+                        content_type.as_deref(),
+                        spec.response_type.as_deref(),
+                    );
                     return Ok(HttpResponse {
                         url,
                         status,
@@ -334,10 +331,7 @@ fn build_client(
 ) -> Result<HttpClient, FetchError> {
     HttpClient::new(timeout_ms, cookies, proxy).map_err(|error| match error {
         HttpClientError::InvalidUrl(message) => FetchError::InvalidUrl(message),
-        HttpClientError::Timeout(message) => FetchError::Timeout {
-            url: None,
-            message,
-        },
+        HttpClientError::Timeout(message) => FetchError::Timeout { url: None, message },
         HttpClientError::Network(message) => FetchError::Network(message),
         HttpClientError::ResponseTooLarge { url, limit } => {
             FetchError::ResponseTooLarge { url, limit }
@@ -365,75 +359,113 @@ pub fn analyze_url(
     source: &BookSource,
 ) -> Result<RequestSpec, String> {
     with_js_lib(source.js_lib.as_deref(), || {
-        let mut rule = raw_rule.trim().to_string();
-        if rule.is_empty() {
-            return Err("URL rule is empty".to_string());
+        compile_url_request(raw_rule, key, page, base_url, source)
+    })
+}
+
+fn compile_url_request(
+    raw_rule: &str,
+    key: &str,
+    page: i32,
+    base_url: &str,
+    source: &BookSource,
+) -> Result<RequestSpec, String> {
+    let raw_rule = raw_rule.trim();
+    if raw_rule.is_empty() {
+        return Err("URL rule is empty".to_string());
+    }
+
+    // Stage 1: initialize source/login headers and pull transport proxy out of headers.
+    let mut headers = source_headers(source)?;
+    let mut proxy = take_proxy_header(&mut headers).filter(|value| !value.trim().is_empty());
+    if let Some(active) = current_active_session() {
+        if let Some(login_header) = active.get_login_header() {
+            merge_headers(&mut headers, headers_from_value(&login_header));
         }
+    }
+    ensure_user_agent(&mut headers);
 
-        if let Some(script) = strip_js_prefix(&rule) {
-            rule = eval_js_search_with_source(script, key, page, &source.book_source_url)
-                .map_err(|error| format!("URL JavaScript failed: {error}"))?;
-        } else {
-            rule = replace_placeholders(&rule, key, page);
-        }
+    let base = strip_url_options(base_url).trim();
 
-        let (url_part, options_text) = split_url_options(&rule);
-        let options = match options_text {
-            Some(text) => parse_url_options(text)?,
-            None => Value::Null,
-        };
+    // Stages 2-4: URL JS segments, embedded JS templates, legacy placeholders, page choices.
+    let mut rule = eval_url_rule_js_segments(raw_rule, key, page, source, base)?;
+    rule = expand_url_templates(&rule, key, page, source, base)?;
+    rule = replace_legacy_placeholders(&rule, key, page);
+    rule = replace_page_choices_before_options(&rule, page);
 
-        let base = strip_url_options(base_url).trim();
-        let url = absolute_url(base, url_part.trim());
-        validate_http_url(&url)?;
+    // Stage 5: split the final URL rule and parse optional JSON.
+    let (url_part, options_text) = split_url_options(&rule);
+    let options = match options_text {
+        Some(text) => parse_url_options(text)?,
+        None => Value::Null,
+    };
 
-        let mut headers = source_headers(source)?;
-        if let Some(active) = current_active_session() {
-            if let Some(login_header) = active.get_login_header() {
-                merge_headers(&mut headers, headers_from_value(&login_header));
-            }
-        }
-        let mut proxy = None;
-        if let Some(extra) = options.get("headers") {
-            merge_headers(&mut headers, headers_from_value(extra));
-        }
-        if let Some(raw_proxy) = options
-            .get("proxy")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-        {
-            proxy = Some(raw_proxy.to_string());
-        }
-        ensure_user_agent(&mut headers);
+    // Stage 6: resolve URL and apply options that modify the request context.
+    let mut url = absolute_url(base, url_part.trim());
+    if let Some(script) = options
+        .get("js")
+        .and_then(Value::as_str)
+        .filter(|script| !script.trim().is_empty())
+    {
+        let rewritten = eval_js_url(script, &url, key, page, &source.book_source_url, base)
+            .map_err(|error| format!("URL option JavaScript failed: {error}"))?;
+        url = absolute_url(base, &rewritten);
+    }
+    validate_http_url(&url)?;
 
-        let method = options
-            .get("method")
-            .and_then(Value::as_str)
-            .map(|value| Method::from_bytes(value.trim().to_uppercase().as_bytes()))
-            .transpose()
-            .map_err(|error| format!("invalid HTTP method: {error}"))?
-            .unwrap_or(Method::GET);
-        let body = options.get("body").and_then(value_to_string);
-        let charset = options
-            .get("charset")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_owned);
-        let retry = options
-            .get("retry")
-            .and_then(value_to_usize)
-            .unwrap_or(0)
-            .min(3);
+    if let Some(extra) = options.get("headers") {
+        merge_headers(&mut headers, headers_from_value(extra));
+    }
+    if let Some(raw_proxy) = options
+        .get("proxy")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        proxy = Some(raw_proxy.to_string());
+    }
+    ensure_user_agent(&mut headers);
 
-        Ok(RequestSpec {
-            url: encode_get_query(&url, charset.as_deref()),
-            method,
-            headers,
-            body,
-            charset,
-            retry,
-            proxy,
-        })
+    let method = if options
+        .get("method")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("POST"))
+    {
+        Method::POST
+    } else {
+        Method::GET
+    };
+    let body = options.get("body").and_then(value_to_string);
+    let charset = options
+        .get("charset")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string());
+    let retry = options
+        .get("retry")
+        .and_then(value_to_usize)
+        .unwrap_or(0)
+        .min(3);
+    let response_type = options
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned);
+    let body = prepare_request_body(
+        method == Method::POST,
+        body,
+        &mut headers,
+        charset.as_deref(),
+    );
+
+    Ok(RequestSpec {
+        url: encode_get_query(&url, charset.as_deref()),
+        method,
+        headers,
+        body,
+        charset,
+        retry,
+        proxy,
+        response_type,
     })
 }
 
@@ -448,17 +480,107 @@ fn strip_js_prefix(value: &str) -> Option<&str> {
         })
 }
 
-fn replace_placeholders(rule: &str, key: &str, page: i32) -> String {
+fn eval_url_rule_js_segments(
+    rule: &str,
+    key: &str,
+    page: i32,
+    source: &BookSource,
+    base_url: &str,
+) -> Result<String, String> {
+    static URL_JS_SEGMENTS: Lazy<Option<regex::Regex>> =
+        Lazy::new(|| regex::Regex::new(r"(?is)<js>(.*?)</js>|@js:(.*)$|^js:(.*)$").ok());
+    let Some(regex) = URL_JS_SEGMENTS.as_ref() else {
+        return Ok(rule.to_string());
+    };
+
+    let mut result = rule.to_string();
+    let mut previous_end = 0;
+    for captures in regex.captures_iter(rule) {
+        let Some(matched) = captures.get(0) else {
+            continue;
+        };
+        if matched.start() > previous_end {
+            let prefix = rule[previous_end..matched.start()].trim();
+            if !prefix.is_empty() {
+                result = prefix.replace("@result", &result);
+            }
+        }
+        let script = captures
+            .get(1)
+            .or_else(|| captures.get(2))
+            .or_else(|| captures.get(3))
+            .map(|value| value.as_str())
+            .unwrap_or_default();
+        result = eval_js_url(
+            script,
+            &result,
+            key,
+            page,
+            &source.book_source_url,
+            base_url,
+        )
+        .map_err(|error| format!("URL JavaScript failed: {error}"))?;
+        previous_end = matched.end();
+    }
+    if previous_end < rule.len() {
+        let suffix = rule[previous_end..].trim();
+        if !suffix.is_empty() {
+            result = suffix.replace("@result", &result);
+        }
+    }
+    Ok(result)
+}
+
+fn expand_url_templates(
+    rule: &str,
+    key: &str,
+    page: i32,
+    source: &BookSource,
+    base_url: &str,
+) -> Result<String, String> {
+    let mut output = String::with_capacity(rule.len());
+    let mut cursor = 0;
+    while let Some(relative_start) = rule[cursor..].find("{{") {
+        let start = cursor + relative_start;
+        output.push_str(&rule[cursor..start]);
+        let expression_start = start + 2;
+        let Some(relative_end) = rule[expression_start..].find("}}") else {
+            output.push_str(&rule[start..]);
+            return Ok(output);
+        };
+        let end = expression_start + relative_end;
+        let expression = rule[expression_start..end].trim();
+        let replacement = eval_js_url_template(
+            expression,
+            rule,
+            key,
+            page,
+            &source.book_source_url,
+            base_url,
+        )
+        .map_err(|error| format!("URL template JavaScript failed: {error}"))?;
+        output.push_str(&replacement);
+        cursor = end + 2;
+    }
+    output.push_str(&rule[cursor..]);
+    Ok(output)
+}
+
+fn replace_legacy_placeholders(rule: &str, key: &str, page: i32) -> String {
     let encoded_key = urlencoding::encode(key);
     let page = page.max(1).to_string();
-    let with_page_choices = replace_page_choices(rule, page.parse().unwrap_or(1));
-    with_page_choices
-        .replace("{{key}}", &encoded_key)
-        .replace("{key}", &encoded_key)
+    rule.replace("{key}", &encoded_key)
         .replace("searchKey", &encoded_key)
-        .replace("{{page}}", &page)
         .replace("{page}", &page)
         .replace("searchPage", &page)
+}
+
+fn replace_page_choices_before_options(rule: &str, page: i32) -> String {
+    let (url, options) = split_url_options(rule);
+    match options {
+        Some(options) => format!("{},{}", replace_page_choices(url, page), options),
+        None => replace_page_choices(url, page),
+    }
 }
 
 fn replace_page_choices(rule: &str, page: i32) -> String {
@@ -613,6 +735,19 @@ fn headers_from_value(value: &Value) -> Vec<(String, String)> {
     }
 }
 
+fn take_proxy_header(headers: &mut Vec<(String, String)>) -> Option<String> {
+    let mut proxy = None;
+    headers.retain(|(name, value)| {
+        if name.eq_ignore_ascii_case("proxy") {
+            proxy = Some(value.clone());
+            false
+        } else {
+            true
+        }
+    });
+    proxy
+}
+
 fn merge_headers(target: &mut Vec<(String, String)>, extra: Vec<(String, String)>) {
     for (name, value) in extra {
         if name.eq_ignore_ascii_case("proxy") {
@@ -661,13 +796,21 @@ fn validate_http_url(raw_url: &str) -> Result<(), String> {
 }
 
 fn encode_get_query(raw_url: &str, charset: Option<&str>) -> String {
-    let Some(charset) = charset.filter(|value| !value.eq_ignore_ascii_case("utf-8")) else {
+    let Some(charset) = charset.filter(|value| {
+        !value.eq_ignore_ascii_case("utf-8") && !value.eq_ignore_ascii_case("utf8")
+    }) else {
         return raw_url.to_string();
     };
-    let Some(encoding) = Encoding::for_label(charset.as_bytes()) else {
-        return raw_url.to_string();
+    let escape_mode = charset.eq_ignore_ascii_case("escape");
+    let encoding = if escape_mode {
+        None
+    } else {
+        Encoding::for_label(charset.as_bytes())
     };
-    let Ok(mut url) = url::Url::parse(raw_url) else {
+    if !escape_mode && encoding.is_none() {
+        return raw_url.to_string();
+    }
+    let Ok(url) = url::Url::parse(raw_url) else {
         return raw_url.to_string();
     };
     let Some(query) = url.query().map(str::to_owned) else {
@@ -680,41 +823,304 @@ fn encode_get_query(raw_url: &str, charset: Option<&str>) -> String {
             let value = urlencoding::decode(value)
                 .unwrap_or_else(|_| value.into())
                 .into_owned();
-            let (bytes, _, _) = encoding.encode(&value);
-            let encoded_value = bytes
-                .iter()
-                .map(|byte| {
-                    if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.' | b'~') {
-                        (*byte as char).to_string()
-                    } else {
-                        format!("%{:02X}", byte)
-                    }
-                })
-                .collect::<String>();
+            let encoded_value = if escape_mode {
+                escape_component(&value)
+            } else {
+                let (bytes, _, _) = encoding.expect("known encoding").encode(&value);
+                percent_encode_bytes(&bytes)
+            };
             format!("{name}={encoded_value}")
         })
         .collect::<Vec<_>>()
         .join("&");
-    url.set_query(Some(&encoded));
-    url.to_string()
+    let serialized = url.to_string();
+    replace_serialized_query(&serialized, &encoded)
+}
+
+fn replace_serialized_query(url: &str, query: &str) -> String {
+    let fragment_at = url.find('#').unwrap_or(url.len());
+    let query_at = url[..fragment_at].find('?');
+    match query_at {
+        Some(index) => format!("{}?{}{}", &url[..index], query, &url[fragment_at..]),
+        None => format!("{}?{}{}", &url[..fragment_at], query, &url[fragment_at..]),
+    }
+}
+
+fn percent_encode_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.' | b'~') {
+                (*byte as char).to_string()
+            } else {
+                format!("%{:02X}", byte)
+            }
+        })
+        .collect()
+}
+
+fn escape_component(value: &str) -> String {
+    value
+        .encode_utf16()
+        .map(|unit| {
+            if unit <= 0x7F {
+                let byte = unit as u8;
+                if byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'*' | b'+' | b'-' | b'.' | b'/' | b'@' | b'_')
+                {
+                    (byte as char).to_string()
+                } else {
+                    format!("%{:02X}", byte)
+                }
+            } else {
+                format!("%u{:04X}", unit)
+            }
+        })
+        .collect()
+}
+
+fn prepare_request_body(
+    is_post: bool,
+    body: Option<String>,
+    headers: &mut Vec<(String, String)>,
+    charset: Option<&str>,
+) -> Option<String> {
+    let body = body?;
+    if !is_post || body.trim().is_empty() || has_content_type(headers) {
+        return Some(body);
+    }
+
+    let trimmed = body.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        headers.push((
+            CONTENT_TYPE.as_str().to_string(),
+            "application/json".to_string(),
+        ));
+        return Some(body);
+    }
+    if trimmed.starts_with("<?xml") || (trimmed.starts_with('<') && trimmed.contains('>')) {
+        headers.push((
+            CONTENT_TYPE.as_str().to_string(),
+            "application/xml".to_string(),
+        ));
+        return Some(body);
+    }
+
+    headers.push((
+        CONTENT_TYPE.as_str().to_string(),
+        "application/x-www-form-urlencoded".to_string(),
+    ));
+    Some(encode_form_body(&body, charset))
+}
+
+fn has_content_type(headers: &[(String, String)]) -> bool {
+    headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(CONTENT_TYPE.as_str()))
+}
+
+fn encode_form_body(body: &str, charset: Option<&str>) -> String {
+    if charset.is_none_or(|value| value.trim().is_empty()) && is_encoded_form(body) {
+        return body.to_string();
+    }
+    let charset = charset.map(str::trim).filter(|value| !value.is_empty());
+    let escape_mode = charset.is_some_and(|value| value.eq_ignore_ascii_case("escape"));
+    let encoding = charset
+        .filter(|value| !value.eq_ignore_ascii_case("escape"))
+        .and_then(|value| Encoding::for_label(value.as_bytes()))
+        .unwrap_or(UTF_8);
+    body.split('&')
+        .map(|part| {
+            let (name, value) = part.split_once('=').unwrap_or((part, ""));
+            let name = encode_form_component(name, encoding, escape_mode);
+            let value = encode_form_component(value, encoding, escape_mode);
+            format!("{name}={value}")
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn encode_form_component(value: &str, encoding: &'static Encoding, escape_mode: bool) -> String {
+    if escape_mode {
+        return escape_component(value);
+    }
+    let (bytes, _, _) = encoding.encode(value);
+    bytes
+        .iter()
+        .map(|byte| match *byte {
+            b' ' => "+".to_string(),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' => {
+                (*byte as char).to_string()
+            }
+            _ => format!("%{:02X}", byte),
+        })
+        .collect()
+}
+
+fn is_encoded_form(body: &str) -> bool {
+    let bytes = body.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len()
+                && bytes[index + 1].is_ascii_hexdigit()
+                && bytes[index + 2].is_ascii_hexdigit() =>
+            {
+                index += 3
+            }
+            b'%' => return false,
+            byte if byte.is_ascii_alphanumeric()
+                || matches!(byte, b'*' | b'-' | b'.' | b'_' | b'+' | b'&' | b'=') =>
+            {
+                index += 1
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn format_response_body(
+    raw_body: &[u8],
+    decoded_body: String,
+    content_type: Option<&str>,
+    response_type: Option<&str>,
+) -> String {
+    if response_type.is_some_and(|value| !value.trim().is_empty()) {
+        return raw_body.iter().map(|byte| format!("{byte:02x}")).collect();
+    }
+    if content_type.is_some_and(is_xml_content_type) && !decoded_body.starts_with("<?xml") {
+        return format!("<?xml version=\"1.0\"?>{decoded_body}");
+    }
+    decoded_body
+}
+
+fn is_xml_content_type(content_type: &str) -> bool {
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    mime == "text/xml" || mime == "application/xml" || mime.ends_with("+xml")
 }
 
 fn decode_body(bytes: &[u8], charset: Option<&str>, content_type: Option<&str>) -> String {
-    let charset = charset.map(str::to_owned).or_else(|| {
-        content_type.and_then(|value| {
-            value.split(';').find_map(|part| {
-                let (name, value) = part.split_once('=')?;
-                name.trim()
-                    .eq_ignore_ascii_case("charset")
-                    .then(|| value.trim().trim_matches(['\'', '"']).to_string())
-            })
-        })
-    });
-    if let Some(charset) = charset.and_then(|value| Encoding::for_label(value.as_bytes())) {
-        let (text, _, _) = charset.decode(bytes);
-        return text.into_owned();
+    // An explicitly supplied URL charset is authoritative when it is known.
+    if let Some(encoding) = charset.and_then(|label| Encoding::for_label(label.as_bytes())) {
+        return decode_with_encoding(bytes, encoding).0;
     }
+
+    // A BOM is stronger evidence than response headers and must not leak into
+    // the resulting text as a leading U+FEFF.
+    if let Some((encoding, body)) = charset_from_bom(bytes) {
+        return decode_with_encoding(body, encoding).0;
+    }
+
+    // Honor valid HTTP declarations. A broken UTF-8 declaration is common for
+    // legacy pages, so allow meta declarations and statistical detection to
+    // recover instead of immediately returning replacement characters.
+    if let Some(encoding) = charset_from_content_type(content_type)
+        .and_then(|label| Encoding::for_label(label.as_bytes()))
+    {
+        let (text, had_errors) = decode_with_encoding(bytes, encoding);
+        if !had_errors {
+            return text;
+        }
+    }
+
+    if let Some(encoding) =
+        charset_from_html_meta(bytes).and_then(|label| Encoding::for_label(label.as_bytes()))
+    {
+        let (text, had_errors) = decode_with_encoding(bytes, encoding);
+        if !had_errors {
+            return text;
+        }
+    }
+
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_owned();
+    }
+
+    let mut detector = EncodingDetector::new();
+    detector.feed(bytes, true);
+    let encoding = detector.guess(None, true);
+    let (text, had_errors) = decode_with_encoding(bytes, encoding);
+    if !had_errors {
+        return text;
+    }
+
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn charset_from_content_type(content_type: Option<&str>) -> Option<String> {
+    content_type?.split(';').find_map(|part| {
+        let (name, value) = part.split_once('=')?;
+        name.trim()
+            .eq_ignore_ascii_case("charset")
+            .then(|| value.trim().trim_matches(['\'', '"']).to_string())
+    })
+}
+
+fn charset_from_bom(bytes: &[u8]) -> Option<(&'static Encoding, &[u8])> {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        Some((UTF_8, &bytes[3..]))
+    } else if bytes.starts_with(&[0xFF, 0xFE]) {
+        Some((UTF_16LE, &bytes[2..]))
+    } else if bytes.starts_with(&[0xFE, 0xFF]) {
+        Some((UTF_16BE, &bytes[2..]))
+    } else {
+        None
+    }
+}
+
+fn charset_from_html_meta(bytes: &[u8]) -> Option<String> {
+    static META_TAG: Lazy<regex::Regex> =
+        Lazy::new(|| regex::Regex::new(r"(?is)<meta\b[^>]*>").expect("valid meta tag regex"));
+    static META_ATTRIBUTE: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(r#"(?is)([a-z_:][a-z0-9_:.-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#)
+            .expect("valid meta attribute regex")
+    });
+    static CONTENT_CHARSET: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(r#"(?i)charset\s*=\s*["']?([a-z0-9._:-]+)"#)
+            .expect("valid content charset regex")
+    });
+
+    let prefix = &bytes[..bytes.len().min(4096)];
+    let html = String::from_utf8_lossy(prefix);
+    for tag in META_TAG.find_iter(&html) {
+        let mut charset = None;
+        let mut http_equiv = None;
+        let mut content = None;
+        for attribute in META_ATTRIBUTE.captures_iter(tag.as_str()) {
+            let name = attribute.get(1)?.as_str();
+            let value = (2..=4)
+                .find_map(|index| attribute.get(index))
+                .map(|value| value.as_str())
+                .unwrap_or_default();
+            if name.eq_ignore_ascii_case("charset") {
+                charset = Some(value.to_string());
+            } else if name.eq_ignore_ascii_case("http-equiv") {
+                http_equiv = Some(value);
+            } else if name.eq_ignore_ascii_case("content") {
+                content = Some(value);
+            }
+        }
+        if let Some(charset) = charset.filter(|value| !value.trim().is_empty()) {
+            return Some(charset.trim().to_string());
+        }
+        if http_equiv.is_some_and(|value| value.eq_ignore_ascii_case("content-type")) {
+            if let Some(capture) = content.and_then(|value| CONTENT_CHARSET.captures(value)) {
+                return capture.get(1).map(|value| value.as_str().to_string());
+            }
+        }
+    }
+    None
+}
+
+fn decode_with_encoding(bytes: &[u8], encoding: &'static Encoding) -> (String, bool) {
+    let (text, _, had_errors) = encoding.decode(bytes);
+    (text.into_owned(), had_errors)
 }
 
 fn value_to_string(value: &Value) -> Option<String> {
@@ -736,6 +1142,328 @@ fn value_to_usize(value: &Value) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode(text: &str, label: &str) -> Vec<u8> {
+        let encoding = Encoding::for_label(label.as_bytes()).unwrap();
+        let (bytes, _, had_errors) = encoding.encode(text);
+        assert!(!had_errors, "test sample must be representable in {label}");
+        bytes.into_owned()
+    }
+
+    fn test_source(header: Option<&str>) -> BookSource {
+        BookSource {
+            book_source_name: "URL compatibility".to_string(),
+            book_source_url: "https://a.test".to_string(),
+            header: header.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn compat_url_compile_expands_key_page_and_headers() {
+        let source = test_source(None);
+        let spec = analyze_url(
+            "/search?q={{key}}&page=<1,2,3>,{\"headers\":{\"Referer\":\"https://a.test\"}}",
+            "斗破",
+            2,
+            "https://a.test",
+            &source,
+        )
+        .unwrap();
+
+        assert_eq!(
+            spec.url,
+            "https://a.test/search?q=%E6%96%97%E7%A0%B4&page=2"
+        );
+        assert!(spec.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("referer") && value == "https://a.test"
+        }));
+    }
+
+    #[test]
+    fn compat_url_rule_js_segments_and_templates() {
+        let source = test_source(None);
+        let spec = analyze_url(
+            "start<js>result + '-one'</js>@result<js>result + '-two'</js>@result",
+            "keyword",
+            1,
+            "https://a.test",
+            &source,
+        )
+        .unwrap();
+        assert_eq!(spec.url, "https://a.test/start-one-two");
+
+        let spec = analyze_url(
+            "@js:'https://a.test/search?q='+encodeURIComponent(key)",
+            "a b",
+            1,
+            "https://a.test",
+            &source,
+        )
+        .unwrap();
+        assert_eq!(spec.url, "https://a.test/search?q=a%20b");
+
+        let spec = analyze_url(
+            "js:'https://a.test/legacy'",
+            "keyword",
+            1,
+            "https://a.test",
+            &source,
+        )
+        .unwrap();
+        assert_eq!(spec.url, "https://a.test/legacy");
+
+        let spec = analyze_url(
+            "/search?q={{1 + 1}}&a={{'word'}}&empty={{null}}",
+            "keyword",
+            1,
+            "https://a.test",
+            &source,
+        )
+        .unwrap();
+        assert_eq!(spec.url, "https://a.test/search?q=2&a=word&empty=");
+        assert_eq!(
+            eval_js_url_template(
+                "({value: 1})",
+                "",
+                "key",
+                1,
+                "https://a.test",
+                "https://a.test"
+            )
+            .unwrap(),
+            "[object Object]"
+        );
+    }
+
+    #[test]
+    fn compat_url_option_js_and_source_proxy() {
+        let source = test_source(Some(
+            "@js:JSON.stringify({proxy:'http://source-proxy:8080', Referer:'https://source.test'})",
+        ));
+        let spec = analyze_url(
+            "/search,{\"proxy\":\"http://option-proxy:8080\",\"js\":\"'/final'\"}",
+            "key",
+            1,
+            "https://a.test",
+            &source,
+        )
+        .unwrap();
+        assert_eq!(spec.url, "https://a.test/final");
+        assert_eq!(spec.proxy.as_deref(), Some("http://option-proxy:8080"));
+        assert!(!spec
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("proxy")));
+        assert!(spec
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("user-agent")));
+        assert!(spec.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("referer") && value == "https://source.test"
+        }));
+
+        let spec = analyze_url("/search", "key", 1, "https://a.test", &source).unwrap();
+        assert_eq!(spec.proxy.as_deref(), Some("http://source-proxy:8080"));
+    }
+
+    #[test]
+    fn compat_url_escape_charset_and_form_encoding() {
+        let source = test_source(None);
+        let query = analyze_url(
+            "/search?q=中文, {\"charset\":\"escape\"}",
+            "key",
+            1,
+            "https://a.test",
+            &source,
+        )
+        .unwrap();
+        assert_eq!(query.url, "https://a.test/search?q=%u4E2D%u6587");
+
+        let form = analyze_url(
+            "/submit,{\"method\":\"POST\",\"body\":\"q=中文&title=a b\"}",
+            "key",
+            1,
+            "https://a.test",
+            &source,
+        )
+        .unwrap();
+        assert_eq!(form.body.as_deref(), Some("q=%E4%B8%AD%E6%96%87&title=a+b"));
+        assert!(form.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type")
+                && value == "application/x-www-form-urlencoded"
+        }));
+
+        let encoded = analyze_url(
+            "/submit,{\"method\":\"POST\",\"body\":\"q=hello+world&x=%2F\"}",
+            "key",
+            1,
+            "https://a.test",
+            &source,
+        )
+        .unwrap();
+        assert_eq!(encoded.body.as_deref(), Some("q=hello+world&x=%2F"));
+
+        let gbk_form = analyze_url(
+            "/submit,{\"method\":\"POST\",\"charset\":\"gbk\",\"body\":\"q=中文\"}",
+            "key",
+            1,
+            "https://a.test",
+            &source,
+        )
+        .unwrap();
+        assert_eq!(gbk_form.body.as_deref(), Some("q=%D6%D0%CE%C4"));
+
+        let escape_form = analyze_url(
+            "/submit,{\"method\":\"POST\",\"charset\":\"escape\",\"body\":\"q=中文\"}",
+            "key",
+            1,
+            "https://a.test",
+            &source,
+        )
+        .unwrap();
+        assert_eq!(escape_form.body.as_deref(), Some("q=%u4E2D%u6587"));
+    }
+
+    #[test]
+    fn compat_url_json_body_charset_and_response_type() {
+        let source = test_source(None);
+        let json = analyze_url(
+            "/submit,{\"method\":\"POST\",\"body\":{\"q\":\"中文\"},\"charset\":\"gbk\",\"type\":\"hex\"}",
+            "key",
+            1,
+            "https://a.test",
+            &source,
+        )
+        .unwrap();
+        assert_eq!(json.body.as_deref(), Some(r#"{"q":"中文"}"#));
+        assert_eq!(json.response_type.as_deref(), Some("hex"));
+        assert!(json.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type") && value == "application/json"
+        }));
+
+        let xml = analyze_url(
+            "/submit,{\"method\":\"POST\",\"body\":\"<root/>\"}",
+            "key",
+            1,
+            "https://a.test",
+            &source,
+        )
+        .unwrap();
+        assert_eq!(xml.body.as_deref(), Some("<root/>"));
+        assert!(xml.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type") && value == "application/xml"
+        }));
+
+        assert_eq!(
+            format_response_body(b"<root/>", "<root/>".into(), Some("application/xml"), None),
+            "<?xml version=\"1.0\"?><root/>"
+        );
+        assert_eq!(
+            format_response_body(&[0, 255], String::new(), None, Some("hex")),
+            "00ff"
+        );
+        assert_eq!(
+            format_response_body(
+                b"<?xml version='1.0'?>",
+                "<?xml version='1.0'?>".into(),
+                Some("text/xml"),
+                None
+            ),
+            "<?xml version='1.0'?>"
+        );
+    }
+
+    #[test]
+    fn decodes_utf8_without_declaration() {
+        let text = "Hello, 世界";
+        assert_eq!(decode_body(text.as_bytes(), None, None), text);
+    }
+
+    #[test]
+    fn decodes_utf8_bom_without_returning_bom() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice("你好".as_bytes());
+        assert_eq!(decode_body(&bytes, None, None), "你好");
+    }
+
+    #[test]
+    fn decodes_utf16_bom() {
+        let text = "Hello 世界";
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+        assert_eq!(decode_body(&bytes, None, None), text);
+    }
+
+    #[test]
+    fn decodes_utf16be_bom() {
+        let text = "Hello 世界";
+        let mut bytes = vec![0xFE, 0xFF];
+        bytes.extend(text.encode_utf16().flat_map(u16::to_be_bytes));
+        assert_eq!(decode_body(&bytes, None, None), text);
+    }
+
+    #[test]
+    fn decodes_gbk_from_http_charset() {
+        let bytes = encode("中文页面", "gbk");
+        assert_eq!(
+            decode_body(&bytes, None, Some("text/html; charset=gbk")),
+            "中文页面"
+        );
+    }
+
+    #[test]
+    fn decodes_gbk_from_html_meta_charset() {
+        let text = "这是中文页面";
+        let mut bytes = b"<meta charset=gbk><title>".to_vec();
+        bytes.extend(encode(text, "gbk"));
+        bytes.extend_from_slice(b"</title>");
+        let decoded = decode_body(&bytes, None, None);
+        assert!(decoded.contains(text));
+        assert!(!decoded.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn recovers_when_http_mislabels_gbk_as_utf8() {
+        let bytes = encode("错误声明也能正确解码", "gbk");
+        let decoded = decode_body(&bytes, None, Some("text/html; charset=utf-8"));
+        assert_eq!(decoded, "错误声明也能正确解码");
+        assert!(!decoded.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn detects_big5_without_declaration() {
+        let text = "繁體中文網頁內容測試，這是一段較長的文字，用來辨識 Big5 編碼。".repeat(4);
+        let bytes = encode(&text, "big5");
+        let decoded = decode_body(&bytes, None, None);
+        assert_eq!(decoded, text);
+        assert!(!decoded.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn detects_shift_jis_without_declaration() {
+        let text = "日本語の文章です。文字コードを検出するための長めのテストです。".repeat(4);
+        let bytes = encode(&text, "shift_jis");
+        let decoded = decode_body(&bytes, None, None);
+        assert_eq!(decoded, text);
+        assert!(!decoded.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn explicit_url_charset_overrides_http_charset() {
+        let text = "日本語の内容";
+        let bytes = encode(text, "shift_jis");
+        assert_eq!(
+            decode_body(&bytes, Some("shift_jis"), Some("text/html; charset=gbk")),
+            text
+        );
+    }
+
+    #[test]
+    fn ascii_is_unchanged() {
+        let text = b"plain ASCII content";
+        assert_eq!(decode_body(text, None, None).as_bytes(), text);
+    }
 
     #[test]
     fn test_cookie_store() {
