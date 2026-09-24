@@ -418,6 +418,15 @@ fn input_chapter_state(params: &Value) -> (Option<String>, Option<String>) {
     (variable, title)
 }
 
+fn input_chapter_is_volume(params: &Value) -> bool {
+    params
+        .get("chapter")
+        .and_then(|chapter| chapter.get("isVolume"))
+        .or_else(|| params.get("isVolume"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 fn execute_info(
     source: &BookSource,
     engine: &RuleEngine,
@@ -576,6 +585,7 @@ fn execute_content(
     let initial_url = required_string(params, "url")?;
     let (book_variable, book_name) = input_book_state(params);
     let (chapter_variable, chapter_title) = input_chapter_state(params);
+    let is_volume = input_chapter_is_volume(params);
     let replace_rules = parse_replace_rules(params.get("replaceRules"))?;
     let mut current_url = initial_url.clone();
     let mut visited_urls = HashSet::new();
@@ -638,6 +648,9 @@ fn execute_content(
     let response =
         final_response.ok_or_else(|| ExecuteError::url_rule("content URL produced no request"))?;
     let content = apply_replace_rules(&fragments.join("\n"), &replace_rules);
+    if content.is_empty() && !is_volume {
+        return Err(ExecuteError::parse("content is empty"));
+    }
     Ok(success(
         json!({"content": content, "pages": visited_urls.len(), "truncated": truncated}),
         visited_urls.len(),
@@ -1284,6 +1297,48 @@ mod tests {
             "C"
         );
         assert_eq!(chapter_title.as_deref(), Some("Chapter"));
+    }
+
+    #[test]
+    fn execute_rejects_empty_content_except_for_volume_chapters() {
+        let source_for = |base_url: String| {
+            serde_json::json!({
+                "bookSourceName": "empty content fixture",
+                "bookSourceUrl": base_url,
+                "ruleContent": {"content": "$.content"}
+            })
+        };
+        let empty_body = r#"{"content":""}"#;
+        let base_url = serve_once(empty_body);
+        let source = source_for(base_url.clone());
+        let result: serde_json::Value = serde_json::from_str(&execute(
+            &source.to_string(),
+            &serde_json::json!({
+                "api": 2,
+                "op": "content",
+                "params": {"url": base_url, "chapter": {"isVolume": false}}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["error"]["kind"], "parse");
+        assert_eq!(result["error"]["message"], "content is empty");
+
+        let base_url = serve_once(empty_body);
+        let source = source_for(base_url.clone());
+        let result: serde_json::Value = serde_json::from_str(&execute(
+            &source.to_string(),
+            &serde_json::json!({
+                "api": 2,
+                "op": "content",
+                "params": {"url": base_url, "chapter": {"isVolume": true}}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["content"], "");
     }
 
     #[test]

@@ -525,11 +525,14 @@ impl RuleEngine {
                 let content_rule =
                     interpolate_common_templates(&content_rule, &content_body, base_url, &context);
                 if has_templates && content_rule.trim_start().starts_with('<') {
-                    let mut content = html::format_keep_img(&content_rule, base_url);
-                    if let Some(replace) = rule.replace_regex.as_deref() {
-                        content = apply_legado_regex(&content, replace);
-                    }
-                    return content;
+                    let content = html::format_keep_img(&content_rule, base_url);
+                    return apply_content_replacement(
+                        content,
+                        rule.replace_regex.as_deref(),
+                        &content_body,
+                        base_url,
+                        &context,
+                    );
                 }
                 if matches!(
                     self.detect_mode(&content_rule, &content_body),
@@ -537,11 +540,14 @@ impl RuleEngine {
                 ) {
                     let script = self.strip_mode_prefix(&content_rule);
                     if let Ok(res) = eval_js(script, &content_body, base_url) {
-                        let mut content = html::format_keep_img(&res, base_url);
-                        if let Some(replace) = rule.replace_regex.as_deref() {
-                            content = apply_legado_regex(&content, replace);
-                        }
-                        return content;
+                        let content = html::format_keep_img(&res, base_url);
+                        return apply_content_replacement(
+                            content,
+                            rule.replace_regex.as_deref(),
+                            &content_body,
+                            base_url,
+                            &context,
+                        );
                     }
                 }
 
@@ -573,12 +579,13 @@ impl RuleEngine {
                 };
 
                 content = html::format_keep_img(&content, base_url);
-
-                if let Some(replace) = rule.replace_regex.as_deref() {
-                    content = apply_legado_regex(&content, replace);
-                }
-
-                return content;
+                return apply_content_replacement(
+                    content,
+                    rule.replace_regex.as_deref(),
+                    &content_body,
+                    base_url,
+                    &context,
+                );
             }
 
             String::new()
@@ -2544,6 +2551,20 @@ pub fn apply_legado_regex(text: &str, regex_part: &str) -> String {
     output
 }
 
+fn apply_content_replacement(
+    content: String,
+    rule: Option<&str>,
+    input: &str,
+    base_url: &str,
+    context: &RuleVariableContext,
+) -> String {
+    let Some(rule) = rule else {
+        return content;
+    };
+    let rule = interpolate_common_templates(rule, input, base_url, context);
+    apply_legado_regex(&content, &rule)
+}
+
 fn apply_regex_replace_all(text: &str, pattern: &str, replacement: &str) -> String {
     crate::util::text::get_cached_regex(pattern)
         .map(|regex| regex.replace_all(text, replacement).into_owned())
@@ -3748,6 +3769,28 @@ mod tests {
             content,
             "“李珞！你这也太过分了！赶紧给班长道歉！”\n“就是啊，溪溪好心想要给你最后冲刺一下，你不领情也就算了，推人干嘛？”\n“当然！”"
         );
+    }
+
+    #[test]
+    fn compat_content_replacement_reads_scoped_variables() {
+        let source = BookSource {
+            rule_content: Some(ContentRule {
+                content: Some(".text@text".to_string()),
+                replace_regex: Some("##{{@get:{pattern}}}##X".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let output = RuleEngine::new().unwrap().content_with_variables(
+            &source,
+            r#"<div class="text">ABAC</div>"#,
+            "https://books.example/chapter/1",
+            Some(r#"{"pattern":"A"}"#),
+            None,
+            Some("Book"),
+            Some("Chapter"),
+        );
+        assert_eq!(output, "XBXC");
     }
 
     #[test]
