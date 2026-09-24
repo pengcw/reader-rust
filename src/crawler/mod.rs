@@ -67,10 +67,7 @@ impl UrlRuleContext {
 
         let chapter_variables = Self::variable_map(self.chapter_variable.as_deref());
         let mut chapter = chapter_variables.clone();
-        chapter.insert(
-            "variableMap".to_string(),
-            Value::Object(chapter_variables),
-        );
+        chapter.insert("variableMap".to_string(), Value::Object(chapter_variables));
         if let Some(title) = self.chapter_title.as_deref() {
             chapter.insert("title".to_string(), Value::String(title.to_string()));
         }
@@ -466,17 +463,8 @@ fn compile_url_request(
 
     // Stages 2-4: URL JS segments, embedded JS templates, legacy placeholders, page choices.
     let bindings = context.map(UrlRuleContext::bindings);
-    let mut rule =
-        eval_url_rule_js_segments(raw_rule, key, page, source, base, bindings.as_ref())?;
-    rule = expand_url_templates(
-        &rule,
-        key,
-        page,
-        source,
-        base,
-        context,
-        bindings.as_ref(),
-    )?;
+    let mut rule = eval_url_rule_js_segments(raw_rule, key, page, source, base, bindings.as_ref())?;
+    rule = expand_url_templates(&rule, key, page, source, base, context, bindings.as_ref())?;
     rule = replace_legacy_placeholders(&rule, key, page);
     rule = replace_page_choices_before_options(&rule, page);
 

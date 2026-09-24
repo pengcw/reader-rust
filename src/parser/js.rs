@@ -531,12 +531,28 @@ fn eval_js_inner_with_source(
                 }),
             )?;
             java_obj.set(
+                "base64DecodeBytes",
+                Func::new(|input: String| -> String {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(input.trim())
+                        .or_else(|_| {
+                            base64::engine::general_purpose::STANDARD_NO_PAD.decode(input.trim())
+                        })
+                        .unwrap_or_default();
+                    serde_json::to_string(&bytes).unwrap_or_else(|_| "[]".to_string())
+                }),
+            )?;
+            java_obj.set(
                 "aesBase64DecodeToString",
                 Func::new(
                     |input: String, key: String, algorithm: String, iv: String| -> String {
                         java_aes_base64_decode_to_string(&input, &key, &algorithm, &iv)
                     },
                 ),
+            )?;
+            java_obj.set(
+                "aesDecryptBytes",
+                Func::new(|input: String| -> String { java_aes_decrypt_bytes(&input) }),
             )?;
             java_obj.set(
                 "aesBase64Encode",
@@ -775,11 +791,25 @@ fn eval_js_inner_with_source(
                     true
                 }),
             )?;
+            let rule_bindings = bindings.cloned().unwrap_or_default();
             java_obj.set(
                 "get",
-                Func::new(|key: String| -> Option<String> {
-                    let map = JS_KV.lock().unwrap_or_else(|e| e.into_inner());
-                    map.get(&key).cloned()
+                Func::new(move |key: String| -> String {
+                    scoped_java_variable(&rule_bindings, &key)
+                        .or_else(|| {
+                            crate::crawler::session::current_active_session()
+                                .and_then(|session| session.get_variable(&key))
+                                .map(|value| json_value_to_string(&value))
+                                .filter(|value| !value.is_empty())
+                        })
+                        .or_else(|| {
+                            JS_KV
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get(&key)
+                                .cloned()
+                        })
+                        .unwrap_or_default()
                 }),
             )?;
             java_obj.set(
@@ -962,6 +992,54 @@ fn eval_js_inner_with_source(
                         getEncoder() { return { encodeToString: base64.encodeToString, withoutPadding() { return this; } }; },
                         getDecoder() { return { decode: base64.decode }; },
                         getUrlEncoder() { return { encodeToString: value => java.base64Encode(String(value)).replace(/\+/g, '-').replace(/\//g, '_') }; }
+                    };
+                    globalThis.Packages = globalThis.Packages || {};
+                    Packages.java = Packages.java || {};
+                    Packages.java.lang = Packages.java.lang || {};
+                    Packages.java.util = Packages.java.util || {};
+                    Packages.javax = Packages.javax || {};
+                    Packages.javax.crypto = Packages.javax.crypto || {};
+                    Packages.javax.crypto.spec = Packages.javax.crypto.spec || {};
+                    const utf8Bytes = value => {
+                        const encoded = encodeURIComponent(String(value));
+                        const bytes = [];
+                        for (let i = 0; i < encoded.length;) {
+                            if (encoded[i] === '%') {
+                                bytes.push(parseInt(encoded.slice(i + 1, i + 3), 16));
+                                i += 3;
+                            } else {
+                                bytes.push(encoded.charCodeAt(i++));
+                            }
+                        }
+                        return bytes;
+                    };
+                    if (!String.prototype.getBytes) {
+                        Object.defineProperty(String.prototype, 'getBytes', {
+                            value() { return utf8Bytes(String(this)); }
+                        });
+                    }
+                    globalThis.JavaImporter = function() {
+                        this.importPackage = function() {};
+                        this.Base64 = { getDecoder() { return { decode: value => JSON.parse(java.base64DecodeBytes(String(value))) }; } };
+                        this.SecretKeySpec = (key, algorithm) => ({ key: Array.from(key), algorithm: String(algorithm) });
+                        this.IvParameterSpec = iv => ({ iv: Array.from(iv) });
+                        this.Arrays = { copyOfRange(value, start, end) {
+                            const bytes = Array.from(value).slice(start, end);
+                            while (bytes.length < end - start) bytes.push(0);
+                            return bytes;
+                        } };
+                        this.Cipher = {
+                            DECRYPT_MODE: 2,
+                            getInstance: algorithm => ({
+                                init(mode, key, iv) { this.mode = mode; this.key = key; this.iv = iv; },
+                                doFinal(data) {
+                                    return java.aesDecryptBytes(JSON.stringify({
+                                        algorithm, mode: this.mode, key: this.key.key,
+                                        iv: this.iv.iv, data: Array.from(data)
+                                    }));
+                                }
+                            })
+                        };
                     };
                     globalThis.URLEncoder = {
                         encode(value) { return encodeURIComponent(String(value)).replace(/%20/g, '+').replace(/[!'()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`); }
@@ -1506,6 +1584,45 @@ fn java_aes_base64_decode_to_string(input: &str, key: &str, algorithm: &str, iv:
         .unwrap_or_default()
 }
 
+fn java_aes_decrypt_bytes(input: &str) -> String {
+    let Ok(value) = serde_json::from_str::<JsonValue>(input) else {
+        return String::new();
+    };
+    let bytes = |key: &str| -> Option<Vec<u8>> {
+        value
+            .get(key)?
+            .as_array()?
+            .iter()
+            .map(|byte| u8::try_from(byte.as_u64()?).ok())
+            .collect()
+    };
+    if value.get("mode").and_then(JsonValue::as_i64) != Some(2)
+        || !matches!(
+            value
+                .get("algorithm")
+                .and_then(JsonValue::as_str)
+                .unwrap_or_default()
+                .to_ascii_uppercase()
+                .as_str(),
+            "AES/CBC/PKCS5PADDING" | "AES/CBC/PKCS7PADDING"
+        )
+    {
+        return String::new();
+    }
+    let (Some(key), Some(iv), Some(mut encrypted)) = (bytes("key"), bytes("iv"), bytes("data"))
+    else {
+        return String::new();
+    };
+    let Ok(cipher) = Aes128CbcDecryptor::new_from_slices(&key, &iv) else {
+        return String::new();
+    };
+    cipher
+        .decrypt_padded_mut::<Pkcs7>(&mut encrypted)
+        .ok()
+        .and_then(|plaintext| String::from_utf8(plaintext.to_vec()).ok())
+        .unwrap_or_default()
+}
+
 fn java_aes_base64_encode(input: &str, key: &str, algorithm: &str, iv: &str) -> String {
     let algorithm = algorithm.to_ascii_uppercase();
     if algorithm != "AES/CBC/PKCS5PADDING" && algorithm != "AES/CBC/PKCS7PADDING" {
@@ -1696,6 +1813,47 @@ fn java_request_simple(method: &str, url: &str, body: Option<String>) -> anyhow:
     Ok(active_js_http_client().request_text(method, url.trim(), &[], body.as_deref())?)
 }
 
+fn scoped_java_variable(bindings: &HashMap<String, JsonValue>, key: &str) -> Option<String> {
+    if key == "bookName" {
+        return binding_object_value(bindings.get("book"), "bookName")
+            .or_else(|| binding_object_value(bindings.get("book"), "name"));
+    }
+    if key == "title" {
+        return binding_object_value(bindings.get("chapter"), "title")
+            .or_else(|| bindings.get("title").map(json_value_to_string))
+            .filter(|value| !value.is_empty());
+    }
+
+    ["chapter", "book", "ruleData", "rule_data"]
+        .iter()
+        .filter_map(|scope| bindings.get(*scope))
+        .find_map(|scope| {
+            let object = scope.as_object()?;
+            object
+                .get("variableMap")
+                .and_then(|variables| variables.get(key))
+                .or_else(|| object.get(key))
+                .map(json_value_to_string)
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn binding_object_value(value: Option<&JsonValue>, key: &str) -> Option<String> {
+    value
+        .and_then(JsonValue::as_object)
+        .and_then(|object| object.get(key))
+        .map(json_value_to_string)
+        .filter(|value| !value.is_empty())
+}
+
+fn json_value_to_string(value: &JsonValue) -> String {
+    match value {
+        JsonValue::String(value) => value.clone(),
+        JsonValue::Null => String::new(),
+        value => value.to_string(),
+    }
+}
+
 fn split_ajax_spec(spec: &str) -> (&str, Option<&str>) {
     let mut depth = 0i32;
     let mut in_string = false;
@@ -1780,6 +1938,46 @@ mod tests {
     }
 
     #[test]
+    fn nashorn_java_importer_decrypts_aes_payload() {
+        let key = "242ccb8230d709e1";
+        let iv = "0123456789abcdef";
+        let plaintext = "本地解析正文测试";
+        let encrypted = base64::engine::general_purpose::STANDARD
+            .decode(java_aes_base64_encode(
+                plaintext,
+                key,
+                "AES/CBC/PKCS5Padding",
+                iv,
+            ))
+            .unwrap();
+        let mut payload = iv.as_bytes().to_vec();
+        payload.extend(encrypted);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
+        let script = format!(
+            r#"
+                var javaImport = new JavaImporter();
+                javaImport.importPackage(Packages.java.lang, Packages.javax.crypto.spec,
+                    Packages.javax.crypto, Packages.java.util);
+                with (javaImport) {{
+                    function decode(content) {{
+                        var ivEncData = Base64.getDecoder().decode(String(content));
+                        var key = SecretKeySpec(String("{key}").getBytes(), "AES");
+                        var iv = IvParameterSpec(Arrays.copyOfRange(ivEncData, 0, 16));
+                        var cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+                        cipher.init(2, key, iv);
+                        return String(cipher.doFinal(Arrays.copyOfRange(ivEncData, 16, ivEncData.length)));
+                    }}
+                }}
+                decode("{encoded}");
+            "#
+        );
+        assert_eq!(
+            eval_js(&script, "", "https://example.com").unwrap(),
+            plaintext
+        );
+    }
+
+    #[test]
     fn legado_android_compat_shims_use_session_and_safe_host_objects() {
         let initial = ExecuteSession::default();
         let script = r#"
@@ -1853,6 +2051,46 @@ mod tests {
         "#;
         let result = eval_js(script, "", "https://example.com").unwrap();
         assert_eq!(result, "first|last|first|p1|<b>one</b>|one");
+    }
+
+    #[test]
+    fn java_get_reads_legado_book_and_chapter_variable_scopes() {
+        let bindings = HashMap::from([
+            (
+                "book".to_string(),
+                json!({
+                    "name": "Book",
+                    "variableMap": {
+                        "bookOnly": "book-value",
+                        "shadowed": "book-value",
+                        "headers": r#"{"headers":{"X-Test":"ok"}}"#
+                    }
+                }),
+            ),
+            (
+                "chapter".to_string(),
+                json!({
+                    "title": "Chapter",
+                    "variableMap": {
+                        "chapterOnly": "chapter-value",
+                        "shadowed": "chapter-value"
+                    }
+                }),
+            ),
+            ("title".to_string(), json!("Chapter")),
+        ]);
+
+        let result = eval_js_with_bindings(
+            "[java.get('bookOnly'), java.get('chapterOnly'), java.get('shadowed'), java.get('headers'), java.get('bookName'), java.get('title')].join('|')",
+            "",
+            "https://example.com",
+            &bindings,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            r#"book-value|chapter-value|chapter-value|{"headers":{"X-Test":"ok"}}|Book|Chapter"#
+        );
     }
 
     #[test]

@@ -82,6 +82,16 @@ impl ExecuteError {
         }
     }
 
+    fn unsupported(message: impl Into<String>) -> Self {
+        Self {
+            kind: "unsupported",
+            message: message.into(),
+            status: None,
+            url: None,
+            auth: None,
+        }
+    }
+
     fn url_rule(message: impl Into<String>) -> Self {
         Self {
             kind: "url_rule",
@@ -201,6 +211,9 @@ pub fn execute(source_json: &str, request_json: &str) -> String {
 }
 
 fn execute_inner(source_json: &str, request_json: &str) -> ExecuteResult<Value> {
+    if is_loc_book(source_json, request_json) {
+        return Err(ExecuteError::unsupported("不支持远程本地书籍"));
+    }
     let source = parse_source(source_json)?;
     let (operation, params, options, request_session) = parse_request(request_json)?;
     let engine = RuleEngine::new().map_err(|error| ExecuteError::internal(error.to_string()))?;
@@ -232,6 +245,53 @@ fn execute_inner(source_json: &str, request_json: &str) -> ExecuteResult<Value> 
     Ok(response)
 }
 
+fn is_loc_book(source_json: &str, request_json: &str) -> bool {
+    let is_loc = |s: Option<&str>| {
+        s.map(str::trim)
+            .is_some_and(|v| v.eq_ignore_ascii_case("loc_book"))
+    };
+
+    if source_json.trim().eq_ignore_ascii_case("loc_book") {
+        return true;
+    }
+
+    if let Ok(val) = serde_json::from_str::<Value>(source_json) {
+        if is_loc(val.get("bookSourceUrl").and_then(Value::as_str))
+            || is_loc(val.get("origin").and_then(Value::as_str))
+        {
+            return true;
+        }
+    }
+
+    if let Ok(req) = serde_json::from_str::<Value>(request_json) {
+        if is_loc(req.get("origin").and_then(Value::as_str)) {
+            return true;
+        }
+        if let Some(params) = req.get("params") {
+            if is_loc(params.get("origin").and_then(Value::as_str))
+                || is_loc(params.get("book").and_then(|b| b.get("origin")).and_then(Value::as_str))
+                || is_loc(params.get("chapter").and_then(|c| c.get("origin")).and_then(Value::as_str))
+            {
+                return true;
+            }
+            if let Some(url) = params.get("url").and_then(Value::as_str) {
+                let trimmed = url.trim();
+                if trimmed.eq_ignore_ascii_case("loc_book") || trimmed.starts_with("content://") {
+                    return true;
+                }
+            }
+        }
+        if let Some(url) = req.get("url").and_then(Value::as_str) {
+            let trimmed = url.trim();
+            if trimmed.eq_ignore_ascii_case("loc_book") || trimmed.starts_with("content://") {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 fn parse_source(raw: &str) -> ExecuteResult<BookSource> {
     let value = serde_json::from_str::<Value>(raw)
         .map_err(|error| ExecuteError::invalid_source(format!("invalid source JSON: {error}")))?;
@@ -239,6 +299,9 @@ fn parse_source(raw: &str) -> ExecuteResult<BookSource> {
         .map_err(|error| ExecuteError::invalid_source(format!("invalid source: {error}")))?;
     if source.book_source_url.trim().is_empty() {
         return Err(ExecuteError::invalid_source("bookSourceUrl is required"));
+    }
+    if source.book_source_url.trim().eq_ignore_ascii_case("loc_book") {
+        return Err(ExecuteError::unsupported("不支持远程本地书籍"));
     }
     Ok(source)
 }
@@ -602,6 +665,31 @@ fn same_resource_url(left: &str, right: &str) -> bool {
     left == right
 }
 
+fn uses_js_ajax_content_rule(source: &BookSource) -> bool {
+    source
+        .rule_content
+        .as_ref()
+        .and_then(|rule| rule.content.as_deref())
+        .is_some_and(|rule| {
+            let rule = rule.trim();
+            let lower_rule = rule.to_ascii_lowercase();
+            let is_js = lower_rule.starts_with("@js:")
+                || lower_rule.starts_with("js:")
+                || lower_rule.starts_with("<js>");
+            let references = |name: &str| {
+                rule.split(|character: char| {
+                    !(character.is_ascii_alphanumeric() || matches!(character, '_' | '$'))
+                })
+                .any(|identifier| identifier == name)
+            };
+            is_js
+                && lower_rule.contains("java.ajax")
+                && references("baseUrl")
+                && !references("input")
+                && !references("result")
+        })
+}
+
 fn execute_content(
     source: &BookSource,
     engine: &RuleEngine,
@@ -614,6 +702,24 @@ fn execute_content(
     let (mut chapter_variable, chapter_title) = input_chapter_state(params);
     let is_volume = input_chapter_is_volume(params);
     let replace_rules = parse_replace_rules(params.get("replaceRules"))?;
+
+    if uses_js_ajax_content_rule(source) {
+        let page = engine.content_page_with_variables(
+            source,
+            "",
+            &initial_url,
+            book_variable.as_deref(),
+            chapter_variable.as_deref(),
+            book_name.as_deref(),
+            chapter_title.as_deref(),
+        );
+        let content = apply_replace_rules(&page.content, &replace_rules);
+        if content.is_empty() && !is_volume {
+            return Err(ExecuteError::parse("content is empty"));
+        }
+        return Ok(success_without_http(json!({"content": content})));
+    }
+
     let mut current_url = initial_url.clone();
     let mut visited_urls = HashSet::new();
     let mut fragments = Vec::new();
@@ -1236,6 +1342,7 @@ fn content_path_base(path: &str, strip_page_suffix: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::{execute, input_book_state, input_chapter_state};
+    use base64::Engine;
     use serde_json::Value;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -1381,6 +1488,257 @@ mod tests {
         .unwrap();
         assert_eq!(result["ok"], true, "{result}");
         assert_eq!(result["data"]["content"], "");
+    }
+
+    #[test]
+    fn execute_toc_js_reads_book_scoped_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let base_url = format!("http://{address}");
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let bytes_read = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..bytes_read]).into_owned();
+                let target = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or_default()
+                    .to_string();
+                let has_rule_header = request.lines().any(|line| {
+                    line.split_once(':').is_some_and(|(name, value)| {
+                        name.trim().eq_ignore_ascii_case("x-test") && value.trim() == "present"
+                    })
+                });
+                let body = if target == "/book" {
+                    r#"{"data":{"book":{"id":"book-id-7","name":"Book"}}}"#
+                } else {
+                    r#"{"data":{"chapter_lists":[{"title":"Chapter","id":"chapter-id-42"}]}}"#
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+                requests.push((target, has_rule_header));
+            }
+            requests
+        });
+
+        let toc_rule = format!(
+            r#"@js: var id = JSON.parse(input).id; "{base_url}/toc?bid=" + id + "," + java.get("headers")"#
+        );
+        let source = serde_json::json!({
+            "bookSourceName": "TOC scoped variable fixture",
+            "bookSourceUrl": base_url,
+            "ruleBookInfo": {
+                "init": "data.book",
+                "name": "$.name",
+                "tocUrl": toc_rule
+            },
+            "ruleToc": {
+                "chapterList": "data.chapter_lists",
+                "chapterName": "title",
+                "chapterUrl": "id"
+            }
+        });
+        let request = serde_json::json!({
+            "api": 2,
+            "op": "toc",
+            "params": {
+                "url": "/book",
+                "book": {
+                    "name": "Book",
+                    "variable": {
+                        "headers": r#"{"headers":{"X-Test":"present"}}"#
+                    }
+                }
+            }
+        });
+
+        let result: Value =
+            serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(
+            result["data"]["chapters"].as_array().unwrap().len(),
+            1,
+            "result={result} requests={requests:?}"
+        );
+        assert_eq!(requests[0].0, "/book");
+        assert_eq!(requests[1].0, "/toc?bid=book-id-7");
+        assert!(requests[1].1);
+    }
+
+    #[test]
+    fn execute_js_content_can_fetch_with_a_non_url_chapter_id() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let base_url = format!("http://{address}");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let bytes_read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..bytes_read]).into_owned();
+            let target = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or_default()
+                .to_string();
+            let has_rule_header = request.lines().any(|line| {
+                line.split_once(':').is_some_and(|(name, value)| {
+                    name.trim().eq_ignore_ascii_case("x-test") && value.trim() == "present"
+                })
+            });
+            let body = r#"{"data":{"content":"正文 from API"}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            (target, has_rule_header)
+        });
+
+        let content_rule = format!(
+            r#"@js: var url = "{base_url}/chapter?bid=" + java.get("bid") + "&cid=" + baseUrl.split("/").pop(); JSON.parse(java.ajax(url + "," + java.get("headers"))).data.content"#
+        );
+        let source = serde_json::json!({
+            "bookSourceName": "JS self-fetch fixture",
+            "bookSourceUrl": base_url,
+            "ruleContent": {"content": content_rule}
+        });
+        let request = serde_json::json!({
+            "api": 2,
+            "op": "content",
+            "params": {
+                "url": "chapter-id-42",
+                "book": {
+                    "name": "Book",
+                    "variable": {
+                        "bid": "book-id-7",
+                        "headers": r#"{"headers":{"X-Test":"present"}}"#
+                    }
+                },
+                "chapter": {"title": "Chapter"}
+            }
+        });
+
+        let result: Value =
+            serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+        let (target, has_rule_header) = server.join().unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["content"], "正文 from API");
+        assert!(target.starts_with("/chapter?bid=book-id-7&cid=chapter-id-42"));
+        assert!(has_rule_header);
+    }
+
+    #[test]
+    fn execute_js_content_self_fetches_from_full_chapter_url() {
+        let key = "242ccb8230d709e1";
+        let iv = "0123456789abcdef";
+        let plaintext = "正文：JavaImporter AES 兼容";
+        let encrypted = base64::engine::general_purpose::STANDARD
+            .decode(
+                crate::parser::js::eval_js(
+                    &format!(
+                        "java.aesBase64Encode({plaintext:?}, {key:?}, 'AES/CBC/PKCS5Padding', {iv:?})"
+                    ),
+                    "",
+                    "",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut payload = iv.as_bytes().to_vec();
+        payload.extend(encrypted);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let base_url = format!("http://{address}");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let bytes_read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..bytes_read]).into_owned();
+            let target = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or_default()
+                .to_string();
+            let has_rule_header = request.lines().any(|line| {
+                line.split_once(':').is_some_and(|(name, value)| {
+                    name.trim().eq_ignore_ascii_case("x-test") && value.trim() == "present"
+                })
+            });
+            let body = serde_json::json!({"data": {"content": encoded}}).to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            (target, has_rule_header)
+        });
+
+        let content_rule = format!(
+            r#"@js:
+                var javaImport = new JavaImporter();
+                javaImport.importPackage(Packages.java.lang, Packages.javax.crypto.spec,
+                    Packages.javax.crypto, Packages.java.util);
+                with (javaImport) {{
+                    function decode(content) {{
+                        var ivEncData = Base64.getDecoder().decode(String(content));
+                        var key = SecretKeySpec(String("{key}").getBytes(), "AES");
+                        var iv = IvParameterSpec(Arrays.copyOfRange(ivEncData, 0, 16));
+                        var cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+                        cipher.init(2, key, iv);
+                        return String(cipher.doFinal(Arrays.copyOfRange(ivEncData, 16, ivEncData.length)));
+                    }}
+                }}
+                var chapterId = baseUrl.split("/").pop();
+                var url = "{base_url}/content?bid=" + java.get("bid") + "&cid=" + chapterId;
+                decode(JSON.parse(java.ajax(url + "," + java.get("headers"))).data.content)
+            "#
+        );
+        let source = serde_json::json!({
+            "bookSourceName": "JavaImporter self-fetch fixture",
+            "bookSourceUrl": base_url,
+            "ruleContent": {"content": content_rule}
+        });
+        let request = serde_json::json!({
+            "api": 2,
+            "op": "content",
+            "params": {
+                "url": format!("{base_url}/chapter/chapter-id-42"),
+                "book": {
+                    "name": "Book",
+                    "variable": {
+                        "bid": "book-id-7",
+                        "headers": r#"{"headers":{"X-Test":"present"}}"#
+                    }
+                },
+                "chapter": {"title": "Chapter"}
+            }
+        });
+
+        let result: Value =
+            serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+        let (target, has_rule_header) = server.join().unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["content"], plaintext);
+        assert_eq!(target, "/content?bid=book-id-7&cid=chapter-id-42");
+        assert!(has_rule_header);
     }
 
     #[test]
@@ -1627,5 +1985,60 @@ mod tests {
             result["error"]["auth"]["loginUrl"],
             "https://catalog.example/login"
         );
+    }
+
+    #[test]
+    fn execute_rejects_loc_book_with_unsupported_error() {
+        let source_loc = serde_json::json!({
+            "bookSourceName": "Local book",
+            "bookSourceUrl": "loc_book"
+        });
+        let req_toc = serde_json::json!({
+            "api": 2,
+            "op": "toc",
+            "params": {"url": "https://example.com/toc"}
+        });
+        let res1: Value =
+            serde_json::from_str(&execute(&source_loc.to_string(), &req_toc.to_string())).unwrap();
+        assert_eq!(res1["ok"], false, "{res1}");
+        assert_eq!(res1["error"]["kind"], "unsupported");
+        assert_eq!(res1["error"]["message"], "不支持远程本地书籍");
+
+        let normal_source = serde_json::json!({
+            "bookSourceName": "Normal",
+            "bookSourceUrl": "https://example.com"
+        });
+        let req_with_loc_origin = serde_json::json!({
+            "api": 2,
+            "op": "toc",
+            "params": {
+                "url": "content://com.android.externalstorage.documents/test.epub",
+                "origin": "loc_book"
+            }
+        });
+        let res2: Value = serde_json::from_str(&execute(
+            &normal_source.to_string(),
+            &req_with_loc_origin.to_string(),
+        ))
+        .unwrap();
+        assert_eq!(res2["ok"], false, "{res2}");
+        assert_eq!(res2["error"]["kind"], "unsupported");
+        assert_eq!(res2["error"]["message"], "不支持远程本地书籍");
+
+        let req_with_content_url = serde_json::json!({
+            "api": 2,
+            "op": "content",
+            "params": {
+                "url": "content://com.android.externalstorage.documents/document/123"
+            }
+        });
+        let res3: Value = serde_json::from_str(&execute(
+            &normal_source.to_string(),
+            &req_with_content_url.to_string(),
+        ))
+        .unwrap();
+        assert_eq!(res3["ok"], false, "{res3}");
+        assert_eq!(res3["error"]["kind"], "unsupported");
+        assert_eq!(res3["error"]["message"], "不支持远程本地书籍");
     }
 }

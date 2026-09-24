@@ -50,6 +50,20 @@ pub fn jsonpath_query(value: &Value, rule: &str) -> Vec<Value> {
     if let Some(rendered) = render_embedded_paths(value, rule) {
         return vec![Value::String(rendered)];
     }
+    let rule = rule.trim();
+    if rule.is_empty() {
+        return vec![];
+    }
+    let normalized;
+    let rule = if rule.starts_with('$') {
+        rule
+    } else if rule.starts_with('[') {
+        normalized = format!("${rule}");
+        &normalized
+    } else {
+        normalized = format!("$.{rule}");
+        &normalized
+    };
     // jsonpath_lib 0.3 panics on range, union, and named-key selectors inside filters.
     // Reject those unsupported expressions before calling it; release builds abort on panic.
     if has_unsupported_filter_selector(rule) {
@@ -130,6 +144,10 @@ mod tests {
         let value = json!({"data":{"name":"书名","author":"作者"}});
         assert_eq!(
             jsonpath_first_string(&value, "$.data.name"),
+            Some("书名".into())
+        );
+        assert_eq!(
+            jsonpath_first_string(&value, "data.name"),
             Some("书名".into())
         );
         assert_eq!(

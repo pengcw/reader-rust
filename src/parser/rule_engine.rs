@@ -670,14 +670,14 @@ impl RuleEngine {
                 context,
             );
         }
-        if matches!(self.detect_mode(&content_rule, &content_body), ParseMode::Js) {
+        if matches!(
+            self.detect_mode(&content_rule, &content_body),
+            ParseMode::Js
+        ) {
             let script = self.strip_mode_prefix(&content_rule);
-            if let Ok(res) = eval_js_with_bindings(
-                script,
-                &content_body,
-                base_url,
-                &context.js_bindings(),
-            ) {
+            if let Ok(res) =
+                eval_js_with_bindings(script, &content_body, base_url, &context.js_bindings())
+            {
                 let content = html::format_keep_img(&res, base_url);
                 return apply_content_replacement(
                     content,
@@ -699,13 +699,12 @@ impl RuleEngine {
                     String::new()
                 }
             }
-            ParseMode::XPath => html::select_xpath_content(
-                &content_body,
-                self.strip_mode_prefix(&content_rule),
-            )
-            .first()
-            .cloned()
-            .unwrap_or_default(),
+            ParseMode::XPath => {
+                html::select_xpath_content(&content_body, self.strip_mode_prefix(&content_rule))
+                    .first()
+                    .cloned()
+                    .unwrap_or_default()
+            }
             ParseMode::Regex => {
                 let rows = regex_capture_rows(
                     self.strip_mode_prefix(&content_rule)
