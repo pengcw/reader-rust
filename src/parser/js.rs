@@ -795,6 +795,77 @@ fn eval_js_inner_with_source(
                 }"#,
             )?;
 
+            eval_script(
+                ctx.clone(),
+                r#"(function() {
+                    const preferenceKey = (name, key) => `__prefs:${String(name)}:${String(key)}`;
+                    const sharedPreferences = name => ({
+                        getString(key, defaultValue) {
+                            const value = source.getVariable(preferenceKey(name, key));
+                            return value === '' ? String(defaultValue == null ? '' : defaultValue) : value;
+                        },
+                        edit() {
+                            const changes = {};
+                            const editor = {
+                                putString(key, value) { changes[String(key)] = String(value); return editor; },
+                                remove(key) { changes[String(key)] = null; return editor; },
+                                commit() {
+                                    for (const [key, value] of Object.entries(changes)) {
+                                        source.setVariable(preferenceKey(name, key), value == null ? '' : value);
+                                    }
+                                    return true;
+                                },
+                                apply() { editor.commit(); }
+                            };
+                            return editor;
+                        }
+                    });
+                    const hostContext = {
+                        MODE_PRIVATE: 0,
+                        getSharedPreferences(name) { return sharedPreferences(name); }
+                    };
+                    const log = {
+                        d(tag, message) { java.log(`[D] ${String(tag)}: ${String(message)}`); return 0; },
+                        e(tag, message) { java.log(`[E] ${String(tag)}: ${String(message)}`); return 0; }
+                    };
+                    const base64 = {
+                        DEFAULT: 0, NO_WRAP: 2, URL_SAFE: 8, NO_PADDING: 1,
+                        encodeToString(value) { return java.base64Encode(String(value)); },
+                        decode(value) { return java.base64Decode(String(value).replace(/\s/g, '')); }
+                    };
+                    globalThis.System = Object.assign(globalThis.System || {}, {
+                        currentTimeMillis: () => java.now()
+                    });
+                    const randomUuid = () => {
+                        const value = java.uuid();
+                        return { toString: () => value };
+                    };
+                    globalThis.UUID = { randomUUID: randomUuid };
+                    java.util = java.util || {};
+                    java.util.UUID = { randomUUID: randomUuid };
+                    java.util.Base64 = {
+                        getEncoder() { return { encodeToString: base64.encodeToString, withoutPadding() { return this; } }; },
+                        getDecoder() { return { decode: base64.decode }; },
+                        getUrlEncoder() { return { encodeToString: value => java.base64Encode(String(value)).replace(/\+/g, '-').replace(/\//g, '_') }; }
+                    };
+                    globalThis.URLEncoder = {
+                        encode(value) { return encodeURIComponent(String(value)).replace(/%20/g, '+').replace(/[!'()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`); }
+                    };
+                    globalThis.URLDecoder = {
+                        decode(value) { return decodeURIComponent(String(value).replace(/\+/g, ' ')); }
+                    };
+                    globalThis.Log = log;
+                    globalThis.android = globalThis.android || {};
+                    globalThis.android.util = globalThis.android.util || {};
+                    globalThis.android.util.Log = log;
+                    globalThis.android.util.Base64 = base64;
+                    globalThis.application = hostContext;
+                    globalThis.context = hostContext;
+                    globalThis.activity = Object.assign({}, hostContext);
+                    globalThis.app = hostContext;
+                })();"#,
+            )?;
+
             if !shared_js.trim().is_empty() {
                 eval_script(ctx.clone(), &shared_js)?;
             }
@@ -1484,6 +1555,41 @@ mod tests {
         assert_eq!(
             compile_js_lib(r#"{"inline":"var notLoaded=1"}"#).unwrap(),
             ""
+        );
+    }
+
+    #[test]
+    fn legado_android_compat_shims_use_session_and_safe_host_objects() {
+        let initial = ExecuteSession::default();
+        let script = r#"
+            const preferences = context.getSharedPreferences('reader', context.MODE_PRIVATE);
+            preferences.edit().putString('token', 'saved').apply();
+            preferences.edit().putString('temporary', 'remove').commit();
+            preferences.edit().remove('temporary').apply();
+            const encoded = URLEncoder.encode('reader rust');
+            const decoded = URLDecoder.decode(encoded);
+            const base64 = java.util.Base64.getEncoder().encodeToString('reader');
+            const decodedBase64 = android.util.Base64.decode(base64, android.util.Base64.DEFAULT);
+            const uuid = UUID.randomUUID().toString();
+            const javaUuid = java.util.UUID.randomUUID().toString();
+            if (preferences.getString('token', '') !== 'saved' ||
+                preferences.getString('temporary', 'fallback') !== 'fallback' ||
+                decoded !== 'reader rust' || decodedBase64 !== 'reader' ||
+                uuid.length !== 36 || javaUuid.length !== 36 ||
+                System.currentTimeMillis() <= 0 ||
+                !application || !context || !activity || !app ||
+                !android.util.Log || Log.d('compat', 'ok') !== 0) {
+                throw new Error('compatibility shim failed');
+            }
+            'OK'
+        "#;
+        let (result, delta) = with_active_session(Some(&initial), "https://example.com", |_| {
+            eval_js(script, "", "https://example.com").unwrap()
+        });
+        assert_eq!(result, "OK");
+        assert_eq!(
+            delta.unwrap().variables.unwrap()["__prefs:reader:token"],
+            JsonValue::String("saved".to_string())
         );
     }
 
