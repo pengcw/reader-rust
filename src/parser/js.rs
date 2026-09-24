@@ -13,7 +13,6 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use once_cell::sync::Lazy;
-use ureq::http::Method;
 use rquickjs::function::Func;
 use rquickjs::{Context, Object, Runtime, Value};
 use serde_json::Value as JsonValue;
@@ -24,6 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::SystemTime;
+use ureq::http::Method;
 use uuid::Uuid;
 
 static JS_KV: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
@@ -1039,7 +1039,6 @@ fn eval_js_inner_with_source(
     }) // closes JS_ENV.with
 }
 
-
 pub(crate) fn java_get_string(
     rule: Option<&str>,
     content: Option<&str>,
@@ -1062,7 +1061,14 @@ pub(crate) fn java_get_string(
     if let Some(delim) = split.delimiter.as_deref() {
         if delim == "||" {
             for part in split.parts {
-                let res = java_get_string(Some(&part), content, default_content, base_url, is_url, unescape);
+                let res = java_get_string(
+                    Some(&part),
+                    content,
+                    default_content,
+                    base_url,
+                    is_url,
+                    unescape,
+                );
                 if !res.is_empty() {
                     return res;
                 }
@@ -1071,7 +1077,14 @@ pub(crate) fn java_get_string(
         } else if delim == "&&" {
             let mut results = Vec::new();
             for part in split.parts {
-                let res = java_get_string(Some(&part), content, default_content, base_url, is_url, unescape);
+                let res = java_get_string(
+                    Some(&part),
+                    content,
+                    default_content,
+                    base_url,
+                    is_url,
+                    unescape,
+                );
                 if !res.is_empty() {
                     results.push(res);
                 }
@@ -1086,7 +1099,10 @@ pub(crate) fn java_get_string(
 
     let mut res = if main_rule.is_empty() {
         target_content.to_string()
-    } else if main_rule.starts_with("<js>") || main_rule.starts_with("@js:") || main_rule.starts_with("js:") {
+    } else if main_rule.starts_with("<js>")
+        || main_rule.starts_with("@js:")
+        || main_rule.starts_with("js:")
+    {
         let script = rule_engine::strip_js_rule(main_rule);
         eval_js(script, target_content, base_url).unwrap_or_default()
     } else if main_rule.starts_with("@json:")
@@ -1212,7 +1228,8 @@ pub(crate) fn java_get_string_list(
     if let Some(delim) = split.delimiter.as_deref() {
         if delim == "||" {
             for part in split.parts {
-                let res = java_get_string_list(Some(&part), content, default_content, base_url, is_url);
+                let res =
+                    java_get_string_list(Some(&part), content, default_content, base_url, is_url);
                 if !res.is_empty() {
                     return res;
                 }
@@ -1221,7 +1238,8 @@ pub(crate) fn java_get_string_list(
         } else if delim == "&&" || delim == "%%" {
             let mut results = Vec::new();
             for part in split.parts {
-                let res = java_get_string_list(Some(&part), content, default_content, base_url, is_url);
+                let res =
+                    java_get_string_list(Some(&part), content, default_content, base_url, is_url);
                 results.extend(res);
             }
             return results;
@@ -1234,7 +1252,10 @@ pub(crate) fn java_get_string_list(
 
     let mut list = if main_rule.is_empty() {
         vec![target_content.to_string()]
-    } else if main_rule.starts_with("<js>") || main_rule.starts_with("@js:") || main_rule.starts_with("js:") {
+    } else if main_rule.starts_with("<js>")
+        || main_rule.starts_with("@js:")
+        || main_rule.starts_with("js:")
+    {
         let script = rule_engine::strip_js_rule(main_rule);
         if let Ok(js_res) = eval_js(script, target_content, base_url) {
             js_res
@@ -1309,7 +1330,9 @@ pub(crate) fn java_get_string_list(
         if let Ok(re) = regex::Regex::new(pure) {
             re.captures_iter(target_content)
                 .filter_map(|caps| {
-                    caps.get(1).or_else(|| caps.get(0)).map(|m| m.as_str().to_string())
+                    caps.get(1)
+                        .or_else(|| caps.get(0))
+                        .map(|m| m.as_str().to_string())
                 })
                 .collect()
         } else {
@@ -1637,12 +1660,7 @@ fn java_ajax(spec: &str) -> anyhow::Result<String> {
         }
     });
 
-    Ok(active_js_http_client().request_text(
-        method,
-        url.trim(),
-        &headers,
-        body.as_deref(),
-    )?)
+    Ok(active_js_http_client().request_text(method, url.trim(), &headers, body.as_deref())?)
 }
 
 fn java_request_simple(method: &str, url: &str, body: Option<String>) -> anyhow::Result<String> {

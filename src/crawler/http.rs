@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use ureq::http::header::{
     AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, LOCATION,
-    PROXY_AUTHORIZATION, SET_COOKIE, TRANSFER_ENCODING, USER_AGENT, WWW_AUTHENTICATE,
+    PROXY_AUTHORIZATION, SET_COOKIE, TRANSFER_ENCODING, WWW_AUTHENTICATE,
 };
 use ureq::http::{HeaderMap, HeaderName, HeaderValue, Method, Request};
 use ureq::{Agent, Proxy};
@@ -20,7 +20,10 @@ pub(crate) struct SharedCookieStore(Arc<Mutex<CookieStore>>);
 
 impl SharedCookieStore {
     pub(crate) fn get_cookie_header(&self, url: &Url) -> Option<String> {
-        let store = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let store = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let value = store
             .get_request_values(url)
             .map(|(name, value)| format!("{name}={value}"))
@@ -30,7 +33,10 @@ impl SharedCookieStore {
     }
 
     pub(crate) fn add_cookie_header(&self, cookie_header: &str, url: &Url) {
-        let mut store = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut store = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for part in cookie_header.split(';') {
             let part = part.trim();
             let Some((name, value)) = part.split_once('=') else {
@@ -40,13 +46,7 @@ impl SharedCookieStore {
             if name.is_empty()
                 || matches!(
                     name.to_ascii_lowercase().as_str(),
-                    "path"
-                        | "domain"
-                        | "expires"
-                        | "max-age"
-                        | "samesite"
-                        | "httponly"
-                        | "secure"
+                    "path" | "domain" | "expires" | "max-age" | "samesite" | "httponly" | "secure"
                 )
             {
                 continue;
@@ -56,12 +56,18 @@ impl SharedCookieStore {
     }
 
     pub(crate) fn add_set_cookie(&self, set_cookie: &str, url: &Url) {
-        let mut store = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut store = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _ = store.parse(set_cookie, url);
     }
 
     fn store_response_cookies(&self, headers: &HeaderMap, url: &Url) {
-        let mut store = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut store = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for value in headers.get_all(SET_COOKIE) {
             if let Ok(value) = value.to_str() {
                 let _ = store.parse(value, url);
@@ -190,8 +196,12 @@ impl HttpClient {
                 }
             }
 
-            let mut response =
-                self.run_once(method.clone(), &current_url, &request_headers, body.as_deref())?;
+            let mut response = self.run_once(
+                method.clone(),
+                &current_url,
+                &request_headers,
+                body.as_deref(),
+            )?;
 
             if let Some(cookies) = &self.cookies {
                 cookies.store_response_cookies(response.headers(), &current_url);
@@ -240,11 +250,7 @@ impl HttpClient {
             let limit = max_response_bytes.unwrap_or(usize::MAX);
             let reader = response.body_mut().as_reader();
             let bytes = if is_deflate {
-                read_limited(
-                    flate2::read::ZlibDecoder::new(reader),
-                    limit,
-                    &current_url,
-                )?
+                read_limited(flate2::read::ZlibDecoder::new(reader), limit, &current_url)?
             } else {
                 read_limited(reader, limit, &current_url)?
             };
@@ -339,12 +345,7 @@ fn same_origin(left: &Url, right: &Url) -> bool {
 }
 
 fn strip_sensitive_headers(headers: &mut HeaderMap) {
-    for name in [
-        AUTHORIZATION,
-        COOKIE,
-        PROXY_AUTHORIZATION,
-        WWW_AUTHENTICATE,
-    ] {
+    for name in [AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION, WWW_AUTHENTICATE] {
         headers.remove(name);
     }
 }

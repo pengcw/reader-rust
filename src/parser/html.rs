@@ -884,8 +884,17 @@ fn append_xpath_element_text(element: sxd_document::dom::Element<'_>, output: &m
     let name = element.name().local_part();
     let is_block = matches!(
         name,
-        "p" | "div" | "br" | "li" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
-            | "blockquote" | "section"
+        "p" | "div"
+            | "br"
+            | "li"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "blockquote"
+            | "section"
     );
     if is_block {
         append_xpath_line_break(output);
@@ -1338,9 +1347,10 @@ mod tests {
     #[test]
     fn test_html_unescape() {
         assert_eq!(
-            html_unescape("&nbsp;文字&quot;双引号&quot;&apos;单引号&apos;&amp;和&lt;小于&gt;大于&#160;"),
+            html_unescape(
+                "&nbsp;文字&quot;双引号&quot;&apos;单引号&apos;&amp;和&lt;小于&gt;大于&#160;"
+            ),
             " 文字\"双引号\"'单引号'&和<小于>大于\u{a0}"
         );
     }
 }
-
