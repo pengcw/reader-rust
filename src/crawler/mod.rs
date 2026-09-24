@@ -47,6 +47,7 @@ pub struct UrlRuleContext {
     pub chapter_variable: Option<String>,
     pub book_name: Option<String>,
     pub chapter_title: Option<String>,
+    pub book_fields: HashMap<String, String>,
 }
 
 impl UrlRuleContext {
@@ -58,7 +59,13 @@ impl UrlRuleContext {
 
     fn bindings(&self) -> HashMap<String, Value> {
         let book_variables = Self::variable_map(self.book_variable.as_deref());
-        let mut book = book_variables.clone();
+        let mut book = serde_json::Map::new();
+        for (key, value) in &self.book_fields {
+            book.insert(key.clone(), Value::String(value.clone()));
+        }
+        for (key, value) in &book_variables {
+            book.insert(key.clone(), value.clone());
+        }
         book.insert("variableMap".to_string(), Value::Object(book_variables));
         if let Some(name) = self.book_name.as_deref() {
             book.insert("name".to_string(), Value::String(name.to_string()));
@@ -83,15 +90,25 @@ impl UrlRuleContext {
     }
 
     fn get(&self, key: &str) -> Option<String> {
+        if let Some(prop) = key.strip_prefix("book.") {
+            if let Some(val) = self.book_fields.get(prop) {
+                return Some(val.clone());
+            }
+            let values = Self::variable_map(self.book_variable.as_deref());
+            if let Some(val) = values.get(prop).and_then(value_to_string) {
+                return Some(val);
+            }
+        }
         let lookup = |raw: Option<&str>| {
             let values = Self::variable_map(raw);
             values.get(key).and_then(value_to_string)
         };
         match key {
-            "bookName" => self.book_name.clone(),
+            "bookName" => self.book_name.clone().or_else(|| self.book_fields.get("name").cloned()),
             "title" => self.chapter_title.clone(),
             _ => lookup(self.chapter_variable.as_deref())
                 .or_else(|| lookup(self.book_variable.as_deref()))
+                .or_else(|| self.book_fields.get(key).cloned())
                 .or_else(|| {
                     current_active_session()
                         .and_then(|session| session.get_variable(key))
@@ -644,6 +661,8 @@ fn expand_url_templates(
             context
                 .and_then(|context| context.get(variable.trim()))
                 .unwrap_or_default()
+        } else if let Some(val) = context.and_then(|c| c.get(expression)) {
+            val
         } else {
             eval_js_url_template_with_bindings(
                 expression,
@@ -1367,6 +1386,7 @@ mod tests {
             chapter_variable: Some(r#"{"cid":"CHAPTER"}"#.to_string()),
             book_name: Some("Book Name".to_string()),
             chapter_title: Some("Chapter Title".to_string()),
+            book_fields: HashMap::new(),
         };
         let spec = analyze_url_with_context(
             "/{{book.variableMap.token}}/{{chapter.variableMap.cid}}/{{@get:{cid}}}/{{title}},{\"js\":\"result + '?name=' + encodeURIComponent(book.bookName)\"}",

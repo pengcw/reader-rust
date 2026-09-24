@@ -1098,7 +1098,11 @@ fn eval_js_inner_with_source(
                 }"#,
             )?;
 
-            let v = eval_script(ctx.clone(), script)?;
+            // Rule scripts may run once per chapter while JS_ENV is reused. Keep
+            // let/const declarations local to this evaluation to avoid a later
+            // chapter failing with a global lexical redeclaration SyntaxError.
+            let scoped_script = format!("{{\n{script}\n}}");
+            let v = eval_script(ctx.clone(), &scoped_script)?;
 
             let result = if v.is_null() || v.is_undefined() {
                 if !template_result {

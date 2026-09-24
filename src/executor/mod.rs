@@ -467,6 +467,23 @@ fn input_book_state(params: &Value) -> (Option<String>, Option<String>) {
     (variable, name)
 }
 
+fn input_book_fields(params: &Value) -> HashMap<String, String> {
+    let mut fields = HashMap::new();
+    if let Some(book) = params.get("book").and_then(Value::as_object) {
+        for (k, v) in book {
+            if let Some(s) = match v {
+                Value::String(s) => Some(s.clone()),
+                Value::Number(n) => Some(n.to_string()),
+                Value::Bool(b) => Some(b.to_string()),
+                _ => None,
+            } {
+                fields.insert(k.clone(), s);
+            }
+        }
+    }
+    fields
+}
+
 fn input_chapter_state(params: &Value) -> (Option<String>, Option<String>) {
     let chapter = params.get("chapter").and_then(Value::as_object);
     let variable = serialized_variable(
@@ -488,11 +505,22 @@ fn url_rule_context(
     book_name: Option<&str>,
     chapter_title: Option<&str>,
 ) -> UrlRuleContext {
+    url_rule_context_with_fields(book_variable, chapter_variable, book_name, chapter_title, None)
+}
+
+fn url_rule_context_with_fields(
+    book_variable: Option<&str>,
+    chapter_variable: Option<&str>,
+    book_name: Option<&str>,
+    chapter_title: Option<&str>,
+    book_fields: Option<&HashMap<String, String>>,
+) -> UrlRuleContext {
     UrlRuleContext {
         book_variable: book_variable.map(str::to_string),
         chapter_variable: chapter_variable.map(str::to_string),
         book_name: book_name.map(str::to_string),
         chapter_title: chapter_title.map(str::to_string),
+        book_fields: book_fields.cloned().unwrap_or_default(),
     }
 }
 
@@ -514,7 +542,17 @@ fn execute_info(
 ) -> ExecuteResult<Value> {
     let book_url = required_string(params, "url")?;
     let (variable, name) = input_book_state(params);
-    let request_context = url_rule_context(variable.as_deref(), None, name.as_deref(), None);
+    let mut book_fields = input_book_fields(params);
+    if let Some(name_str) = &name {
+        book_fields.entry("name".to_string()).or_insert_with(|| name_str.clone());
+    }
+    let request_context = url_rule_context_with_fields(
+        variable.as_deref(),
+        None,
+        name.as_deref(),
+        None,
+        Some(&book_fields),
+    );
     let response = fetch_rule_with_context(
         session,
         source,
@@ -525,13 +563,14 @@ fn execute_info(
         options,
         Some(&request_context),
     )?;
-    let data = serde_json::to_value(engine.book_info_with_variable(
+    let data = serde_json::to_value(engine.book_info_with_context(
         source,
         &response.body,
         &response.url,
         &book_url,
         variable.as_deref(),
         name.as_deref(),
+        Some(&book_fields),
     ))
     .map_err(|error| ExecuteError::internal(error.to_string()))?;
     Ok(success(data, 1, false, &response, options))
@@ -546,7 +585,17 @@ fn execute_toc(
 ) -> ExecuteResult<Value> {
     let initial_url = required_string(params, "url")?;
     let (variable, name) = input_book_state(params);
-    let detail_context = url_rule_context(variable.as_deref(), None, name.as_deref(), None);
+    let mut book_fields = input_book_fields(params);
+    if let Some(name_str) = &name {
+        book_fields.entry("name".to_string()).or_insert_with(|| name_str.clone());
+    }
+    let detail_context = url_rule_context_with_fields(
+        variable.as_deref(),
+        None,
+        name.as_deref(),
+        None,
+        Some(&book_fields),
+    );
     let detail_response = fetch_rule_with_context(
         session,
         source,
@@ -557,23 +606,58 @@ fn execute_toc(
         options,
         Some(&detail_context),
     )?;
-    let book_info = engine.book_info_with_variable(
+    let book_info = engine.book_info_with_context(
         source,
         &detail_response.body,
         &detail_response.url,
         &initial_url,
         variable.as_deref(),
         name.as_deref(),
+        Some(&book_fields),
     );
     let toc_url = book_info
         .toc_url
+        .as_ref()
         .filter(|url| !url.trim().is_empty())
+        .cloned()
         .unwrap_or_else(|| initial_url.clone());
-    let toc_context = url_rule_context(
+
+    if !book_info.name.is_empty() {
+        book_fields.insert("name".to_string(), book_info.name.clone());
+        book_fields.insert("bookName".to_string(), book_info.name.clone());
+    }
+    if !book_info.author.is_empty() {
+        book_fields.insert("author".to_string(), book_info.author.clone());
+    }
+    if let Some(kind) = &book_info.kind {
+        book_fields.insert("kind".to_string(), kind.clone());
+    }
+    if let Some(word_count) = &book_info.word_count {
+        book_fields.insert("wordCount".to_string(), word_count.clone());
+        book_fields.insert("word_count".to_string(), word_count.clone());
+    }
+    if let Some(intro) = &book_info.intro {
+        book_fields.insert("intro".to_string(), intro.clone());
+    }
+    if let Some(cover_url) = &book_info.cover_url {
+        book_fields.insert("coverUrl".to_string(), cover_url.clone());
+        book_fields.insert("cover_url".to_string(), cover_url.clone());
+    }
+    if let Some(toc_url) = &book_info.toc_url {
+        book_fields.insert("tocUrl".to_string(), toc_url.clone());
+        book_fields.insert("toc_url".to_string(), toc_url.clone());
+    }
+    if let Some(latest) = &book_info.latest_chapter_title {
+        book_fields.insert("lastChapter".to_string(), latest.clone());
+        book_fields.insert("latestChapterTitle".to_string(), latest.clone());
+    }
+
+    let toc_context = url_rule_context_with_fields(
         book_info.variable.as_deref(),
         None,
         Some(&book_info.name),
         None,
+        Some(&book_fields),
     );
     let reuse_detail_response = same_resource_url(&toc_url, &initial_url)
         || same_resource_url(&toc_url, &detail_response.url);
@@ -621,12 +705,13 @@ fn execute_toc(
             )?
         };
         visited_pages.insert(url);
-        let (page_chapters, next_urls) = engine.chapter_list_with_variable(
+        let (page_chapters, next_urls) = engine.chapter_list_with_context(
             source,
             &response.body,
             &response.url,
             book_info.variable.as_deref(),
             Some(&book_info.name),
+            Some(&book_fields),
         );
         for mut chapter in page_chapters {
             if seen_chapters.insert(chapter.url.clone()) {
@@ -699,12 +784,16 @@ fn execute_content(
 ) -> ExecuteResult<Value> {
     let initial_url = required_string(params, "url")?;
     let (mut book_variable, book_name) = input_book_state(params);
+    let mut book_fields = input_book_fields(params);
+    if let Some(name_str) = &book_name {
+        book_fields.entry("name".to_string()).or_insert_with(|| name_str.clone());
+    }
     let (mut chapter_variable, chapter_title) = input_chapter_state(params);
     let is_volume = input_chapter_is_volume(params);
     let replace_rules = parse_replace_rules(params.get("replaceRules"))?;
 
     if uses_js_ajax_content_rule(source) {
-        let page = engine.content_page_with_variables(
+        let page = engine.content_page_with_context(
             source,
             "",
             &initial_url,
@@ -712,6 +801,7 @@ fn execute_content(
             chapter_variable.as_deref(),
             book_name.as_deref(),
             chapter_title.as_deref(),
+            Some(&book_fields),
         );
         let content = apply_replace_rules(&page.content, &replace_rules);
         if content.is_empty() && !is_volume {
@@ -732,11 +822,12 @@ fn execute_content(
             truncated = true;
             break;
         }
-        let request_context = url_rule_context(
+        let request_context = url_rule_context_with_fields(
             book_variable.as_deref(),
             chapter_variable.as_deref(),
             book_name.as_deref(),
             chapter_title.as_deref(),
+            Some(&book_fields),
         );
         let response = fetch_rule_with_context(
             session,
@@ -751,7 +842,7 @@ fn execute_content(
         visited_urls.insert(current_url.clone());
         let response_url = response.url.clone();
         let chapter_url = initial_response_url.get_or_insert_with(|| response_url.clone());
-        let page = engine.content_page_with_variables(
+        let page = engine.content_page_with_context(
             source,
             &response.body,
             &response.url,
@@ -759,6 +850,7 @@ fn execute_content(
             chapter_variable.as_deref(),
             book_name.as_deref(),
             chapter_title.as_deref(),
+            Some(&book_fields),
         );
         if !page.content.is_empty() {
             fragments.push(page.content);

@@ -38,6 +38,7 @@ enum ParseMode {
 struct RuleVariableContext {
     rule_data: Option<HashMap<String, String>>,
     book: Option<HashMap<String, String>>,
+    book_fields: HashMap<String, String>,
     chapter: Option<HashMap<String, String>>,
     book_name: Option<String>,
     chapter_title: Option<String>,
@@ -45,11 +46,28 @@ struct RuleVariableContext {
 
 impl RuleVariableContext {
     fn for_book(variable: Option<&str>, book_name: Option<&str>) -> Self {
-        Self {
+        Self::for_book_with_fields(variable, book_name, None)
+    }
+
+    fn for_book_with_fields(
+        variable: Option<&str>,
+        book_name: Option<&str>,
+        fields: Option<&HashMap<String, String>>,
+    ) -> Self {
+        let mut context = Self {
             book: Some(parse_variable_map(variable)),
             book_name: book_name.map(str::to_string),
             ..Default::default()
+        };
+        if let Some(name) = book_name {
+            context.set_book_field("name", name);
         }
+        if let Some(fields) = fields {
+            for (k, v) in fields {
+                context.set_book_field(k, v);
+            }
+        }
+        context
     }
 
     fn for_search_item() -> Self {
@@ -64,6 +82,7 @@ impl RuleVariableContext {
         Self {
             rule_data: self.rule_data.clone(),
             book: self.book.clone(),
+            book_fields: self.book_fields.clone(),
             chapter: Some(parse_variable_map(variable)),
             book_name: self.book_name.clone(),
             chapter_title: Some(title.to_string()),
@@ -76,7 +95,23 @@ impl RuleVariableContext {
         book_name: Option<&str>,
         chapter_title: Option<&str>,
     ) -> Self {
-        let mut context = Self::for_book(book_variable, book_name);
+        Self::for_content_with_fields(
+            book_variable,
+            chapter_variable,
+            book_name,
+            chapter_title,
+            None,
+        )
+    }
+
+    fn for_content_with_fields(
+        book_variable: Option<&str>,
+        chapter_variable: Option<&str>,
+        book_name: Option<&str>,
+        chapter_title: Option<&str>,
+        book_fields: Option<&HashMap<String, String>>,
+    ) -> Self {
+        let mut context = Self::for_book_with_fields(book_variable, book_name, book_fields);
         // Content evaluation always has chapter scope, even when the host has no
         // pre-existing chapter variables. This preserves Legado's put priority.
         context.chapter = Some(parse_variable_map(chapter_variable));
@@ -84,15 +119,63 @@ impl RuleVariableContext {
         context
     }
 
-    fn get(&self, key: &str) -> Option<String> {
+    fn set_book_field(&mut self, key: &str, value: &str) {
+        self.book_fields.insert(key.to_string(), value.to_string());
         match key {
-            "bookName" => self.book_name.clone(),
+            "name" => {
+                self.book_name = Some(value.to_string());
+                self.book_fields.insert("bookName".to_string(), value.to_string());
+            }
+            "bookName" => {
+                self.book_name = Some(value.to_string());
+                self.book_fields.insert("name".to_string(), value.to_string());
+            }
+            "wordCount" => {
+                self.book_fields.insert("word_count".to_string(), value.to_string());
+            }
+            "word_count" => {
+                self.book_fields.insert("wordCount".to_string(), value.to_string());
+            }
+            "coverUrl" => {
+                self.book_fields.insert("cover_url".to_string(), value.to_string());
+            }
+            "cover_url" => {
+                self.book_fields.insert("coverUrl".to_string(), value.to_string());
+            }
+            "tocUrl" => {
+                self.book_fields.insert("toc_url".to_string(), value.to_string());
+            }
+            "toc_url" => {
+                self.book_fields.insert("tocUrl".to_string(), value.to_string());
+            }
+            "lastChapter" => {
+                self.book_fields.insert("latestChapterTitle".to_string(), value.to_string());
+            }
+            "latestChapterTitle" => {
+                self.book_fields.insert("lastChapter".to_string(), value.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<String> {
+        if let Some(prop) = key.strip_prefix("book.") {
+            if let Some(val) = self.book_fields.get(prop) {
+                return Some(val.clone());
+            }
+            if let Some(val) = self.book.as_ref().and_then(|v| v.get(prop)) {
+                return Some(val.clone());
+            }
+        }
+        match key {
+            "bookName" => self.book_name.clone().or_else(|| self.book_fields.get("name").cloned()),
             "title" => self.chapter_title.clone(),
             _ => self
                 .chapter
                 .as_ref()
                 .and_then(|values| values.get(key))
                 .or_else(|| self.book.as_ref().and_then(|values| values.get(key)))
+                .or_else(|| self.book_fields.get(key))
                 .or_else(|| self.rule_data.as_ref().and_then(|values| values.get(key)))
                 .cloned()
                 .or_else(|| {
@@ -126,6 +209,9 @@ impl RuleVariableContext {
     fn js_bindings(&self) -> HashMap<String, Value> {
         let mut book = serde_json::Map::new();
         let mut book_variables = serde_json::Map::new();
+        for (key, value) in &self.book_fields {
+            book.insert(key.clone(), Value::String(value.clone()));
+        }
         if let Some(values) = &self.book {
             for (key, value) in values {
                 let value = Value::String(value.clone());
@@ -475,9 +561,22 @@ impl RuleEngine {
         variable: Option<&str>,
         book_name: Option<&str>,
     ) -> Book {
+        self.book_info_with_context(source, body, base_url, book_url, variable, book_name, None)
+    }
+
+    pub fn book_info_with_context(
+        &self,
+        source: &BookSource,
+        body: &str,
+        base_url: &str,
+        book_url: &str,
+        variable: Option<&str>,
+        book_name: Option<&str>,
+        book_fields: Option<&HashMap<String, String>>,
+    ) -> Book {
         with_js_lib(source.js_lib.as_deref(), || {
             let rule = source.rule_book_info.clone().unwrap_or_default();
-            let mut context = RuleVariableContext::for_book(variable, book_name);
+            let mut context = RuleVariableContext::for_book_with_fields(variable, book_name, book_fields);
 
             let mode = self.detect_mode(rule.name.as_deref().unwrap_or(""), body);
             match mode {
@@ -526,9 +625,22 @@ impl RuleEngine {
         variable: Option<&str>,
         book_name: Option<&str>,
     ) -> (Vec<BookChapter>, Vec<String>) {
+        self.chapter_list_with_context(source, body, base_url, variable, book_name, None)
+    }
+
+    pub fn chapter_list_with_context(
+        &self,
+        source: &BookSource,
+        body: &str,
+        base_url: &str,
+        variable: Option<&str>,
+        book_name: Option<&str>,
+        book_fields: Option<&HashMap<String, String>>,
+    ) -> (Vec<BookChapter>, Vec<String>) {
         with_js_lib(source.js_lib.as_deref(), || {
             let rule = source.rule_toc.clone().unwrap_or_default();
-            let mut context = RuleVariableContext::for_book(variable, book_name);
+            let mut context =
+                RuleVariableContext::for_book_with_fields(variable, book_name, book_fields);
             let (list_rule, reverse) =
                 normalize_list_rule(rule.chapter_list.as_deref().unwrap_or(""));
             let prepared_body = prepare_toc_body(body, base_url, &rule, &context);
@@ -622,12 +734,36 @@ impl RuleEngine {
         book_name: Option<&str>,
         chapter_title: Option<&str>,
     ) -> ContentPageResult {
+        self.content_page_with_context(
+            source,
+            body,
+            base_url,
+            book_variable,
+            chapter_variable,
+            book_name,
+            chapter_title,
+            None,
+        )
+    }
+
+    pub(crate) fn content_page_with_context(
+        &self,
+        source: &BookSource,
+        body: &str,
+        base_url: &str,
+        book_variable: Option<&str>,
+        chapter_variable: Option<&str>,
+        book_name: Option<&str>,
+        chapter_title: Option<&str>,
+        book_fields: Option<&HashMap<String, String>>,
+    ) -> ContentPageResult {
         with_js_lib(source.js_lib.as_deref(), || {
-            let mut context = RuleVariableContext::for_content(
+            let mut context = RuleVariableContext::for_content_with_fields(
                 book_variable,
                 chapter_variable,
                 book_name,
                 chapter_title,
+                book_fields,
             );
             let content = self.content_with_context(source, body, base_url, &mut context);
             let next_url = self.next_content_url_with_context(source, body, base_url, &mut context);
@@ -1558,41 +1694,68 @@ fn parse_book_info_html(
         .as_ref()
         .and_then(|r| eval_field_html_doc_with_ctx(r, &doc, base_url, ctx))
         .unwrap_or_default();
+    if !name.is_empty() {
+        ctx.set_book_field("name", &name);
+    }
     let author = rule
         .author
         .as_ref()
         .and_then(|r| eval_field_html_doc_with_ctx(r, &doc, base_url, ctx))
         .unwrap_or_default();
+    if !author.is_empty() {
+        ctx.set_book_field("author", &author);
+    }
     let intro = rule
         .intro
         .as_ref()
         .and_then(|r| eval_field_html_doc_with_ctx(r, &doc, base_url, ctx));
+    if let Some(val) = &intro {
+        ctx.set_book_field("intro", val);
+    }
     let kind = rule
         .kind
         .as_ref()
         .and_then(|r| eval_field_html_doc_with_ctx(r, &doc, base_url, ctx));
+    if let Some(val) = &kind {
+        ctx.set_book_field("kind", val);
+    }
     let last_chapter = rule
         .last_chapter
         .as_ref()
         .and_then(|r| eval_field_html_doc_with_ctx(r, &doc, base_url, ctx));
+    if let Some(val) = &last_chapter {
+        ctx.set_book_field("lastChapter", val);
+    }
     let update_time = rule
         .update_time
         .as_ref()
         .and_then(|r| eval_field_html_doc_with_ctx(r, &doc, base_url, ctx));
+    if let Some(val) = &update_time {
+        ctx.set_book_field("updateTime", val);
+    }
     let cover_url = rule
         .cover_url
         .as_ref()
         .and_then(|r| eval_field_html_doc_with_ctx(r, &doc, base_url, ctx))
         .map(|u| resolve_url(base_url, &u));
+    if let Some(val) = &cover_url {
+        ctx.set_book_field("coverUrl", val);
+    }
     let word_count = rule
         .word_count
         .as_ref()
         .and_then(|r| eval_field_html_doc_with_ctx(r, &doc, base_url, ctx));
+    if let Some(val) = &word_count {
+        ctx.set_book_field("wordCount", val);
+    }
     let toc_url = rule
         .toc_url
         .as_ref()
         .and_then(|r| eval_field_html_doc_with_ctx(r, &doc, base_url, ctx))
         .map(|u| resolve_url(base_url, &u));
+    if let Some(val) = &toc_url {
+        ctx.set_book_field("tocUrl", val);
+    }
     let can_re_name = rule
         .can_re_name
         .as_ref()
@@ -1646,24 +1809,42 @@ fn parse_book_info_xpath(
 
     let name = eval_field_xpath_with_ctx(rule.name.as_deref().unwrap_or(""), scope, base_url, ctx)
         .unwrap_or_default();
+    if !name.is_empty() {
+        ctx.set_book_field("name", &name);
+    }
     let author =
         eval_field_xpath_with_ctx(rule.author.as_deref().unwrap_or(""), scope, base_url, ctx)
             .unwrap_or_default();
+    if !author.is_empty() {
+        ctx.set_book_field("author", &author);
+    }
     let intro =
         eval_field_xpath_with_ctx(rule.intro.as_deref().unwrap_or(""), scope, base_url, ctx);
+    if let Some(val) = &intro {
+        ctx.set_book_field("intro", val);
+    }
     let kind = eval_field_xpath_with_ctx(rule.kind.as_deref().unwrap_or(""), scope, base_url, ctx);
+    if let Some(val) = &kind {
+        ctx.set_book_field("kind", val);
+    }
     let last_chapter = eval_field_xpath_with_ctx(
         rule.last_chapter.as_deref().unwrap_or(""),
         scope,
         base_url,
         ctx,
     );
+    if let Some(val) = &last_chapter {
+        ctx.set_book_field("lastChapter", val);
+    }
     let update_time = eval_field_xpath_with_ctx(
         rule.update_time.as_deref().unwrap_or(""),
         scope,
         base_url,
         ctx,
     );
+    if let Some(val) = &update_time {
+        ctx.set_book_field("updateTime", val);
+    }
     let cover_url = eval_field_xpath_with_ctx(
         rule.cover_url.as_deref().unwrap_or(""),
         scope,
@@ -1671,15 +1852,24 @@ fn parse_book_info_xpath(
         ctx,
     )
     .map(|u| resolve_url(base_url, &u));
+    if let Some(val) = &cover_url {
+        ctx.set_book_field("coverUrl", val);
+    }
     let word_count = eval_field_xpath_with_ctx(
         rule.word_count.as_deref().unwrap_or(""),
         scope,
         base_url,
         ctx,
     );
+    if let Some(val) = &word_count {
+        ctx.set_book_field("wordCount", val);
+    }
     let toc_url =
         eval_field_xpath_with_ctx(rule.toc_url.as_deref().unwrap_or(""), scope, base_url, ctx)
             .map(|u| resolve_url(base_url, &u));
+    if let Some(val) = &toc_url {
+        ctx.set_book_field("tocUrl", val);
+    }
     let can_re_name = eval_field_xpath_with_ctx(
         rule.can_re_name.as_deref().unwrap_or(""),
         scope,
@@ -1726,24 +1916,42 @@ fn parse_book_info_json(
     let scope = select_json_scope(v, rule.init.as_deref(), base_url, ctx);
     let name = eval_field_json_with_ctx(rule.name.as_deref().unwrap_or(""), &scope, base_url, ctx)
         .unwrap_or_default();
+    if !name.is_empty() {
+        ctx.set_book_field("name", &name);
+    }
     let author =
         eval_field_json_with_ctx(rule.author.as_deref().unwrap_or(""), &scope, base_url, ctx)
             .unwrap_or_default();
+    if !author.is_empty() {
+        ctx.set_book_field("author", &author);
+    }
     let intro =
         eval_field_json_with_ctx(rule.intro.as_deref().unwrap_or(""), &scope, base_url, ctx);
+    if let Some(val) = &intro {
+        ctx.set_book_field("intro", val);
+    }
     let kind = eval_field_json_with_ctx(rule.kind.as_deref().unwrap_or(""), &scope, base_url, ctx);
+    if let Some(val) = &kind {
+        ctx.set_book_field("kind", val);
+    }
     let last_chapter = eval_field_json_with_ctx(
         rule.last_chapter.as_deref().unwrap_or(""),
         &scope,
         base_url,
         ctx,
     );
+    if let Some(val) = &last_chapter {
+        ctx.set_book_field("lastChapter", val);
+    }
     let update_time = eval_field_json_with_ctx(
         rule.update_time.as_deref().unwrap_or(""),
         &scope,
         base_url,
         ctx,
     );
+    if let Some(val) = &update_time {
+        ctx.set_book_field("updateTime", val);
+    }
     let cover_url = eval_field_json_with_ctx(
         rule.cover_url.as_deref().unwrap_or(""),
         &scope,
@@ -1751,15 +1959,24 @@ fn parse_book_info_json(
         ctx,
     )
     .map(|u| resolve_url(base_url, &u));
+    if let Some(val) = &cover_url {
+        ctx.set_book_field("coverUrl", val);
+    }
     let word_count = eval_field_json_with_ctx(
         rule.word_count.as_deref().unwrap_or(""),
         &scope,
         base_url,
         ctx,
     );
+    if let Some(val) = &word_count {
+        ctx.set_book_field("wordCount", val);
+    }
     let toc_url =
         eval_field_json_with_ctx(rule.toc_url.as_deref().unwrap_or(""), &scope, base_url, ctx)
             .map(|u| resolve_url(base_url, &u));
+    if let Some(val) = &toc_url {
+        ctx.set_book_field("tocUrl", val);
+    }
     let can_re_name = eval_field_json_with_ctx(
         rule.can_re_name.as_deref().unwrap_or(""),
         &scope,
@@ -4573,5 +4790,117 @@ chapter_id='{{$.chapter_id}}'
             assert!(!content.is_empty());
             assert!(content.contains("起雾了") || content.contains("雾"));
         }
+    }
+
+    #[test]
+    fn test_qq_dihuang_toc_and_content() {
+        let engine = RuleEngine::new().unwrap();
+        let source_json = serde_json::json!({
+            "bookSourceName": "企鹅浏览（优）",
+            "bookSourceUrl": "https://so.html5.qq.com/",
+            "ruleBookInfo": {
+                "kind": "$..resourceID",
+                "wordCount": "$..contentsize",
+                "tocUrl": "https://novel.html5.qq.com/qbread/api/book/all-chapter?bookId={{book.kind}}",
+                "name": "$..resourceName",
+                "lastChapter": "$..lastSerialname",
+                "coverUrl": "$..picurl",
+                "author": "$..author",
+                "intro": "$..summary"
+            },
+            "ruleToc": {
+                "chapterList": "$..rows[*]",
+                "chapterName": "$.serialName",
+                "chapterUrl": "$.serialID\n@js:\nlet data = JSON.stringify({\n  ContentAnchorBatch: [{\n    BookID: book.kind,\n    ChapterSeqNo: [\n      result\n    ]\n  }],\n  Scene: \"chapter\"\n})\nlet option = {\"method\":\"POST\",\"body\":data}\n\"https://novel.html5.qq.com/be-api/content/ads-read,\"+JSON.stringify(option)"
+            },
+            "ruleContent": {
+                "content": "$.data.Content[0].Content"
+            }
+        });
+        let source: BookSource = serde_json::from_value(source_json).unwrap();
+
+        // 1. Verify book_info extracts kind and interpolates {{book.kind}} into tocUrl
+        let info_body = r#"{
+            "ret": 0,
+            "data": {
+                "bookInfo": {
+                    "resourceID": "1132746073",
+                    "resourceName": "帝皇的告死天使",
+                    "author": "莫格卓根",
+                    "summary": "此乃银河人类帝国的第41个千年",
+                    "contentsize": 10287548
+                }
+            }
+        }"#;
+        let book = engine.book_info(&source, info_body, "https://novel.html5.qq.com/", "https://novel.html5.qq.com/qbread/api/novel/bookInfo?resourceId=1132746073");
+        assert_eq!(book.name, "帝皇的告死天使");
+        assert_eq!(book.author, "莫格卓根");
+        assert_eq!(book.kind.as_deref(), Some("1132746073"));
+        assert_eq!(
+            book.toc_url.as_deref(),
+            Some("https://novel.html5.qq.com/qbread/api/book/all-chapter?bookId=1132746073")
+        );
+
+        // 2. Verify chapter_list uses book.kind in JS to build chapter URL
+        let toc_body = r#"{
+            "ret": 0,
+            "bookId": "1132746073",
+            "rows": [
+                {"serialID": 1, "serialName": "第1章 星界骑士"},
+                {"serialID": 2, "serialName": "第2章 新兵（上）"}
+            ]
+        }"#;
+        let mut book_fields = std::collections::HashMap::new();
+        book_fields.insert("kind".to_string(), "1132746073".to_string());
+        book_fields.insert("name".to_string(), "帝皇的告死天使".to_string());
+
+        let (chapters, _) = engine.chapter_list_with_context(
+            &source,
+            toc_body,
+            "https://novel.html5.qq.com/qbread/api/book/all-chapter?bookId=1132746073",
+            None,
+            Some("帝皇的告死天使"),
+            Some(&book_fields),
+        );
+        assert_eq!(chapters.len(), 2);
+        assert_eq!(chapters[0].title, "第1章 星界骑士");
+        assert!(
+            chapters[0].url.contains(r#"\"BookID\":\"1132746073\""#),
+            "chapter url: {}",
+            chapters[0].url
+        );
+        assert!(chapters[0].url.contains(r#"\"ChapterSeqNo\":[\"1\"]"#));
+        assert!(
+            chapters[1].url.contains(r#"\"ChapterSeqNo\":[\"2\"]"#),
+            "second chapter url: {}",
+            chapters[1].url
+        );
+
+        // If the full real chapter json exists, test complete 4719 chapters parsing
+        if let Ok(full_toc) = std::fs::read_to_string("/tmp/qq_all_chapter.json") {
+            let (all_chapters, _) = engine.chapter_list_with_context(
+                &source,
+                &full_toc,
+                "https://novel.html5.qq.com/qbread/api/book/all-chapter?bookId=1132746073",
+                None,
+                Some("帝皇的告死天使"),
+                Some(&book_fields),
+            );
+            assert_eq!(all_chapters.len(), 4719);
+            assert_eq!(all_chapters[0].title, "第1章 星界骑士");
+            assert!(all_chapters[0].url.contains(r#"\"BookID\":\"1132746073\""#));
+        }
+
+        // 3. Verify content extraction
+        let content_body = r#"{
+            "ret": 0,
+            "data": {
+                "Content": [{
+                    "Content": ["标准泰拉历.912.M41\r\n虚空之中，众多舰船聚集在一起"]
+                }]
+            }
+        }"#;
+        let content = engine.content(&source, content_body, "https://novel.html5.qq.com/be-api/content/ads-read");
+        assert!(content.contains("标准泰拉历.912.M41"));
     }
 }
