@@ -249,6 +249,7 @@ fn eval_js_inner_with_source(
         ctx.with(|ctx| {
             let globals = ctx.globals();
             let input_value = input.unwrap_or("");
+            let content_state = Arc::new(Mutex::new(input_value.to_string()));
             let base_url_value = base_url.unwrap_or("");
             let shared_js = active_js_lib_script()?;
 
@@ -435,6 +436,14 @@ fn eval_js_inner_with_source(
             globals.set("cache", cache_obj)?;
 
             let java_obj = Object::new(ctx.clone())?;
+            let content_for_set = content_state.clone();
+            java_obj.set(
+                "setContent",
+                Func::new(move |content: String| -> String {
+                    *content_for_set.lock().unwrap_or_else(|e| e.into_inner()) = content.clone();
+                    content
+                }),
+            )?;
             java_obj.set(
                 "ajax",
                 Func::new(|spec: String| -> String { java_ajax(&spec).unwrap_or_default() }),
@@ -651,7 +660,7 @@ fn eval_js_inner_with_source(
                 Func::new(|| -> String { Uuid::new_v4().to_string() }),
             )?;
 
-            let default_content_for_get_string = input_value.to_string();
+            let default_content_for_get_string = content_state.clone();
             let base_url_for_get_string = base_url_value.to_string();
             java_obj.set(
                 "getString",
@@ -661,10 +670,14 @@ fn eval_js_inner_with_source(
                           is_url: Option<bool>,
                           unescape: Option<bool>|
                           -> String {
+                        let default_content = default_content_for_get_string
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
                         java_get_string(
                             rule.as_deref(),
                             content.as_deref(),
-                            &default_content_for_get_string,
+                            &default_content,
                             &base_url_for_get_string,
                             is_url.unwrap_or(false),
                             unescape.unwrap_or(true),
@@ -673,7 +686,7 @@ fn eval_js_inner_with_source(
                 ),
             )?;
 
-            let default_content_for_get_string_list = input_value.to_string();
+            let default_content_for_get_string_list = content_state.clone();
             let base_url_for_get_string_list = base_url_value.to_string();
             java_obj.set(
                 "getStringList",
@@ -682,15 +695,52 @@ fn eval_js_inner_with_source(
                           content: Option<String>,
                           is_url: Option<bool>|
                           -> Vec<String> {
+                        let default_content = default_content_for_get_string_list
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
                         java_get_string_list(
                             rule.as_deref(),
                             content.as_deref(),
-                            &default_content_for_get_string_list,
+                            &default_content,
                             &base_url_for_get_string_list,
                             is_url.unwrap_or(false),
                         )
                     },
                 ),
+            )?;
+
+            let content_for_elements = content_state.clone();
+            let base_url_for_elements = base_url_value.to_string();
+            java_obj.set(
+                "getElements",
+                Func::new(move |rule: String, content: Option<String>| -> String {
+                    let default_content = content_for_elements
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    java_get_elements_json(
+                        &rule,
+                        content.as_deref().unwrap_or(&default_content),
+                        &base_url_for_elements,
+                    )
+                }),
+            )?;
+            let content_for_element = content_state.clone();
+            let base_url_for_element = base_url_value.to_string();
+            java_obj.set(
+                "getElement",
+                Func::new(move |rule: String, content: Option<String>| -> String {
+                    let default_content = content_for_element
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    java_get_elements_json(
+                        &rule,
+                        content.as_deref().unwrap_or(&default_content),
+                        &base_url_for_element,
+                    )
+                }),
             )?;
 
             java_obj.set(
@@ -800,6 +850,35 @@ fn eval_js_inner_with_source(
                         const c = (content !== undefined && content !== null) ? String(content) : undefined;
                         return _orig_getStringList(r, c, isUrl);
                     };
+                    const _origSetContent = globalThis.java.setContent;
+                    globalThis.java.setContent = function(content) {
+                        if (typeof content === 'object' && content !== null) {
+                            try { content = JSON.stringify(content); } catch (e) {}
+                        }
+                        return _origSetContent(String(content == null ? '' : content));
+                    };
+                    const _nativeGetElements = globalThis.java.getElements;
+                    const _wrapElements = (rule, content) => {
+                        const raw = _nativeGetElements(rule, content);
+                        let values;
+                        try { values = JSON.parse(raw); } catch (e) { values = []; }
+                        if (!Array.isArray(values)) values = [];
+                        const items = values.map(item => {
+                            if (!item || item.__readerHtmlElement !== true) return item;
+                            const attrs = item.attrs || {};
+                            return {
+                                attr(name) { return attrs[String(name)] || ''; },
+                                html() { return item.html || ''; },
+                                text() { return item.text || ''; },
+                                outerHtml() { return item.outerHtml || ''; },
+                                toString() { return item.outerHtml || ''; }
+                            };
+                        });
+                        items.toArray = function() { return Array.from(this); };
+                        return items;
+                    };
+                    globalThis.java.getElements = _wrapElements;
+                    globalThis.java.getElement = _wrapElements;
                 }"#,
             )?;
 
@@ -1267,6 +1346,94 @@ pub(crate) fn java_get_string_list(
     list
 }
 
+fn java_get_elements_json(rule: &str, content: &str, base_url: &str) -> String {
+    let rule = rule.trim();
+    let content = content.trim();
+    if rule.is_empty() || content.is_empty() {
+        return "[]".to_string();
+    }
+
+    let lower_rule = rule.to_ascii_lowercase();
+    let explicit_css = rule.starts_with("@@") || lower_rule.starts_with("@css:");
+    let explicit_other_mode = lower_rule.starts_with("@xpath:")
+        || lower_rule.starts_with("@regex:")
+        || lower_rule.starts_with("@js:")
+        || lower_rule.starts_with("js:")
+        || rule.starts_with('/')
+        || rule.starts_with("./")
+        || rule.starts_with(':');
+    let json_content = serde_json::from_str::<JsonValue>(content).ok();
+    let json_rule = rule.starts_with('$') || lower_rule.starts_with("@json:");
+    if !explicit_css && !explicit_other_mode && (json_rule || json_content.is_some()) {
+        let Some(value) = json_content else {
+            return "[]".to_string();
+        };
+        let pure = if lower_rule.starts_with("@json:") {
+            &rule[6..]
+        } else {
+            rule
+        }
+        .trim();
+        let values = if pure.starts_with('$') {
+            jsonpath::jsonpath_query(&value, pure)
+        } else if let Some(found) = value.get(pure) {
+            match found {
+                JsonValue::Array(items) => items.clone(),
+                other => vec![other.clone()],
+            }
+        } else {
+            jsonpath::jsonpath_query(&value, &format!("$.{pure}"))
+        };
+        return serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string());
+    }
+
+    if rule.starts_with("@xpath:")
+        || rule.starts_with("@XPath:")
+        || rule.starts_with("@XPATH:")
+        || rule.starts_with('/')
+        || rule.starts_with("./")
+        || rule.starts_with("@regex:")
+        || rule.starts_with(':')
+        || rule.starts_with("@js:")
+        || rule.starts_with("js:")
+    {
+        let values = java_get_string_list(Some(rule), Some(content), "", base_url, false)
+            .into_iter()
+            .map(JsonValue::String)
+            .collect::<Vec<_>>();
+        return serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string());
+    }
+
+    let selector = if rule.starts_with("@@") {
+        &rule[2..]
+    } else if lower_rule.starts_with("@css:") {
+        &rule[5..]
+    } else {
+        rule
+    }
+    .trim();
+    let document = html::parse_document(content);
+    let elements = html::select_list(&document, selector);
+    let values = elements
+        .into_iter()
+        .map(|element| {
+            let attrs = element
+                .value()
+                .attrs()
+                .map(|(name, value)| (name.to_string(), JsonValue::String(value.to_string())))
+                .collect::<serde_json::Map<_, _>>();
+            serde_json::json!({
+                "__readerHtmlElement": true,
+                "attrs": attrs,
+                "html": element.inner_html(),
+                "outerHtml": element.html(),
+                "text": element.text().collect::<Vec<_>>().join(" ").trim(),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string())
+}
+
 fn java_aes_base64_decode_to_string(input: &str, key: &str, algorithm: &str, iv: &str) -> String {
     let algorithm = algorithm.to_ascii_uppercase();
     if algorithm != "AES/CBC/PKCS5PADDING" && algorithm != "AES/CBC/PKCS7PADDING" {
@@ -1618,6 +1785,22 @@ mod tests {
         .0;
 
         assert_eq!(result, "initial_token|a=b=c|");
+    }
+
+    #[test]
+    fn compat_java_set_content_and_get_elements_support_json_and_html() {
+        let script = r#"
+            java.setContent(JSON.stringify({data:{list:[{name:'first'},{name:'last'}]}}));
+            const list = java.getElements('$.data.list[*]').toArray();
+            const last = java.getElement('$.data.list[-1]').toArray()[0];
+            const firstName = java.getString('$.data.list[0].name');
+            java.setContent('<div><p id="p1"><b>one</b></p><p id="p2">two</p></div>');
+            const paragraphs = java.getElements('@@tag.p').toArray();
+            [list[0].name, last.name, firstName, paragraphs[0].attr('id'),
+             paragraphs[0].html(), paragraphs[0].text()].join('|')
+        "#;
+        let result = eval_js(script, "", "https://example.com").unwrap();
+        assert_eq!(result, "first|last|first|p1|<b>one</b>|one");
     }
 
     #[test]
