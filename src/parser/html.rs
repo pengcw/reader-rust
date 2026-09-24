@@ -423,26 +423,77 @@ fn expand_range(len: usize, start: Option<i32>, end: Option<i32>, step: i32) -> 
     indices
 }
 
+fn is_value_extractor(part: &str) -> bool {
+    let s = part.trim();
+    let s = s.strip_prefix('@').unwrap_or(s);
+    matches!(
+        s,
+        "text" | "textNodes" | "ownText" | "html" | "all" | "src" | "href"
+    ) || s.starts_with("attr[")
+}
+
+fn select_chain<'a>(doc: &'a Html, rule: &str) -> Vec<ElementRef<'a>> {
+    let rule = rule.trim();
+    if rule.is_empty() {
+        return Vec::new();
+    }
+    let rule = rule.strip_prefix("@@").unwrap_or(rule);
+    let parts = split_top_level(rule, &["@", "@@"]).parts;
+    let mut current_matches: Vec<ElementRef<'a>> = Vec::new();
+    let mut is_first = true;
+
+    for part in parts {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if is_value_extractor(part) {
+            break;
+        }
+        let parsed = parse_selector_with_index(part);
+        if is_first {
+            current_matches = collect_matches(doc, &parsed);
+            is_first = false;
+        } else {
+            let mut next = Vec::new();
+            for parent in current_matches {
+                next.extend(collect_matches_from_element(parent, &parsed));
+            }
+            current_matches = next;
+        }
+        if current_matches.is_empty() {
+            break;
+        }
+    }
+    current_matches
+}
+
 /// Select elements with Legado rule syntax
 pub fn select_list<'a>(doc: &'a Html, selector: &str) -> Vec<ElementRef<'a>> {
     let selector = selector.trim();
-
-    let chain = split_top_level(selector, &["@@"]);
-    let sel_text = chain.parts.first().map(String::as_str).unwrap_or(selector);
-    let split = split_top_level(sel_text, &["@"]);
-    let sel_text = split
-        .parts
-        .first()
-        .map(String::as_str)
-        .unwrap_or(sel_text)
-        .trim();
-
-    // Handle list combination operators at the top level
-    if sel_text.contains("&&") || sel_text.contains("||") || sel_text.contains("%%") {
-        return select_with_combination(doc, sel_text);
+    if selector.is_empty() {
+        return Vec::new();
     }
 
-    collect_matches(doc, &parse_selector_with_index(sel_text))
+    // Strip trailing JS if present (e.g. <js>...</js> or @js:...)
+    let selector = if let Some(idx) = selector.find("<js>") {
+        selector[..idx].trim()
+    } else if let Some(idx) = selector.find("@js:") {
+        selector[..idx].trim()
+    } else {
+        selector
+    };
+
+    if selector.is_empty() {
+        return Vec::new();
+    }
+
+    // Handle list combination operators at the top level
+    if selector.contains("&&") || selector.contains("||") || selector.contains("%%") {
+        return select_with_combination(doc, selector);
+    }
+
+    select_chain(doc, selector)
 }
 
 /// Handle list combination operators
@@ -454,11 +505,11 @@ fn select_with_combination<'a>(doc: &'a Html, rule: &str) -> Vec<ElementRef<'a>>
         return vec![];
     }
 
-    let mut result = select_list_simple(doc, &rules[0]);
+    let mut result = select_chain(doc, &rules[0]);
     let operator = split.delimiter.as_deref().unwrap_or("");
 
     for next_rule in rules.iter().skip(1) {
-        let next_results = select_list_simple(doc, next_rule);
+        let next_results = select_chain(doc, next_rule);
 
         match operator {
             "&&" => {
@@ -487,11 +538,6 @@ fn select_with_combination<'a>(doc: &'a Html, rule: &str) -> Vec<ElementRef<'a>>
     }
 
     result
-}
-
-/// Simple select without combination operators
-fn select_list_simple<'a>(doc: &'a Html, selector: &str) -> Vec<ElementRef<'a>> {
-    collect_matches(doc, &parse_selector_with_index(selector))
 }
 
 /// Extract text from element with various Legado extractors

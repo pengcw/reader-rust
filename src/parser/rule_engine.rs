@@ -10,6 +10,7 @@ use crate::parser::{
 };
 use crate::util::text::normalize_source_url;
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use sxd_xpath::{Context as XPathContext, Factory as XPathFactory, Value as XPathValue};
 
@@ -369,23 +370,30 @@ impl RuleEngine {
             }
             let rule = source.rule_search.clone().unwrap_or_default();
             let (list_rule, reverse) = normalize_list_rule(rule.book_list.as_deref().unwrap_or(""));
-            let mode = self.detect_mode(list_rule, body);
+            let context = RuleVariableContext::default();
+            let (body, list_rule) = prepare_list_rule_and_body(
+                Cow::Borrowed(body),
+                list_rule,
+                base_url,
+                &context,
+            );
+            let mode = self.detect_mode(list_rule, &body);
             let mut results = match mode {
                 ParseMode::JsonPath => {
-                    self.search_books_json(source, body, base_url, &rule, list_rule)
+                    self.search_books_json(source, &body, base_url, &rule, list_rule)
                 }
                 ParseMode::XPath => {
-                    self.search_books_xpath(source, body, base_url, &rule, list_rule)
+                    self.search_books_xpath(source, &body, base_url, &rule, list_rule)
                 }
-                ParseMode::Js => self.search_books_js(source, body, base_url, &rule, list_rule),
+                ParseMode::Js => self.search_books_js(source, &body, base_url, &rule, list_rule),
                 ParseMode::Regex => {
-                    self.search_books_regex(source, body, base_url, &rule, list_rule)
+                    self.search_books_regex(source, &body, base_url, &rule, list_rule)
                 }
-                ParseMode::Css => self.search_books_html(source, body, base_url, &rule, list_rule),
+                ParseMode::Css => self.search_books_html(source, &body, base_url, &rule, list_rule),
             };
 
             if results.is_empty() && !has_book_url_pattern(source.book_url_pattern.as_deref()) {
-                if let Some(detail_book) = self.search_detail_fallback(source, body, base_url) {
+                if let Some(detail_book) = self.search_detail_fallback(source, &body, base_url) {
                     results.push(detail_book);
                 }
             }
@@ -414,22 +422,29 @@ impl RuleEngine {
                 })
                 .unwrap_or_else(|| source.rule_search.clone().unwrap_or_default());
             let (list_rule, reverse) = normalize_list_rule(rule.book_list.as_deref().unwrap_or(""));
-            let mode = self.detect_mode(list_rule, body);
+            let context = RuleVariableContext::default();
+            let (body, list_rule) = prepare_list_rule_and_body(
+                Cow::Borrowed(body),
+                list_rule,
+                base_url,
+                &context,
+            );
+            let mode = self.detect_mode(list_rule, &body);
             let mut results = match mode {
                 ParseMode::JsonPath => {
-                    self.search_books_json(source, body, base_url, &rule, list_rule)
+                    self.search_books_json(source, &body, base_url, &rule, list_rule)
                 }
                 ParseMode::XPath => {
-                    self.search_books_xpath(source, body, base_url, &rule, list_rule)
+                    self.search_books_xpath(source, &body, base_url, &rule, list_rule)
                 }
-                ParseMode::Js => self.search_books_js(source, body, base_url, &rule, list_rule),
+                ParseMode::Js => self.search_books_js(source, &body, base_url, &rule, list_rule),
                 ParseMode::Regex => {
-                    self.search_books_regex(source, body, base_url, &rule, list_rule)
+                    self.search_books_regex(source, &body, base_url, &rule, list_rule)
                 }
-                ParseMode::Css => self.search_books_html(source, body, base_url, &rule, list_rule),
+                ParseMode::Css => self.search_books_html(source, &body, base_url, &rule, list_rule),
             };
             if results.is_empty() && !has_book_url_pattern(source.book_url_pattern.as_deref()) {
-                if let Some(detail_book) = self.search_detail_fallback(source, body, base_url) {
+                if let Some(detail_book) = self.search_detail_fallback(source, &body, base_url) {
                     results.push(detail_book);
                 }
             }
@@ -517,6 +532,12 @@ impl RuleEngine {
             let (list_rule, reverse) =
                 normalize_list_rule(rule.chapter_list.as_deref().unwrap_or(""));
             let prepared_body = prepare_toc_body(body, base_url, &rule, &context);
+            let (prepared_body, list_rule) = prepare_list_rule_and_body(
+                Cow::Owned(prepared_body),
+                list_rule,
+                base_url,
+                &context,
+            );
             let mode = self.detect_mode(list_rule, &prepared_body);
             let (mut chapters, next_urls) = match mode {
                 ParseMode::JsonPath => parse_chapter_list_json(
@@ -1963,7 +1984,18 @@ fn parse_chapter_list_json(
         Err(_) => return (vec![], vec![]),
     };
     let scope = select_json_scope(&v, rule.init.as_deref(), base_url, ctx);
-    let items = jsonpath::jsonpath_query(&scope, list_rule);
+    if ctx.get("cid").is_none() {
+        if let Some(cid) = scope
+            .get("comic_id")
+            .or_else(|| scope.get("cid"))
+            .or_else(|| v.get("comic_id"))
+            .or_else(|| v.get("cid"))
+            .and_then(jsonpath::value_to_string)
+        {
+            ctx.insert("cid".to_string(), cid);
+        }
+    }
+    let items = jsonpath::jsonpath_query(&scope, strip_mode_prefix(list_rule));
 
     let mut seen_urls = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(items.len());
@@ -2092,15 +2124,46 @@ fn select_json_scope(
     });
     let interpolated = interpolate_json_templates(&source_rule.rule, v, base_url, ctx);
     source_rule.make_up_rule(&interpolated);
-    let (pure, _) = extract_js(&source_rule.rule);
+    if source_rule.mode == ParseMode::Js || source_rule.rule.trim().starts_with("<js>") {
+        let (script, remainder) =
+            if let Some((s, r)) = split_leading_js_transform(&source_rule.rule) {
+                (s, r)
+            } else {
+                (strip_js_rule(&source_rule.rule), "")
+            };
+        let input = serde_json::to_string(v).unwrap_or_default();
+        if let Ok(output) = eval_js_with_bindings(script, &input, base_url, &ctx.js_bindings()) {
+            if let Ok(new_v) = serde_json::from_str::<Value>(&output) {
+                if !remainder.is_empty() {
+                    return jsonpath::jsonpath_query(&new_v, remainder)
+                        .into_iter()
+                        .next()
+                        .unwrap_or(new_v);
+                }
+                return new_v;
+            }
+        }
+        return v.clone();
+    }
+
+    let (pure, js) = extract_js(&source_rule.rule);
     if pure.is_empty() || source_rule.mode != ParseMode::JsonPath {
         return v.clone();
     }
 
-    jsonpath::jsonpath_query(v, pure)
+    let target = jsonpath::jsonpath_query(v, pure)
         .into_iter()
         .next()
-        .unwrap_or_else(|| v.clone())
+        .unwrap_or_else(|| v.clone());
+    if let Some(script) = js {
+        let input = serde_json::to_string(&target).unwrap_or_default();
+        if let Ok(output) = eval_js_with_bindings(script, &input, base_url, &ctx.js_bindings()) {
+            if let Ok(new_v) = serde_json::from_str::<Value>(&output) {
+                return new_v;
+            }
+        }
+    }
+    target
 }
 
 fn pick_json_field(v: &Value, rule: Option<&str>) -> Option<String> {
@@ -2795,6 +2858,42 @@ fn normalize_list_rule(rule: &str) -> (&str, bool) {
         return (rest.trim(), false);
     }
     (rule, false)
+}
+
+fn split_leading_js_transform(rule: &str) -> Option<(&str, &str)> {
+    let trimmed = rule.trim();
+    if let Some(rest) = strip_prefix_ascii_case(trimmed, "<js>") {
+        if let Some(end) = find_ascii_case(rest, "</js>") {
+            let script = rest[..end].trim();
+            let remainder = rest[end + "</js>".len()..].trim();
+            if !remainder.is_empty() {
+                return Some((script, remainder));
+            }
+        }
+    }
+    None
+}
+
+fn prepare_list_rule_and_body<'a>(
+    body: Cow<'a, str>,
+    rule: &'a str,
+    base_url: &str,
+    ctx: &RuleVariableContext,
+) -> (Cow<'a, str>, &'a str) {
+    let mut current_body = body;
+    let mut current_rule = rule.trim();
+
+    while let Some((script, remainder)) = split_leading_js_transform(current_rule) {
+        match eval_js_with_bindings(script, &current_body, base_url, &ctx.js_bindings()) {
+            Ok(result) if !result.trim().is_empty() => {
+                current_body = Cow::Owned(result);
+                current_rule = remainder;
+            }
+            _ => break,
+        }
+    }
+
+    (current_body, current_rule)
 }
 
 fn strip_mode_prefix(rule: &str) -> &str {
@@ -4322,5 +4421,157 @@ img=u.match(/\[(.*)\]/)[1].split(",").map(x=>'\n<img src='+x+'>').join("\n")
             "https://novel.html5.qq.com/be-api/content/ads-read",
         );
         assert!(content.contains("李珞！你这也太过分了！"));
+    }
+
+    #[test]
+    fn test_kaiman_toc_and_book_info() {
+        let engine = RuleEngine::new().unwrap();
+        let rule_book_info = BookInfoRule {
+            init: Some(
+                r#"<js>
+result=String(java.getString("$.data")).replace(/arsadata/,"");
+java.aesBase64DecodeToString(result,"4548ded8c9e02690","AES/CBC/PKCS5Padding","1992360ee9bc4f8f");
+</js>"#
+                    .to_string(),
+            ),
+            name: Some("$.comic_name@put:{cid:$.comic_id}".to_string()),
+            author: Some("$.author_name".to_string()),
+            ..Default::default()
+        };
+        let rule_toc = TocRule {
+            chapter_list: Some(
+                r#"<js>
+result=String(java.getString("$.data")).replace(/arsadata/,"");
+java.aesBase64DecodeToString(result,"4548ded8c9e02690","AES/CBC/PKCS5Padding","1992360ee9bc4f8f");
+</js>
+$.chapters[*]"#
+                    .to_string(),
+            ),
+            chapter_name: Some("$.chapter_name".to_string()),
+            chapter_url: Some(
+                r#"@js:
+cid='@get:{cid}'
+chapter_id='{{$.chapter_id}}'
+"https://api-cdn.kaimanhua.com/comic-api/v2/comic/getchapterdata?comic_id="+cid+"&chapter_id="+chapter_id;"#
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let source = BookSource {
+            book_source_name: "全免漫画（优）".to_string(),
+            book_source_url: "https://api-cdn.kaimanhua.com/".to_string(),
+            rule_book_info: Some(rule_book_info),
+            rule_toc: Some(rule_toc),
+            ..Default::default()
+        };
+
+        let mock_body = r#"{"data":"arsadataUMNAHxEs93aodUJwIx4FcWXXx5RnV0XXbcPcN6JNbBGFl+nRnI3oLzKOkWqQvEU3aYfonNTUyImBoOjk884Xb+e4CHPXR8ZJrIL4uhRMRuArcX/wpzHvionV+aZb+VcfPXuOilMIPt2r6ObLkdedP3fFBpIrXGBdBgFy/DpZrGKyOwfwqDSG/rkA3XX2Rq0nRQbM4uLT+Ii0DzHjxumDH5ALs6MVXWcTvA/dZJkbisWwXK/vgfQsM+t11xykYDannTKAHx4B3nul20EykzZay/4OUS5wm46gpIFgWaIxjRg=","status":0}"#;
+        let base_url = "https://api-cdn.kaimanhua.com/comic-api/v2/comic/getcomicdata?comic_id=10034";
+        let book = engine.book_info(&source, mock_body, base_url, base_url);
+        assert_eq!(book.name, "开局十个大帝都是我徒弟");
+        assert_eq!(book.author, "九月十月");
+        assert!(book.variable.as_deref().unwrap_or("").contains("10034"));
+
+        let (chapters, _) = engine.chapter_list_with_variable(
+            &source,
+            mock_body,
+            base_url,
+            book.variable.as_deref(),
+            Some(&book.name),
+        );
+        assert_eq!(chapters.len(), 2);
+        assert_eq!(chapters[0].title, "第1话");
+        assert!(chapters[0].url.contains("comic_id=10034"));
+        assert!(chapters[0].url.contains("chapter_id=1"));
+        assert_eq!(chapters[1].title, "第2话");
+        assert!(chapters[1].url.contains("comic_id=10034"));
+        assert!(chapters[1].url.contains("chapter_id=2"));
+
+        if let Ok(comic_body) = std::fs::read_to_string("/tmp/kaiman_comic.json") {
+            let real_book = engine.book_info(&source, &comic_body, base_url, base_url);
+            assert_eq!(real_book.name, "开局十个大帝都是我徒弟");
+            assert_eq!(real_book.author, "iCiyuan动漫");
+            assert!(real_book.variable.as_deref().unwrap_or("").contains("112464"));
+
+            let (real_chapters, _) = engine.chapter_list_with_variable(
+                &source,
+                &comic_body,
+                base_url,
+                real_book.variable.as_deref(),
+                Some(&real_book.name),
+            );
+            assert_eq!(real_chapters.len(), 420);
+            assert_eq!(real_chapters[0].title, "第1话 要么突破，要么死！");
+            assert!(real_chapters[0].url.contains("comic_id=112464"));
+            assert!(real_chapters[0].url.contains("chapter_id=2066785"));
+        }
+    }
+
+    #[test]
+    fn test_shenhai_toc_extraction() {
+        let engine = RuleEngine::new().unwrap();
+        let source_json = serde_json::json!({
+            "bookSourceName": "穿越小说（优）",
+            "bookSourceUrl": "http://www.kk169.org",
+            "ruleBookInfo": {
+                "author": "[property$=author]@content",
+                "name": "[property$=book_name]@content",
+                "tocUrl": "text.点击阅读@href"
+            },
+            "ruleToc": {
+                "chapterList": "li.chapter@a\n<js>\nvar r=result;\nvar v=book.getVariable(\"custom\")\nvar b=[];\nif(v!=\"\"){\n        for(i=0;i<r.length-v;i++){\n                b.push(r[i]);\n                }\n                result=b;\n        }\n        result\n</js>",
+                "chapterName": "text",
+                "chapterUrl": "href",
+                "updateTime": "更新时间：{{@@title##更新，共##·章节字数：}}"
+            },
+            "ruleContent": {
+                "content": "#acontent@textNodes"
+            }
+        });
+        let source: BookSource = serde_json::from_value(source_json).unwrap();
+        let toc_body = match std::fs::read_to_string("/tmp/kk169_toc.html") {
+            Ok(body) => body,
+            Err(_) => return,
+        };
+        let doc = html::parse_document(&toc_body);
+        let items_chained = html::select_list(&doc, "li.chapter@a");
+        let items_space = html::select_list(&doc, "li.chapter a");
+        let items_li = html::select_list(&doc, "li.chapter");
+        eprintln!("items_chained (li.chapter@a) len: {}", items_chained.len());
+        eprintln!("items_space (li.chapter a) len: {}", items_space.len());
+        eprintln!("items_li (li.chapter) len: {}", items_li.len());
+        if !items_chained.is_empty() {
+            eprintln!("items_chained[0] tag: {}, text: {}, href: {:?}",
+                items_chained[0].value().name(),
+                html::extract_text(&items_chained[0], "text").unwrap_or_default(),
+                items_chained[0].value().attr("href")
+            );
+        }
+        if !items_li.is_empty() {
+            eprintln!("items_li[0] tag: {}, text: {}, href: {:?}",
+                items_li[0].value().name(),
+                html::extract_text(&items_li[0], "text").unwrap_or_default(),
+                items_li[0].value().attr("href")
+            );
+        }
+        let (chapters, _) = engine.chapter_list_with_variable(
+            &source,
+            &toc_body,
+            "http://www.kk169.la/html/701/701798/",
+            None,
+            Some("深海余烬"),
+        );
+        eprintln!("Extracted chapters len: {}", chapters.len());
+        if !chapters.is_empty() {
+            eprintln!("Chapter 0: title={}, url={}", chapters[0].title, chapters[0].url);
+        }
+        assert_eq!(chapters.len(), 858);
+
+        if let Ok(content_body) = std::fs::read_to_string("/tmp/kk169_content.html") {
+            let content = engine.content(&source, &content_body, &chapters[0].url);
+            eprintln!("Extracted content len: {}", content.len());
+            assert!(!content.is_empty());
+            assert!(content.contains("起雾了") || content.contains("雾"));
+        }
     }
 }
