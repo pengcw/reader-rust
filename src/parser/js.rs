@@ -154,6 +154,18 @@ pub fn eval_js_url(
     source_key: &str,
     base_url: &str,
 ) -> anyhow::Result<String> {
+    eval_js_url_with_bindings(script, result, key, page, source_key, base_url, None)
+}
+
+pub fn eval_js_url_with_bindings(
+    script: &str,
+    result: &str,
+    key: &str,
+    page: i32,
+    source_key: &str,
+    base_url: &str,
+    bindings: Option<&HashMap<String, JsonValue>>,
+) -> anyhow::Result<String> {
     eval_js_inner_with_source(
         script,
         Some(result),
@@ -161,7 +173,7 @@ pub fn eval_js_url(
         Some(key),
         Some(page),
         Some(source_key),
-        None,
+        bindings,
         false,
     )
 }
@@ -174,6 +186,18 @@ pub fn eval_js_url_template(
     source_key: &str,
     base_url: &str,
 ) -> anyhow::Result<String> {
+    eval_js_url_template_with_bindings(script, result, key, page, source_key, base_url, None)
+}
+
+pub fn eval_js_url_template_with_bindings(
+    script: &str,
+    result: &str,
+    key: &str,
+    page: i32,
+    source_key: &str,
+    base_url: &str,
+    bindings: Option<&HashMap<String, JsonValue>>,
+) -> anyhow::Result<String> {
     eval_js_inner_with_source(
         script,
         Some(result),
@@ -181,7 +205,7 @@ pub fn eval_js_url_template(
         Some(key),
         Some(page),
         Some(source_key),
-        None,
+        bindings,
         true,
     )
 }
@@ -817,6 +841,7 @@ fn eval_js_inner_with_source(
             globals.set("title", "")?;
             globals.set("nextChapterUrl", "")?;
             globals.set("rssArticle", Object::new(ctx.clone())?)?;
+            globals.set("__allowTocRefresh", false)?;
 
             if let Some(bindings) = bindings {
                 for (key, value) in bindings {
@@ -826,7 +851,7 @@ fn eval_js_inner_with_source(
             }
             eval_script(
                 ctx.clone(),
-                "source.getLoginInfo = function() { return globalThis.loginInfo || {}; }; source.getLoginInfoMap = function() { return new Map(Object.entries(globalThis.loginInfo || {}).map(([key, value]) => [key, String(value)])); };",
+                "source.getLoginInfo = function() { return globalThis.loginInfo || {}; }; source.getLoginInfoMap = function() { return new Map(Object.entries(globalThis.loginInfo || {}).map(([key, value]) => [key, String(value)])); }; java.reGetBook = function() { if (globalThis.__allowTocRefresh !== true) throw new Error('java.reGetBook is only available in preUpdateJs'); return false; }; java.refreshTocUrl = function() { if (globalThis.__allowTocRefresh !== true) throw new Error('java.refreshTocUrl is only available in preUpdateJs'); return false; };",
             )?;
 
             eval_script(
@@ -878,7 +903,10 @@ fn eval_js_inner_with_source(
                         return items;
                     };
                     globalThis.java.getElements = _wrapElements;
-                    globalThis.java.getElement = _wrapElements;
+                    globalThis.java.getElement = function(rule, content) {
+                        const items = _wrapElements(rule, content);
+                        return items.length > 0 ? items[0] : null;
+                    };
                 }"#,
             )?;
 
@@ -1787,6 +1815,12 @@ mod tests {
     }
 
     #[test]
+    fn toc_refresh_shims_are_rejected_outside_pre_update_context() {
+        assert!(eval_js("java.reGetBook()", "", "https://example.com").is_err());
+        assert!(eval_js("java.refreshTocUrl()", "", "https://example.com").is_err());
+    }
+
+    #[test]
     fn compat_cookie_get_key_reads_session_cookie_values() {
         let initial = ExecuteSession {
             cookies: Some("sid=initial_token; token=a=b=c".to_string()),
@@ -1810,7 +1844,7 @@ mod tests {
         let script = r#"
             java.setContent(JSON.stringify({data:{list:[{name:'first'},{name:'last'}]}}));
             const list = java.getElements('$.data.list[*]').toArray();
-            const last = java.getElement('$.data.list[-1]').toArray()[0];
+            const last = java.getElement('$.data.list[-1]');
             const firstName = java.getString('$.data.list[0].name');
             java.setContent('<div><p id="p1"><b>one</b></p><p id="p2">two</p></div>');
             const paragraphs = java.getElements('@@tag.p').toArray();

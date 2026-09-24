@@ -16,6 +16,14 @@ use sxd_xpath::{Context as XPathContext, Factory as XPathFactory, Value as XPath
 #[derive(Clone, Default)]
 pub struct RuleEngine;
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ContentPageResult {
+    pub content: String,
+    pub next_url: Option<String>,
+    pub book_variable: Option<String>,
+    pub chapter_variable: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParseMode {
     Css,
@@ -59,6 +67,20 @@ impl RuleVariableContext {
             book_name: self.book_name.clone(),
             chapter_title: Some(title.to_string()),
         }
+    }
+
+    fn for_content(
+        book_variable: Option<&str>,
+        chapter_variable: Option<&str>,
+        book_name: Option<&str>,
+        chapter_title: Option<&str>,
+    ) -> Self {
+        let mut context = Self::for_book(book_variable, book_name);
+        // Content evaluation always has chapter scope, even when the host has no
+        // pre-existing chapter variables. This preserves Legado's put priority.
+        context.chapter = Some(parse_variable_map(chapter_variable));
+        context.chapter_title = chapter_title.map(str::to_string);
+        context
     }
 
     fn get(&self, key: &str) -> Option<String> {
@@ -210,7 +232,11 @@ impl SourceRule {
         self.rule = expanded_rule[..index].trim().to_string();
         self.replace_regex = fields.first().map(|value| (*value).to_string());
         self.replacement = fields.get(1).map(|value| (*value).to_string());
-        self.replace_first = replacement_rule.ends_with("###");
+        self.replace_first = replacement_rule.ends_with("###")
+            || replacement_rule
+                .strip_prefix("##")
+                .map(|steps| steps.trim_end_matches("###").split("##").count() > 2)
+                .unwrap_or(false);
         self.replacement_rule = Some(replacement_rule.to_string());
     }
 
@@ -555,110 +581,175 @@ impl RuleEngine {
         chapter_title: Option<&str>,
     ) -> String {
         with_js_lib(source.js_lib.as_deref(), || {
-            let mut context = RuleVariableContext::for_book(book_variable, book_name);
-            if chapter_variable.is_some() {
-                context.chapter = Some(parse_variable_map(chapter_variable));
-            }
-            context.chapter_title = chapter_title.map(str::to_string);
-            let rule = source.rule_content.clone().unwrap_or_default();
-            let mut content_body = body.to_string();
+            let mut context = RuleVariableContext::for_content(
+                book_variable,
+                chapter_variable,
+                book_name,
+                chapter_title,
+            );
+            self.content_with_context(source, body, base_url, &mut context)
+        })
+    }
 
-            if let Some(source_regex) = rule
-                .source_regex
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-            {
-                content_body = apply_legado_regex(&content_body, source_regex);
+    pub(crate) fn content_page_with_variables(
+        &self,
+        source: &BookSource,
+        body: &str,
+        base_url: &str,
+        book_variable: Option<&str>,
+        chapter_variable: Option<&str>,
+        book_name: Option<&str>,
+        chapter_title: Option<&str>,
+    ) -> ContentPageResult {
+        with_js_lib(source.js_lib.as_deref(), || {
+            let mut context = RuleVariableContext::for_content(
+                book_variable,
+                chapter_variable,
+                book_name,
+                chapter_title,
+            );
+            let content = self.content_with_context(source, body, base_url, &mut context);
+            let next_url = self.next_content_url_with_context(source, body, base_url, &mut context);
+            ContentPageResult {
+                content,
+                next_url,
+                book_variable: context.book_variable(),
+                chapter_variable: context.chapter_variable(),
             }
-            if let Some(web_js) = rule.web_js.as_deref().filter(|s| !s.trim().is_empty()) {
-                if let Ok(processed) = eval_js_with_bindings(
-                    self.strip_mode_prefix(web_js),
-                    &content_body,
-                    base_url,
-                    &context.js_bindings(),
-                ) {
-                    if !processed.trim().is_empty() {
-                        content_body = processed;
-                    }
+        })
+    }
+
+    fn content_with_context(
+        &self,
+        source: &BookSource,
+        body: &str,
+        base_url: &str,
+        context: &mut RuleVariableContext,
+    ) -> String {
+        let rule = source.rule_content.clone().unwrap_or_default();
+        let mut content_body = body.to_string();
+
+        if let Some(source_regex) = rule
+            .source_regex
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            content_body = apply_legado_regex(&content_body, source_regex);
+        }
+        if let Some(web_js) = rule.web_js.as_deref().filter(|s| !s.trim().is_empty()) {
+            if let Ok(processed) = eval_js_with_bindings(
+                self.strip_mode_prefix(web_js),
+                &content_body,
+                base_url,
+                &context.js_bindings(),
+            ) {
+                if !processed.trim().is_empty() {
+                    content_body = processed;
                 }
             }
+        }
 
-            if let Some(content_rule) = rule.content.clone() {
-                let has_templates = content_rule.contains("{{");
-                let content_rule =
-                    interpolate_common_templates(&content_rule, &content_body, base_url, &context);
-                if has_templates && content_rule.trim_start().starts_with('<') {
-                    let content = html::format_keep_img(&content_rule, base_url);
-                    return apply_content_replacement(
-                        content,
-                        rule.replace_regex.as_deref(),
-                        &content_body,
-                        base_url,
-                        &context,
-                    );
-                }
-                if matches!(
-                    self.detect_mode(&content_rule, &content_body),
-                    ParseMode::Js
-                ) {
-                    let script = self.strip_mode_prefix(&content_rule);
-                    if let Ok(res) = eval_js_with_bindings(
-                        script,
-                        &content_body,
-                        base_url,
-                        &context.js_bindings(),
-                    ) {
-                        let content = html::format_keep_img(&res, base_url);
-                        return apply_content_replacement(
-                            content,
-                            rule.replace_regex.as_deref(),
-                            &content_body,
-                            base_url,
-                            &context,
-                        );
-                    }
-                }
+        let Some(raw_content_rule) = rule.content.as_deref() else {
+            return String::new();
+        };
+        let (content_rule, put_entries) = extract_put_entries(raw_content_rule);
+        evaluate_put_entries(&put_entries, context, |put_rule, context| {
+            self.eval_body_rule_with_context(put_rule, &content_body, base_url, context)
+        });
 
-                let mode = self.detect_mode(&content_rule, &content_body);
-                let mut content = match mode {
-                    ParseMode::JsonPath => {
-                        if let Ok(v) = serde_json::from_str::<Value>(&content_body) {
-                            jsonpath::jsonpath_first_string(
-                                &v,
-                                self.strip_mode_prefix(&content_rule),
-                            )
-                            .unwrap_or_default()
-                        } else {
-                            String::new()
-                        }
-                    }
-                    ParseMode::XPath => html::select_xpath_content(
-                        &content_body,
-                        self.strip_mode_prefix(&content_rule),
-                    )
-                    .first()
-                    .cloned()
-                    .unwrap_or_default(),
-                    _ => {
-                        let doc = html::parse_document(&content_body);
-                        let result =
-                            html::select_all_text(&doc, self.strip_mode_prefix(&content_rule));
-                        result.unwrap_or_default()
-                    }
-                };
-
-                content = html::format_keep_img(&content, base_url);
+        let has_templates = content_rule.contains("{{");
+        let content_rule =
+            interpolate_common_templates(&content_rule, &content_body, base_url, context);
+        if has_templates && content_rule.trim_start().starts_with('<') {
+            let content = html::format_keep_img(&content_rule, base_url);
+            return apply_content_replacement(
+                content,
+                rule.replace_regex.as_deref(),
+                &content_body,
+                base_url,
+                context,
+            );
+        }
+        if matches!(self.detect_mode(&content_rule, &content_body), ParseMode::Js) {
+            let script = self.strip_mode_prefix(&content_rule);
+            if let Ok(res) = eval_js_with_bindings(
+                script,
+                &content_body,
+                base_url,
+                &context.js_bindings(),
+            ) {
+                let content = html::format_keep_img(&res, base_url);
                 return apply_content_replacement(
                     content,
                     rule.replace_regex.as_deref(),
                     &content_body,
                     base_url,
-                    &context,
+                    context,
                 );
             }
+        }
 
-            String::new()
-        })
+        let mode = self.detect_mode(&content_rule, &content_body);
+        let mut content = match mode {
+            ParseMode::JsonPath => {
+                if let Ok(v) = serde_json::from_str::<Value>(&content_body) {
+                    jsonpath::jsonpath_first_string(&v, self.strip_mode_prefix(&content_rule))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                }
+            }
+            ParseMode::XPath => html::select_xpath_content(
+                &content_body,
+                self.strip_mode_prefix(&content_rule),
+            )
+            .first()
+            .cloned()
+            .unwrap_or_default(),
+            ParseMode::Regex => {
+                let rows = regex_capture_rows(
+                    self.strip_mode_prefix(&content_rule)
+                        .trim_start_matches(':')
+                        .trim(),
+                    &content_body,
+                );
+                rows.first()
+                    .and_then(|row| row.get(1).or_else(|| row.first()))
+                    .and_then(Clone::clone)
+                    .unwrap_or_default()
+            }
+            ParseMode::Css => {
+                let doc = html::parse_document(&content_body);
+                html::select_all_text(&doc, self.strip_mode_prefix(&content_rule))
+                    .unwrap_or_default()
+            }
+            ParseMode::Js => String::new(),
+        };
+
+        content = html::format_keep_img(&content, base_url);
+        apply_content_replacement(
+            content,
+            rule.replace_regex.as_deref(),
+            &content_body,
+            base_url,
+            context,
+        )
+    }
+
+    fn eval_body_rule_with_context(
+        &self,
+        rule: &str,
+        body: &str,
+        base_url: &str,
+        context: &mut RuleVariableContext,
+    ) -> Option<String> {
+        if serde_json::from_str::<Value>(body).is_ok() {
+            let value = serde_json::from_str::<Value>(body).ok()?;
+            eval_field_json_with_ctx(rule, &value, base_url, context)
+        } else {
+            let doc = html::parse_document(body);
+            eval_field_html_doc_with_ctx(rule, &doc, base_url, context)
+        }
     }
 
     /// Get the next content page URL if pagination exists.
@@ -682,27 +773,31 @@ impl RuleEngine {
         chapter_title: Option<&str>,
     ) -> Option<String> {
         with_js_lib(source.js_lib.as_deref(), || {
-            let rule = source.rule_content.clone().unwrap_or_default();
-            let next_rule = rule.next_content_url.as_deref()?.trim();
-            if next_rule.is_empty() {
-                return None;
-            }
-
-            let mut context = RuleVariableContext::for_book(book_variable, book_name);
-            if chapter_variable.is_some() {
-                context.chapter = Some(parse_variable_map(chapter_variable));
-            }
-            context.chapter_title = chapter_title.map(str::to_string);
-
-            let next_url = if self.detect_mode(next_rule, body) == ParseMode::JsonPath {
-                let value = serde_json::from_str::<Value>(body).ok()?;
-                eval_field_json_with_ctx(next_rule, &value, base_url, &mut context)
-            } else {
-                let doc = html::parse_document(body);
-                eval_field_html_doc_with_ctx(next_rule, &doc, base_url, &mut context)
-            }?;
-            (!next_url.is_empty()).then(|| resolve_url(base_url, &next_url))
+            let mut context = RuleVariableContext::for_content(
+                book_variable,
+                chapter_variable,
+                book_name,
+                chapter_title,
+            );
+            self.next_content_url_with_context(source, body, base_url, &mut context)
         })
+    }
+
+    fn next_content_url_with_context(
+        &self,
+        source: &BookSource,
+        body: &str,
+        base_url: &str,
+        context: &mut RuleVariableContext,
+    ) -> Option<String> {
+        let rule = source.rule_content.clone().unwrap_or_default();
+        let next_rule = rule.next_content_url.as_deref()?.trim();
+        if next_rule.is_empty() {
+            return None;
+        }
+
+        let next_url = self.eval_body_rule_with_context(next_rule, body, base_url, context)?;
+        (!next_url.is_empty()).then(|| resolve_url(base_url, &next_url))
     }
 
     fn search_detail_fallback(
@@ -1035,6 +1130,7 @@ impl RuleEngine {
         list_rule: &str,
         ctx: &mut RuleVariableContext,
     ) -> (Vec<BookChapter>, Vec<String>) {
+        let next_urls = self.parse_next_toc_urls(body, base_url, rule, ctx);
         let rows = regex_capture_rows(self.strip_mode_prefix(list_rule), body);
         let mut out = Vec::new();
         let mut seen_urls = std::collections::HashSet::new();
@@ -1091,7 +1187,7 @@ impl RuleEngine {
                 variable: chapter_ctx.chapter_variable(),
             });
         }
-        (out, vec![])
+        (out, next_urls)
     }
 
     fn search_books_html(
@@ -1116,6 +1212,9 @@ impl RuleEngine {
                 .as_ref()
                 .and_then(|r| eval_field_html_with_ctx(r, &el, base_url, &mut context))
                 .unwrap_or_default();
+            if name.trim().is_empty() {
+                continue;
+            }
             let author = rule
                 .author
                 .as_ref()
@@ -1197,6 +1296,9 @@ impl RuleEngine {
                 base_url,
                 &mut context,
             );
+            if name.as_deref().is_none_or(|value| value.trim().is_empty()) {
+                continue;
+            }
             let author = eval_field_xpath_with_ctx(
                 rule.author.as_deref().unwrap_or(""),
                 item,
@@ -1286,6 +1388,9 @@ impl RuleEngine {
                 base_url,
                 &mut context,
             );
+            if name.as_deref().is_none_or(|value| value.trim().is_empty()) {
+                continue;
+            }
             let author = eval_field_json_with_ctx(
                 rule.author.as_deref().unwrap_or(""),
                 &item,
@@ -2000,8 +2105,11 @@ fn select_json_scope(
 }
 
 fn pick_json_field(v: &Value, rule: Option<&str>) -> Option<String> {
-    let rule = rule?;
-    if rule.trim_start().starts_with('$') {
+    let rule = rule?.trim();
+    if rule.is_empty() {
+        return None;
+    }
+    if rule.starts_with('$') {
         return jsonpath::jsonpath_first_string(v, rule);
     }
     if let Some(obj) = v.as_object() {
@@ -2009,7 +2117,12 @@ fn pick_json_field(v: &Value, rule: Option<&str>) -> Option<String> {
             return jsonpath::value_to_string(val);
         }
     }
-    None
+    let normalized = if rule.starts_with('[') {
+        format!("${rule}")
+    } else {
+        format!("$.{rule}")
+    };
+    jsonpath::jsonpath_first_string(v, &normalized)
 }
 
 pub(crate) fn resolve_url(base: &str, url: &str) -> String {
@@ -2576,15 +2689,10 @@ fn eval_field_json_with_ctx(
         ParseMode::JsonPath => {
             if pure.is_empty() {
                 String::new()
-            } else if pure.contains('/')
-                || pure.contains('?')
-                || pure.contains('&')
-                || pure.contains('=')
-                || pure.contains(',')
-            {
-                pure.to_string()
-            } else {
+            } else if pure.starts_with('$') {
                 pick_json_field(v, Some(pure)).unwrap_or_default()
+            } else {
+                pick_json_field(v, Some(pure)).unwrap_or_else(|| pure.to_string())
             }
         }
         ParseMode::Regex => {
@@ -2629,31 +2737,22 @@ pub fn apply_legado_regex(text: &str, regex_part: &str) -> String {
     let Some(steps) = regex_part.strip_prefix("##") else {
         return text.to_string();
     };
-    let first_only = steps.ends_with("###");
+    let legacy_first_only = steps.ends_with("###");
     let steps = steps.strip_suffix("###").unwrap_or(steps);
     let parts = steps.split("##").collect::<Vec<_>>();
-    if parts.first().is_some_and(|pattern| pattern.is_empty()) {
+    let Some(pattern) = parts.first().copied().filter(|pattern| !pattern.is_empty()) else {
         return text.to_string();
-    }
+    };
+    let replacement = parts.get(1).copied().unwrap_or_default();
+    // Legado treats the presence of a fourth `##` segment as replaceFirst.
+    // Keep the historical trailing `###` form as a compatibility extension.
+    let first_only = legacy_first_only || parts.len() > 2;
 
-    let mut output = text.to_string();
-    let mut index = 0;
-    while index < parts.len() {
-        let pattern = parts[index];
-        if pattern.is_empty() {
-            index += 1;
-            continue;
-        }
-        let replacement = parts.get(index + 1).copied().unwrap_or_default();
-        let is_last = index + 2 >= parts.len();
-        output = if first_only && is_last {
-            apply_regex_replace_first(&output, pattern, replacement)
-        } else {
-            apply_regex_replace_all(&output, pattern, replacement)
-        };
-        index += 2;
+    if first_only {
+        apply_regex_replace_first(text, pattern, replacement)
+    } else {
+        apply_regex_replace_all(text, pattern, replacement)
     }
-    output
 }
 
 fn apply_content_replacement(
@@ -2744,7 +2843,9 @@ fn prepare_toc_body(
     else {
         return body.to_string();
     };
-    match eval_js_with_bindings(strip_js_rule(script), body, base_url, &ctx.js_bindings()) {
+    let mut bindings = ctx.js_bindings();
+    bindings.insert("__allowTocRefresh".to_string(), json!(true));
+    match eval_js_with_bindings(strip_js_rule(script), body, base_url, &bindings) {
         Ok(result) if !result.trim().is_empty() => result,
         _ => body.to_string(),
     }
@@ -2760,10 +2861,16 @@ fn apply_toc_format_js(
         return;
     };
     let script = strip_js_rule(script);
+    let script_literal = serde_json::to_string(script).unwrap_or_else(|_| "\"\"".to_string());
+    let wrapped_script = format!(
+        "(()=>{{const __value=eval({script_literal});return JSON.stringify({{value:__value,gInt:Number(globalThis.gInt)||0}});}})()"
+    );
+    let mut g_int = 0i64;
     for (index, chapter) in chapters.iter_mut().enumerate() {
         let chapter_ctx = ctx.for_chapter(chapter.variable.as_deref(), &chapter.title);
         let mut bindings = chapter_ctx.js_bindings();
         bindings.insert("index".to_string(), json!(index + 1));
+        bindings.insert("gInt".to_string(), json!(g_int));
         let mut chapter_value = serde_json::to_value(&*chapter).unwrap_or_else(|_| json!({}));
         if let Value::Object(fields) = &mut chapter_value {
             fields.insert(
@@ -2772,9 +2879,16 @@ fn apply_toc_format_js(
             );
         }
         bindings.insert("chapter".to_string(), chapter_value);
-        if let Ok(result) = eval_js_with_bindings(script, &chapter.title, base_url, &bindings) {
-            if !result.trim().is_empty() {
-                chapter.title = result;
+        if let Ok(result) =
+            eval_js_with_bindings(&wrapped_script, &chapter.title, base_url, &bindings)
+        {
+            if let Ok(value) = serde_json::from_str::<Value>(&result) {
+                g_int = value.get("gInt").and_then(Value::as_i64).unwrap_or(g_int);
+                if let Some(title) = value.get("value").and_then(jsonpath::value_to_string) {
+                    if !title.trim().is_empty() {
+                        chapter.title = title;
+                    }
+                }
             }
         }
     }
@@ -3364,6 +3478,38 @@ mod tests {
     }
 
     #[test]
+    fn compat_content_and_next_url_share_chapter_variables() {
+        let source = BookSource {
+            rule_content: Some(ContentRule {
+                content: Some("@put:{pageToken:.token@text}.text@text".to_string()),
+                next_content_url: Some("js:'next/' + chapter.variableMap.pageToken".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let page = RuleEngine::new().unwrap().content_page_with_variables(
+            &source,
+            r#"<span class="token">NEXT</span><div class="text">正文</div>"#,
+            "https://books.example/chapter/1",
+            Some(r#"{"bid":"BOOK"}"#),
+            None,
+            Some("Book"),
+            Some("Chapter"),
+        );
+
+        assert_eq!(page.content, "正文");
+        assert_eq!(
+            page.next_url.as_deref(),
+            Some("https://books.example/chapter/next/NEXT")
+        );
+        let chapter_vars = serde_json::from_str::<HashMap<String, String>>(
+            page.chapter_variable.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(chapter_vars["pageToken"], "NEXT");
+    }
+
+    #[test]
     fn compat_templates_coerce_values_and_expand_only_once() {
         let value = json!({"name": "Book"});
         let mut ctx = RuleVariableContext::for_book(None, None);
@@ -3444,11 +3590,24 @@ mod tests {
             "Hello World NUM NUM"
         );
         assert_eq!(apply_legado_regex(text, "##\\d+##NUM###"), "NUM");
+        assert_eq!(apply_legado_regex(text, "##\\d+##NUM##"), "NUM");
         assert_eq!(apply_legado_regex(text, "##[##X"), "Hello World 123 456");
         assert_eq!(apply_legado_regex("a[b", "##[##X"), "aXb");
         assert_eq!(apply_legado_regex("nothing", "##\\d+##N###"), "");
         assert_eq!(apply_legado_regex("a[b", "##[##X###"), "X");
         assert_eq!(apply_legado_regex("no match", "##[##X###"), "X");
+    }
+
+    #[test]
+    fn compat_json_field_filter_is_evaluated_in_rule_engine() {
+        let value = json!({"books":[{"name":"A","price":5},{"name":"B","price":10}]});
+        let result = eval_field_json_with_ctx(
+            "$.books[?(@.price == 10)].name",
+            &value,
+            "https://books.example",
+            &mut RuleVariableContext::default(),
+        );
+        assert_eq!(result.as_deref(), Some("B"));
     }
 
     #[test]
@@ -3554,6 +3713,27 @@ mod tests {
     }
 
     #[test]
+    fn compat_search_discards_items_with_empty_names() {
+        let source = BookSource {
+            book_source_url: "https://source.example".to_string(),
+            book_url_pattern: Some("NONE".to_string()),
+            rule_search: Some(SearchRule {
+                book_list: Some(".item".to_string()),
+                name: Some(".missing@text".to_string()),
+                book_url: Some("a@href".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let results = RuleEngine::new().unwrap().search_books(
+            &source,
+            r#"<div class="item"><a href="/book/1">unnamed</a></div>"#,
+            "https://books.example/search",
+        );
+        assert!(results.is_empty());
+    }
+
+    #[test]
     fn test_search_books_regex_list() {
         let engine = RuleEngine::new().unwrap();
         let source = BookSource {
@@ -3614,7 +3794,7 @@ mod tests {
                 chapter_url: Some("chapterUrl".to_string()),
                 is_vip: Some("isVip".to_string()),
                 is_pay: Some("isPay".to_string()),
-                format_js: Some("`${index}.${title}`".to_string()),
+                format_js: Some("gInt++; `${gInt}-${index}.${title}`".to_string()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -3624,11 +3804,53 @@ mod tests {
             engine.chapter_list(&source, "<html></html>", "https://books.example");
         assert!(next_urls.is_empty());
         assert_eq!(chapters.len(), 2);
-        assert_eq!(chapters[0].title, "1.One");
+        assert_eq!(chapters[0].title, "1-1.One");
         assert_eq!(chapters[0].url, "https://books.example/1");
         assert!(chapters[0].is_vip);
-        assert_eq!(chapters[1].title, "2.Two");
+        assert_eq!(chapters[1].title, "2-2.Two");
         assert!(chapters[1].is_pay);
+    }
+
+    #[test]
+    fn compat_pre_update_js_allows_toc_refresh_shims() {
+        let source = BookSource {
+            rule_toc: Some(TocRule {
+                pre_update_js: Some("java.reGetBook(); java.refreshTocUrl(); result".to_string()),
+                chapter_list: Some(".chapter".to_string()),
+                chapter_name: Some(".name@text".to_string()),
+                chapter_url: Some(".url@href".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (chapters, _) = RuleEngine::new().unwrap().chapter_list(
+            &source,
+            r#"<div class="chapter"><span class="name">One</span><a class="url" href="/one"></a></div>"#,
+            "https://books.example/toc",
+        );
+        assert_eq!(chapters.len(), 1);
+        assert_eq!(chapters[0].title, "One");
+    }
+
+    #[test]
+    fn compat_regex_toc_keeps_next_page_urls() {
+        let source = BookSource {
+            rule_toc: Some(TocRule {
+                chapter_list: Some(r#":<li data-url="([^"]+)">([^<]+)</li>"#.to_string()),
+                chapter_name: Some("$2".to_string()),
+                chapter_url: Some("$1".to_string()),
+                next_toc_url: Some(".next@href".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (chapters, next_urls) = RuleEngine::new().unwrap().chapter_list(
+            &source,
+            r#"<li data-url="/one">One</li><a class="next" href="/toc/2"></a>"#,
+            "https://books.example/toc/1",
+        );
+        assert_eq!(chapters.len(), 1);
+        assert_eq!(next_urls, vec!["https://books.example/toc/2"]);
     }
 
     #[test]

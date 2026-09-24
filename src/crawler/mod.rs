@@ -4,7 +4,9 @@
 //! 执行引擎需要的同步路径，避免为 `cdylib` 引入异步 runtime。
 
 use crate::model::book_source::BookSource;
-use crate::parser::js::{eval_js, eval_js_url, eval_js_url_template, with_js_lib};
+use crate::parser::js::{
+    eval_js, eval_js_url_template_with_bindings, eval_js_url_with_bindings, with_js_lib,
+};
 use chardetng::EncodingDetector;
 use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8};
 use once_cell::sync::Lazy;
@@ -37,6 +39,69 @@ static SESSION_CACHE: Lazy<Mutex<VecDeque<CachedSession>>> =
 #[derive(Clone)]
 pub struct HttpSession {
     client: HttpClient,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UrlRuleContext {
+    pub book_variable: Option<String>,
+    pub chapter_variable: Option<String>,
+    pub book_name: Option<String>,
+    pub chapter_title: Option<String>,
+}
+
+impl UrlRuleContext {
+    fn variable_map(raw: Option<&str>) -> serde_json::Map<String, Value> {
+        raw.and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default()
+    }
+
+    fn bindings(&self) -> HashMap<String, Value> {
+        let book_variables = Self::variable_map(self.book_variable.as_deref());
+        let mut book = book_variables.clone();
+        book.insert("variableMap".to_string(), Value::Object(book_variables));
+        if let Some(name) = self.book_name.as_deref() {
+            book.insert("name".to_string(), Value::String(name.to_string()));
+            book.insert("bookName".to_string(), Value::String(name.to_string()));
+        }
+
+        let chapter_variables = Self::variable_map(self.chapter_variable.as_deref());
+        let mut chapter = chapter_variables.clone();
+        chapter.insert(
+            "variableMap".to_string(),
+            Value::Object(chapter_variables),
+        );
+        if let Some(title) = self.chapter_title.as_deref() {
+            chapter.insert("title".to_string(), Value::String(title.to_string()));
+        }
+
+        HashMap::from([
+            ("book".to_string(), Value::Object(book)),
+            ("chapter".to_string(), Value::Object(chapter)),
+            (
+                "title".to_string(),
+                Value::String(self.chapter_title.clone().unwrap_or_default()),
+            ),
+        ])
+    }
+
+    fn get(&self, key: &str) -> Option<String> {
+        let lookup = |raw: Option<&str>| {
+            let values = Self::variable_map(raw);
+            values.get(key).and_then(value_to_string)
+        };
+        match key {
+            "bookName" => self.book_name.clone(),
+            "title" => self.chapter_title.clone(),
+            _ => lookup(self.chapter_variable.as_deref())
+                .or_else(|| lookup(self.book_variable.as_deref()))
+                .or_else(|| {
+                    current_active_session()
+                        .and_then(|session| session.get_variable(key))
+                        .and_then(|value| value_to_string(&value))
+                }),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -358,8 +423,19 @@ pub fn analyze_url(
     base_url: &str,
     source: &BookSource,
 ) -> Result<RequestSpec, String> {
+    analyze_url_with_context(raw_rule, key, page, base_url, source, None)
+}
+
+pub fn analyze_url_with_context(
+    raw_rule: &str,
+    key: &str,
+    page: i32,
+    base_url: &str,
+    source: &BookSource,
+    context: Option<&UrlRuleContext>,
+) -> Result<RequestSpec, String> {
     with_js_lib(source.js_lib.as_deref(), || {
-        compile_url_request(raw_rule, key, page, base_url, source)
+        compile_url_request(raw_rule, key, page, base_url, source, context)
     })
 }
 
@@ -369,6 +445,7 @@ fn compile_url_request(
     page: i32,
     base_url: &str,
     source: &BookSource,
+    context: Option<&UrlRuleContext>,
 ) -> Result<RequestSpec, String> {
     let raw_rule = raw_rule.trim();
     if raw_rule.is_empty() {
@@ -388,8 +465,18 @@ fn compile_url_request(
     let base = strip_url_options(base_url).trim();
 
     // Stages 2-4: URL JS segments, embedded JS templates, legacy placeholders, page choices.
-    let mut rule = eval_url_rule_js_segments(raw_rule, key, page, source, base)?;
-    rule = expand_url_templates(&rule, key, page, source, base)?;
+    let bindings = context.map(UrlRuleContext::bindings);
+    let mut rule =
+        eval_url_rule_js_segments(raw_rule, key, page, source, base, bindings.as_ref())?;
+    rule = expand_url_templates(
+        &rule,
+        key,
+        page,
+        source,
+        base,
+        context,
+        bindings.as_ref(),
+    )?;
     rule = replace_legacy_placeholders(&rule, key, page);
     rule = replace_page_choices_before_options(&rule, page);
 
@@ -407,8 +494,16 @@ fn compile_url_request(
         .and_then(Value::as_str)
         .filter(|script| !script.trim().is_empty())
     {
-        let rewritten = eval_js_url(script, &url, key, page, &source.book_source_url, base)
-            .map_err(|error| format!("URL option JavaScript failed: {error}"))?;
+        let rewritten = eval_js_url_with_bindings(
+            script,
+            &url,
+            key,
+            page,
+            &source.book_source_url,
+            base,
+            bindings.as_ref(),
+        )
+        .map_err(|error| format!("URL option JavaScript failed: {error}"))?;
         url = absolute_url(base, &rewritten);
     }
     validate_http_url(&url)?;
@@ -486,6 +581,7 @@ fn eval_url_rule_js_segments(
     page: i32,
     source: &BookSource,
     base_url: &str,
+    bindings: Option<&HashMap<String, Value>>,
 ) -> Result<String, String> {
     static URL_JS_SEGMENTS: Lazy<Option<regex::Regex>> =
         Lazy::new(|| regex::Regex::new(r"(?is)<js>(.*?)</js>|@js:(.*)$|^js:(.*)$").ok());
@@ -511,13 +607,14 @@ fn eval_url_rule_js_segments(
             .or_else(|| captures.get(3))
             .map(|value| value.as_str())
             .unwrap_or_default();
-        result = eval_js_url(
+        result = eval_js_url_with_bindings(
             script,
             &result,
             key,
             page,
             &source.book_source_url,
             base_url,
+            bindings,
         )
         .map_err(|error| format!("URL JavaScript failed: {error}"))?;
         previous_end = matched.end();
@@ -537,6 +634,8 @@ fn expand_url_templates(
     page: i32,
     source: &BookSource,
     base_url: &str,
+    context: Option<&UrlRuleContext>,
+    bindings: Option<&HashMap<String, Value>>,
 ) -> Result<String, String> {
     let mut output = String::with_capacity(rule.len());
     let mut cursor = 0;
@@ -544,26 +643,62 @@ fn expand_url_templates(
         let start = cursor + relative_start;
         output.push_str(&rule[cursor..start]);
         let expression_start = start + 2;
-        let Some(relative_end) = rule[expression_start..].find("}}") else {
+        let Some(relative_end) = find_url_template_close(&rule[expression_start..]) else {
             output.push_str(&rule[start..]);
             return Ok(output);
         };
         let end = expression_start + relative_end;
         let expression = rule[expression_start..end].trim();
-        let replacement = eval_js_url_template(
-            expression,
-            rule,
-            key,
-            page,
-            &source.book_source_url,
-            base_url,
-        )
-        .map_err(|error| format!("URL template JavaScript failed: {error}"))?;
+        let replacement = if let Some(variable) = expression
+            .strip_prefix("@get:{")
+            .and_then(|value| value.strip_suffix('}'))
+        {
+            context
+                .and_then(|context| context.get(variable.trim()))
+                .unwrap_or_default()
+        } else {
+            eval_js_url_template_with_bindings(
+                expression,
+                rule,
+                key,
+                page,
+                &source.book_source_url,
+                base_url,
+                bindings,
+            )
+            .map_err(|error| format!("URL template JavaScript failed: {error}"))?
+        };
         output.push_str(&replacement);
         cursor = end + 2;
     }
     output.push_str(&rule[cursor..]);
     Ok(output)
+}
+
+fn find_url_template_close(expression: &str) -> Option<usize> {
+    let mut brace_depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in expression.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' | '`' => quote = Some(ch),
+            '{' => brace_depth += 1,
+            '}' if brace_depth > 0 => brace_depth -= 1,
+            '}' if expression[index..].starts_with("}}") => return Some(index),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn replace_legacy_placeholders(rule: &str, key: &str, page: i32) -> String {
@@ -1223,7 +1358,7 @@ mod tests {
         .unwrap();
         assert_eq!(spec.url, "https://a.test/search?q=2&a=word&empty=");
         assert_eq!(
-            eval_js_url_template(
+            crate::parser::js::eval_js_url_template(
                 "({value: 1})",
                 "",
                 "key",
@@ -1233,6 +1368,31 @@ mod tests {
             )
             .unwrap(),
             "[object Object]"
+        );
+    }
+
+    #[test]
+    fn compat_url_rules_receive_book_and_chapter_scope() {
+        let source = test_source(None);
+        let context = UrlRuleContext {
+            book_variable: Some(r#"{"token":"BOOK"}"#.to_string()),
+            chapter_variable: Some(r#"{"cid":"CHAPTER"}"#.to_string()),
+            book_name: Some("Book Name".to_string()),
+            chapter_title: Some("Chapter Title".to_string()),
+        };
+        let spec = analyze_url_with_context(
+            "/{{book.variableMap.token}}/{{chapter.variableMap.cid}}/{{@get:{cid}}}/{{title}},{\"js\":\"result + '?name=' + encodeURIComponent(book.bookName)\"}",
+            "",
+            1,
+            "https://a.test",
+            &source,
+            Some(&context),
+        )
+        .unwrap();
+
+        assert_eq!(
+            spec.url,
+            "https://a.test/BOOK/CHAPTER/CHAPTER/Chapter%20Title?name=Book%20Name"
         );
     }
 

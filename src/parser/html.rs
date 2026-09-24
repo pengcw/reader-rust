@@ -1,3 +1,4 @@
+use once_cell::sync::Lazy;
 use scraper::{ElementRef, Html, Selector};
 use std::collections::HashSet;
 
@@ -762,13 +763,58 @@ pub(crate) fn parse_xpath_package(
     input: &str,
 ) -> Result<sxd_document::Package, sxd_document::parser::Error> {
     let normalized = normalize_xpath_entities(input);
-    match sxd_document::parser::parse(normalized.as_ref()) {
-        Ok(package) => Ok(package),
-        Err(_) => {
-            let fragment = format!("<reader-root>{normalized}</reader-root>");
-            sxd_document::parser::parse(&fragment)
-        }
+    if let Ok(package) = sxd_document::parser::parse(normalized.as_ref()) {
+        return Ok(package);
     }
+
+    // Preserve XML fragment semantics before falling back to HTML5 recovery.
+    let fragment = format!("<reader-root>{normalized}</reader-root>");
+    if let Ok(package) = sxd_document::parser::parse(&fragment) {
+        return Ok(package);
+    }
+
+    // Ordinary web pages are HTML, not XML: html5ever repairs unclosed/mismatched
+    // tags and normalizes attributes first. Match Legado's fragment wrappers for
+    // table cells/rows before parsing so HTML5 error recovery does not discard them.
+    let trimmed = input.trim();
+    let html_input = if trimmed.to_ascii_lowercase().ends_with("</td>") {
+        format!("<table><tbody><tr>{trimmed}</tr></tbody></table>")
+    } else if trimmed.to_ascii_lowercase().ends_with("</tr>")
+        || trimmed.to_ascii_lowercase().ends_with("</tbody>")
+    {
+        format!("<table>{trimmed}</table>")
+    } else {
+        input.to_string()
+    };
+    // Scraper serializes HTML void elements without a closing slash, so make
+    // only those elements XML-safe afterwards.
+    let document = Html::parse_document(&html_input);
+    let repaired = html_to_xpath_xml(&document.html());
+    sxd_document::parser::parse(&repaired)
+}
+
+fn html_to_xpath_xml(html: &str) -> String {
+    static DOCTYPE: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(r"(?is)<!doctype[^>]*>").expect("valid doctype regex")
+    });
+    static VOID_ELEMENT: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(
+            r"(?is)<(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)(\b[^>]*)>",
+        )
+        .expect("valid HTML void element regex")
+    });
+
+    let without_doctype = DOCTYPE.replace_all(html, "");
+    let xml = VOID_ELEMENT.replace_all(&without_doctype, |captures: &regex::Captures| {
+        let whole = captures.get(0).map(|value| value.as_str()).unwrap_or_default();
+        let attrs = captures.get(2).map(|value| value.as_str()).unwrap_or_default();
+        if attrs.trim_end().ends_with('/') {
+            whole.to_string()
+        } else {
+            format!("<{}{} />", &captures[1], attrs)
+        }
+    });
+    normalize_xpath_entities(xml.as_ref()).into_owned()
 }
 
 fn normalize_xpath_entities(input: &str) -> std::borrow::Cow<'_, str> {
@@ -1171,6 +1217,23 @@ mod tests {
             "/html/body/p",
         );
         assert_eq!(values, vec!["Normal"]);
+    }
+
+    #[test]
+    fn xpath_parser_repairs_ordinary_html_before_xml_fallback() {
+        let values = select_xpath(
+            r#"<!doctype html><div class=test>Hello<br><img src=/cover.jpg><span>World</span></div>"#,
+            "//div[@class='test']",
+        );
+        assert_eq!(values, vec!["HelloWorld"]);
+        assert_eq!(
+            select_xpath(
+                r#"<div><img src=/cover.jpg><span>World</span></div>"#,
+                "string(//img/@src)",
+            ),
+            vec!["/cover.jpg"]
+        );
+        assert_eq!(select_xpath("<td>Cell</td>", "//td"), vec!["Cell"]);
     }
 
     #[test]

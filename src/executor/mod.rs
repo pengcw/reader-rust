@@ -4,7 +4,8 @@
 //! `RuleEngine` 调用，并将所有业务失败转换成稳定的 JSON envelope。
 
 use crate::crawler::{
-    analyze_url, with_active_session, ExecuteSession, FetchError, HttpResponse, HttpSession,
+    analyze_url_with_context, with_active_session, ExecuteSession, FetchError, HttpResponse,
+    HttpSession, UrlRuleContext,
 };
 use crate::model::book_source::{book_source_from_value, BookSource};
 use crate::model::replace_rule::ReplaceRule;
@@ -418,6 +419,20 @@ fn input_chapter_state(params: &Value) -> (Option<String>, Option<String>) {
     (variable, title)
 }
 
+fn url_rule_context(
+    book_variable: Option<&str>,
+    chapter_variable: Option<&str>,
+    book_name: Option<&str>,
+    chapter_title: Option<&str>,
+) -> UrlRuleContext {
+    UrlRuleContext {
+        book_variable: book_variable.map(str::to_string),
+        chapter_variable: chapter_variable.map(str::to_string),
+        book_name: book_name.map(str::to_string),
+        chapter_title: chapter_title.map(str::to_string),
+    }
+}
+
 fn input_chapter_is_volume(params: &Value) -> bool {
     params
         .get("chapter")
@@ -435,7 +450,9 @@ fn execute_info(
     options: &ValidatedOptions,
 ) -> ExecuteResult<Value> {
     let book_url = required_string(params, "url")?;
-    let response = fetch_rule(
+    let (variable, name) = input_book_state(params);
+    let request_context = url_rule_context(variable.as_deref(), None, name.as_deref(), None);
+    let response = fetch_rule_with_context(
         session,
         source,
         &book_url,
@@ -443,8 +460,8 @@ fn execute_info(
         1,
         &source.book_source_url,
         options,
+        Some(&request_context),
     )?;
-    let (variable, name) = input_book_state(params);
     let data = serde_json::to_value(engine.book_info_with_variable(
         source,
         &response.body,
@@ -465,7 +482,9 @@ fn execute_toc(
     options: &ValidatedOptions,
 ) -> ExecuteResult<Value> {
     let initial_url = required_string(params, "url")?;
-    let detail_response = fetch_rule(
+    let (variable, name) = input_book_state(params);
+    let detail_context = url_rule_context(variable.as_deref(), None, name.as_deref(), None);
+    let detail_response = fetch_rule_with_context(
         session,
         source,
         &initial_url,
@@ -473,8 +492,8 @@ fn execute_toc(
         1,
         &source.book_source_url,
         options,
+        Some(&detail_context),
     )?;
-    let (variable, name) = input_book_state(params);
     let book_info = engine.book_info_with_variable(
         source,
         &detail_response.body,
@@ -487,6 +506,12 @@ fn execute_toc(
         .toc_url
         .filter(|url| !url.trim().is_empty())
         .unwrap_or_else(|| initial_url.clone());
+    let toc_context = url_rule_context(
+        book_info.variable.as_deref(),
+        None,
+        Some(&book_info.name),
+        None,
+    );
     let reuse_detail_response = same_resource_url(&toc_url, &initial_url)
         || same_resource_url(&toc_url, &detail_response.url);
     let mut detail_toc_response = reuse_detail_response.then(|| detail_response.clone());
@@ -509,7 +534,7 @@ fn execute_toc(
             if let Some(response) = detail_toc_response.take() {
                 response
             } else {
-                fetch_rule(
+                fetch_rule_with_context(
                     session,
                     source,
                     &url,
@@ -517,10 +542,11 @@ fn execute_toc(
                     1,
                     &source.book_source_url,
                     options,
+                    Some(&toc_context),
                 )?
             }
         } else {
-            fetch_rule(
+            fetch_rule_with_context(
                 session,
                 source,
                 &url,
@@ -528,6 +554,7 @@ fn execute_toc(
                 1,
                 &source.book_source_url,
                 options,
+                Some(&toc_context),
             )?
         };
         visited_pages.insert(url);
@@ -583,8 +610,8 @@ fn execute_content(
     options: &ValidatedOptions,
 ) -> ExecuteResult<Value> {
     let initial_url = required_string(params, "url")?;
-    let (book_variable, book_name) = input_book_state(params);
-    let (chapter_variable, chapter_title) = input_chapter_state(params);
+    let (mut book_variable, book_name) = input_book_state(params);
+    let (mut chapter_variable, chapter_title) = input_chapter_state(params);
     let is_volume = input_chapter_is_volume(params);
     let replace_rules = parse_replace_rules(params.get("replaceRules"))?;
     let mut current_url = initial_url.clone();
@@ -599,7 +626,13 @@ fn execute_content(
             truncated = true;
             break;
         }
-        let response = fetch_rule(
+        let request_context = url_rule_context(
+            book_variable.as_deref(),
+            chapter_variable.as_deref(),
+            book_name.as_deref(),
+            chapter_title.as_deref(),
+        );
+        let response = fetch_rule_with_context(
             session,
             source,
             &current_url,
@@ -607,11 +640,12 @@ fn execute_content(
             1,
             &source.book_source_url,
             options,
+            Some(&request_context),
         )?;
         visited_urls.insert(current_url.clone());
         let response_url = response.url.clone();
         let chapter_url = initial_response_url.get_or_insert_with(|| response_url.clone());
-        let content = engine.content_with_variables(
+        let page = engine.content_page_with_variables(
             source,
             &response.body,
             &response.url,
@@ -620,18 +654,12 @@ fn execute_content(
             book_name.as_deref(),
             chapter_title.as_deref(),
         );
-        if !content.is_empty() {
-            fragments.push(content);
+        if !page.content.is_empty() {
+            fragments.push(page.content);
         }
-        let next_url = engine.next_content_url_with_variables(
-            source,
-            &response.body,
-            &response.url,
-            book_variable.as_deref(),
-            chapter_variable.as_deref(),
-            book_name.as_deref(),
-            chapter_title.as_deref(),
-        );
+        book_variable = page.book_variable;
+        chapter_variable = page.chapter_variable;
+        let next_url = page.next_url;
         final_response = Some(response);
 
         match next_url {
@@ -859,7 +887,21 @@ fn fetch_rule(
     base_url: &str,
     options: &ValidatedOptions,
 ) -> ExecuteResult<HttpResponse> {
-    let spec = analyze_url(rule, key, page, base_url, source).map_err(ExecuteError::url_rule)?;
+    fetch_rule_with_context(session, source, rule, key, page, base_url, options, None)
+}
+
+fn fetch_rule_with_context(
+    session: &HttpSession,
+    source: &BookSource,
+    rule: &str,
+    key: &str,
+    page: i32,
+    base_url: &str,
+    options: &ValidatedOptions,
+    context: Option<&UrlRuleContext>,
+) -> ExecuteResult<HttpResponse> {
+    let spec = analyze_url_with_context(rule, key, page, base_url, source, context)
+        .map_err(ExecuteError::url_rule)?;
     let response = session
         .fetch(&spec, options.max_response_bytes)
         .map_err(|error| map_fetch_error(error, source))?;
