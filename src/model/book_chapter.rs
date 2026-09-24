@@ -10,4 +10,7 @@ pub struct BookChapter {
     pub is_vip: bool,
     pub is_pay: bool,
     pub is_volume: bool,
+    /// JSON-serialized chapter variables, separate from the owning book's variables.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variable: Option<String>,
 }

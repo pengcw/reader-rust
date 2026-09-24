@@ -380,6 +380,44 @@ fn execute_explore(
     Ok(success(data, 1, false, &response, options))
 }
 
+fn serialized_variable(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(serialized) => Some(serialized.clone()),
+        Value::Object(_) => serde_json::to_string(value?).ok(),
+        _ => None,
+    }
+}
+
+fn input_book_state(params: &Value) -> (Option<String>, Option<String>) {
+    let book = params.get("book").and_then(Value::as_object);
+    let variable = serialized_variable(
+        book.and_then(|value| value.get("variable").or_else(|| value.get("variableMap")))
+            .or_else(|| params.get("variable").or_else(|| params.get("variableMap"))),
+    );
+    let name = book
+        .and_then(|value| value.get("name"))
+        .or_else(|| params.get("bookName"))
+        .or_else(|| params.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    (variable, name)
+}
+
+fn input_chapter_state(params: &Value) -> (Option<String>, Option<String>) {
+    let chapter = params.get("chapter").and_then(Value::as_object);
+    let variable = serialized_variable(
+        chapter
+            .and_then(|value| value.get("variable").or_else(|| value.get("variableMap")))
+            .or_else(|| params.get("chapterVariable")),
+    );
+    let title = chapter
+        .and_then(|value| value.get("title"))
+        .or_else(|| params.get("title"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    (variable, title)
+}
+
 fn execute_info(
     source: &BookSource,
     engine: &RuleEngine,
@@ -397,9 +435,16 @@ fn execute_info(
         &source.book_source_url,
         options,
     )?;
-    let data =
-        serde_json::to_value(engine.book_info(source, &response.body, &response.url, &book_url))
-            .map_err(|error| ExecuteError::internal(error.to_string()))?;
+    let (variable, name) = input_book_state(params);
+    let data = serde_json::to_value(engine.book_info_with_variable(
+        source,
+        &response.body,
+        &response.url,
+        &book_url,
+        variable.as_deref(),
+        name.as_deref(),
+    ))
+    .map_err(|error| ExecuteError::internal(error.to_string()))?;
     Ok(success(data, 1, false, &response, options))
 }
 
@@ -420,11 +465,14 @@ fn execute_toc(
         &source.book_source_url,
         options,
     )?;
-    let book_info = engine.book_info(
+    let (variable, name) = input_book_state(params);
+    let book_info = engine.book_info_with_variable(
         source,
         &detail_response.body,
         &detail_response.url,
         &initial_url,
+        variable.as_deref(),
+        name.as_deref(),
     );
     let toc_url = book_info
         .toc_url
@@ -455,7 +503,13 @@ fn execute_toc(
             options,
         )?;
         visited_pages.insert(url);
-        let (page_chapters, next_urls) = engine.chapter_list(source, &response.body, &response.url);
+        let (page_chapters, next_urls) = engine.chapter_list_with_variable(
+            source,
+            &response.body,
+            &response.url,
+            book_info.variable.as_deref(),
+            Some(&book_info.name),
+        );
         for mut chapter in page_chapters {
             if seen_chapters.insert(chapter.url.clone()) {
                 chapter.index = chapters.len() as i32;
@@ -489,6 +543,8 @@ fn execute_content(
     options: &ValidatedOptions,
 ) -> ExecuteResult<Value> {
     let initial_url = required_string(params, "url")?;
+    let (book_variable, book_name) = input_book_state(params);
+    let (chapter_variable, chapter_title) = input_chapter_state(params);
     let replace_rules = parse_replace_rules(params.get("replaceRules"))?;
     let mut current_url = initial_url.clone();
     let mut visited_urls = HashSet::new();
@@ -514,11 +570,27 @@ fn execute_content(
         visited_urls.insert(current_url.clone());
         let response_url = response.url.clone();
         let chapter_url = initial_response_url.get_or_insert_with(|| response_url.clone());
-        let content = engine.content(source, &response.body, &response.url);
+        let content = engine.content_with_variables(
+            source,
+            &response.body,
+            &response.url,
+            book_variable.as_deref(),
+            chapter_variable.as_deref(),
+            book_name.as_deref(),
+            chapter_title.as_deref(),
+        );
         if !content.is_empty() {
             fragments.push(content);
         }
-        let next_url = engine.next_content_url(source, &response.body, &response.url);
+        let next_url = engine.next_content_url_with_variables(
+            source,
+            &response.body,
+            &response.url,
+            book_variable.as_deref(),
+            chapter_variable.as_deref(),
+            book_name.as_deref(),
+            chapter_title.as_deref(),
+        );
         final_response = Some(response);
 
         match next_url {
@@ -1077,7 +1149,7 @@ fn content_path_base(path: &str, strip_page_suffix: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::execute;
+    use super::{execute, input_book_state, input_chapter_state};
     use serde_json::Value;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -1163,6 +1235,24 @@ mod tests {
             }
         });
         format!("http://{address}")
+    }
+
+    #[test]
+    fn execute_state_inputs_accept_serialized_and_map_variables() {
+        let params = serde_json::json!({
+            "book": {"name": "Book", "variable": r#"{"bid":"B"}"#},
+            "chapter": {"title": "Chapter", "variableMap": {"cid": "C"}}
+        });
+        let (book_variable, book_name) = input_book_state(&params);
+        let (chapter_variable, chapter_title) = input_chapter_state(&params);
+        assert_eq!(book_variable.as_deref(), Some(r#"{"bid":"B"}"#));
+        assert_eq!(book_name.as_deref(), Some("Book"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(chapter_variable.as_deref().unwrap())
+                .unwrap()["cid"],
+            "C"
+        );
+        assert_eq!(chapter_title.as_deref(), Some("Chapter"));
     }
 
     #[test]

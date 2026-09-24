@@ -30,4 +30,7 @@ pub struct Book {
     pub update_time: Option<String>,
     pub can_re_name: Option<String>,
     pub download_urls: Option<String>,
+    /// JSON-serialized book variables; the evaluator parses this into its book scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variable: Option<String>,
 }

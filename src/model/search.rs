@@ -13,6 +13,9 @@ pub struct SearchBook {
     pub last_chapter: Option<String>,
     pub update_time: Option<String>,
     pub word_count: Option<String>,
+    /// JSON-serialized book variables, matching Legado's SearchBook wire format.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variable: Option<String>,
     /// Book source URLs for the same book from different sources (for merged results)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub book_source_urls: Option<Vec<String>>,
