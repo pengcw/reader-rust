@@ -968,36 +968,46 @@ pub fn format_keep_img(content: &str, redirect_url: &str) -> String {
 
     // 1. 移除 script、style 与注释
     let mut text = content.to_string();
-    if let Ok(re) = regex::Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<!--.*?-->") {
+    if let Ok(re) =
+        regex::Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<!--.*?-->")
+    {
         text = re.replace_all(&text, "").into_owned();
     }
 
     // 2. 提取并保留 <img> 标签，补全相对 URL，使用占位符保护
     let mut img_placeholders: Vec<String> = Vec::new();
     if let Ok(img_re) = regex::Regex::new(r"(?i)<img\b[^>]*>") {
-        if let Ok(src_re) = regex::Regex::new(r#"(?i)\b(?:src|data-src|data-original)\s*=\s*["']?([^"'\s>]+)["']?"#) {
-            text = img_re.replace_all(&text, |caps: &regex::Captures| {
-                let img_tag = caps.get(0).unwrap().as_str();
-                let full_img = if let Some(src_caps) = src_re.captures(img_tag) {
-                    let raw_src = src_caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-                    if !raw_src.is_empty() && !redirect_url.is_empty() {
-                        let abs_src = crate::parser::rule_engine::resolve_url(redirect_url, raw_src);
-                        format!(r#"<img src="{}">"#, abs_src)
+        if let Ok(src_re) =
+            regex::Regex::new(r#"(?i)\b(?:src|data-src|data-original)\s*=\s*["']?([^"'\s>]+)["']?"#)
+        {
+            text = img_re
+                .replace_all(&text, |caps: &regex::Captures| {
+                    let img_tag = caps.get(0).unwrap().as_str();
+                    let full_img = if let Some(src_caps) = src_re.captures(img_tag) {
+                        let raw_src = src_caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+                        if !raw_src.is_empty() && !redirect_url.is_empty() {
+                            let abs_src =
+                                crate::parser::rule_engine::resolve_url(redirect_url, raw_src);
+                            format!(r#"<img src="{}">"#, abs_src)
+                        } else {
+                            format!(r#"<img src="{}">"#, raw_src)
+                        }
                     } else {
-                        format!(r#"<img src="{}">"#, raw_src)
-                    }
-                } else {
-                    img_tag.to_string()
-                };
-                let placeholder = format!("__READER_IMG_PLACEHOLDER_{}__", img_placeholders.len());
-                img_placeholders.push(full_img);
-                format!("\n{}\n", placeholder)
-            }).into_owned();
+                        img_tag.to_string()
+                    };
+                    let placeholder =
+                        format!("__READER_IMG_PLACEHOLDER_{}__", img_placeholders.len());
+                    img_placeholders.push(full_img);
+                    format!("\n{}\n", placeholder)
+                })
+                .into_owned();
         }
     }
 
     // 3. 将块级换行标签转换为换行符 \n
-    if let Ok(block_re) = regex::Regex::new(r"(?i)<br\s*/?>|</?p\b[^>]*>|</?div\b[^>]*>|</?h[1-6]\b[^>]*>") {
+    if let Ok(block_re) =
+        regex::Regex::new(r"(?i)<br\s*/?>|</?(?:p|div|h[1-6]|li|ul|ol|hr|article|dd|dl)\b[^>]*>")
+    {
         text = block_re.replace_all(&text, "\n").into_owned();
     }
 
@@ -1027,6 +1037,92 @@ pub fn format_keep_img(content: &str, redirect_url: &str) -> String {
     }
 
     lines.join("\n")
+}
+
+/// 将 HTML 转换为换行与段落保留的纯文本。
+/// 会移除 script、style 与注释，将所有块级换行标签（含 <p>, <br>, <li>, <div>, <h1-h6> 等）转换为 \n，
+/// 剔除所有 HTML 标签并执行 HTML 实体反转义。
+pub fn html_to_text(html: &str) -> String {
+    if html.trim().is_empty() {
+        return String::new();
+    }
+
+    // 1. 移除 script、style 与注释
+    let mut text = html.to_string();
+    if let Ok(re) =
+        regex::Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<!--.*?-->")
+    {
+        text = re.replace_all(&text, "").into_owned();
+    }
+
+    // 2. 将块级换行标签转换为换行符 \n
+    if let Ok(block_re) =
+        regex::Regex::new(r"(?i)<br\s*/?>|</?(?:p|div|h[1-6]|li|ul|ol|hr|article|dd|dl)\b[^>]*>")
+    {
+        text = block_re.replace_all(&text, "\n").into_owned();
+    }
+
+    // 3. 清理剩余所有 HTML 标签
+    if let Ok(tag_re) = regex::Regex::new(r"<[^>]+>") {
+        text = tag_re.replace_all(&text, "").into_owned();
+    }
+
+    // 4. 若含 &，进行 HTML-unescape
+    if text.contains('&') {
+        text = html_unescape(&text);
+    }
+
+    // 5. 规范化空白行与段落：按 \n 切分，每行 trim，去掉连续空行
+    let mut lines = Vec::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if !line.is_empty() {
+            lines.push(line.to_string());
+        }
+    }
+
+    lines.join("\n")
+}
+
+/// 净化 HTML（保留基础排版标签，剥离属性与 CSS/脚本）。
+/// 常用于电子书阅读排版（保留 p, br, b, strong, i, em, u, h1-h6, li, ul, ol 等基础标签）。
+pub fn clean_html(html: &str) -> String {
+    use regex::Regex;
+    let mut output = html.to_string();
+    for pattern in [
+        r"(?is)<script[^>]*>.*?</script>",
+        r"(?is)<style[^>]*>.*?</style>",
+        r"(?s)<!--.*?-->",
+    ] {
+        if let Ok(regex) = Regex::new(pattern) {
+            output = regex.replace_all(&output, "").into_owned();
+        }
+    }
+    if let Ok(regex) =
+        Regex::new(r"(?i)<(/?)(p|br|b|strong|i|em|u|h[1-6]|li|ul|ol)(?:\s+[^>]*)?/?>")
+    {
+        output = regex.replace_all(&output, "<$1$2>").into_owned();
+    }
+    if let Ok(regex) = Regex::new(r"<[^>]+>") {
+        let mut cleaned = String::new();
+        let mut last_end = 0;
+        for found in regex.find_iter(&output) {
+            cleaned.push_str(&output[last_end..found.start()]);
+            match found.as_str().to_ascii_lowercase().as_str() {
+                "<p>" | "</p>" | "<br>" | "<b>" | "</b>" | "<strong>" | "</strong>" | "<i>"
+                | "</i>" | "<em>" | "</em>" | "<u>" | "</u>" | "<h1>" | "</h1>" | "<h2>"
+                | "</h2>" | "<h3>" | "</h3>" | "<h4>" | "</h4>" | "<h5>" | "</h5>" | "<h6>"
+                | "</h6>" | "<li>" | "</li>" | "<ul>" | "</ul>" | "<ol>" | "</ol>" => {
+                    cleaned.push_str(found.as_str());
+                }
+                _ => {}
+            }
+            last_end = found.end();
+        }
+        cleaned.push_str(&output[last_end..]);
+        output = cleaned;
+    }
+    output
 }
 
 #[cfg(test)]
@@ -1217,11 +1313,26 @@ mod tests {
         );
 
         // 清洗无用标签与脚本样式
-        let messy_html = "<div><script>alert(1);</script><p>正文内容<span>注释</span><br>第二行</p></div>";
-        assert_eq!(
-            format_keep_img(messy_html, ""),
-            "正文内容注释\n第二行"
-        );
+        let messy_html =
+            "<div><script>alert(1);</script><p>正文内容<span>注释</span><br>第二行</p></div>";
+        assert_eq!(format_keep_img(messy_html, ""), "正文内容注释\n第二行");
+
+        // 清洗 <li> 标签并正确分段换行
+        let list_html = "<ul><li>第一条列表项</li><li>第二条列表项</li></ul>";
+        assert_eq!(format_keep_img(list_html, ""), "第一条列表项\n第二条列表项");
+    }
+
+    #[test]
+    fn test_html_to_text() {
+        let html =
+            "<div><h1>标题</h1><p>第一段</p><ul><li>项目 1</li><li>项目 2</li></ul><br>尾注</div>";
+        assert_eq!(html_to_text(html), "标题\n第一段\n项目 1\n项目 2\n尾注");
+    }
+
+    #[test]
+    fn test_clean_html() {
+        let html = r#"<div style="color:red"><script>var a=1;</script><p class="content">段落</p><ul><li class="item">列表项</li></ul></div>"#;
+        assert_eq!(clean_html(html), "<p>段落</p><ul><li>列表项</li></ul>");
     }
 
     #[test]

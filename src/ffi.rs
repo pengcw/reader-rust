@@ -44,10 +44,10 @@ pub fn reader_eval(input: char_p::Ref<'_>, rule: char_p::Ref<'_>) -> char_p::Box
         );
     }
     if rule == "@clean" {
-        return ffi_string(format_html(input));
+        return ffi_string(crate::parser::html::clean_html(input));
     }
     if rule == "@text" {
-        return ffi_string(html_to_text(input));
+        return ffi_string(crate::parser::html::html_to_text(input));
     }
     if rule == "@merge" {
         return ffi_string(merge_search_results(input));
@@ -245,53 +245,29 @@ fn validate_source(raw: &str) -> String {
     json!({"valid": errors.is_empty(), "errors": errors}).to_string()
 }
 
-fn html_to_text(html: &str) -> String {
-    let replaced = html
-        .replace("<br/>", "\n")
-        .replace("<br>", "\n")
-        .replace("</p>", "\n")
-        .replace("<p>", "");
-    let document = scraper::Html::parse_fragment(&replaced);
-    document
-        .root_element()
-        .text()
-        .collect::<Vec<_>>()
-        .join("")
-        .trim()
-        .to_string()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
 
-fn format_html(html: &str) -> String {
-    use regex::Regex;
-    let mut output = html.to_string();
-    for pattern in [
-        r"(?is)<script[^>]*>.*?</script>",
-        r"(?is)<style[^>]*>.*?</style>",
-        r"(?s)<!--.*?-->",
-    ] {
-        if let Ok(regex) = Regex::new(pattern) {
-            output = regex.replace_all(&output, "").into_owned();
-        }
+    #[test]
+    fn test_reader_eval_text_and_clean() {
+        let input = "<div><p>段落一</p><ul><li>项A</li><li>项B</li></ul><br>尾部</div>";
+        let c_input = CString::new(input).unwrap();
+        let c_rule_text = CString::new("@text").unwrap();
+        let c_rule_clean = CString::new("@clean").unwrap();
+
+        let ref_input = char_p::Ref::try_from(c_input.as_c_str()).unwrap();
+        let ref_text = char_p::Ref::try_from(c_rule_text.as_c_str()).unwrap();
+        let ref_clean = char_p::Ref::try_from(c_rule_clean.as_c_str()).unwrap();
+
+        let res_text = reader_eval(ref_input, ref_text);
+        assert_eq!(res_text.to_str(), "段落一\n项A\n项B\n尾部");
+
+        let res_clean = reader_eval(ref_input, ref_clean);
+        assert_eq!(
+            res_clean.to_str(),
+            "<p>段落一</p><ul><li>项A</li><li>项B</li></ul><br>尾部"
+        );
     }
-    if let Ok(regex) = Regex::new(r"(?i)<(/?)(p|br|b|strong|i|em|u|h[1-6])(?:\s+[^>]*)?/?>") {
-        output = regex.replace_all(&output, "<$1$2>").into_owned();
-    }
-    if let Ok(regex) = Regex::new(r"<[^>]+>") {
-        let mut cleaned = String::new();
-        let mut last_end = 0;
-        for found in regex.find_iter(&output) {
-            cleaned.push_str(&output[last_end..found.start()]);
-            match found.as_str() {
-                "<p>" | "</p>" | "<br>" | "<b>" | "</b>" | "<strong>" | "</strong>" | "<i>"
-                | "</i>" | "<em>" | "</em>" | "<u>" | "</u>" | "<h1>" | "</h1>" | "<h2>"
-                | "</h2>" | "<h3>" | "</h3>" | "<h4>" | "</h4>" | "<h5>" | "</h5>" | "<h6>"
-                | "</h6>" => cleaned.push_str(found.as_str()),
-                _ => {}
-            }
-            last_end = found.end();
-        }
-        cleaned.push_str(&output[last_end..]);
-        output = cleaned;
-    }
-    output
 }
