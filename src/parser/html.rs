@@ -828,25 +828,87 @@ fn xpath_html_entity(entity: &str) -> Option<&'static str> {
 
 /// XPath support using sxd-xpath
 pub fn select_xpath(html: &str, xpath: &str) -> Vec<String> {
+    select_xpath_values(html, xpath, false)
+}
+
+pub(crate) fn select_xpath_content(html: &str, xpath: &str) -> Vec<String> {
+    select_xpath_values(html, xpath, true)
+}
+
+fn select_xpath_values(html: &str, xpath: &str, format_nodes: bool) -> Vec<String> {
     let package = match parse_xpath_package(html) {
-        Ok(p) => p,
+        Ok(package) => package,
         Err(_) => return vec![],
     };
-
     let document = package.as_document();
     let context = sxd_xpath::Context::new();
 
     match sxd_xpath::Factory::new().build(xpath) {
-        Ok(Some(xpath_expr)) => match xpath_expr.evaluate(&context, document.root()) {
-            Ok(value) => match value {
-                sxd_xpath::Value::Nodeset(ns) => ns.into_iter().map(|n| n.string_value()).collect(),
-                sxd_xpath::Value::String(s) => vec![s],
-                sxd_xpath::Value::Number(n) => vec![n.to_string()],
-                sxd_xpath::Value::Boolean(b) => vec![b.to_string()],
-            },
+        Ok(Some(expression)) => match expression.evaluate(&context, document.root()) {
+            Ok(sxd_xpath::Value::Nodeset(nodes)) => nodes
+                .into_iter()
+                .map(|node| {
+                    if format_nodes {
+                        xpath_formatted_text(node)
+                    } else {
+                        node.string_value()
+                    }
+                })
+                .collect(),
+            Ok(sxd_xpath::Value::String(value)) => vec![value],
+            Ok(sxd_xpath::Value::Number(value)) => vec![value.to_string()],
+            Ok(sxd_xpath::Value::Boolean(value)) => vec![value.to_string()],
             Err(_) => vec![],
         },
         _ => vec![],
+    }
+}
+
+fn xpath_formatted_text(node: sxd_xpath::nodeset::Node<'_>) -> String {
+    let mut text = String::new();
+    match node {
+        sxd_xpath::nodeset::Node::Element(element) => append_xpath_element_text(element, &mut text),
+        sxd_xpath::nodeset::Node::Root(root) => {
+            for child in root.children() {
+                if let sxd_document::dom::ChildOfRoot::Element(element) = child {
+                    append_xpath_element_text(element, &mut text);
+                }
+            }
+        }
+        _ => return node.string_value(),
+    }
+    text
+}
+
+fn append_xpath_element_text(element: sxd_document::dom::Element<'_>, output: &mut String) {
+    let name = element.name().local_part();
+    let is_block = matches!(
+        name,
+        "p" | "div" | "br" | "li" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+            | "blockquote" | "section"
+    );
+    if is_block {
+        append_xpath_line_break(output);
+    }
+
+    for child in element.children() {
+        match child {
+            sxd_document::dom::ChildOfElement::Element(child) => {
+                append_xpath_element_text(child, output)
+            }
+            sxd_document::dom::ChildOfElement::Text(child) => output.push_str(child.text()),
+            _ => {}
+        }
+    }
+
+    if is_block {
+        append_xpath_line_break(output);
+    }
+}
+
+fn append_xpath_line_break(output: &mut String) {
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
     }
 }
 

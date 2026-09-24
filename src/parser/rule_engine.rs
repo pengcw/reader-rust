@@ -285,8 +285,8 @@ fn classify_rule_mode_with_css_regex_fallback(
     fallback: ParseMode,
     content_is_json: bool,
 ) -> (ParseMode, String) {
-    let explicit_css = starts_with_ascii_case(raw_rule.trim(), "@css:")
-        || raw_rule.trim().starts_with("@@");
+    let explicit_css =
+        starts_with_ascii_case(raw_rule.trim(), "@css:") || raw_rule.trim().starts_with("@@");
     let (mode, rule) = classify_rule_mode(raw_rule, fallback, content_is_json);
     if mode == ParseMode::Css
         && !explicit_css
@@ -632,12 +632,13 @@ impl RuleEngine {
                             String::new()
                         }
                     }
-                    ParseMode::XPath => {
-                        html::select_xpath(&content_body, self.strip_mode_prefix(&content_rule))
-                            .first()
-                            .cloned()
-                            .unwrap_or_default()
-                    }
+                    ParseMode::XPath => html::select_xpath_content(
+                        &content_body,
+                        self.strip_mode_prefix(&content_rule),
+                    )
+                    .first()
+                    .cloned()
+                    .unwrap_or_default(),
                     _ => {
                         let doc = html::parse_document(&content_body);
                         let result =
@@ -3881,6 +3882,35 @@ mod tests {
         );
         assert_eq!(book.name, "Book-Alias");
         assert_eq!(book.author, "Tester");
+    }
+
+    #[test]
+    fn compat_xpath_content_preserves_block_breaks_without_changing_scalar_rules() {
+        let source = BookSource {
+            rule_content: Some(ContentRule {
+                content: Some("//div".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let body = "<div><p>A</p><p>B</p></div>";
+        let engine = RuleEngine::new().unwrap();
+
+        assert_eq!(
+            engine.content(&source, body, "https://books.example/chapter/1"),
+            "A\nB"
+        );
+        let scalar = BookSource {
+            rule_content: Some(ContentRule {
+                content: Some("@xpath:string(//div)".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            engine.content(&scalar, body, "https://books.example/chapter/1"),
+            html::select_xpath(body, "string(//div)")[0]
+        );
     }
 
     #[test]
