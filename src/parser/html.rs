@@ -408,8 +408,8 @@ fn expand_range(len: usize, start: Option<i32>, end: Option<i32>, step: i32) -> 
 pub fn select_list<'a>(doc: &'a Html, selector: &str) -> Vec<ElementRef<'a>> {
     let selector = selector.trim();
 
-    // Split by @ first to get the base selector (handle @@ separately in text extraction)
-    let sel_text = selector.split("@@").next().unwrap_or(selector).trim();
+    let chain = split_top_level(selector, &["@@"]);
+    let sel_text = chain.parts.first().map(String::as_str).unwrap_or(selector);
     let split = split_top_level(sel_text, &["@"]);
     let sel_text = split
         .parts
@@ -686,25 +686,23 @@ pub fn select_text_list(doc: &Html, rule: &str) -> Vec<String> {
         return result;
     }
 
-    // Handle rule chaining with @@
-    if rule.contains("@@") {
-        let rules: Vec<&str> = rule.split("@@").collect();
-        if rules.is_empty() {
+    // Handle rule chaining with @@ only when it appears at the top level.
+    let chain = split_top_level(rule, &["@@"]);
+    if chain.delimiter.is_some() {
+        let mut rules = chain.parts.into_iter();
+        let Some(first_rule) = rules.next() else {
             return vec![];
-        }
+        };
+        let mut current_texts = select_text_list(doc, &first_rule);
 
-        // Start with first rule - get all matching texts
-        let mut current_texts = select_text_list(doc, rules[0]);
-
-        // Apply subsequent rules
-        for r in rules.iter().skip(1) {
+        for rule in rules {
             if current_texts.is_empty() {
                 break;
             }
             let mut new_texts = Vec::new();
             for text in &current_texts {
                 let sub_doc = Html::parse_document(text);
-                new_texts.extend(select_text_list(&sub_doc, r));
+                new_texts.extend(select_text_list(&sub_doc, &rule));
             }
             current_texts = new_texts;
         }
@@ -1057,6 +1055,28 @@ mod tests {
                     step: 1,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn compat_css_chain_split_ignores_embedded_at_signs() {
+        let doc = parse_document(
+            r#"<div data-value="left@@right">Literal</div><section><span>Nested</span></section>"#,
+        );
+
+        assert_eq!(
+            select_text(&doc, r#"div[data-value="left@@right"]@text"#),
+            Some("Literal".to_string())
+        );
+        assert_eq!(
+            select_text_list(&doc, "section@html@@span@text"),
+            vec!["Nested".to_string()]
+        );
+
+        let regex_chain = split_top_level(":regex((?:left@@right))@@span", &["@@"]);
+        assert_eq!(
+            regex_chain.parts,
+            vec![":regex((?:left@@right))".to_string(), "span".to_string()]
         );
     }
 
