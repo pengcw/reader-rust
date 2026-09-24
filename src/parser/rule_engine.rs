@@ -275,6 +275,12 @@ impl RuleEngine {
 
     pub fn search_books(&self, source: &BookSource, body: &str, base_url: &str) -> Vec<SearchBook> {
         with_js_lib(source.js_lib.as_deref(), || {
+            if book_url_pattern_matches(source.book_url_pattern.as_deref(), base_url) {
+                return self
+                    .search_detail_fallback(source, body, base_url)
+                    .into_iter()
+                    .collect();
+            }
             let rule = source.rule_search.clone().unwrap_or_default();
             let (list_rule, reverse) = normalize_list_rule(rule.book_list.as_deref().unwrap_or(""));
             let mode = self.detect_mode(list_rule, body);
@@ -292,17 +298,12 @@ impl RuleEngine {
                 ParseMode::Css => self.search_books_html(source, body, base_url, &rule, list_rule),
             };
 
-            if results.is_empty()
-                && source
-                    .book_url_pattern
-                    .as_deref()
-                    .map(|s| s.trim().is_empty())
-                    .unwrap_or(true)
-            {
+            if results.is_empty() && !has_book_url_pattern(source.book_url_pattern.as_deref()) {
                 if let Some(detail_book) = self.search_detail_fallback(source, body, base_url) {
                     results.push(detail_book);
                 }
             }
+            dedupe_search_books(&mut results);
             if reverse {
                 results.reverse();
             }
@@ -341,6 +342,12 @@ impl RuleEngine {
                 }
                 ParseMode::Css => self.search_books_html(source, body, base_url, &rule, list_rule),
             };
+            if results.is_empty() && !has_book_url_pattern(source.book_url_pattern.as_deref()) {
+                if let Some(detail_book) = self.search_detail_fallback(source, body, base_url) {
+                    results.push(detail_book);
+                }
+            }
+            dedupe_search_books(&mut results);
             if reverse {
                 results.reverse();
             }
@@ -2568,6 +2575,28 @@ fn parse_js_output_items(output: &str) -> Option<Vec<Value>> {
     }
 }
 
+fn has_book_url_pattern(pattern: Option<&str>) -> bool {
+    pattern
+        .map(str::trim)
+        .is_some_and(|pattern| !pattern.is_empty() && !pattern.eq_ignore_ascii_case("NONE"))
+}
+
+fn book_url_pattern_matches(pattern: Option<&str>, url: &str) -> bool {
+    let Some(pattern) = pattern
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty() && !pattern.eq_ignore_ascii_case("NONE"))
+    else {
+        return false;
+    };
+    let anchored = format!(r"\A(?:{pattern})\z");
+    crate::util::text::get_cached_regex(&anchored).is_some_and(|regex| regex.is_match(url))
+}
+
+fn dedupe_search_books(books: &mut Vec<SearchBook>) {
+    let mut seen = std::collections::HashSet::new();
+    books.retain(|book| seen.insert((book.origin.clone(), book.book_url.clone())));
+}
+
 fn search_book_from_book(book: Book) -> Option<SearchBook> {
     if book.name.trim().is_empty() {
         return None;
@@ -3213,6 +3242,77 @@ mod tests {
         assert_eq!(results[0].name, "Fallback Book");
         assert_eq!(results[0].author, "Fallback Author");
         assert_eq!(results[0].intro.as_deref(), Some("Fallback Intro"));
+    }
+
+    #[test]
+    fn compat_book_url_pattern_prefers_detail_parse_and_matches_whole_url() {
+        let source = BookSource {
+            book_url_pattern: Some(r"https://books\.example/detail/\d+".to_string()),
+            rule_search: Some(SearchRule {
+                book_list: Some(".result".to_string()),
+                name: Some(".list-name@text".to_string()),
+                ..Default::default()
+            }),
+            rule_book_info: Some(BookInfoRule {
+                name: Some(".detail-name@text".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let body = r#"<div class="result"><span class="list-name">List result</span></div><h1 class="detail-name">Detail page</h1>"#;
+        let results = RuleEngine::new().unwrap().search_books(
+            &source,
+            body,
+            "https://books.example/detail/12",
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "Detail page");
+        assert!(!book_url_pattern_matches(
+            source.book_url_pattern.as_deref(),
+            "https://books.example/detail/12?query=1"
+        ));
+        assert!(!book_url_pattern_matches(
+            Some("NONE"),
+            "https://books.example/detail/12"
+        ));
+    }
+
+    #[test]
+    fn compat_empty_explore_falls_back_to_detail_and_search_dedupes_in_order() {
+        let source = BookSource {
+            rule_explore: Some(SearchRule {
+                book_list: Some(".missing".to_string()),
+                ..Default::default()
+            }),
+            rule_search: Some(SearchRule {
+                book_list: Some("-.item".to_string()),
+                name: Some(".name@text".to_string()),
+                book_url: Some("@href".to_string()),
+                ..Default::default()
+            }),
+            rule_book_info: Some(BookInfoRule {
+                name: Some(".detail-name@text".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let engine = RuleEngine::new().unwrap();
+        let detail = engine.explore_books(
+            &source,
+            r#"<h1 class="detail-name">Fallback detail</h1>"#,
+            "https://books.example/detail/1",
+        );
+        assert_eq!(detail.len(), 1);
+        assert_eq!(detail[0].name, "Fallback detail");
+
+        let results = engine.search_books(
+            &source,
+            r#"<a class="item" href="/a"><span class="name">First</span></a><a class="item" href="/b"><span class="name">Middle</span></a><a class="item" href="/a"><span class="name">Duplicate</span></a>"#,
+            "https://books.example/search",
+        );
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].name, "Middle");
+        assert_eq!(results[1].name, "First");
     }
 
     #[test]
