@@ -186,6 +186,37 @@ pub fn eval_js_url_template(
     )
 }
 
+pub fn eval_js_template(script: &str, input: &str, base_url: &str) -> anyhow::Result<String> {
+    eval_js_inner_with_source(
+        script,
+        Some(input),
+        Some(base_url),
+        None,
+        None,
+        None,
+        None,
+        true,
+    )
+}
+
+pub fn eval_js_template_with_bindings(
+    script: &str,
+    input: &str,
+    base_url: &str,
+    bindings: &HashMap<String, JsonValue>,
+) -> anyhow::Result<String> {
+    eval_js_inner_with_source(
+        script,
+        Some(input),
+        Some(base_url),
+        None,
+        None,
+        None,
+        Some(bindings),
+        true,
+    )
+}
+
 fn eval_js_inner(
     script: &str,
     input: Option<&str>,
@@ -1278,9 +1309,9 @@ fn compile_js_lib(js_lib: &str) -> anyhow::Result<String> {
         if let Ok(value) = serde_json::from_str::<JsonValue>(trimmed) {
             if let Some(map) = value.as_object() {
                 let mut scripts = Vec::new();
-                for entry in map.values() {
-                    if let Some(raw) = entry.as_str() {
-                        scripts.push(resolve_js_lib_entry(raw)?);
+                for entry in map.values().filter_map(JsonValue::as_str) {
+                    if is_absolute_http_url(entry) {
+                        scripts.push(resolve_js_lib_entry(entry)?);
                     }
                 }
                 return Ok(scripts.join("\n"));
@@ -1290,9 +1321,13 @@ fn compile_js_lib(js_lib: &str) -> anyhow::Result<String> {
     Ok(trimmed.to_string())
 }
 
+fn is_absolute_http_url(value: &str) -> bool {
+    url::Url::parse(value).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+}
+
 fn resolve_js_lib_entry(entry: &str) -> anyhow::Result<String> {
     let value = entry.trim();
-    if value.starts_with("http://") || value.starts_with("https://") {
+    if is_absolute_http_url(value) {
         return Ok(active_js_http_client().request_text(Method::GET, value, &[], None)?);
     }
     Ok(value.to_string())
@@ -1412,6 +1447,45 @@ mod tests {
     use super::*;
     use crate::crawler::session::{with_active_session, ExecuteSession};
     use serde_json::json;
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn js_lib_json_object_loads_only_absolute_urls_and_uses_cache() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("http://{address}/shared.js");
+        let marker = format!("shared_lib_{}", address.port());
+        let script = format!("globalThis.{marker}=41;");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{script}",
+                script.len()
+            )
+            .unwrap();
+        });
+        let js_lib = serde_json::json!({
+            "remote": url,
+            "inline": "throw new Error('inline value must be ignored')",
+            "relative": "/not-a-script.js"
+        })
+        .to_string();
+
+        with_js_lib(Some(&js_lib), || {
+            let expression = format!("{marker} + 1");
+            assert_eq!(eval_js(&expression, "", &url).unwrap(), "42");
+            assert_eq!(eval_js(&expression, "", &url).unwrap(), "42");
+        });
+        server.join().unwrap();
+        assert_eq!(
+            compile_js_lib(r#"{"inline":"var notLoaded=1"}"#).unwrap(),
+            ""
+        );
+    }
 
     #[test]
     fn test_js_session_bindings() {

@@ -5,7 +5,7 @@ use crate::model::{
 };
 use crate::parser::{
     html,
-    js::{eval_js, eval_js_template, eval_js_with_bindings, with_js_lib},
+    js::{eval_js_template_with_bindings, eval_js_with_bindings, with_js_lib},
     jsonpath, rule_analyzer,
 };
 use crate::util::text::normalize_source_url;
@@ -98,6 +98,46 @@ impl RuleVariableContext {
 
     fn chapter_variable(&self) -> Option<String> {
         serialize_variable_map(self.chapter.as_ref())
+    }
+
+    fn js_bindings(&self) -> HashMap<String, Value> {
+        let mut book = serde_json::Map::new();
+        let mut book_variables = serde_json::Map::new();
+        if let Some(values) = &self.book {
+            for (key, value) in values {
+                let value = Value::String(value.clone());
+                book.insert(key.clone(), value.clone());
+                book_variables.insert(key.clone(), value);
+            }
+        }
+        book.insert("variableMap".to_string(), Value::Object(book_variables));
+        if let Some(name) = &self.book_name {
+            book.insert("name".to_string(), Value::String(name.clone()));
+            book.insert("bookName".to_string(), Value::String(name.clone()));
+        }
+
+        let mut chapter = serde_json::Map::new();
+        let mut chapter_variables = serde_json::Map::new();
+        if let Some(values) = &self.chapter {
+            for (key, value) in values {
+                let value = Value::String(value.clone());
+                chapter.insert(key.clone(), value.clone());
+                chapter_variables.insert(key.clone(), value);
+            }
+        }
+        chapter.insert("variableMap".to_string(), Value::Object(chapter_variables));
+        if let Some(title) = &self.chapter_title {
+            chapter.insert("title".to_string(), Value::String(title.clone()));
+        }
+
+        HashMap::from([
+            ("book".to_string(), Value::Object(book)),
+            ("chapter".to_string(), Value::Object(chapter)),
+            (
+                "title".to_string(),
+                Value::String(self.chapter_title.clone().unwrap_or_default()),
+            ),
+        ])
     }
 }
 
@@ -430,7 +470,7 @@ impl RuleEngine {
             let mut context = RuleVariableContext::for_book(variable, book_name);
             let (list_rule, reverse) =
                 normalize_list_rule(rule.chapter_list.as_deref().unwrap_or(""));
-            let prepared_body = prepare_toc_body(body, base_url, &rule);
+            let prepared_body = prepare_toc_body(body, base_url, &rule, &context);
             let mode = self.detect_mode(list_rule, &prepared_body);
             let (mut chapters, next_urls) = match mode {
                 ParseMode::JsonPath => parse_chapter_list_json(
@@ -469,7 +509,7 @@ impl RuleEngine {
                     &mut context,
                 ),
             };
-            apply_toc_format_js(&mut chapters, rule.format_js.as_deref(), base_url);
+            apply_toc_format_js(&mut chapters, rule.format_js.as_deref(), base_url, &context);
             if reverse {
                 chapters.reverse();
             }
@@ -511,9 +551,12 @@ impl RuleEngine {
                 content_body = apply_legado_regex(&content_body, source_regex);
             }
             if let Some(web_js) = rule.web_js.as_deref().filter(|s| !s.trim().is_empty()) {
-                if let Ok(processed) =
-                    eval_js(self.strip_mode_prefix(web_js), &content_body, base_url)
-                {
+                if let Ok(processed) = eval_js_with_bindings(
+                    self.strip_mode_prefix(web_js),
+                    &content_body,
+                    base_url,
+                    &context.js_bindings(),
+                ) {
                     if !processed.trim().is_empty() {
                         content_body = processed;
                     }
@@ -539,7 +582,12 @@ impl RuleEngine {
                     ParseMode::Js
                 ) {
                     let script = self.strip_mode_prefix(&content_rule);
-                    if let Ok(res) = eval_js(script, &content_body, base_url) {
+                    if let Ok(res) = eval_js_with_bindings(
+                        script,
+                        &content_body,
+                        base_url,
+                        &context.js_bindings(),
+                    ) {
                         let content = html::format_keep_img(&res, base_url);
                         return apply_content_replacement(
                             content,
@@ -654,7 +702,13 @@ impl RuleEngine {
         rule: &SearchRule,
         list_rule: &str,
     ) -> Vec<SearchBook> {
-        let output = match eval_js(self.strip_mode_prefix(list_rule), body, base_url) {
+        let context = RuleVariableContext::default();
+        let output = match eval_js_with_bindings(
+            self.strip_mode_prefix(list_rule),
+            body,
+            base_url,
+            &context.js_bindings(),
+        ) {
             Ok(result) => result,
             Err(_) => return vec![],
         };
@@ -824,13 +878,18 @@ impl RuleEngine {
                 })
                 .unwrap_or_default(),
             ParseMode::XPath => html::select_xpath(body, self.strip_mode_prefix(&expanded)),
-            ParseMode::Js => eval_js(self.strip_mode_prefix(&expanded), body, base_url)
-                .map(|output| {
-                    parse_js_output_items(&output)
-                        .map(|items| items.iter().filter_map(jsonpath::value_to_string).collect())
-                        .unwrap_or_else(|| vec![output])
-                })
-                .unwrap_or_default(),
+            ParseMode::Js => eval_js_with_bindings(
+                self.strip_mode_prefix(&expanded),
+                body,
+                base_url,
+                &ctx.js_bindings(),
+            )
+            .map(|output| {
+                parse_js_output_items(&output)
+                    .map(|items| items.iter().filter_map(jsonpath::value_to_string).collect())
+                    .unwrap_or_else(|| vec![output])
+            })
+            .unwrap_or_default(),
             ParseMode::Regex => regex_capture_rows(
                 self.strip_mode_prefix(&expanded)
                     .trim_start_matches(':')
@@ -857,7 +916,12 @@ impl RuleEngine {
         ctx: &mut RuleVariableContext,
     ) -> (Vec<BookChapter>, Vec<String>) {
         let next_urls = self.parse_next_toc_urls(body, base_url, rule, ctx);
-        let output = match eval_js(self.strip_mode_prefix(list_rule), body, base_url) {
+        let output = match eval_js_with_bindings(
+            self.strip_mode_prefix(list_rule),
+            body,
+            base_url,
+            &ctx.js_bindings(),
+        ) {
             Ok(result) => result,
             Err(_) => return (vec![], vec![]),
         };
@@ -1289,7 +1353,13 @@ fn prepare_html_init_scope(
     let is_js_rule = init.starts_with("js:") || extract_js(init).1.is_some();
     if is_js_rule {
         let result = if init.starts_with("js:") {
-            eval_js(strip_js_rule(init), &doc.html(), base_url).ok()
+            eval_js_with_bindings(
+                strip_js_rule(init),
+                &doc.html(),
+                base_url,
+                &ctx.js_bindings(),
+            )
+            .ok()
         } else {
             eval_field_html_doc_with_ctx(init, doc, base_url, ctx)
         }?;
@@ -2182,7 +2252,8 @@ fn evaluate_template_expression(
         return pick_json_field(value, Some(path)).unwrap_or_default();
     }
     if let Some(script) = strip_prefix_ascii_case(expression, "@js:") {
-        return eval_js_template(script, input, base_url).unwrap_or_default();
+        return eval_js_template_with_bindings(script, input, base_url, &ctx.js_bindings())
+            .unwrap_or_default();
     }
     if let Some(pattern) = strip_prefix_ascii_case(expression, "@regex:") {
         let rows = regex_capture_rows(pattern, input);
@@ -2197,7 +2268,8 @@ fn evaluate_template_expression(
             .get(expression.trim_start_matches('@'))
             .unwrap_or_default();
     }
-    eval_js_template(expression, input, base_url).unwrap_or_default()
+    eval_js_template_with_bindings(expression, input, base_url, &ctx.js_bindings())
+        .unwrap_or_default()
 }
 
 fn strip_url_config(url: &str) -> &str {
@@ -2286,14 +2358,17 @@ fn eval_field_html_with_ctx(
                 .and_then(Clone::clone)
                 .unwrap_or_default()
         }
-        ParseMode::Js => eval_js(strip_js_rule(pure), &input, base_url).unwrap_or_default(),
+        ParseMode::Js => {
+            eval_js_with_bindings(strip_js_rule(pure), &input, base_url, &ctx.js_bindings())
+                .unwrap_or_default()
+        }
         ParseMode::JsonPath => String::new(),
     };
     if text.is_empty() && had_templates && source_rule.mode == ParseMode::Css && !pure.is_empty() {
         text = pure.to_string();
     }
     if let Some(script) = js {
-        if let Ok(result) = eval_js(script, &text, base_url) {
+        if let Ok(result) = eval_js_with_bindings(script, &text, base_url, &ctx.js_bindings()) {
             text = result;
         }
     }
@@ -2333,14 +2408,17 @@ fn eval_field_html_doc_with_ctx(
                 .and_then(Clone::clone)
                 .unwrap_or_default()
         }
-        ParseMode::Js => eval_js(strip_js_rule(pure), &input, base_url).unwrap_or_default(),
+        ParseMode::Js => {
+            eval_js_with_bindings(strip_js_rule(pure), &input, base_url, &ctx.js_bindings())
+                .unwrap_or_default()
+        }
         ParseMode::JsonPath => String::new(),
     };
     if text.is_empty() && had_templates && source_rule.mode == ParseMode::Css && !pure.is_empty() {
         text = pure.to_string();
     }
     if let Some(script) = js {
-        if let Ok(result) = eval_js(script, &text, base_url) {
+        if let Ok(result) = eval_js_with_bindings(script, &text, base_url, &ctx.js_bindings()) {
             text = result;
         }
     }
@@ -2380,7 +2458,10 @@ fn eval_field_xpath_with_ctx(
                 .and_then(Clone::clone)
                 .unwrap_or_default()
         }
-        ParseMode::Js => eval_js(strip_js_rule(pure), &input, base_url).unwrap_or_default(),
+        ParseMode::Js => {
+            eval_js_with_bindings(strip_js_rule(pure), &input, base_url, &ctx.js_bindings())
+                .unwrap_or_default()
+        }
         ParseMode::Css => {
             let doc = html::parse_document(&input);
             html::select_text(&doc, pure).unwrap_or_default()
@@ -2391,7 +2472,7 @@ fn eval_field_xpath_with_ctx(
         text = pure.to_string();
     }
     if let Some(script) = js {
-        if let Ok(result) = eval_js(script, &text, base_url) {
+        if let Ok(result) = eval_js_with_bindings(script, &text, base_url, &ctx.js_bindings()) {
             text = result;
         }
     }
@@ -2492,7 +2573,10 @@ fn eval_field_json_with_ctx(
                 .and_then(Clone::clone)
                 .unwrap_or_default()
         }
-        ParseMode::Js => eval_js(strip_js_rule(pure), &input, base_url).unwrap_or_default(),
+        ParseMode::Js => {
+            eval_js_with_bindings(strip_js_rule(pure), &input, base_url, &ctx.js_bindings())
+                .unwrap_or_default()
+        }
         ParseMode::XPath => html::select_xpath(&input, pure)
             .first()
             .cloned()
@@ -2503,7 +2587,7 @@ fn eval_field_json_with_ctx(
         }
     };
     if let Some(script) = js {
-        if let Ok(result) = eval_js(script, &text, base_url) {
+        if let Ok(result) = eval_js_with_bindings(script, &text, base_url, &ctx.js_bindings()) {
             text = result;
         }
     }
@@ -2626,7 +2710,12 @@ pub(crate) fn strip_js_rule(rule: &str) -> &str {
         .unwrap_or(rule)
 }
 
-fn prepare_toc_body(body: &str, base_url: &str, rule: &TocRule) -> String {
+fn prepare_toc_body(
+    body: &str,
+    base_url: &str,
+    rule: &TocRule,
+    ctx: &RuleVariableContext,
+) -> String {
     let Some(script) = rule
         .pre_update_js
         .as_deref()
@@ -2634,25 +2723,34 @@ fn prepare_toc_body(body: &str, base_url: &str, rule: &TocRule) -> String {
     else {
         return body.to_string();
     };
-    match eval_js(strip_js_rule(script), body, base_url) {
+    match eval_js_with_bindings(strip_js_rule(script), body, base_url, &ctx.js_bindings()) {
         Ok(result) if !result.trim().is_empty() => result,
         _ => body.to_string(),
     }
 }
 
-fn apply_toc_format_js(chapters: &mut [BookChapter], format_js: Option<&str>, base_url: &str) {
+fn apply_toc_format_js(
+    chapters: &mut [BookChapter],
+    format_js: Option<&str>,
+    base_url: &str,
+    ctx: &RuleVariableContext,
+) {
     let Some(script) = format_js.filter(|s| !s.trim().is_empty()) else {
         return;
     };
     let script = strip_js_rule(script);
     for (index, chapter) in chapters.iter_mut().enumerate() {
-        let mut bindings = HashMap::new();
+        let chapter_ctx = ctx.for_chapter(chapter.variable.as_deref(), &chapter.title);
+        let mut bindings = chapter_ctx.js_bindings();
         bindings.insert("index".to_string(), json!(index + 1));
-        bindings.insert("title".to_string(), json!(chapter.title.clone()));
-        bindings.insert(
-            "chapter".to_string(),
-            serde_json::to_value(&*chapter).unwrap_or_else(|_| json!({})),
-        );
+        let mut chapter_value = serde_json::to_value(&*chapter).unwrap_or_else(|_| json!({}));
+        if let Value::Object(fields) = &mut chapter_value {
+            fields.insert(
+                "variableMap".to_string(),
+                json!(parse_variable_map(chapter.variable.as_deref())),
+            );
+        }
+        bindings.insert("chapter".to_string(), chapter_value);
         if let Ok(result) = eval_js_with_bindings(script, &chapter.title, base_url, &bindings) {
             if !result.trim().is_empty() {
                 chapter.title = result;
@@ -2939,6 +3037,7 @@ mod tests {
     use super::*;
     use crate::model::book_source::BookSource;
     use crate::model::rule::{BookInfoRule, ContentRule, SearchRule, TocRule};
+    use crate::parser::js::eval_js;
 
     #[test]
     fn test_detect_mode() {
@@ -3768,6 +3867,50 @@ mod tests {
         assert_eq!(
             content,
             "“李珞！你这也太过分了！赶紧给班长道歉！”\n“就是啊，溪溪好心想要给你最后冲刺一下，你不领情也就算了，推人干嘛？”\n“当然！”"
+        );
+    }
+
+    #[test]
+    fn compat_javascript_receives_book_chapter_and_title_bindings() {
+        let source = BookSource {
+            rule_toc: Some(TocRule {
+                chapter_list: Some(
+                    r#"js:JSON.stringify([{chapterName:'Original',chapterUrl:'/one',variable:'{"cid":"C"}'}])"#
+                        .to_string(),
+                ),
+                chapter_name: Some("chapterName".to_string()),
+                chapter_url: Some("chapterUrl".to_string()),
+                format_js: Some("book.variableMap.bid + '/' + chapter.variableMap.cid + '/' + title".to_string()),
+                ..Default::default()
+            }),
+            rule_content: Some(ContentRule {
+                content: Some("js:book.variableMap.bid + '/' + chapter.variableMap.cid + '/' + title".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let engine = RuleEngine::new().unwrap();
+        let book_variable = r#"{"bid":"B"}"#;
+        let (chapters, _) = engine.chapter_list_with_variable(
+            &source,
+            "<html></html>",
+            "https://books.example/toc",
+            Some(book_variable),
+            Some("Book"),
+        );
+        assert_eq!(chapters.len(), 1);
+        assert_eq!(chapters[0].title, "B/C/Original");
+        assert_eq!(
+            engine.content_with_variables(
+                &source,
+                "<html></html>",
+                "https://books.example/chapter/1",
+                Some(book_variable),
+                chapters[0].variable.as_deref(),
+                Some("Book"),
+                Some(&chapters[0].title),
+            ),
+            "B/C/B/C/Original"
         );
     }
 
