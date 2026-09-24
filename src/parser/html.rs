@@ -123,6 +123,24 @@ fn parse_selector_with_index(selector: &str) -> ParsedSelector {
     }
 }
 
+pub(crate) fn css_rule_is_valid(rule: &str) -> bool {
+    let combinations = split_top_level(rule, &["&&", "||", "%%"]);
+    combinations.parts.iter().all(|part| {
+        let chain = split_top_level(part, &["@@"]);
+        chain.parts.iter().all(|step| {
+            let selector = split_top_level(step, &["@"])
+                .parts
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            match parse_selector_with_index(&selector).base {
+                SelectorBase::Css(css) => Selector::parse(&css).is_ok(),
+                SelectorBase::Children | SelectorBase::Text(_) => true,
+            }
+        })
+    })
+}
+
 fn parse_selector_base(selector: &str) -> SelectorBase {
     let selector = selector.trim();
     if selector.is_empty() || selector == "children" {

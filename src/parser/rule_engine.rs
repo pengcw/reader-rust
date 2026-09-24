@@ -183,7 +183,8 @@ struct SourceRule {
 impl SourceRule {
     fn compile(rule: &str, fallback: ParseMode, content_is_json: bool) -> Self {
         let (without_put, put_entries) = extract_put_entries(rule);
-        let (mode, rule) = classify_rule_mode(&without_put, fallback, content_is_json);
+        let (mode, rule) =
+            classify_rule_mode_with_css_regex_fallback(&without_put, fallback, content_is_json);
         Self {
             mode,
             rule,
@@ -279,6 +280,25 @@ fn classify_rule_mode(
     (fallback, rule.to_string())
 }
 
+fn classify_rule_mode_with_css_regex_fallback(
+    raw_rule: &str,
+    fallback: ParseMode,
+    content_is_json: bool,
+) -> (ParseMode, String) {
+    let explicit_css = starts_with_ascii_case(raw_rule.trim(), "@css:")
+        || raw_rule.trim().starts_with("@@");
+    let (mode, rule) = classify_rule_mode(raw_rule, fallback, content_is_json);
+    if mode == ParseMode::Css
+        && !explicit_css
+        && !html::css_rule_is_valid(&rule)
+        && regex::Regex::new(&rule).is_ok()
+    {
+        (ParseMode::Regex, rule)
+    } else {
+        (mode, rule)
+    }
+}
+
 fn starts_with_ascii_case(value: &str, prefix: &str) -> bool {
     value
         .get(..prefix.len())
@@ -305,7 +325,7 @@ impl RuleEngine {
         let content = content.trim();
         let content_is_json = (content.starts_with('{') || content.starts_with('['))
             && serde_json::from_str::<Value>(content).is_ok();
-        classify_rule_mode(rule, ParseMode::Css, content_is_json).0
+        classify_rule_mode_with_css_regex_fallback(rule, ParseMode::Css, content_is_json).0
     }
 
     /// Strip mode prefix from rule
@@ -3050,6 +3070,29 @@ mod tests {
         assert_eq!(engine.detect_mode(".class", ""), ParseMode::Css);
         assert_eq!(engine.detect_mode("js:return 1", ""), ParseMode::Js);
         assert_eq!(engine.detect_mode("<js>return 1</js>", ""), ParseMode::Js);
+    }
+
+    #[test]
+    fn compat_invalid_implicit_css_falls_back_only_to_valid_regex() {
+        let engine = RuleEngine::new().unwrap();
+        let regex_rule = r"(?s)<h1>(.*?)</h1>";
+
+        assert_eq!(engine.detect_mode(regex_rule, ""), ParseMode::Regex);
+        assert_eq!(
+            engine.detect_mode(&format!("@css:{regex_rule}"), ""),
+            ParseMode::Css
+        );
+        assert_eq!(engine.detect_mode(".missing", ""), ParseMode::Css);
+        assert_eq!(engine.detect_mode("div[", ""), ParseMode::Css);
+
+        assert_eq!(
+            SourceRule::compile(regex_rule, ParseMode::Css, false).mode,
+            ParseMode::Regex
+        );
+        assert_eq!(
+            SourceRule::compile(&format!("@css:{regex_rule}"), ParseMode::Css, false).mode,
+            ParseMode::Css
+        );
     }
 
     #[test]
