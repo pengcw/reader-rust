@@ -4,10 +4,10 @@ use crate::model::{
 };
 use crate::parser::{
     html,
-    js::{eval_js, eval_js_with_bindings, with_js_lib},
-    jsonpath,
+    js::{eval_js, eval_js_template, eval_js_with_bindings, with_js_lib},
+    jsonpath, rule_analyzer,
 };
-use crate::util::text::{apply_regex_replace, normalize_source_url};
+use crate::util::text::normalize_source_url;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use sxd_xpath::{Context as XPathContext, Factory as XPathFactory, Value as XPathValue};
@@ -15,13 +15,145 @@ use sxd_xpath::{Context as XPathContext, Factory as XPathFactory, Value as XPath
 #[derive(Clone, Default)]
 pub struct RuleEngine;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParseMode {
-    Css,      // CSS selector
-    XPath,    // XPath expression
-    JsonPath, // JSONPath expression
-    Regex,    // Regex pattern
-    Js,       // JavaScript
+    Css,
+    XPath,
+    JsonPath,
+    Regex,
+    Js,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PutEntry {
+    key: String,
+    value_rule: String,
+}
+
+#[derive(Debug, Clone)]
+struct SourceRule {
+    mode: ParseMode,
+    rule: String,
+    replace_regex: Option<String>,
+    replacement: Option<String>,
+    replace_first: bool,
+    replacement_rule: Option<String>,
+    put_entries: Vec<PutEntry>,
+}
+
+impl SourceRule {
+    fn compile(rule: &str, fallback: ParseMode, content_is_json: bool) -> Self {
+        let (without_put, put_entries) = extract_put_entries(rule);
+        let (mode, rule) = classify_rule_mode(&without_put, fallback, content_is_json);
+        Self {
+            mode,
+            rule,
+            replace_regex: None,
+            replacement: None,
+            replace_first: false,
+            replacement_rule: None,
+            put_entries,
+        }
+    }
+
+    fn make_up_rule(&mut self, expanded_rule: &str) {
+        let Some(index) = expanded_rule.find("##") else {
+            self.rule = expanded_rule.trim().to_string();
+            return;
+        };
+        let replacement_rule = &expanded_rule[index..];
+        let fields = replacement_rule
+            .trim_end_matches("###")
+            .trim_start_matches("##")
+            .split("##")
+            .collect::<Vec<_>>();
+        self.rule = expanded_rule[..index].trim().to_string();
+        self.replace_regex = fields.first().map(|value| (*value).to_string());
+        self.replacement = fields.get(1).map(|value| (*value).to_string());
+        self.replace_first = replacement_rule.ends_with("###");
+        self.replacement_rule = Some(replacement_rule.to_string());
+    }
+
+    fn apply_replacement(&self, value: &str) -> String {
+        let Some(rule) = self.replacement_rule.as_deref() else {
+            return value.to_string();
+        };
+        let steps = rule
+            .strip_prefix("##")
+            .unwrap_or(rule)
+            .strip_suffix("###")
+            .unwrap_or_else(|| rule.strip_prefix("##").unwrap_or(rule));
+        if steps.split("##").count() <= 2 {
+            let pattern = self.replace_regex.as_deref().unwrap_or_default();
+            let replacement = self.replacement.as_deref().unwrap_or_default();
+            return if self.replace_first {
+                apply_regex_replace_first(value, pattern, replacement)
+            } else {
+                apply_regex_replace_all(value, pattern, replacement)
+            };
+        }
+        apply_legado_regex(value, rule)
+    }
+}
+
+fn classify_rule_mode(
+    raw_rule: &str,
+    fallback: ParseMode,
+    content_is_json: bool,
+) -> (ParseMode, String) {
+    let rule = raw_rule.trim();
+    if matches!(fallback, ParseMode::Js | ParseMode::Regex) {
+        return (fallback, rule.to_string());
+    }
+    if let Some(rest) = strip_prefix_ascii_case(rule, "@css:") {
+        return (ParseMode::Css, rest.trim().to_string());
+    }
+    if let Some(rest) = rule.strip_prefix("@@") {
+        return (ParseMode::Css, rest.to_string());
+    }
+    if let Some(rest) = strip_prefix_ascii_case(rule, "@xpath:") {
+        return (ParseMode::XPath, rest.to_string());
+    }
+    if let Some(rest) = strip_prefix_ascii_case(rule, "@json:") {
+        return (ParseMode::JsonPath, rest.to_string());
+    }
+    if let Some(rest) = strip_prefix_ascii_case(rule, "@regex:") {
+        return (ParseMode::Regex, rest.trim().to_string());
+    }
+    if let Some(rest) =
+        strip_prefix_ascii_case(rule, "js:").or_else(|| strip_prefix_ascii_case(rule, "@js:"))
+    {
+        return (ParseMode::Js, rest.trim().to_string());
+    }
+    if rule.starts_with("<js>") {
+        return (ParseMode::Js, rule.to_string());
+    }
+    if content_is_json || rule.starts_with("$.") || rule.starts_with("$[") {
+        return (ParseMode::JsonPath, rule.to_string());
+    }
+    if rule.starts_with('/') || rule.starts_with("./") {
+        return (ParseMode::XPath, rule.to_string());
+    }
+    if rule.starts_with(':') {
+        return (ParseMode::Regex, rule.to_string());
+    }
+    (fallback, rule.to_string())
+}
+
+fn starts_with_ascii_case(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+fn find_ascii_case(value: &str, needle: &str) -> Option<usize> {
+    value
+        .char_indices()
+        .find_map(|(index, _)| starts_with_ascii_case(&value[index..], needle).then_some(index))
+}
+
+fn strip_prefix_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    starts_with_ascii_case(value, prefix).then(|| &value[prefix.len()..])
 }
 
 impl RuleEngine {
@@ -29,54 +161,12 @@ impl RuleEngine {
         Ok(Self)
     }
 
-    /// Detect the parsing mode from the rule string
+    /// Detect the parsing mode from the rule and its current content.
     fn detect_mode(&self, rule: &str, content: &str) -> ParseMode {
-        let rule = rule.trim();
-
-        // Explicit mode forcing
-        if rule.starts_with("@css:") || rule.starts_with("@CSS:") {
-            return ParseMode::Css;
-        }
-        if rule.starts_with("@xpath:") || rule.starts_with("@XPath:") || rule.starts_with("@XPATH:")
-        {
-            return ParseMode::XPath;
-        }
-        if rule.starts_with("@json:") || rule.starts_with("@Json:") || rule.starts_with("@JSON:") {
-            return ParseMode::JsonPath;
-        }
-        if rule.starts_with("@regex:") || rule.starts_with("@Regex:") {
-            return ParseMode::Regex;
-        }
-        if rule.starts_with("js:") || rule.starts_with("@js:") || rule.starts_with("<js>") {
-            return ParseMode::Js;
-        }
-
-        // Auto-detect from rule prefix
-        if rule.starts_with('/') || rule.starts_with("./") {
-            return ParseMode::XPath;
-        }
-        if rule.starts_with("$.") || rule.starts_with("$[") {
-            return ParseMode::JsonPath;
-        }
-        if rule.starts_with(':') {
-            return ParseMode::Regex;
-        }
-
-        // Auto-detect from content
-        let content_trimmed = content.trim();
-        if content_trimmed.starts_with('{') || content_trimmed.starts_with('[') {
-            // Likely JSON content
-            if rule.starts_with("$.") || rule.starts_with("$[") {
-                return ParseMode::JsonPath;
-            }
-            // Try to parse as JSON
-            if serde_json::from_str::<Value>(content_trimmed).is_ok() {
-                return ParseMode::JsonPath;
-            }
-        }
-
-        // Default to CSS
-        ParseMode::Css
+        let content = content.trim();
+        let content_is_json = (content.starts_with('{') || content.starts_with('['))
+            && serde_json::from_str::<Value>(content).is_ok();
+        classify_rule_mode(rule, ParseMode::Css, content_is_json).0
     }
 
     /// Strip mode prefix from rule
@@ -500,31 +590,23 @@ impl RuleEngine {
         rule: &SearchRule,
         list_rule: &str,
     ) -> Vec<SearchBook> {
-        let pattern = self
-            .strip_mode_prefix(list_rule)
-            .trim_start_matches(':')
-            .trim();
-        let re = match crate::util::text::get_cached_regex(pattern) {
-            Some(r) => r,
-            None => return vec![],
-        };
-
+        let rows = regex_capture_rows(self.strip_mode_prefix(list_rule), body);
         let mut out = Vec::new();
-        for captures in re.captures_iter(body) {
-            let name = capture_rule_value(rule.name.as_deref(), &captures).unwrap_or_default();
+        for captures in rows {
+            let name = capture_rule_values(rule.name.as_deref(), &captures).unwrap_or_default();
             if name.is_empty() {
                 continue;
             }
-            let author = capture_rule_value(rule.author.as_deref(), &captures).unwrap_or_default();
+            let author = capture_rule_values(rule.author.as_deref(), &captures).unwrap_or_default();
             let book_url =
-                capture_rule_value(rule.book_url.as_deref(), &captures).unwrap_or_default();
-            let cover_url = capture_rule_value(rule.cover_url.as_deref(), &captures)
+                capture_rule_values(rule.book_url.as_deref(), &captures).unwrap_or_default();
+            let cover_url = capture_rule_values(rule.cover_url.as_deref(), &captures)
                 .map(|u| resolve_url(base_url, &u));
-            let intro = capture_rule_value(rule.intro.as_deref(), &captures);
-            let kind = capture_rule_value(rule.kind.as_deref(), &captures);
-            let last_chapter = capture_rule_value(rule.last_chapter.as_deref(), &captures);
-            let update_time = capture_rule_value(rule.update_time.as_deref(), &captures);
-            let word_count = capture_rule_value(rule.word_count.as_deref(), &captures);
+            let intro = capture_rule_values(rule.intro.as_deref(), &captures);
+            let kind = capture_rule_values(rule.kind.as_deref(), &captures);
+            let last_chapter = capture_rule_values(rule.last_chapter.as_deref(), &captures);
+            let update_time = capture_rule_values(rule.update_time.as_deref(), &captures);
+            let word_count = capture_rule_values(rule.word_count.as_deref(), &captures);
             out.push(SearchBook {
                 name,
                 author,
@@ -638,33 +720,25 @@ impl RuleEngine {
         rule: &TocRule,
         list_rule: &str,
     ) -> (Vec<BookChapter>, Vec<String>) {
-        let pattern = self
-            .strip_mode_prefix(list_rule)
-            .trim_start_matches(':')
-            .trim();
-        let re = match crate::util::text::get_cached_regex(pattern) {
-            Some(r) => r,
-            None => return (vec![], vec![]),
-        };
-
+        let rows = regex_capture_rows(self.strip_mode_prefix(list_rule), body);
         let mut out = Vec::new();
         let mut seen_urls = std::collections::HashSet::new();
-        for captures in re.captures_iter(body) {
+        for captures in rows {
             let title =
-                capture_rule_value(rule.chapter_name.as_deref(), &captures).unwrap_or_default();
+                capture_rule_values(rule.chapter_name.as_deref(), &captures).unwrap_or_default();
             if title.is_empty() {
                 continue;
             }
             let raw_url =
-                capture_rule_value(rule.chapter_url.as_deref(), &captures).unwrap_or_default();
-            let tag = capture_rule_value(rule.update_time.as_deref(), &captures);
-            let is_volume = capture_rule_value(rule.is_volume.as_deref(), &captures)
+                capture_rule_values(rule.chapter_url.as_deref(), &captures).unwrap_or_default();
+            let tag = capture_rule_values(rule.update_time.as_deref(), &captures);
+            let is_volume = capture_rule_values(rule.is_volume.as_deref(), &captures)
                 .map(is_truthy)
                 .unwrap_or(false);
-            let is_vip = capture_rule_value(rule.is_vip.as_deref(), &captures)
+            let is_vip = capture_rule_values(rule.is_vip.as_deref(), &captures)
                 .map(is_truthy)
                 .unwrap_or(false);
-            let is_pay = capture_rule_value(rule.is_pay.as_deref(), &captures)
+            let is_pay = capture_rule_values(rule.is_pay.as_deref(), &captures)
                 .map(is_truthy)
                 .unwrap_or(false);
             let url = finalize_chapter_url(base_url, &raw_url, &title, is_volume, out.len());
@@ -1431,15 +1505,17 @@ fn select_json_scope(
         return v.clone();
     };
 
-    if let Some(res) = try_put_get_json(init_rule, v, base_url, ctx) {
-        let _ = res;
+    if direct_get_key(init_rule).is_some() {
         return v.clone();
     }
-
-    let interpolated = interpolate_json_templates(init_rule, v, base_url, ctx);
-    let (pure_rule, _) = split_legado_regex(&interpolated);
-    let (pure, _) = extract_js(&pure_rule);
-    if pure.is_empty() {
+    let mut source_rule = SourceRule::compile(init_rule, ParseMode::JsonPath, true);
+    evaluate_put_entries(&source_rule.put_entries, ctx, |put_rule, ctx| {
+        eval_field_json_with_ctx(put_rule, v, base_url, ctx)
+    });
+    let interpolated = interpolate_json_templates(&source_rule.rule, v, base_url, ctx);
+    source_rule.make_up_rule(&interpolated);
+    let (pure, _) = extract_js(&source_rule.rule);
+    if pure.is_empty() || source_rule.mode != ParseMode::JsonPath {
         return v.clone();
     }
 
@@ -1491,46 +1567,117 @@ pub(crate) fn resolve_url(base: &str, url: &str) -> String {
     }
 }
 
+fn extract_put_entries(rule: &str) -> (String, Vec<PutEntry>) {
+    let lower = rule.to_ascii_lowercase();
+    let mut output = String::with_capacity(rule.len());
+    let mut entries = Vec::new();
+    let mut cursor = 0;
+
+    while let Some(relative) = lower[cursor..].find("@put:") {
+        let marker = cursor + relative;
+        let object_start = marker + "@put:".len();
+        if !rule[object_start..].starts_with('{') {
+            output.push_str(&rule[cursor..object_start]);
+            cursor = object_start;
+            continue;
+        }
+        let Some(object_end) = find_put_object_end(rule, object_start) else {
+            output.push_str(&rule[cursor..]);
+            return (output, entries);
+        };
+
+        output.push_str(&rule[cursor..marker]);
+        entries.extend(parse_put_entries(&rule[object_start..=object_end]));
+        cursor = object_end + 1;
+    }
+
+    output.push_str(&rule[cursor..]);
+    (output, entries)
+}
+
+fn find_put_object_end(rule: &str, open: usize) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in rule[open + 1..].char_indices() {
+        let index = open + 1 + index;
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '}' => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_put_entries(object: &str) -> Vec<PutEntry> {
+    if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(object) {
+        return map
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let value_rule = match value {
+                    Value::String(value) => value,
+                    Value::Object(_) | Value::Array(_) | Value::Null => return None,
+                    value => value.to_string(),
+                };
+                Some(PutEntry { key, value_rule })
+            })
+            .collect();
+    }
+
+    let Some(inner) = object.strip_prefix('{').and_then(|s| s.strip_suffix('}')) else {
+        return Vec::new();
+    };
+    rule_analyzer::split_top_level(inner, &[","])
+        .parts
+        .into_iter()
+        .filter_map(|part| {
+            let pair = rule_analyzer::split_top_level(&part, &[":"]);
+            if pair.parts.len() < 2 {
+                return None;
+            }
+            let key = pair.parts[0].trim().trim_matches(['\'', '"']).to_string();
+            let value_rule = pair.parts[1..].join(":");
+            (!key.is_empty()).then_some(PutEntry {
+                key,
+                value_rule: unquote_put_value(&value_rule),
+            })
+        })
+        .collect()
+}
+
+fn unquote_put_value(value: &str) -> String {
+    let value = value.trim();
+    if value.len() >= 2 {
+        let quote = value.as_bytes()[0] as char;
+        if matches!(quote, '\'' | '"') && value.ends_with(quote) {
+            let inner = &value[1..value.len() - 1];
+            if quote == '"' {
+                return serde_json::from_str::<String>(value).unwrap_or_else(|_| inner.to_string());
+            }
+            return inner.replace("\\'", "'").replace("\\\\", "\\");
+        }
+    }
+    value.to_string()
+}
+
 fn interpolate_json_templates(
     rule: &str,
     v: &Value,
     base_url: &str,
     ctx: &HashMap<String, String>,
 ) -> String {
-    let re = regex::Regex::new(r"\{\{(.*?)\}\}").unwrap();
-    re.replace_all(rule, |caps: &regex::Captures| {
-        let expr = caps.get(1).map(|m| m.as_str().trim()).unwrap_or_default();
-        if expr.is_empty() {
-            return String::new();
-        }
-
-        if let Some(key) = expr
-            .strip_prefix("@get:{")
-            .and_then(|s| s.strip_suffix('}'))
-        {
-            return ctx.get(key.trim()).cloned().unwrap_or_default();
-        }
-
-        if expr.starts_with('$') {
-            return pick_json_field(v, Some(expr)).unwrap_or_default();
-        }
-
-        if let Some(val) = ctx.get(expr) {
-            return val.clone();
-        }
-
-        if let Some(val) = pick_json_field(v, Some(expr)) {
-            return val;
-        }
-
-        eval_js(
-            expr,
-            &serde_json::to_string(v).unwrap_or_default(),
-            base_url,
-        )
-        .unwrap_or_default()
-    })
-    .into_owned()
+    let input = serde_json::to_string(v).unwrap_or_default();
+    interpolate_templates(rule, &input, base_url, ctx, Some(v))
 }
 
 fn interpolate_common_templates(
@@ -1539,25 +1686,136 @@ fn interpolate_common_templates(
     base_url: &str,
     ctx: &HashMap<String, String>,
 ) -> String {
-    let get_re = regex::Regex::new(r"@get:\{([^}]+)\}").unwrap();
-    let with_get = get_re.replace_all(rule, |caps: &regex::Captures| {
-        let key = caps.get(1).map(|m| m.as_str().trim()).unwrap_or_default();
-        ctx.get(key).cloned().unwrap_or_default()
-    });
+    interpolate_templates(rule, input, base_url, ctx, None)
+}
 
-    let js_re = regex::Regex::new(r"\{\{(.*?)\}\}").unwrap();
-    js_re
-        .replace_all(&with_get, |caps: &regex::Captures| {
-            let expr = caps.get(1).map(|m| m.as_str().trim()).unwrap_or_default();
-            if expr.is_empty() {
+fn interpolate_templates(
+    rule: &str,
+    input: &str,
+    base_url: &str,
+    ctx: &HashMap<String, String>,
+    json_value: Option<&Value>,
+) -> String {
+    let mut output = String::with_capacity(rule.len());
+    let mut cursor = 0;
+    while cursor < rule.len() {
+        let remaining = &rule[cursor..];
+        if let Some(expression) = remaining.strip_prefix("{{") {
+            if let Some(end) = find_template_close(expression) {
+                output.push_str(&evaluate_template_expression(
+                    expression[..end].trim(),
+                    input,
+                    base_url,
+                    ctx,
+                    json_value,
+                ));
+                cursor += 2 + end + 2;
+                continue;
+            }
+        }
+        if let Some(key_and_rest) = remaining.strip_prefix("@get:{") {
+            if let Some(end) = key_and_rest.find('}') {
+                let key = key_and_rest[..end].trim();
+                output.push_str(ctx.get(key).map(String::as_str).unwrap_or_default());
+                cursor += "@get:{".len() + end + 1;
+                continue;
+            }
+        }
+        let ch = remaining.chars().next().expect("cursor remains in string");
+        output.push(ch);
+        cursor += ch.len_utf8();
+    }
+    output
+}
+
+fn find_template_close(expression: &str) -> Option<usize> {
+    let mut brace_depth = 0;
+    for (index, ch) in expression.char_indices() {
+        match ch {
+            '{' => brace_depth += 1,
+            '}' if brace_depth > 0 => brace_depth -= 1,
+            '}' if expression[index..].starts_with("}}") => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn evaluate_template_expression(
+    expression: &str,
+    input: &str,
+    base_url: &str,
+    ctx: &HashMap<String, String>,
+    json_value: Option<&Value>,
+) -> String {
+    if expression.is_empty() {
+        return String::new();
+    }
+    if let Some(key) = expression
+        .strip_prefix("@get:{")
+        .and_then(|value| value.strip_suffix('}'))
+    {
+        return ctx.get(key.trim()).cloned().unwrap_or_default();
+    }
+    if let Some(value) = ctx.get(expression) {
+        return value.clone();
+    }
+    if expression.starts_with("$.") || expression.starts_with("$[") {
+        let parsed;
+        let value = if let Some(value) = json_value {
+            value
+        } else {
+            parsed = serde_json::from_str::<Value>(input).ok();
+            let Some(value) = parsed.as_ref() else {
                 return String::new();
-            }
-            if let Some(val) = ctx.get(expr) {
-                return val.clone();
-            }
-            eval_js(expr, input, base_url).unwrap_or_default()
-        })
-        .into_owned()
+            };
+            value
+        };
+        return pick_json_field(value, Some(expression)).unwrap_or_default();
+    }
+    if expression.starts_with("//") || starts_with_ascii_case(expression, "@xpath:") {
+        let xpath = strip_prefix_ascii_case(expression, "@xpath:").unwrap_or(expression);
+        return html::select_xpath(input, xpath)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+    }
+    if starts_with_ascii_case(expression, "@css:") {
+        let selector = strip_prefix_ascii_case(expression, "@css:").unwrap_or(expression);
+        return html::select_text(&html::parse_document(input), selector).unwrap_or_default();
+    }
+    if starts_with_ascii_case(expression, "@json:") {
+        let path = strip_prefix_ascii_case(expression, "@json:").unwrap_or(expression);
+        let parsed;
+        let value = if let Some(value) = json_value {
+            value
+        } else {
+            parsed = serde_json::from_str::<Value>(input).ok();
+            let Some(value) = parsed.as_ref() else {
+                return String::new();
+            };
+            value
+        };
+        return pick_json_field(value, Some(path)).unwrap_or_default();
+    }
+    if let Some(script) = strip_prefix_ascii_case(expression, "@js:") {
+        return eval_js_template(script, input, base_url).unwrap_or_default();
+    }
+    if let Some(pattern) = strip_prefix_ascii_case(expression, "@regex:") {
+        let rows = regex_capture_rows(pattern, input);
+        return rows
+            .first()
+            .and_then(|row| row.get(1).or_else(|| row.first()))
+            .and_then(Clone::clone)
+            .unwrap_or_default();
+    }
+    if expression.starts_with('@') {
+        return ctx
+            .get(expression.trim_start_matches('@'))
+            .cloned()
+            .unwrap_or_default();
+    }
+    eval_js_template(expression, input, base_url).unwrap_or_default()
 }
 
 fn strip_url_config(url: &str) -> &str {
@@ -1582,12 +1840,30 @@ fn extract_js(rule: &str) -> (&str, Option<&str>) {
             }
         }
     }
-    if let Some(idx) = rule.find("@js:") {
+    if let Some(idx) = find_ascii_case(rule, "@js:") {
         let pure = rule[..idx].trim();
         let js = &rule[idx + 4..];
         return (pure, Some(js));
     }
     (rule, None)
+}
+
+fn direct_get_key(rule: &str) -> Option<&str> {
+    rule.trim()
+        .strip_prefix("@get:{")
+        .and_then(|value| value.strip_suffix('}'))
+        .map(str::trim)
+}
+
+fn evaluate_put_entries(
+    entries: &[PutEntry],
+    ctx: &mut HashMap<String, String>,
+    mut evaluate: impl FnMut(&str, &mut HashMap<String, String>) -> Option<String>,
+) {
+    for entry in entries {
+        let value = evaluate(&entry.value_rule, ctx).unwrap_or_default();
+        ctx.insert(entry.key.clone(), value);
+    }
 }
 
 fn eval_field_html(rule: &str, el: &scraper::ElementRef, base_url: &str) -> Option<String> {
@@ -1600,55 +1876,51 @@ fn eval_field_html_with_ctx(
     base_url: &str,
     ctx: &mut HashMap<String, String>,
 ) -> Option<String> {
-    // Handle mode forcing prefixes
-    let rule = rule.trim();
-    if let Some(pure) = rule.strip_prefix("@css:") {
-        return eval_field_html_with_ctx(pure, el, base_url, ctx);
+    if let Some(key) = direct_get_key(rule) {
+        return ctx.get(key).cloned();
     }
-    if rule.starts_with("@xpath:") {
-        // XPath from element - not directly supported, return None
-        return None;
-    }
-    if rule.starts_with("@json:") {
-        // JSON from element - not applicable
-        return None;
-    }
-
-    // Handle @put/@get
-    if let Some(res) = try_put_get_html(rule, el, base_url, ctx) {
-        return Some(res);
-    }
-
     let input = html::extract_text(el, "textNodes").unwrap_or_default();
-    let interpolated_rule = interpolate_common_templates(rule, &input, base_url, ctx);
-    let had_templates = interpolated_rule != rule;
-    let (pure_rule, regex_part) = split_legado_regex(&interpolated_rule);
-    let (pure, js) = extract_js(&pure_rule);
+    let mut source_rule = SourceRule::compile(rule, ParseMode::Css, false);
+    evaluate_put_entries(&source_rule.put_entries, ctx, |put_rule, ctx| {
+        eval_field_html_with_ctx(put_rule, el, base_url, ctx)
+    });
+    let expanded = interpolate_common_templates(&source_rule.rule, &input, base_url, ctx);
+    let had_templates = expanded != source_rule.rule;
+    source_rule.make_up_rule(&expanded);
+    let (pure, js) = extract_js(&source_rule.rule);
 
-    let mut text = if pure.is_empty() {
-        "".to_string()
-    } else {
-        html::select_text_from_element(el, pure).unwrap_or_default()
+    let mut text = match source_rule.mode {
+        ParseMode::Css => {
+            if pure.is_empty() {
+                String::new()
+            } else {
+                html::select_text_from_element(el, pure).unwrap_or_default()
+            }
+        }
+        ParseMode::XPath => html::select_xpath(&el.html(), pure)
+            .into_iter()
+            .next()
+            .unwrap_or_default(),
+        ParseMode::Regex => {
+            let rows = regex_capture_rows(pure.trim_start_matches(':').trim(), &input);
+            rows.first()
+                .and_then(|row| row.get(1).or_else(|| row.first()))
+                .and_then(Clone::clone)
+                .unwrap_or_default()
+        }
+        ParseMode::Js => eval_js(strip_js_rule(pure), &input, base_url).unwrap_or_default(),
+        ParseMode::JsonPath => String::new(),
     };
-    if text.is_empty() && had_templates && !pure.is_empty() {
+    if text.is_empty() && had_templates && source_rule.mode == ParseMode::Css && !pure.is_empty() {
         text = pure.to_string();
     }
-
     if let Some(script) = js {
-        if let Ok(res) = eval_js(script, &text, base_url) {
-            text = res;
+        if let Ok(result) = eval_js(script, &text, base_url) {
+            text = result;
         }
     }
-
-    if let Some(reg) = regex_part {
-        text = apply_legado_regex(&text, reg);
-    }
-
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
+    text = source_rule.apply_replacement(&text);
+    (!text.is_empty()).then_some(text)
 }
 
 fn eval_field_html_doc_with_ctx(
@@ -1657,43 +1929,45 @@ fn eval_field_html_doc_with_ctx(
     base_url: &str,
     ctx: &mut HashMap<String, String>,
 ) -> Option<String> {
-    // Handle mode forcing prefixes
-    let rule = rule.trim();
-    if let Some(pure) = rule.strip_prefix("@css:") {
-        return eval_field_html_doc_with_ctx(pure, doc, base_url, ctx);
+    if let Some(key) = direct_get_key(rule) {
+        return ctx.get(key).cloned();
     }
-    if let Some(pure) = rule.strip_prefix("@xpath:") {
-        return html::select_xpath(&doc.html(), pure).first().cloned();
-    }
+    let input = doc.html();
+    let mut source_rule = SourceRule::compile(rule, ParseMode::Css, false);
+    evaluate_put_entries(&source_rule.put_entries, ctx, |put_rule, ctx| {
+        eval_field_html_doc_with_ctx(put_rule, doc, base_url, ctx)
+    });
+    let expanded = interpolate_common_templates(&source_rule.rule, &input, base_url, ctx);
+    let had_templates = expanded != source_rule.rule;
+    source_rule.make_up_rule(&expanded);
+    let (pure, js) = extract_js(&source_rule.rule);
 
-    if let Some(res) = try_put_get_html_doc(rule, doc, base_url, ctx) {
-        return Some(res);
-    }
-
-    let interpolated_rule = interpolate_common_templates(rule, &doc.html(), base_url, ctx);
-    let had_templates = interpolated_rule != rule;
-    let (pure, js) = extract_js(&interpolated_rule);
-    let mut text = if pure.is_empty() {
-        "".to_string()
-    } else {
-        html::select_text(doc, pure).unwrap_or_default()
+    let mut text = match source_rule.mode {
+        ParseMode::Css => html::select_text(doc, pure).unwrap_or_default(),
+        ParseMode::XPath => html::select_xpath(&input, pure)
+            .first()
+            .cloned()
+            .unwrap_or_default(),
+        ParseMode::Regex => {
+            let rows = regex_capture_rows(pure.trim_start_matches(':').trim(), &input);
+            rows.first()
+                .and_then(|row| row.get(1).or_else(|| row.first()))
+                .and_then(Clone::clone)
+                .unwrap_or_default()
+        }
+        ParseMode::Js => eval_js(strip_js_rule(pure), &input, base_url).unwrap_or_default(),
+        ParseMode::JsonPath => String::new(),
     };
-    if text.is_empty() && had_templates && !pure.is_empty() {
+    if text.is_empty() && had_templates && source_rule.mode == ParseMode::Css && !pure.is_empty() {
         text = pure.to_string();
     }
-
     if let Some(script) = js {
-        if let Ok(res) = eval_js(script, &text, base_url) {
-            return Some(res);
+        if let Ok(result) = eval_js(script, &text, base_url) {
+            text = result;
         }
-        return Some(text);
     }
-
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
+    text = source_rule.apply_replacement(&text);
+    (!text.is_empty()).then_some(text)
 }
 
 fn eval_field_json(rule: &str, v: &Value, base_url: &str) -> Option<String> {
@@ -1714,42 +1988,49 @@ fn eval_field_xpath_with_ctx(
     base_url: &str,
     ctx: &mut HashMap<String, String>,
 ) -> Option<String> {
-    if rule.trim().is_empty() {
-        return None;
+    if let Some(key) = direct_get_key(rule) {
+        return ctx.get(key).cloned();
     }
-    if let Some(res) = try_put_get_xpath(rule, node, base_url, ctx) {
-        return Some(res);
-    }
+    let input = node.string_value();
+    let mut source_rule = SourceRule::compile(rule, ParseMode::XPath, false);
+    evaluate_put_entries(&source_rule.put_entries, ctx, |put_rule, ctx| {
+        eval_field_xpath_with_ctx(put_rule, node, base_url, ctx)
+    });
+    let expanded = interpolate_common_templates(&source_rule.rule, &input, base_url, ctx);
+    let had_templates = expanded != source_rule.rule;
+    source_rule.make_up_rule(&expanded);
+    let (pure, js) = extract_js(&source_rule.rule);
 
-    let interpolated_rule = interpolate_common_templates(rule, &node.string_value(), base_url, ctx);
-    let had_templates = interpolated_rule != rule;
-    let (pure_rule, regex_part) = split_legado_regex(&interpolated_rule);
-    let (pure, js) = extract_js(&pure_rule);
-    let mut text = if pure.trim().is_empty() {
-        node.string_value()
-    } else {
-        xpath_eval_strings(node, pure)
+    let mut text = match source_rule.mode {
+        ParseMode::XPath if pure.trim().is_empty() => input.clone(),
+        ParseMode::XPath => xpath_eval_strings(node, pure)
             .into_iter()
             .next()
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        ParseMode::Regex => {
+            let rows = regex_capture_rows(pure.trim_start_matches(':').trim(), &input);
+            rows.first()
+                .and_then(|row| row.get(1).or_else(|| row.first()))
+                .and_then(Clone::clone)
+                .unwrap_or_default()
+        }
+        ParseMode::Js => eval_js(strip_js_rule(pure), &input, base_url).unwrap_or_default(),
+        ParseMode::Css => {
+            let doc = html::parse_document(&input);
+            html::select_text(&doc, pure).unwrap_or_default()
+        }
+        ParseMode::JsonPath => String::new(),
     };
     if text.is_empty() && had_templates && !pure.is_empty() {
         text = pure.to_string();
     }
-
     if let Some(script) = js {
-        if let Ok(res) = eval_js(script, &text, base_url) {
-            text = res;
+        if let Ok(result) = eval_js(script, &text, base_url) {
+            text = result;
         }
     }
-    if let Some(reg) = regex_part {
-        text = apply_legado_regex(&text, reg);
-    }
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
+    text = source_rule.apply_replacement(&text);
+    (!text.is_empty()).then_some(text)
 }
 
 fn select_xpath_scope<'a>(
@@ -1811,164 +2092,57 @@ fn eval_field_json_with_ctx(
     base_url: &str,
     ctx: &mut HashMap<String, String>,
 ) -> Option<String> {
-    if let Some(res) = try_put_get_json(rule, v, base_url, ctx) {
-        return Some(res);
+    if let Some(key) = direct_get_key(rule) {
+        return ctx.get(key).cloned();
     }
+    let input = serde_json::to_string(v).unwrap_or_default();
+    let mut source_rule = SourceRule::compile(rule, ParseMode::JsonPath, true);
+    evaluate_put_entries(&source_rule.put_entries, ctx, |put_rule, ctx| {
+        eval_field_json_with_ctx(put_rule, v, base_url, ctx)
+    });
+    let expanded = interpolate_json_templates(&source_rule.rule, v, base_url, ctx);
+    source_rule.make_up_rule(&expanded);
+    let (pure, js) = extract_js(&source_rule.rule);
 
-    let interpolated_rule = interpolate_json_templates(rule, v, base_url, ctx);
-    let (pure_rule, regex_part) = split_legado_regex(&interpolated_rule);
-    let (pure, js) = extract_js(&pure_rule);
-
-    let mut text = if pure.is_empty() {
-        "".to_string()
-    } else if pure.contains("{{") && pure.contains("}}") {
-        pure.to_string()
-    } else if pure.contains('/')
-        || pure.contains('?')
-        || pure.contains('&')
-        || pure.contains('=')
-        || pure.contains(',')
-    {
-        pure.to_string()
-    } else {
-        pick_json_field(v, Some(pure)).unwrap_or_default()
+    let mut text = match source_rule.mode {
+        ParseMode::JsonPath => {
+            if pure.is_empty() {
+                String::new()
+            } else if pure.contains('/')
+                || pure.contains('?')
+                || pure.contains('&')
+                || pure.contains('=')
+                || pure.contains(',')
+            {
+                pure.to_string()
+            } else {
+                pick_json_field(v, Some(pure)).unwrap_or_default()
+            }
+        }
+        ParseMode::Regex => {
+            let rows = regex_capture_rows(pure.trim_start_matches(':').trim(), &input);
+            rows.first()
+                .and_then(|row| row.get(1).or_else(|| row.first()))
+                .and_then(Clone::clone)
+                .unwrap_or_default()
+        }
+        ParseMode::Js => eval_js(strip_js_rule(pure), &input, base_url).unwrap_or_default(),
+        ParseMode::XPath => html::select_xpath(&input, pure)
+            .first()
+            .cloned()
+            .unwrap_or_default(),
+        ParseMode::Css => {
+            let doc = html::parse_document(&input);
+            html::select_text(&doc, pure).unwrap_or_default()
+        }
     };
-
     if let Some(script) = js {
-        if let Ok(res) = eval_js(script, &text, base_url) {
-            text = res;
+        if let Ok(result) = eval_js(script, &text, base_url) {
+            text = result;
         }
     }
-
-    if let Some(reg) = regex_part {
-        text = apply_legado_regex(&text, reg);
-    }
-
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
-}
-
-fn try_put_get_html(
-    rule: &str,
-    el: &scraper::ElementRef,
-    base_url: &str,
-    ctx: &mut HashMap<String, String>,
-) -> Option<String> {
-    if let Some(content) = rule.strip_prefix("@put:") {
-        if content.starts_with('{') && content.ends_with('}') {
-            let inner = &content[1..content.len() - 1];
-            for part in inner.split(',') {
-                if let Some(idx) = part.find(':') {
-                    let key = part[..idx].trim();
-                    let val_rule = part[idx + 1..].trim().trim_matches('"');
-                    let val =
-                        eval_field_html_with_ctx(val_rule, el, base_url, ctx).unwrap_or_default();
-                    ctx.insert(key.to_string(), val);
-                }
-            }
-        }
-        return Some("".to_string());
-    }
-    if let Some(content) = rule.strip_prefix("@get:") {
-        if content.starts_with('{') && content.ends_with('}') {
-            let key = &content[1..content.len() - 1].trim();
-            return ctx.get(*key).cloned();
-        }
-    }
-    None
-}
-
-fn try_put_get_html_doc(
-    rule: &str,
-    doc: &scraper::Html,
-    base_url: &str,
-    ctx: &mut HashMap<String, String>,
-) -> Option<String> {
-    if let Some(content) = rule.strip_prefix("@put:") {
-        if content.starts_with('{') && content.ends_with('}') {
-            let inner = &content[1..content.len() - 1];
-            for part in inner.split(',') {
-                if let Some(idx) = part.find(':') {
-                    let key = part[..idx].trim();
-                    let val_rule = part[idx + 1..].trim().trim_matches('"');
-                    let val = eval_field_html_doc_with_ctx(val_rule, doc, base_url, ctx)
-                        .unwrap_or_default();
-                    ctx.insert(key.to_string(), val);
-                }
-            }
-        }
-        return Some("".to_string());
-    }
-    if let Some(content) = rule.strip_prefix("@get:") {
-        if content.starts_with('{') && content.ends_with('}') {
-            let key = &content[1..content.len() - 1].trim();
-            return ctx.get(*key).cloned();
-        }
-    }
-    None
-}
-
-fn try_put_get_json(
-    rule: &str,
-    v: &Value,
-    base_url: &str,
-    ctx: &mut HashMap<String, String>,
-) -> Option<String> {
-    if let Some(content) = rule.strip_prefix("@put:") {
-        if content.starts_with('{') && content.ends_with('}') {
-            let inner = &content[1..content.len() - 1];
-            for part in inner.split(',') {
-                if let Some(idx) = part.find(':') {
-                    let key = part[..idx].trim();
-                    let val_rule = part[idx + 1..].trim().trim_matches('"');
-                    let val =
-                        eval_field_json_with_ctx(val_rule, v, base_url, ctx).unwrap_or_default();
-                    ctx.insert(key.to_string(), val);
-                }
-            }
-        }
-        return Some("".to_string());
-    }
-    if let Some(content) = rule.strip_prefix("@get:") {
-        if content.starts_with('{') && content.ends_with('}') {
-            let key = &content[1..content.len() - 1].trim();
-            return ctx.get(*key).cloned();
-        }
-    }
-    None
-}
-
-fn try_put_get_xpath(
-    rule: &str,
-    node: sxd_xpath::nodeset::Node<'_>,
-    base_url: &str,
-    ctx: &mut HashMap<String, String>,
-) -> Option<String> {
-    if let Some(content) = rule.strip_prefix("@put:") {
-        if content.starts_with('{') && content.ends_with('}') {
-            let inner = &content[1..content.len() - 1];
-            for part in inner.split(',') {
-                if let Some(idx) = part.find(':') {
-                    let key = part[..idx].trim();
-                    let val_rule = part[idx + 1..].trim().trim_matches('"');
-                    let val = eval_field_xpath_with_ctx(val_rule, node, base_url, ctx)
-                        .unwrap_or_default();
-                    ctx.insert(key.to_string(), val);
-                }
-            }
-        }
-        return Some(String::new());
-    }
-    if let Some(content) = rule.strip_prefix("@get:") {
-        if content.starts_with('{') && content.ends_with('}') {
-            let key = &content[1..content.len() - 1].trim();
-            return ctx.get(*key).cloned();
-        }
-    }
-    None
+    text = source_rule.apply_replacement(&text);
+    (!text.is_empty()).then_some(text)
 }
 
 pub(crate) fn split_legado_regex(rule: &str) -> (String, Option<&str>) {
@@ -1980,55 +2154,53 @@ pub(crate) fn split_legado_regex(rule: &str) -> (String, Option<&str>) {
 }
 
 pub fn apply_legado_regex(text: &str, regex_part: &str) -> String {
-    if regex_part.trim().is_empty() {
+    let regex_part = regex_part.trim();
+    let Some(steps) = regex_part.strip_prefix("##") else {
+        return text.to_string();
+    };
+    let first_only = steps.ends_with("###");
+    let steps = steps.strip_suffix("###").unwrap_or(steps);
+    let parts = steps.split("##").collect::<Vec<_>>();
+    if parts.first().is_some_and(|pattern| pattern.is_empty()) {
         return text.to_string();
     }
 
-    // Handle ### suffix for first-match-only replacement
-    let (regex_part, first_only) = if regex_part.ends_with("###") {
-        (&regex_part[..regex_part.len() - 3], true)
-    } else {
-        (regex_part, false)
-    };
-
-    let parts: Vec<&str> = regex_part.split("##").collect();
-
-    // Support: ##regex##replace
-    let start_idx = if regex_part.starts_with("##") { 1 } else { 0 };
-
-    let mut out = text.to_string();
-    let mut i = start_idx;
-    while i < parts.len() {
-        let regex = parts[i];
-        if regex.is_empty() {
-            i += 1;
+    let mut output = text.to_string();
+    let mut index = 0;
+    while index < parts.len() {
+        let pattern = parts[index];
+        if pattern.is_empty() {
+            index += 1;
             continue;
         }
-
-        let replace = if i + 1 < parts.len() {
-            parts[i + 1]
+        let replacement = parts.get(index + 1).copied().unwrap_or_default();
+        let is_last = index + 2 >= parts.len();
+        output = if first_only && is_last {
+            apply_regex_replace_first(&output, pattern, replacement)
         } else {
-            ""
+            apply_regex_replace_all(&output, pattern, replacement)
         };
-        let is_last = (i + 1 >= parts.len()) || (i + 2 >= parts.len());
-
-        if first_only && is_last {
-            // Last replacement with ### suffix - first match only
-            out = apply_regex_replace_first(&out, regex, replace);
-        } else {
-            out = apply_regex_replace(&out, regex, replace);
-        }
-        i += 2;
+        index += 2;
     }
-    out
+    output
+}
+
+fn apply_regex_replace_all(text: &str, pattern: &str, replacement: &str) -> String {
+    crate::util::text::get_cached_regex(pattern)
+        .map(|regex| regex.replace_all(text, replacement).into_owned())
+        .unwrap_or_else(|| text.replace(pattern, replacement))
 }
 
 fn apply_regex_replace_first(text: &str, pattern: &str, replacement: &str) -> String {
-    let re = match crate::util::text::get_cached_regex(pattern) {
-        Some(r) => r,
-        None => return text.to_string(),
+    let Some(regex) = crate::util::text::get_cached_regex(pattern) else {
+        return replacement.to_string();
     };
-    re.replace(text, replacement).to_string()
+    let Some(found) = regex.find(text) else {
+        return String::new();
+    };
+    regex
+        .replace(&text[found.start()..found.end()], replacement)
+        .into_owned()
 }
 
 fn normalize_list_rule(rule: &str) -> (&str, bool) {
@@ -2046,15 +2218,15 @@ fn strip_mode_prefix(rule: &str) -> &str {
     let rule = rule.trim();
     if let Some(rest) = rule
         .strip_prefix("<js>")
-        .and_then(|s| s.strip_suffix("</js>"))
+        .and_then(|value| value.strip_suffix("</js>"))
     {
         return rest;
     }
-    for prefix in [
-        "@css:", "@CSS:", "@xpath:", "@XPath:", "@XPATH:", "@json:", "@Json:", "@JSON:", "@regex:",
-        "@Regex:", "@js:", "js:",
-    ] {
-        if let Some(rest) = rule.strip_prefix(prefix) {
+    if let Some(rest) = rule.strip_prefix("@@") {
+        return rest;
+    }
+    for prefix in ["@css:", "@xpath:", "@json:", "@regex:", "@js:", "js:"] {
+        if let Some(rest) = strip_prefix_ascii_case(rule, prefix) {
             return rest;
         }
     }
@@ -2065,17 +2237,13 @@ pub(crate) fn strip_js_rule(rule: &str) -> &str {
     let rule = rule.trim();
     if let Some(rest) = rule
         .strip_prefix("<js>")
-        .and_then(|s| s.strip_suffix("</js>"))
+        .and_then(|value| value.strip_suffix("</js>"))
     {
         return rest;
     }
-    if let Some(rest) = rule.strip_prefix("@js:") {
-        return rest;
-    }
-    if let Some(rest) = rule.strip_prefix("js:") {
-        return rest;
-    }
-    rule
+    strip_prefix_ascii_case(rule, "@js:")
+        .or_else(|| strip_prefix_ascii_case(rule, "js:"))
+        .unwrap_or(rule)
 }
 
 fn prepare_toc_body(body: &str, base_url: &str, rule: &TocRule) -> String {
@@ -2269,44 +2437,73 @@ fn build_chapter_from_json(
     })
 }
 
-fn capture_rule_value(rule: Option<&str>, captures: &regex::Captures<'_>) -> Option<String> {
+fn regex_capture_rows(rule: &str, input: &str) -> Vec<Vec<Option<String>>> {
+    let patterns = rule_analyzer::split_top_level(rule, &["&&"]).parts;
+    let mut inputs = vec![input.to_string()];
+
+    for (stage, pattern) in patterns.iter().enumerate() {
+        let pattern = pattern.trim().trim_start_matches(':').trim();
+        let pattern = strip_prefix_ascii_case(pattern, "@regex:").unwrap_or(pattern);
+        let Some(regex) = crate::util::text::get_cached_regex(pattern.trim()) else {
+            return Vec::new();
+        };
+
+        if stage + 1 == patterns.len() {
+            return inputs
+                .iter()
+                .flat_map(|input| {
+                    regex.captures_iter(input).map(|captures| {
+                        (0..captures.len())
+                            .map(|index| {
+                                captures.get(index).map(|value| value.as_str().to_string())
+                            })
+                            .collect()
+                    })
+                })
+                .collect();
+        }
+
+        inputs = inputs
+            .iter()
+            .flat_map(|input| {
+                regex
+                    .captures_iter(input)
+                    .filter_map(|captures| captures.get(0).map(|value| value.as_str().to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        if inputs.is_empty() {
+            return Vec::new();
+        }
+    }
+    Vec::new()
+}
+
+fn capture_rule_values(rule: Option<&str>, captures: &[Option<String>]) -> Option<String> {
     let rule = rule?.trim();
     if rule.is_empty() {
         return None;
     }
-    let placeholder = regex::Regex::new(r"\$(\d{1,2})").unwrap();
+    let placeholder = regex::Regex::new(r"\$(\d{1,2})").expect("valid capture placeholder");
     let replaced = placeholder.replace_all(rule, |cap: &regex::Captures| {
         let index = cap
             .get(1)
-            .and_then(|m| m.as_str().parse::<usize>().ok())
+            .and_then(|value| value.as_str().parse::<usize>().ok())
             .unwrap_or(0);
         if index == 0 {
-            return cap
-                .get(0)
-                .map(|m| m.as_str())
-                .unwrap_or_default()
-                .to_string();
+            return cap[0].to_string();
         }
         captures
             .get(index)
-            .map(|m| m.as_str().to_string())
-            .unwrap_or_else(|| {
-                cap.get(0)
-                    .map(|m| m.as_str())
-                    .unwrap_or_default()
-                    .to_string()
-            })
+            .and_then(Option::as_deref)
+            .map(str::to_string)
+            .unwrap_or_else(|| cap[0].to_string())
     });
     let (pure, regex_part) = split_legado_regex(&replaced);
-    let mut output = pure;
-    if let Some(regex_part) = regex_part {
-        output = apply_legado_regex(&output, regex_part);
-    }
-    if output.is_empty() {
-        None
-    } else {
-        Some(output)
-    }
+    let output = regex_part
+        .map(|replacement| apply_legado_regex(&pure, replacement))
+        .unwrap_or(pure);
+    (!output.is_empty()).then_some(output)
 }
 
 fn finalize_chapter_url(
@@ -2434,6 +2631,68 @@ mod tests {
     }
 
     #[test]
+    fn compat_all_in_one_regex_chains_stages_and_preserves_literal_groups() {
+        let rows = regex_capture_rows(r":([a-z]\d)&&([a-z])(\d)", "a1 b2");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            vec![Some("a1".into()), Some("a".into()), Some("1".into())]
+        );
+        assert_eq!(
+            capture_rule_values(Some("$1/$2/$0/$99"), &rows[0]).as_deref(),
+            Some("a/1/$0/$99")
+        );
+    }
+
+    #[test]
+    fn compat_mode_detection_strips_css_override_and_double_at() {
+        assert_eq!(
+            classify_rule_mode("@@.title", ParseMode::Css, false),
+            (ParseMode::Css, ".title".to_string())
+        );
+        assert_eq!(
+            classify_rule_mode("@CSS:.title", ParseMode::Css, false),
+            (ParseMode::Css, ".title".to_string())
+        );
+    }
+
+    #[test]
+    fn compat_put_parser_keeps_quoted_commas_inside_values() {
+        let (rule, entries) = extract_put_entries(r#"@put:{alias: ".name, .author"}"#);
+        assert!(rule.is_empty());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "alias");
+        assert_eq!(entries[0].value_rule, ".name, .author");
+    }
+
+    #[test]
+    fn compat_templates_coerce_values_and_expand_only_once() {
+        let value = json!({"name": "Book"});
+        let mut ctx = HashMap::new();
+        ctx.insert("alias".to_string(), "Alias".to_string());
+        let expanded = interpolate_templates(
+            "{{$.name}}|{{1 + 2}}|{{null}}|{{String.fromCharCode(123,123) + 'x' + String.fromCharCode(125,125)}}|{{@get:{alias}}}",
+            r#"{"name":"Book"}"#,
+            "https://example.test",
+            &ctx,
+            Some(&value),
+        );
+        assert_eq!(expanded, "Book|3||{{x}}|Alias");
+    }
+
+    #[test]
+    fn compat_css_rule_can_chain_javascript_transform() {
+        let doc = html::parse_document(r#"<div class="name">Book</div>"#);
+        let value = eval_field_html_doc_with_ctx(
+            ".name@js:result.toUpperCase()",
+            &doc,
+            "https://example.test",
+            &mut HashMap::new(),
+        );
+        assert_eq!(value.as_deref(), Some("BOOK"));
+    }
+
+    #[test]
     fn compat_toc_truthiness_matches_standard_values() {
         for value in ["", "null", "false", "no", "0"] {
             assert!(!is_truthy(value.to_string()), "{value:?} must be false");
@@ -2453,13 +2712,16 @@ mod tests {
     fn test_apply_legado_regex() {
         let text = "Hello World 123 456";
 
-        // Test basic replacement (all matches)
-        let result = apply_legado_regex(text, "##\\d+##NUM");
-        assert_eq!(result, "Hello World NUM NUM");
-
-        // Test first match only (###)
-        let result = apply_legado_regex(text, "##\\d+##NUM###");
-        assert_eq!(result, "Hello World NUM 456");
+        assert_eq!(
+            apply_legado_regex(text, "##\\d+##NUM"),
+            "Hello World NUM NUM"
+        );
+        assert_eq!(apply_legado_regex(text, "##\\d+##NUM###"), "NUM");
+        assert_eq!(apply_legado_regex(text, "##[##X"), "Hello World 123 456");
+        assert_eq!(apply_legado_regex("a[b", "##[##X"), "aXb");
+        assert_eq!(apply_legado_regex("nothing", "##\\d+##N###"), "");
+        assert_eq!(apply_legado_regex("a[b", "##[##X###"), "X");
+        assert_eq!(apply_legado_regex("no match", "##[##X###"), "X");
     }
 
     #[test]
