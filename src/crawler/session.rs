@@ -160,6 +160,13 @@ impl ActiveSession {
         self.cookie_store.get_cookie_header(&url)
     }
 
+    pub fn get_cookie_key(&self, target_url: &str, key: &str) -> Option<String> {
+        self.get_cookie(target_url)?.split(';').find_map(|cookie| {
+            let (name, value) = cookie.trim().split_once('=')?;
+            (name.trim() == key.trim()).then(|| value.trim().to_string())
+        })
+    }
+
     pub fn set_cookie(&self, target_url: &str, cookie_str: &str) {
         if let Some(url) = self.resolve_url(target_url) {
             self.cookie_store.add_cookie_header(cookie_str, &url);

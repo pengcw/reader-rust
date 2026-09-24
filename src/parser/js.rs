@@ -361,6 +361,14 @@ fn eval_js_inner_with_source(
                 }),
             )?;
             cookie_obj.set(
+                "getKey",
+                Func::new(|url: String, key: String| -> String {
+                    crate::crawler::session::current_active_session()
+                        .and_then(|active| active.get_cookie_key(&url, &key))
+                        .unwrap_or_default()
+                }),
+            )?;
+            cookie_obj.set(
                 "get",
                 Func::new(|url: String| -> String {
                     if let Some(active) = crate::crawler::session::current_active_session() {
@@ -1591,6 +1599,25 @@ mod tests {
             delta.unwrap().variables.unwrap()["__prefs:reader:token"],
             JsonValue::String("saved".to_string())
         );
+    }
+
+    #[test]
+    fn compat_cookie_get_key_reads_session_cookie_values() {
+        let initial = ExecuteSession {
+            cookies: Some("sid=initial_token; token=a=b=c".to_string()),
+            ..Default::default()
+        };
+        let result = with_active_session(Some(&initial), "https://example.com", |_| {
+            eval_js(
+                "[cookie.getKey('example.com', 'sid'), cookie.getKey('https://example.com/path', 'token'), cookie.getKey('example.com', 'missing')].join('|')",
+                "",
+                "https://example.com",
+            )
+            .unwrap()
+        })
+        .0;
+
+        assert_eq!(result, "initial_token|a=b=c|");
     }
 
     #[test]
