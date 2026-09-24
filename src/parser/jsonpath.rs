@@ -1,8 +1,59 @@
 use serde_json::Value;
 
+fn has_unsupported_filter_selector(rule: &str) -> bool {
+    let mut filter_depth = 0usize;
+    let mut in_filter_selector = false;
+    let mut quote = None;
+    let mut escaped = false;
+    let chars: Vec<char> = rule.chars().collect();
+    let mut index = 0;
+
+    while index < chars.len() {
+        let ch = chars[index];
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+
+        if ch == '\'' || ch == '\"' {
+            if in_filter_selector {
+                return true;
+            }
+            quote = Some(ch);
+        } else if filter_depth > 0 {
+            match ch {
+                '[' => in_filter_selector = true,
+                ']' => in_filter_selector = false,
+                ':' | ',' if in_filter_selector => return true,
+                '(' => filter_depth += 1,
+                ')' => filter_depth -= 1,
+                _ => {}
+            }
+        } else if ch == '?' && chars.get(index + 1) == Some(&'(') {
+            filter_depth = 1;
+            index += 1;
+        }
+
+        index += 1;
+    }
+    false
+}
+
 pub fn jsonpath_query(value: &Value, rule: &str) -> Vec<Value> {
     if let Some(rendered) = render_embedded_paths(value, rule) {
         return vec![Value::String(rendered)];
+    }
+    // jsonpath_lib 0.3 panics on range, union, and named-key selectors inside filters.
+    // Reject those unsupported expressions before calling it; release builds abort on panic.
+    if has_unsupported_filter_selector(rule) {
+        return vec![];
     }
     if let Ok(res) = jsonpath_lib::select(value, rule) {
         let mut out = Vec::new();
@@ -118,5 +169,91 @@ mod tests {
             jsonpath_first_string(&value, rule_spaces),
             Some("第一行\n第二行".to_string())
         );
+    }
+
+    #[test]
+    fn compat_jsonpath_matrix() {
+        let value = json!({
+            "books": [
+                {"name":"A", "price":5, "vip":true, "tags":["x","y"]},
+                {"name":"B", "price":10, "vip":false, "tags":["y"]},
+                {"name":"C", "price":"10", "tags":[]}
+            ],
+            "items": [{"name":"one"}, {"name":"two"}]
+        });
+
+        // PASS: comparison operators and JSON type distinction.
+        for (rule, expected) in [
+            ("$.books[?(@.price == 10)].name", vec![json!("B")]),
+            ("$.books[?(@.price == '10')].name", vec![json!("C")]),
+            ("$.books[?(@.price != 10)].name", vec![json!("A")]),
+            ("$.books[?(@.price < 10)].name", vec![json!("A")]),
+            (
+                "$.books[?(@.price <= 10)].name",
+                vec![json!("A"), json!("B")],
+            ),
+            ("$.books[?(@.price > 5)].name", vec![json!("B")]),
+            ("$.books[?(@.price >= 10)].name", vec![json!("B")]),
+        ] {
+            assert_eq!(jsonpath_query(&value, rule), expected, "{rule}");
+        }
+
+        // PASS: a presence predicate matches a present false-valued field.
+        assert_eq!(
+            jsonpath_query(&value, "$.books[?(@.vip)].name"),
+            vec![json!("A"), json!("B")]
+        );
+        // DIFFERENT_SEMANTICS: missing-field != currently yields no match.
+        assert!(jsonpath_query(&value, "$.books[?(@.missing != 1)].name").is_empty());
+
+        // PASS: negative index, stepped slice, recursive descent, and root arrays.
+        assert_eq!(jsonpath_query(&value, "$.books[-1].name"), vec![json!("C")]);
+        assert_eq!(
+            jsonpath_query(&value, "$.books[0:3:2].name"),
+            vec![json!("A"), json!("C")]
+        );
+        assert_eq!(
+            jsonpath_query(&value, "$..name"),
+            vec![
+                json!("A"),
+                json!("B"),
+                json!("C"),
+                json!("one"),
+                json!("two")
+            ]
+        );
+        let root_array = json!([{"direct":"ok"}]);
+        assert_eq!(
+            jsonpath_query(&root_array, "$[*].direct"),
+            vec![json!("ok")]
+        );
+
+        // UNSUPPORTED: regex, membership, size, and reverse slices are parse errors.
+        for rule in [
+            "$.books[?(@.name =~ /A|B/)].name",
+            "$.books[?(@.name in ['A','C'])].name",
+            "$.books[?(@.name nin ['A','C'])].name",
+            "$.books[?(@.tags size 0)].name",
+            "$.books[::-1].name",
+        ] {
+            assert!(jsonpath_lib::select(&value, rule).is_err(), "{rule}");
+            assert!(jsonpath_query(&value, rule).is_empty(), "{rule}");
+        }
+
+        // UNSUPPORTED selectors inside filters panic in jsonpath_lib 0.3; reject safely.
+        for rule in [
+            "$.books[?(@.tags[0:1])].name",
+            "$.books[?(@.tags[0,1])].name",
+            "$.books[?(@['name'])].name",
+        ] {
+            assert!(has_unsupported_filter_selector(rule), "{rule}");
+            assert!(jsonpath_query(&value, rule).is_empty(), "{rule}");
+        }
+
+        // PASS: malformed and deep paths fail closed rather than panicking.
+        assert!(jsonpath_query(&value, "$.books[").is_empty());
+        assert!(jsonpath_query(&value, "$.books[?(@.price >)]").is_empty());
+        let deep_path = format!("$.{}", vec!["missing"; 64].join("."));
+        assert!(jsonpath_query(&value, &deep_path).is_empty());
     }
 }
