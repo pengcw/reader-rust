@@ -787,6 +787,60 @@ impl RuleEngine {
         out
     }
 
+    fn parse_next_toc_urls(
+        &self,
+        body: &str,
+        base_url: &str,
+        rule: &TocRule,
+        ctx: &RuleVariableContext,
+    ) -> Vec<String> {
+        let Some(next_rule) = rule.next_toc_url.as_deref().map(str::trim) else {
+            return vec![];
+        };
+        if next_rule.is_empty() {
+            return vec![];
+        }
+        if let Some(key) = direct_get_key(next_rule) {
+            return normalize_toc_next_urls(base_url, ctx.get(key).into_iter().collect());
+        }
+
+        let expanded = interpolate_common_templates(next_rule, body, base_url, ctx);
+        let mode = self.detect_mode(&expanded, body);
+        let raw_urls = match mode {
+            ParseMode::JsonPath => serde_json::from_str::<Value>(body)
+                .ok()
+                .map(|value| {
+                    jsonpath::jsonpath_query(&value, self.strip_mode_prefix(&expanded))
+                        .iter()
+                        .filter_map(jsonpath::value_to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            ParseMode::XPath => html::select_xpath(body, self.strip_mode_prefix(&expanded)),
+            ParseMode::Js => eval_js(self.strip_mode_prefix(&expanded), body, base_url)
+                .map(|output| {
+                    parse_js_output_items(&output)
+                        .map(|items| items.iter().filter_map(jsonpath::value_to_string).collect())
+                        .unwrap_or_else(|| vec![output])
+                })
+                .unwrap_or_default(),
+            ParseMode::Regex => regex_capture_rows(
+                self.strip_mode_prefix(&expanded)
+                    .trim_start_matches(':')
+                    .trim(),
+                body,
+            )
+            .into_iter()
+            .filter_map(|row| row.get(1).or_else(|| row.first()).and_then(Clone::clone))
+            .collect(),
+            ParseMode::Css => {
+                let doc = html::parse_document(body);
+                html::select_text_list(&doc, self.strip_mode_prefix(&expanded))
+            }
+        };
+        normalize_toc_next_urls(base_url, raw_urls)
+    }
+
     fn parse_chapter_list_js(
         &self,
         body: &str,
@@ -795,6 +849,7 @@ impl RuleEngine {
         list_rule: &str,
         ctx: &mut RuleVariableContext,
     ) -> (Vec<BookChapter>, Vec<String>) {
+        let next_urls = self.parse_next_toc_urls(body, base_url, rule, ctx);
         let output = match eval_js(self.strip_mode_prefix(list_rule), body, base_url) {
             Ok(result) => result,
             Err(_) => return (vec![], vec![]),
@@ -814,7 +869,7 @@ impl RuleEngine {
                     }
                 }
             }
-            return (out, vec![]);
+            return (out, next_urls);
         }
 
         let doc = html::parse_document(&output);
@@ -877,7 +932,7 @@ impl RuleEngine {
                 variable: chapter_ctx.chapter_variable(),
             });
         }
-        (out, vec![])
+        (out, next_urls)
     }
 
     fn parse_chapter_list_regex(
@@ -1595,11 +1650,7 @@ fn parse_chapter_list_html(
     // Extract next_toc_url(s)
     let rule_str = rule.next_toc_url.as_deref().unwrap_or("");
     let raw_urls: Vec<String> = html::select_text_list(&doc, rule_str);
-    let next_urls: Vec<String> = raw_urls
-        .into_iter()
-        .filter(|u| !u.is_empty())
-        .map(|u| resolve_url(base_url, &u))
-        .collect();
+    let next_urls = normalize_toc_next_urls(base_url, raw_urls);
 
     (out, next_urls)
 }
@@ -1692,11 +1743,8 @@ fn parse_chapter_list_xpath(
         .next_toc_url
         .as_deref()
         .map(|xpath| xpath_eval_strings(scope, xpath))
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|u| !u.is_empty())
-        .map(|u| resolve_url(base_url, &u))
-        .collect();
+        .unwrap_or_default();
+    let next_urls = normalize_toc_next_urls(base_url, next_urls);
 
     (out, next_urls)
 }
@@ -1783,18 +1831,44 @@ fn parse_chapter_list_json(
         });
     }
 
-    let next_urls: Vec<String> = rule
+    let next_urls = rule
         .next_toc_url
         .as_ref()
-        .map(|r| jsonpath::jsonpath_query(&scope, r))
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-        .filter(|u| !u.is_empty())
-        .map(|u| resolve_url(base_url, &u))
-        .collect();
+        .map(|r| {
+            jsonpath::jsonpath_query(&scope, r)
+                .into_iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let next_urls = normalize_toc_next_urls(base_url, next_urls);
 
     (out, next_urls)
+}
+
+fn normalize_toc_next_urls(base_url: &str, urls: Vec<String>) -> Vec<String> {
+    let current = normalized_url_identity(base_url);
+    let mut seen = std::collections::HashSet::new();
+    urls.into_iter()
+        .map(|url| url.trim().to_string())
+        .filter(|url| !url.is_empty())
+        .map(|url| resolve_url(base_url, &url))
+        .filter(|url| {
+            let identity = normalized_url_identity(url);
+            identity != current && seen.insert(identity)
+        })
+        .collect()
+}
+
+fn normalized_url_identity(url: &str) -> String {
+    let normalized = normalize_source_url(url);
+    match url::Url::parse(&normalized) {
+        Ok(mut url) => {
+            url.set_fragment(None);
+            url.to_string()
+        }
+        Err(_) => normalized,
+    }
 }
 
 fn select_json_scope(
@@ -2834,7 +2908,7 @@ fn is_truthy(value: String) -> bool {
     }
     !matches!(
         value.to_ascii_lowercase().as_str(),
-        "0" | "false" | "null" | "none" | "no" | "off"
+        "0" | "false" | "null" | "none" | "no" | "not" | "off"
     )
 }
 
@@ -3192,9 +3266,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known P1-4 gap: `not` is not yet treated as false by is_truthy"]
     fn compat_toc_truthiness_treats_not_as_false() {
         assert!(!is_truthy("not".to_string()));
+        assert!(!is_truthy("NOT".to_string()));
     }
 
     #[test]
@@ -3391,6 +3465,55 @@ mod tests {
         assert!(chapters[0].is_vip);
         assert_eq!(chapters[1].title, "2.Two");
         assert!(chapters[1].is_pay);
+    }
+
+    #[test]
+    fn compat_toc_next_urls_drop_current_page_and_dedupe() {
+        let source = BookSource {
+            rule_toc: Some(TocRule {
+                chapter_list: Some(".chapter".to_string()),
+                chapter_name: Some(".name@text".to_string()),
+                chapter_url: Some(".url@href".to_string()),
+                next_toc_url: Some(".next@href".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let body = r#"
+            <div class="chapter"><span class="name">One</span><a class="url" href="/one"></a></div>
+            <a class="next" href="/toc/1#page"></a>
+            <a class="next" href="/toc/2"></a>
+            <a class="next" href="/toc/2"></a>
+        "#;
+        let (chapters, next_urls) =
+            RuleEngine::new()
+                .unwrap()
+                .chapter_list(&source, body, "https://books.example/toc/1");
+        assert_eq!(chapters.len(), 1);
+        assert_eq!(next_urls, vec!["https://books.example/toc/2"]);
+    }
+
+    #[test]
+    fn compat_js_toc_rule_keeps_next_page_urls() {
+        let source = BookSource {
+            rule_toc: Some(TocRule {
+                chapter_list: Some(
+                    "js:JSON.stringify([{chapterName:'One',chapterUrl:'/one'}])".to_string(),
+                ),
+                chapter_name: Some("chapterName".to_string()),
+                chapter_url: Some("chapterUrl".to_string()),
+                next_toc_url: Some("$.next".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (chapters, next_urls) = RuleEngine::new().unwrap().chapter_list(
+            &source,
+            r#"{"next":"/toc/2"}"#,
+            "https://books.example/toc/1",
+        );
+        assert_eq!(chapters.len(), 1);
+        assert_eq!(next_urls, vec!["https://books.example/toc/2"]);
     }
 
     #[test]

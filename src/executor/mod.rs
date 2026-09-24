@@ -477,8 +477,11 @@ fn execute_toc(
     let toc_url = book_info
         .toc_url
         .filter(|url| !url.trim().is_empty())
-        .unwrap_or(initial_url);
-    let mut pending = VecDeque::from([toc_url]);
+        .unwrap_or_else(|| initial_url.clone());
+    let reuse_detail_response = same_resource_url(&toc_url, &initial_url)
+        || same_resource_url(&toc_url, &detail_response.url);
+    let mut detail_toc_response = reuse_detail_response.then(|| detail_response.clone());
+    let mut pending = VecDeque::from([toc_url.clone()]);
     let mut visited_pages = HashSet::new();
     let mut seen_chapters = HashSet::new();
     let mut chapters = Vec::new();
@@ -493,15 +496,31 @@ fn execute_toc(
             truncated = true;
             break;
         }
-        let response = fetch_rule(
-            session,
-            source,
-            &url,
-            "",
-            1,
-            &source.book_source_url,
-            options,
-        )?;
+        let response = if same_resource_url(&url, &toc_url) {
+            if let Some(response) = detail_toc_response.take() {
+                response
+            } else {
+                fetch_rule(
+                    session,
+                    source,
+                    &url,
+                    "",
+                    1,
+                    &source.book_source_url,
+                    options,
+                )?
+            }
+        } else {
+            fetch_rule(
+                session,
+                source,
+                &url,
+                "",
+                1,
+                &source.book_source_url,
+                options,
+            )?
+        };
         visited_pages.insert(url);
         let (page_chapters, next_urls) = engine.chapter_list_with_variable(
             source,
@@ -533,6 +552,18 @@ fn execute_toc(
         &response,
         options,
     ))
+}
+
+fn same_resource_url(left: &str, right: &str) -> bool {
+    let Some(mut left) = url::Url::parse(left).ok() else {
+        return left == right;
+    };
+    let Some(mut right) = url::Url::parse(right).ok() else {
+        return false;
+    };
+    left.set_fragment(None);
+    right.set_fragment(None);
+    left == right
 }
 
 fn execute_content(
@@ -1300,9 +1331,9 @@ mod tests {
 
     #[test]
     fn execute_supports_explore_info_toc_and_content_pagination() {
-        // explore + info + two TOC pages + two content pages. The second content
-        // page requires the cookie set by the first one.
-        let base_url = serve_operation_fixture(7);
+        // explore + info + TOC detail/reuse + next TOC page + two content pages.
+        // The second content page requires the cookie set by the first one.
+        let base_url = serve_operation_fixture(6);
         let source = serde_json::json!({
             "bookSourceName": "all operation fixture",
             "bookSourceUrl": base_url,
