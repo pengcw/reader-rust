@@ -916,15 +916,13 @@ fn eval_js_inner_with_source(
                         return _origSetContent(String(content == null ? '' : content));
                     };
                     const _nativeGetElements = globalThis.java.getElements;
-                    const _wrapElements = (rule, content, rawCss = false) => {
-                        const raw = _nativeGetElements(rule, content, rawCss);
-                        let values;
-                        try { values = JSON.parse(raw); } catch (e) { values = []; }
+                    const _decorateItems = (values, rawCss = false) => {
                         if (!Array.isArray(values)) values = [];
                         const items = values.map(item => {
                             if (!item || item.__readerHtmlElement !== true) return item;
                             const attrs = item.attrs || {};
                             return {
+                                __readerIndex: item.__readerIndex,
                                 attr(name) { return attrs[String(name)] || ''; },
                                 hasClass(name) {
                                     return String(attrs.class || '').split(/\s+/).includes(String(name));
@@ -932,7 +930,11 @@ fn eval_js_inner_with_source(
                                 html() { return item.html || ''; },
                                 text() { return item.text || ''; },
                                 outerHtml() { return item.outerHtml || ''; },
-                                select(selector) { return _wrapElements(String(selector), item.outerHtml || '', rawCss); },
+                                select(selector) {
+                                    const rule = String(selector);
+                                    const xpath = /^\s*(?:@xpath:|\/|\.\/|id\()/i.test(rule);
+                                    return _wrapElements(rule, item.outerHtml || '', xpath ? false : true);
+                                },
                                 toString() { return item.outerHtml || ''; }
                             };
                         });
@@ -946,6 +948,28 @@ fn eval_js_inner_with_source(
                         items.toArray = function() { return Array.from(this); };
                         return items;
                     };
+                    const _wrapElements = (rule, content, rawCss = false) => {
+                        const raw = _nativeGetElements(rule, content, rawCss);
+                        let values;
+                        try { values = JSON.parse(raw); } catch (e) { values = []; }
+                        return _decorateItems(values, rawCss);
+                    };
+                    globalThis.__wrapReaderElements = values => _decorateItems(values, false);
+                    if (Array.isArray(globalThis.result)) {
+                        globalThis.result = _decorateItems(globalThis.result, false);
+                    }
+                    const _attachVariableMap = value => {
+                        if (!value || typeof value !== 'object') return;
+                        if (typeof value.getVariable !== 'function') {
+                            value.getVariable = function(key) {
+                                const variables = this.variableMap || {};
+                                const found = variables[String(key)];
+                                return found == null ? '' : String(found);
+                            };
+                        }
+                    };
+                    _attachVariableMap(globalThis.book);
+                    _attachVariableMap(globalThis.chapter);
                     globalThis.java.getElements = _wrapElements;
                     globalThis.java.getElement = function(rule, content) {
                         const items = _wrapElements(rule, content);
@@ -1250,6 +1274,11 @@ pub(crate) fn java_get_string(
     {
         let script = rule_engine::strip_js_rule(main_rule);
         eval_js(script, target_content, base_url).unwrap_or_default()
+    } else if let Some(pure) = html::xpath_rule(main_rule) {
+        html::select_xpath(target_content, pure)
+            .into_iter()
+            .next()
+            .unwrap_or_default()
     } else if main_rule.starts_with("@json:")
         || main_rule.starts_with("@Json:")
         || main_rule.starts_with("@JSON:")
@@ -1281,26 +1310,6 @@ pub(crate) fn java_get_string(
         } else {
             String::new()
         }
-    } else if main_rule.starts_with("@xpath:")
-        || main_rule.starts_with("@XPath:")
-        || main_rule.starts_with("@XPATH:")
-        || main_rule.starts_with('/')
-        || main_rule.starts_with("./")
-    {
-        // XPath 模式
-        let pure = if let Some(stripped) = main_rule
-            .strip_prefix("@xpath:")
-            .or_else(|| main_rule.strip_prefix("@XPath:"))
-            .or_else(|| main_rule.strip_prefix("@XPATH:"))
-        {
-            stripped.trim()
-        } else {
-            main_rule
-        };
-        html::select_xpath(target_content, pure)
-            .into_iter()
-            .next()
-            .unwrap_or_default()
     } else if main_rule.starts_with("@regex:") || main_rule.starts_with(':') {
         // Regex 模式
         let pure = if let Some(stripped) = main_rule.strip_prefix("@regex:") {
@@ -1411,6 +1420,8 @@ pub(crate) fn java_get_string_list(
         } else {
             Vec::new()
         }
+    } else if let Some(pure) = html::xpath_rule(main_rule) {
+        html::select_xpath(target_content, pure)
     } else if main_rule.starts_with("@json:")
         || main_rule.starts_with("@Json:")
         || main_rule.starts_with("@JSON:")
@@ -1450,22 +1461,6 @@ pub(crate) fn java_get_string_list(
         } else {
             Vec::new()
         }
-    } else if main_rule.starts_with("@xpath:")
-        || main_rule.starts_with("@XPath:")
-        || main_rule.starts_with("@XPATH:")
-        || main_rule.starts_with('/')
-        || main_rule.starts_with("./")
-    {
-        let pure = if let Some(stripped) = main_rule
-            .strip_prefix("@xpath:")
-            .or_else(|| main_rule.strip_prefix("@XPath:"))
-            .or_else(|| main_rule.strip_prefix("@XPATH:"))
-        {
-            stripped.trim()
-        } else {
-            main_rule
-        };
-        html::select_xpath(target_content, pure)
     } else if main_rule.starts_with("@regex:") || main_rule.starts_with(':') {
         let pure = if let Some(stripped) = main_rule.strip_prefix("@regex:") {
             stripped.trim()
@@ -1532,12 +1527,10 @@ fn java_get_elements_json_with_mode(
 
     let lower_rule = rule.to_ascii_lowercase();
     let explicit_css = rule.starts_with("@@") || lower_rule.starts_with("@css:");
-    let explicit_other_mode = lower_rule.starts_with("@xpath:")
+    let explicit_other_mode = html::xpath_rule(rule).is_some()
         || lower_rule.starts_with("@regex:")
         || lower_rule.starts_with("@js:")
         || lower_rule.starts_with("js:")
-        || rule.starts_with('/')
-        || rule.starts_with("./")
         || rule.starts_with(':');
     let json_content = serde_json::from_str::<JsonValue>(content).ok();
     let json_rule = rule.starts_with('$') || lower_rule.starts_with("@json:");
@@ -1564,19 +1557,10 @@ fn java_get_elements_json_with_mode(
         return serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string());
     }
 
-    if !raw_css
-        && (lower_rule.starts_with("@xpath:")
-            || rule.starts_with('/')
-            || rule.starts_with("./")
-            || rule.starts_with("id("))
-    {
-        let pure = if lower_rule.starts_with("@xpath:") {
-            &rule[7..]
-        } else {
-            rule
+    if !raw_css {
+        if let Some(pure) = html::xpath_rule(rule) {
+            return html::select_xpath_elements_json(content, pure);
         }
-        .trim();
-        return html::select_xpath_elements_json(content, pure);
     }
 
     if !raw_css
@@ -2327,10 +2311,20 @@ mod tests {
         let script_mixed = r#"
             const catalog = java.getElement('//div[@id="catalog"]', result);
             const span = catalog.select('span.count').first();
-            [span.text(), span.attr('class')].join('|')
+            const link = catalog.select('ul li a').first();
+            [span.text(), span.attr('class'), link.attr('href')].join('|')
         "#;
         let output_mixed = eval_js(script_mixed, body, "https://example.com").unwrap();
-        assert_eq!(output_mixed, "Total: 2|count");
+        assert_eq!(output_mixed, "Total: 2|count|/ch1");
+
+        // 4. All java string APIs share the same XPath mode detection, including id().
+        let script_strings = r#"
+            const footer = java.getString('id("footer")/text()', result);
+            const hrefs = java.getStringList('id("catalog")//a/@href', result);
+            [footer, hrefs.join(',')].join('|')
+        "#;
+        let output_strings = eval_js(script_strings, body, "https://example.com").unwrap();
+        assert_eq!(output_strings, "The End|/ch1,/ch2");
     }
 }
 

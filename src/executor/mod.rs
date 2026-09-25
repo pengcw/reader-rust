@@ -10,7 +10,9 @@ use crate::crawler::{
 use crate::model::book_source::{book_source_from_value, BookSource};
 use crate::model::replace_rule::ReplaceRule;
 use crate::parser::js::{eval_js, eval_js_with_bindings, with_js_http_client, with_js_lib};
-use crate::parser::rule_engine::{apply_legado_regex, RuleEngine};
+use crate::parser::rule_engine::{
+    apply_legado_regex, dedupe_chapters_last_wins, RuleEngine,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -664,7 +666,6 @@ fn execute_toc(
     let mut detail_toc_response = reuse_detail_response.then(|| detail_response.clone());
     let mut pending = VecDeque::from([toc_url.clone()]);
     let mut visited_pages = HashSet::new();
-    let mut seen_chapters = HashSet::new();
     let mut chapters = Vec::new();
     let mut final_response = None;
     let mut truncated = false;
@@ -713,12 +714,7 @@ fn execute_toc(
             Some(&book_info.name),
             Some(&book_fields),
         );
-        for mut chapter in page_chapters {
-            if seen_chapters.insert(chapter.url.clone()) {
-                chapter.index = chapters.len() as i32;
-                chapters.push(chapter);
-            }
-        }
+        chapters.extend(page_chapters);
         for next_url in next_urls {
             if !next_url.trim().is_empty() && !visited_pages.contains(&next_url) {
                 pending.push_back(next_url);
@@ -729,6 +725,7 @@ fn execute_toc(
 
     let response =
         final_response.ok_or_else(|| ExecuteError::url_rule("toc URL produced no request"))?;
+    let chapters = dedupe_chapters_last_wins(chapters);
     Ok(success(
         json!({"chapters": chapters, "pages": visited_pages.len(), "truncated": truncated}),
         visited_pages.len(),
@@ -750,6 +747,83 @@ fn same_resource_url(left: &str, right: &str) -> bool {
     left == right
 }
 
+fn js_code_only(script: &str) -> String {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum State {
+        Code,
+        Quote(char),
+        LineComment,
+        BlockComment,
+    }
+
+    let chars = script.chars().collect::<Vec<_>>();
+    let mut output = String::with_capacity(script.len());
+    let mut state = State::Code;
+    let mut escaped = false;
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        let next = chars.get(index + 1).copied();
+        match state {
+            State::Code if ch == '/' && next == Some('/') => {
+                output.push_str("  ");
+                state = State::LineComment;
+                index += 2;
+                continue;
+            }
+            State::Code if ch == '/' && next == Some('*') => {
+                output.push_str("  ");
+                state = State::BlockComment;
+                index += 2;
+                continue;
+            }
+            State::Code if matches!(ch, '\'' | '"' | '\u{60}') => {
+                output.push(' ');
+                state = State::Quote(ch);
+                escaped = false;
+            }
+            State::Code => output.push(ch),
+            State::Quote(quote) => {
+                output.push(' ');
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == quote {
+                    state = State::Code;
+                }
+            }
+            State::LineComment => {
+                output.push(if ch == '\n' { '\n' } else { ' ' });
+                if ch == '\n' {
+                    state = State::Code;
+                }
+            }
+            State::BlockComment if ch == '*' && next == Some('/') => {
+                output.push_str("  ");
+                state = State::Code;
+                index += 2;
+                continue;
+            }
+            State::BlockComment => output.push(if ch == '\n' { '\n' } else { ' ' }),
+        }
+        index += 1;
+    }
+    output
+}
+
+fn js_has_call(code: &str, name: &str) -> bool {
+    let mut rest = code;
+    while let Some(index) = rest.find(name) {
+        let after = &rest[index + name.len()..];
+        if after.trim_start().starts_with('(') {
+            return true;
+        }
+        rest = after;
+    }
+    false
+}
+
 fn uses_js_ajax_content_rule(source: &BookSource) -> bool {
     source
         .rule_content
@@ -761,17 +835,22 @@ fn uses_js_ajax_content_rule(source: &BookSource) -> bool {
             let is_js = lower_rule.starts_with("@js:")
                 || lower_rule.starts_with("js:")
                 || lower_rule.starts_with("<js>");
+            if !is_js {
+                return false;
+            }
+
+            let code = js_code_only(rule);
             let references = |name: &str| {
-                rule.split(|character: char| {
+                code.split(|character: char| {
                     !(character.is_ascii_alphanumeric() || matches!(character, '_' | '$'))
                 })
                 .any(|identifier| identifier == name)
             };
-            is_js
-                && lower_rule.contains("java.ajax")
+            js_has_call(&code, "java.ajax")
                 && references("baseUrl")
                 && !references("input")
                 && !references("result")
+                && !references("src")
         })
 }
 
@@ -1433,7 +1512,9 @@ fn content_path_base(path: &str, strip_page_suffix: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute, input_book_state, input_chapter_state};
+    use super::{
+        execute, input_book_state, input_chapter_state, uses_js_ajax_content_rule, BookSource,
+    };
     use base64::Engine;
     use serde_json::Value;
     use std::io::{Read, Write};
@@ -1498,7 +1579,7 @@ mod tests {
                     "/toc/2" => (
                         "200 OK",
                         "",
-                        r#"{"chapters":[{"title":"第二章","url":"/chapter/2.html"}]}"#,
+                        r#"{"chapters":[{"title":"第一章（更新）","url":"/chapter/1.html"},{"title":"第二章","url":"/chapter/2.html"}]}"#,
                     ),
                     "/chapter/1.html" => (
                         "200 OK",
@@ -1665,6 +1746,31 @@ mod tests {
         assert_eq!(requests[0].0, "/book");
         assert_eq!(requests[1].0, "/toc?bid=book-id-7");
         assert!(requests[1].1);
+    }
+
+    #[test]
+    fn js_self_fetch_detection_ignores_strings_and_comments() {
+        let source = |content: &str| -> BookSource {
+            serde_json::from_value(serde_json::json!({
+                "bookSourceName": "self-fetch detection",
+                "bookSourceUrl": "https://example.com",
+                "ruleContent": {"content": content}
+            }))
+            .unwrap()
+        };
+
+        assert!(!uses_js_ajax_content_rule(&source(
+            r#"@js: const note = "java.ajax(baseUrl)"; baseUrl"#
+        )));
+        assert!(!uses_js_ajax_content_rule(&source(
+            "@js: /* java.ajax(baseUrl) */ baseUrl"
+        )));
+        assert!(!uses_js_ajax_content_rule(&source(
+            "@js: java.ajax(baseUrl); input"
+        )));
+        assert!(uses_js_ajax_content_rule(&source(
+            "@js: java.ajax(baseUrl)"
+        )));
     }
 
     #[test]
@@ -1924,6 +2030,8 @@ mod tests {
         let toc = call("toc", "/toc/1");
         assert_eq!(toc["ok"], true, "{toc}");
         assert_eq!(toc["data"]["chapters"].as_array().unwrap().len(), 2);
+        assert_eq!(toc["data"]["chapters"][0]["title"], "第一章（更新）");
+        assert_eq!(toc["data"]["chapters"][1]["title"], "第二章");
         assert_eq!(toc["data"]["pages"], 2);
 
         let content = call("content", "/chapter/1.html");

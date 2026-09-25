@@ -12,7 +12,6 @@ use crate::util::text::normalize_source_url;
 use serde_json::{json, Value};
 use std::borrow::Cow;
 use std::collections::HashMap;
-use sxd_xpath::{Factory as XPathFactory, Value as XPathValue};
 
 #[derive(Clone, Default)]
 pub struct RuleEngine;
@@ -214,9 +213,7 @@ impl RuleVariableContext {
         }
         if let Some(values) = &self.book {
             for (key, value) in values {
-                let value = Value::String(value.clone());
-                book.insert(key.clone(), value.clone());
-                book_variables.insert(key.clone(), value);
+                book_variables.insert(key.clone(), Value::String(value.clone()));
             }
         }
         book.insert("variableMap".to_string(), Value::Object(book_variables));
@@ -364,7 +361,7 @@ fn classify_rule_mode(
     if let Some(rest) = rule.strip_prefix("@@") {
         return (ParseMode::Css, rest.to_string());
     }
-    if let Some(rest) = strip_prefix_ascii_case(rule, "@xpath:") {
+    if let Some(rest) = html::xpath_rule(rule) {
         return (ParseMode::XPath, rest.to_string());
     }
     if let Some(rest) = strip_prefix_ascii_case(rule, "@json:") {
@@ -383,9 +380,6 @@ fn classify_rule_mode(
     }
     if content_is_json || rule.starts_with("$.") || rule.starts_with("$[") {
         return (ParseMode::JsonPath, rule.to_string());
-    }
-    if rule.starts_with('/') || rule.starts_with("./") || rule.starts_with("id(") {
-        return (ParseMode::XPath, rule.to_string());
     }
     if rule.starts_with(':') {
         return (ParseMode::Regex, rule.to_string());
@@ -438,7 +432,13 @@ impl RuleEngine {
         let content = content.trim();
         let content_is_json = (content.starts_with('{') || content.starts_with('['))
             && serde_json::from_str::<Value>(content).is_ok();
-        classify_rule_mode_with_css_regex_fallback(rule, ParseMode::Css, content_is_json).0
+        let (pure, js) = extract_js(rule);
+        let mode_rule = if js.is_some() && !pure.trim().is_empty() {
+            pure
+        } else {
+            rule
+        };
+        classify_rule_mode_with_css_regex_fallback(mode_rule, ParseMode::Css, content_is_json).0
     }
 
     /// Strip mode prefix from rule
@@ -651,7 +651,7 @@ impl RuleEngine {
                 &context,
             );
             let mode = self.detect_mode(list_rule, &prepared_body);
-            let (mut chapters, next_urls) = match mode {
+            let (chapters, next_urls) = match mode {
                 ParseMode::JsonPath => parse_chapter_list_json(
                     &prepared_body,
                     base_url,
@@ -688,6 +688,7 @@ impl RuleEngine {
                     &mut context,
                 ),
             };
+            let mut chapters = dedupe_chapters_last_wins(chapters);
             apply_toc_format_js(&mut chapters, rule.format_js.as_deref(), base_url, &context);
             if reverse {
                 chapters.reverse();
@@ -1085,7 +1086,14 @@ impl RuleEngine {
         rule: &SearchRule,
         list_rule: &str,
     ) -> Vec<SearchBook> {
-        let rows = regex_capture_rows(self.strip_mode_prefix(list_rule), body);
+        let (list_rule, list_js) = extract_js(list_rule);
+        let list_context = RuleVariableContext::for_search_item();
+        let rows = apply_regex_list_js(
+            regex_capture_rows(self.strip_mode_prefix(list_rule), body),
+            list_js,
+            base_url,
+            &list_context,
+        );
         let mut out = Vec::new();
         for captures in rows {
             let mut context = RuleVariableContext::for_search_item();
@@ -1210,23 +1218,13 @@ impl RuleEngine {
 
         if let Some(items) = parse_js_output_items(&output) {
             let mut out: Vec<BookChapter> = Vec::with_capacity(items.len());
-            let mut url_positions = HashMap::new();
             for item in items {
                 let mut chapter_ctx =
                     ctx.for_chapter(item.get("variable").and_then(Value::as_str), "");
                 if let Some(mut chapter) =
                     build_chapter_from_json(&item, base_url, rule, &mut chapter_ctx, out.len())
                 {
-                    // Match Android's last-wins behavior for repeated placeholder chapter URLs.
-                    if let Some(previous) = url_positions.remove(&chapter.url) {
-                        out.remove(previous);
-                        for (index, existing) in out.iter_mut().enumerate().skip(previous) {
-                            existing.index = index as i32;
-                            url_positions.insert(existing.url.clone(), index);
-                        }
-                    }
                     chapter.index = out.len() as i32;
-                    url_positions.insert(chapter.url.clone(), out.len());
                     out.push(chapter);
                 }
             }
@@ -1239,7 +1237,6 @@ impl RuleEngine {
             Err(_) => return (vec![], vec![]),
         };
         let mut out = Vec::new();
-        let mut seen_urls = std::collections::HashSet::new();
         for el in doc.select(&sel) {
             let mut chapter_ctx = ctx.for_chapter(None, "");
             let title = rule
@@ -1279,9 +1276,6 @@ impl RuleEngine {
                 .map(is_truthy)
                 .unwrap_or(false);
             let url = finalize_chapter_url(base_url, &raw_url, &title, is_volume, out.len());
-            if !seen_urls.insert(url.clone()) {
-                continue;
-            }
             out.push(BookChapter {
                 title,
                 url,
@@ -1305,9 +1299,14 @@ impl RuleEngine {
         ctx: &mut RuleVariableContext,
     ) -> (Vec<BookChapter>, Vec<String>) {
         let next_urls = self.parse_next_toc_urls(body, base_url, rule, ctx);
-        let rows = regex_capture_rows(self.strip_mode_prefix(list_rule), body);
+        let (list_rule, list_js) = extract_js(list_rule);
+        let rows = apply_regex_list_js(
+            regex_capture_rows(self.strip_mode_prefix(list_rule), body),
+            list_js,
+            base_url,
+            ctx,
+        );
         let mut out = Vec::new();
-        let mut seen_urls = std::collections::HashSet::new();
         for captures in rows {
             let mut chapter_ctx = ctx.for_chapter(None, "");
             let title = capture_rule_values_with_ctx(
@@ -1347,9 +1346,6 @@ impl RuleEngine {
                     .map(is_truthy)
                     .unwrap_or(false);
             let url = finalize_chapter_url(base_url, &raw_url, &title, is_volume, out.len());
-            if !seen_urls.insert(url.clone()) {
-                continue;
-            }
             out.push(BookChapter {
                 title,
                 url,
@@ -1376,7 +1372,14 @@ impl RuleEngine {
             return vec![];
         }
         let doc = html::parse_document(body);
-        let items = html::select_list(&doc, self.strip_mode_prefix(list_sel));
+        let (selector, list_js) = extract_js(list_sel);
+        let list_context = RuleVariableContext::for_search_item();
+        let items = apply_html_list_js(
+            html::select_list(&doc, self.strip_mode_prefix(selector)),
+            list_js,
+            base_url,
+            &list_context,
+        );
         let mut out = Vec::with_capacity(items.len());
 
         for el in items {
@@ -1456,9 +1459,16 @@ impl RuleEngine {
             Err(_) => return vec![],
         };
         let document = package.as_document();
-        let items = xpath_select_nodes(
-            sxd_xpath::nodeset::Node::Root(document.root()),
-            self.strip_mode_prefix(list_rule),
+        let (list_rule, list_js) = extract_js(list_rule);
+        let list_context = RuleVariableContext::for_search_item();
+        let items = apply_xpath_list_js(
+            html::xpath_select_nodes(
+                sxd_xpath::nodeset::Node::Root(document.root()),
+                self.strip_mode_prefix(list_rule),
+            ),
+            list_js,
+            base_url,
+            &list_context,
         );
         let mut out = Vec::with_capacity(items.len());
 
@@ -1540,7 +1550,14 @@ impl RuleEngine {
             Ok(v) => v,
             Err(_) => return vec![],
         };
-        let items = jsonpath::jsonpath_query(&v, self.strip_mode_prefix(list_rule));
+        let (list_rule, list_js) = extract_js(list_rule);
+        let list_context = RuleVariableContext::for_search_item();
+        let items = apply_json_list_js(
+            jsonpath::jsonpath_query(&v, self.strip_mode_prefix(list_rule)),
+            list_js,
+            base_url,
+            &list_context,
+        );
         let mut out = Vec::with_capacity(items.len());
         for item in items {
             let mut context = RuleVariableContext::for_search_item();
@@ -2034,10 +2051,13 @@ fn parse_chapter_list_html(
         let _ = eval_field_html_doc_with_ctx(init, &doc, base_url, ctx);
     }
 
-    let items = html::select_list(&doc, strip_mode_prefix(list_sel));
-
-    // Use a set to deduplicate chapters by URL
-    let mut seen_urls = std::collections::HashSet::new();
+    let (selector, list_js) = extract_js(list_sel);
+    let items = apply_html_list_js(
+        html::select_list(&doc, strip_mode_prefix(selector)),
+        list_js,
+        base_url,
+        ctx,
+    );
     let mut out = Vec::with_capacity(items.len());
 
     for el in items {
@@ -2077,10 +2097,6 @@ fn parse_chapter_list_html(
             .unwrap_or(false);
         let url_abs = finalize_chapter_url(base_url, &url, &title, is_volume, out.len());
 
-        if seen_urls.contains(&url_abs) {
-            continue;
-        }
-        seen_urls.insert(url_abs.clone());
         out.push(BookChapter {
             title,
             url: url_abs,
@@ -2117,9 +2133,14 @@ fn parse_chapter_list_xpath(
         sxd_xpath::nodeset::Node::Root(document.root()),
         rule.init.as_deref(),
     );
-    let items = xpath_select_nodes(scope, list_rule);
+    let (list_rule, list_js) = extract_js(list_rule);
+    let items = apply_xpath_list_js(
+        html::xpath_select_nodes(scope, strip_mode_prefix(list_rule)),
+        list_js,
+        base_url,
+        ctx,
+    );
 
-    let mut seen_urls = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         let mut chapter_ctx = ctx.for_chapter(None, "");
@@ -2169,10 +2190,6 @@ fn parse_chapter_list_xpath(
         .map(is_truthy)
         .unwrap_or(false);
         let url_abs = finalize_chapter_url(base_url, &url, &title, is_volume, out.len());
-        if seen_urls.contains(&url_abs) {
-            continue;
-        }
-        seen_urls.insert(url_abs.clone());
         out.push(BookChapter {
             title,
             url: url_abs,
@@ -2188,7 +2205,7 @@ fn parse_chapter_list_xpath(
     let next_urls = rule
         .next_toc_url
         .as_deref()
-        .map(|xpath| xpath_eval_strings(scope, xpath))
+        .map(|xpath| html::xpath_eval_strings(scope, xpath))
         .unwrap_or_default();
     let next_urls = normalize_toc_next_urls(base_url, next_urls);
 
@@ -2218,9 +2235,14 @@ fn parse_chapter_list_json(
             ctx.insert("cid".to_string(), cid);
         }
     }
-    let items = jsonpath::jsonpath_query(&scope, strip_mode_prefix(list_rule));
+    let (list_rule, list_js) = extract_js(list_rule);
+    let items = apply_json_list_js(
+        jsonpath::jsonpath_query(&scope, strip_mode_prefix(list_rule)),
+        list_js,
+        base_url,
+        ctx,
+    );
 
-    let mut seen_urls = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         let mut chapter_ctx = ctx.for_chapter(item.get("variable").and_then(Value::as_str), "");
@@ -2271,11 +2293,6 @@ fn parse_chapter_list_json(
         .unwrap_or(false);
         let url_abs = finalize_chapter_url(base_url, &url, &title, is_volume, out.len());
 
-        if seen_urls.contains(&url_abs) {
-            continue;
-        }
-        seen_urls.insert(url_abs.clone());
-
         out.push(BookChapter {
             title,
             url: url_abs,
@@ -2301,6 +2318,22 @@ fn parse_chapter_list_json(
     let next_urls = normalize_toc_next_urls(base_url, next_urls);
 
     (out, next_urls)
+}
+
+pub(crate) fn dedupe_chapters_last_wins(chapters: Vec<BookChapter>) -> Vec<BookChapter> {
+    let mut last_positions = HashMap::with_capacity(chapters.len());
+    for (index, chapter) in chapters.iter().enumerate() {
+        last_positions.insert(chapter.url.clone(), index);
+    }
+
+    let mut out = Vec::with_capacity(last_positions.len());
+    for (index, mut chapter) in chapters.into_iter().enumerate() {
+        if last_positions.get(&chapter.url) == Some(&index) {
+            chapter.index = out.len() as i32;
+            out.push(chapter);
+        }
+    }
+    out
 }
 
 fn normalize_toc_next_urls(base_url: &str, urls: Vec<String>) -> Vec<String> {
@@ -2645,8 +2678,7 @@ fn evaluate_template_expression(
         };
         return pick_json_field(value, Some(expression)).unwrap_or_default();
     }
-    if expression.starts_with("//") || starts_with_ascii_case(expression, "@xpath:") {
-        let xpath = strip_prefix_ascii_case(expression, "@xpath:").unwrap_or(expression);
+    if let Some(xpath) = html::xpath_rule(expression) {
         return html::select_xpath(input, xpath)
             .into_iter()
             .next()
@@ -2719,6 +2751,174 @@ fn extract_js(rule: &str) -> (&str, Option<&str>) {
         return (pure, Some(js));
     }
     (rule, None)
+}
+
+fn eval_list_js(
+    values: Vec<Value>,
+    script: Option<&str>,
+    base_url: &str,
+    ctx: &RuleVariableContext,
+) -> Option<Value> {
+    let script = script.filter(|script| !script.trim().is_empty())?;
+    let mut bindings = ctx.js_bindings();
+    bindings.insert("result".to_string(), Value::Array(values));
+    let script_literal = serde_json::to_string(script).unwrap_or_else(|_| "\"\"".to_string());
+    let wrapped = format!(
+        "const __readerOut = eval({script_literal});\
+         const __readerList = __readerOut == null ? globalThis.result : __readerOut;\
+         JSON.stringify(__readerList);"
+    );
+    let output = eval_js_with_bindings(&wrapped, "", base_url, &bindings).ok()?;
+    serde_json::from_str(&output).ok()
+}
+
+fn apply_html_list_js<'a>(
+    items: Vec<scraper::ElementRef<'a>>,
+    script: Option<&str>,
+    base_url: &str,
+    ctx: &RuleVariableContext,
+) -> Vec<scraper::ElementRef<'a>> {
+    if script.is_none() {
+        return items;
+    }
+
+    let values = items
+        .iter()
+        .enumerate()
+        .map(|(index, element)| {
+            let attrs = element
+                .value()
+                .attrs()
+                .map(|(name, value)| (name.to_string(), Value::String(value.to_string())))
+                .collect::<serde_json::Map<_, _>>();
+            json!({
+                "__readerHtmlElement": true,
+                "__readerIndex": index,
+                "attrs": attrs,
+                "html": element.inner_html(),
+                "outerHtml": element.html(),
+                "text": element.text().collect::<Vec<_>>().join(" ").trim(),
+            })
+        })
+        .collect();
+
+    let Some(Value::Array(result)) = eval_list_js(values, script, base_url, ctx) else {
+        return items;
+    };
+    let indices = result
+        .into_iter()
+        .filter_map(|item| item.get("__readerIndex").and_then(Value::as_u64))
+        .map(|index| index as usize)
+        .collect::<Vec<_>>();
+    indices
+        .into_iter()
+        .filter_map(|index| items.get(index).copied())
+        .collect()
+}
+
+fn apply_json_list_js(
+    items: Vec<Value>,
+    script: Option<&str>,
+    base_url: &str,
+    ctx: &RuleVariableContext,
+) -> Vec<Value> {
+    if script.is_none() {
+        return items;
+    }
+    match eval_list_js(items.clone(), script, base_url, ctx) {
+        Some(Value::Array(items)) => items,
+        _ => items,
+    }
+}
+
+fn apply_regex_list_js(
+    rows: Vec<Vec<Option<String>>>,
+    script: Option<&str>,
+    base_url: &str,
+    ctx: &RuleVariableContext,
+) -> Vec<Vec<Option<String>>> {
+    if script.is_none() {
+        return rows;
+    }
+
+    let values = rows
+        .iter()
+        .map(|row| {
+            Value::Array(
+                row.iter()
+                    .map(|value| value.clone().map(Value::String).unwrap_or(Value::Null))
+                    .collect(),
+            )
+        })
+        .collect();
+    let Some(Value::Array(result)) = eval_list_js(values, script, base_url, ctx) else {
+        return rows;
+    };
+
+    result
+        .into_iter()
+        .filter_map(|row| row.as_array().cloned())
+        .map(|row| {
+            row.into_iter()
+                .map(|value| match value {
+                    Value::Null => None,
+                    Value::String(value) => Some(value),
+                    value => Some(value.to_string()),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn apply_xpath_list_js<'a>(
+    items: Vec<sxd_xpath::nodeset::Node<'a>>,
+    script: Option<&str>,
+    base_url: &str,
+    ctx: &RuleVariableContext,
+) -> Vec<sxd_xpath::nodeset::Node<'a>> {
+    if script.is_none() {
+        return items;
+    }
+
+    let values = items
+        .iter()
+        .enumerate()
+        .map(|(index, node)| match node {
+            sxd_xpath::nodeset::Node::Element(element) => {
+                let attrs = element
+                    .attributes()
+                    .iter()
+                    .map(|attr| {
+                        (
+                            attr.name().local_part().to_string(),
+                            Value::String(attr.value().to_string()),
+                        )
+                    })
+                    .collect::<serde_json::Map<_, _>>();
+                json!({
+                    "__readerHtmlElement": true,
+                    "__readerIndex": index,
+                    "attrs": attrs,
+                    "html": html::sxd_element_to_html(*element, false),
+                    "outerHtml": html::sxd_element_to_html(*element, true),
+                    "text": node.string_value(),
+                })
+            }
+            _ => json!({
+                "__readerIndex": index,
+                "value": node.string_value(),
+            }),
+        })
+        .collect();
+
+    let Some(Value::Array(result)) = eval_list_js(values, script, base_url, ctx) else {
+        return items;
+    };
+    result
+        .into_iter()
+        .filter_map(|item| item.get("__readerIndex").and_then(Value::as_u64))
+        .filter_map(|index| items.get(index as usize).copied())
+        .collect()
 }
 
 fn direct_get_key(rule: &str) -> Option<&str> {
@@ -2869,7 +3069,7 @@ fn eval_field_xpath_with_ctx(
 
     let mut text = match source_rule.mode {
         ParseMode::XPath if pure.trim().is_empty() => input.clone(),
-        ParseMode::XPath => xpath_eval_strings(node, pure)
+        ParseMode::XPath => html::xpath_eval_strings(node, pure)
             .into_iter()
             .next()
             .unwrap_or_default(),
@@ -2910,112 +3110,10 @@ fn select_xpath_scope<'a>(
     let Some(init_rule) = init_rule.map(str::trim).filter(|s| !s.is_empty()) else {
         return node;
     };
-    xpath_select_nodes(node, init_rule)
+    html::xpath_select_nodes(node, init_rule)
         .into_iter()
         .next()
         .unwrap_or(node)
-}
-
-fn xpath_select_nodes<'a>(
-    node: sxd_xpath::nodeset::Node<'a>,
-    xpath: &str,
-) -> Vec<sxd_xpath::nodeset::Node<'a>> {
-    let norm = html::normalize_xpath_query(xpath);
-    let xpath = norm.trim();
-    if xpath.is_empty() {
-        return vec![];
-    }
-    let context = html::new_xpath_context();
-    let mut nodes = match XPathFactory::new().build(xpath) {
-        Ok(Some(expr)) => match expr.evaluate(&context, node) {
-            Ok(XPathValue::Nodeset(ns)) => ns.document_order(),
-            _ => vec![],
-        },
-        _ => vec![],
-    };
-
-    if nodes.is_empty()
-        && matches!(node, sxd_xpath::nodeset::Node::Root(_))
-        && xpath.starts_with('/')
-        && !xpath.starts_with("//")
-        && !xpath.starts_with("/html")
-        && !xpath.starts_with("/reader-root")
-    {
-        let fallback_html = if xpath.starts_with("/body") {
-            format!("/html{xpath}")
-        } else {
-            format!("/html/body{xpath}")
-        };
-        if let Ok(Some(expr)) = XPathFactory::new().build(&fallback_html) {
-            if let Ok(XPathValue::Nodeset(ns)) = expr.evaluate(&context, node) {
-                nodes = ns.document_order();
-            }
-        }
-    }
-
-    nodes
-}
-
-fn xpath_eval_strings(node: sxd_xpath::nodeset::Node<'_>, xpath: &str) -> Vec<String> {
-    let wants_html = xpath.trim().ends_with("/html()");
-    let norm = html::normalize_xpath_query(xpath);
-    let xpath = norm.trim();
-    if xpath.is_empty() {
-        return vec![];
-    }
-    let context = html::new_xpath_context();
-    let res = match XPathFactory::new().build(xpath) {
-        Ok(Some(expr)) => match expr.evaluate(&context, node) {
-            Ok(val) => Some(val),
-            Err(_) => None,
-        },
-        _ => None,
-    };
-
-    let val = match res {
-        Some(XPathValue::Nodeset(ns)) if ns.size() == 0 => {
-            if matches!(node, sxd_xpath::nodeset::Node::Root(_))
-                && xpath.starts_with('/')
-                && !xpath.starts_with("//")
-                && !xpath.starts_with("/html")
-                && !xpath.starts_with("/reader-root")
-            {
-                let fallback = if xpath.starts_with("/body") {
-                    format!("/html{xpath}")
-                } else {
-                    format!("/html/body{xpath}")
-                };
-                XPathFactory::new()
-                    .build(&fallback)
-                    .ok()
-                    .flatten()
-                    .and_then(|expr| expr.evaluate(&context, node).ok())
-                    .unwrap_or(XPathValue::Nodeset(ns))
-            } else {
-                XPathValue::Nodeset(ns)
-            }
-        }
-        Some(val) => val,
-        None => return vec![],
-    };
-
-    match val {
-        XPathValue::Nodeset(ns) => ns
-            .document_order()
-            .into_iter()
-            .map(|n| {
-                if wants_html {
-                    if let sxd_xpath::nodeset::Node::Element(el) = n {
-                        return html::sxd_element_to_html(el, false);
-                    }
-                }
-                n.string_value()
-            })
-            .collect(),
-        XPathValue::String(s) => vec![s],
-        XPathValue::Number(n) => vec![n.to_string()],
-        XPathValue::Boolean(b) => vec![b.to_string()],
-    }
 }
 
 fn eval_field_json_with_ctx(
@@ -4947,71 +5045,97 @@ chapter_id='{{$.chapter_id}}'
     }
 
     #[test]
-    fn test_shenhai_toc_extraction() {
+    fn test_html_toc_trailing_js_filters_selected_elements() {
         let engine = RuleEngine::new().unwrap();
         let source_json = serde_json::json!({
-            "bookSourceName": "穿越小说（优）",
-            "bookSourceUrl": "http://www.kk169.org",
-            "ruleBookInfo": {
-                "author": "[property$=author]@content",
-                "name": "[property$=book_name]@content",
-                "tocUrl": "text.点击阅读@href"
-            },
+            "bookSourceName": "HTML trailing JS fixture",
+            "bookSourceUrl": "https://example.com",
             "ruleToc": {
-                "chapterList": "li.chapter@a\n<js>\nvar r=result;\nvar v=book.getVariable(\"custom\")\nvar b=[];\nif(v!=\"\"){\n        for(i=0;i<r.length-v;i++){\n                b.push(r[i]);\n                }\n                result=b;\n        }\n        result\n</js>",
+                "chapterList": "li.chapter@a\n<js>\nvar r=result;\nvar v=book.getVariable(\"custom\");\nvar b=[];\nfor(i=0;i<r.length-v;i++){ b.push(r[i]); }\nresult=b;\nresult\n</js>",
                 "chapterName": "text",
-                "chapterUrl": "href",
-                "updateTime": "更新时间：{{@@title##更新，共##·章节字数：}}"
-            },
-            "ruleContent": {
-                "content": "#acontent@textNodes"
+                "chapterUrl": "href"
             }
         });
         let source: BookSource = serde_json::from_value(source_json).unwrap();
-        let toc_body = match std::fs::read_to_string("/tmp/kk169_toc.html") {
-            Ok(body) => body,
-            Err(_) => return,
-        };
-        let doc = html::parse_document(&toc_body);
-        let items_chained = html::select_list(&doc, "li.chapter@a");
-        let items_space = html::select_list(&doc, "li.chapter a");
-        let items_li = html::select_list(&doc, "li.chapter");
-        eprintln!("items_chained (li.chapter@a) len: {}", items_chained.len());
-        eprintln!("items_space (li.chapter a) len: {}", items_space.len());
-        eprintln!("items_li (li.chapter) len: {}", items_li.len());
-        if !items_chained.is_empty() {
-            eprintln!("items_chained[0] tag: {}, text: {}, href: {:?}",
-                items_chained[0].value().name(),
-                html::extract_text(&items_chained[0], "text").unwrap_or_default(),
-                items_chained[0].value().attr("href")
-            );
-        }
-        if !items_li.is_empty() {
-            eprintln!("items_li[0] tag: {}, text: {}, href: {:?}",
-                items_li[0].value().name(),
-                html::extract_text(&items_li[0], "text").unwrap_or_default(),
-                items_li[0].value().attr("href")
-            );
-        }
+        let toc_body = r#"
+            <ul>
+                <li class="chapter"><a href="/1">第一章</a></li>
+                <li class="chapter"><a href="/2">第二章</a></li>
+                <li class="chapter"><a href="/3">第三章</a></li>
+            </ul>
+        "#;
         let (chapters, _) = engine.chapter_list_with_variable(
             &source,
-            &toc_body,
-            "http://www.kk169.la/html/701/701798/",
-            None,
-            Some("深海余烬"),
+            toc_body,
+            "https://example.com/toc",
+            Some(r#"{"custom":"1"}"#),
+            Some("Book"),
         );
-        eprintln!("Extracted chapters len: {}", chapters.len());
-        if !chapters.is_empty() {
-            eprintln!("Chapter 0: title={}, url={}", chapters[0].title, chapters[0].url);
-        }
-        assert_eq!(chapters.len(), 858);
 
-        if let Ok(content_body) = std::fs::read_to_string("/tmp/kk169_content.html") {
-            let content = engine.content(&source, &content_body, &chapters[0].url);
-            eprintln!("Extracted content len: {}", content.len());
-            assert!(!content.is_empty());
-            assert!(content.contains("起雾了") || content.contains("雾"));
-        }
+        assert_eq!(chapters.len(), 2);
+        assert_eq!(chapters[0].title, "第一章");
+        assert_eq!(chapters[0].url, "https://example.com/1");
+        assert_eq!(chapters[1].title, "第二章");
+        assert_eq!(chapters[1].url, "https://example.com/2");
+    }
+
+    #[test]
+    fn test_trailing_js_filters_json_xpath_and_regex_lists() {
+        let engine = RuleEngine::new().unwrap();
+
+        let json_source: BookSource = serde_json::from_value(serde_json::json!({
+            "bookSourceName": "JSON trailing JS",
+            "bookSourceUrl": "https://example.com",
+            "ruleToc": {
+                "chapterList": "$.chapters[*]<js>result.slice(1)</js>",
+                "chapterName": "$.title",
+                "chapterUrl": "$.url"
+            }
+        }))
+        .unwrap();
+        let (json_chapters, _) = engine.chapter_list(
+            &json_source,
+            r#"{"chapters":[{"title":"一","url":"/1"},{"title":"二","url":"/2"}]}"#,
+            "https://example.com/toc",
+        );
+        assert_eq!(json_chapters.len(), 1);
+        assert_eq!(json_chapters[0].title, "二");
+
+        let xpath_source: BookSource = serde_json::from_value(serde_json::json!({
+            "bookSourceName": "XPath trailing JS",
+            "bookSourceUrl": "https://example.com",
+            "ruleToc": {
+                "chapterList": "//a<js>result.slice(1)</js>",
+                "chapterName": "./text()",
+                "chapterUrl": "./@href"
+            }
+        }))
+        .unwrap();
+        let (xpath_chapters, _) = engine.chapter_list(
+            &xpath_source,
+            r#"<div><a href="/1">一</a><a href="/2">二</a></div>"#,
+            "https://example.com/toc",
+        );
+        assert_eq!(xpath_chapters.len(), 1);
+        assert_eq!(xpath_chapters[0].title, "二");
+
+        let regex_source: BookSource = serde_json::from_value(serde_json::json!({
+            "bookSourceName": "Regex trailing JS",
+            "bookSourceUrl": "https://example.com",
+            "ruleToc": {
+                "chapterList": ":<a href=\"([^\"]+)\">([^<]+)</a><js>result.slice(1)</js>",
+                "chapterName": "$2",
+                "chapterUrl": "$1"
+            }
+        }))
+        .unwrap();
+        let (regex_chapters, _) = engine.chapter_list(
+            &regex_source,
+            r#"<a href="/1">一</a><a href="/2">二</a>"#,
+            "https://example.com/toc",
+        );
+        assert_eq!(regex_chapters.len(), 1);
+        assert_eq!(regex_chapters[0].title, "二");
     }
 
     #[test]
@@ -5080,7 +5204,7 @@ chapter_id='{{$.chapter_id}}'
             &source,
             toc_body,
             "https://novel.html5.qq.com/qbread/api/book/all-chapter?bookId=1132746073",
-            None,
+            Some(r#"{"kind":"variable-value"}"#),
             Some("帝皇的告死天使"),
             Some(&book_fields),
         );

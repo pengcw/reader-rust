@@ -63,9 +63,6 @@ impl UrlRuleContext {
         for (key, value) in &self.book_fields {
             book.insert(key.clone(), Value::String(value.clone()));
         }
-        for (key, value) in &book_variables {
-            book.insert(key.clone(), value.clone());
-        }
         book.insert("variableMap".to_string(), Value::Object(book_variables));
         if let Some(name) = self.book_name.as_deref() {
             book.insert("name".to_string(), Value::String(name.to_string()));
@@ -1401,6 +1398,30 @@ mod tests {
         assert_eq!(
             spec.url,
             "https://a.test/BOOK/CHAPTER/CHAPTER/Chapter%20Title?name=Book%20Name"
+        );
+    }
+
+    #[test]
+    fn compat_url_book_fields_do_not_collide_with_variable_map() {
+        let source = test_source(None);
+        let context = UrlRuleContext {
+            book_variable: Some(r#"{"kind":"VARIABLE"}"#.to_string()),
+            book_fields: HashMap::from([("kind".to_string(), "FIELD".to_string())]),
+            ..Default::default()
+        };
+        let spec = analyze_url_with_context(
+            "/{{book.kind}}/{{book.variableMap.kind}},{"js":"result + '?direct=' + book.kind + '&variable=' + book.variableMap.kind"}",
+            "",
+            1,
+            "https://a.test",
+            &source,
+            Some(&context),
+        )
+        .unwrap();
+
+        assert_eq!(
+            spec.url,
+            "https://a.test/FIELD/VARIABLE?direct=FIELD&variable=VARIABLE"
         );
     }
 
