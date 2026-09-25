@@ -754,17 +754,20 @@ fn eval_js_inner_with_source(
             let base_url_for_elements = base_url_value.to_string();
             java_obj.set(
                 "getElements",
-                Func::new(move |rule: String, content: Option<String>| -> String {
-                    let default_content = content_for_elements
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone();
-                    java_get_elements_json(
-                        &rule,
-                        content.as_deref().unwrap_or(&default_content),
-                        &base_url_for_elements,
-                    )
-                }),
+                Func::new(
+                    move |rule: String, content: Option<String>, raw_css: Option<bool>| -> String {
+                        let default_content = content_for_elements
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
+                        java_get_elements_json_with_mode(
+                            &rule,
+                            content.as_deref().unwrap_or(&default_content),
+                            &base_url_for_elements,
+                            raw_css.unwrap_or(false),
+                        )
+                    },
+                ),
             )?;
             let content_for_element = content_state.clone();
             let base_url_for_element = base_url_value.to_string();
@@ -913,8 +916,8 @@ fn eval_js_inner_with_source(
                         return _origSetContent(String(content == null ? '' : content));
                     };
                     const _nativeGetElements = globalThis.java.getElements;
-                    const _wrapElements = (rule, content) => {
-                        const raw = _nativeGetElements(rule, content);
+                    const _wrapElements = (rule, content, rawCss = false) => {
+                        const raw = _nativeGetElements(rule, content, rawCss);
                         let values;
                         try { values = JSON.parse(raw); } catch (e) { values = []; }
                         if (!Array.isArray(values)) values = [];
@@ -923,12 +926,23 @@ fn eval_js_inner_with_source(
                             const attrs = item.attrs || {};
                             return {
                                 attr(name) { return attrs[String(name)] || ''; },
+                                hasClass(name) {
+                                    return String(attrs.class || '').split(/\s+/).includes(String(name));
+                                },
                                 html() { return item.html || ''; },
                                 text() { return item.text || ''; },
                                 outerHtml() { return item.outerHtml || ''; },
+                                select(selector) { return _wrapElements(String(selector), item.outerHtml || '', rawCss); },
                                 toString() { return item.outerHtml || ''; }
                             };
                         });
+                        items.first = function() { return this.length ? this[0] : null; };
+                        items.get = function(index) {
+                            const position = Number(index);
+                            return Number.isInteger(position) && position >= 0 && position < this.length
+                                ? this[position] : null;
+                        };
+                        items.size = function() { return this.length; };
                         items.toArray = function() { return Array.from(this); };
                         return items;
                     };
@@ -938,6 +952,27 @@ fn eval_js_inner_with_source(
                         return items.length > 0 ? items[0] : null;
                     };
                 }"#,
+            )?;
+
+            eval_script(
+                ctx.clone(),
+                r#"(function() {
+                    const asObject = value => value && (typeof value === 'object' || typeof value === 'function')
+                        ? value : {};
+                    globalThis.org = asObject(globalThis.org);
+                    globalThis.org.jsoup = asObject(globalThis.org.jsoup);
+                    globalThis.org.jsoup.Jsoup = asObject(globalThis.org.jsoup.Jsoup);
+                    if (typeof globalThis.org.jsoup.Jsoup.parse !== 'function') {
+                        globalThis.org.jsoup.Jsoup.parse = function(html) {
+                            const source = String(html == null ? '' : html);
+                            return {
+                                select(selector) {
+                                    return globalThis.java.getElements(String(selector), source, true);
+                                }
+                            };
+                        };
+                    }
+                })();"#,
             )?;
 
             eval_script(
@@ -1480,6 +1515,15 @@ pub(crate) fn java_get_string_list(
 }
 
 fn java_get_elements_json(rule: &str, content: &str, base_url: &str) -> String {
+    java_get_elements_json_with_mode(rule, content, base_url, false)
+}
+
+fn java_get_elements_json_with_mode(
+    rule: &str,
+    content: &str,
+    base_url: &str,
+    raw_css: bool,
+) -> String {
     let rule = rule.trim();
     let content = content.trim();
     if rule.is_empty() || content.is_empty() {
@@ -1497,7 +1541,7 @@ fn java_get_elements_json(rule: &str, content: &str, base_url: &str) -> String {
         || rule.starts_with(':');
     let json_content = serde_json::from_str::<JsonValue>(content).ok();
     let json_rule = rule.starts_with('$') || lower_rule.starts_with("@json:");
-    if !explicit_css && !explicit_other_mode && (json_rule || json_content.is_some()) {
+    if !raw_css && !explicit_css && !explicit_other_mode && (json_rule || json_content.is_some()) {
         let Some(value) = json_content else {
             return "[]".to_string();
         };
@@ -1520,15 +1564,16 @@ fn java_get_elements_json(rule: &str, content: &str, base_url: &str) -> String {
         return serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string());
     }
 
-    if rule.starts_with("@xpath:")
-        || rule.starts_with("@XPath:")
-        || rule.starts_with("@XPATH:")
-        || rule.starts_with('/')
-        || rule.starts_with("./")
-        || rule.starts_with("@regex:")
-        || rule.starts_with(':')
-        || rule.starts_with("@js:")
-        || rule.starts_with("js:")
+    if !raw_css
+        && (rule.starts_with("@xpath:")
+            || rule.starts_with("@XPath:")
+            || rule.starts_with("@XPATH:")
+            || rule.starts_with('/')
+            || rule.starts_with("./")
+            || rule.starts_with("@regex:")
+            || rule.starts_with(':')
+            || rule.starts_with("@js:")
+            || rule.starts_with("js:"))
     {
         let values = java_get_string_list(Some(rule), Some(content), "", base_url, false)
             .into_iter()
@@ -1537,7 +1582,9 @@ fn java_get_elements_json(rule: &str, content: &str, base_url: &str) -> String {
         return serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string());
     }
 
-    let selector = if rule.starts_with("@@") {
+    let selector = if raw_css {
+        rule
+    } else if rule.starts_with("@@") {
         &rule[2..]
     } else if lower_rule.starts_with("@css:") {
         &rule[5..]
@@ -1546,7 +1593,11 @@ fn java_get_elements_json(rule: &str, content: &str, base_url: &str) -> String {
     }
     .trim();
     let document = html::parse_document(content);
-    let elements = html::select_list(&document, selector);
+    let elements = if raw_css {
+        html::select_css_list(&document, selector)
+    } else {
+        html::select_list(&document, selector)
+    };
     let values = elements
         .into_iter()
         .map(|element| {
@@ -2014,6 +2065,39 @@ mod tests {
             delta.unwrap().variables.unwrap()["__prefs:reader:token"],
             JsonValue::String("saved".to_string())
         );
+    }
+
+    #[test]
+    fn compat_jsoup_subset_supports_select_collection_and_element_methods() {
+        let script = r#"
+            var doc = org.jsoup.Jsoup.parse(result);
+            var items = doc.select('ul.volume-chapters li.chapter-li:not(.volume-cover)');
+            var output = [];
+            for (var i = 0; i < items.size(); i++) {
+                var item = items.get(i);
+                var link = item.select('a').first();
+                output.push({
+                    title: link ? link.text() : '',
+                    url: link ? link.attr('href') : '',
+                    isVolume: item.hasClass('chapter-bar')
+                });
+            }
+            JSON.stringify(output);
+        "#;
+        let body = r#"<ul class="volume-chapters">
+            <li class="chapter-li"><a href="/chapter/1">Chapter 1</a></li>
+            <li class="chapter-li chapter-bar"><a href="/volume/1">Volume 1</a></li>
+            <li class="chapter-li volume-cover"><a href="/cover">Cover</a></li>
+        </ul>"#;
+
+        let output = eval_js(script, body, "https://source.example").unwrap();
+        let items = serde_json::from_str::<Vec<JsonValue>>(&output).unwrap();
+
+        assert_eq!(items.len(), 2, "Jsoup output: {output}");
+        assert_eq!(items[0]["title"], "Chapter 1");
+        assert_eq!(items[0]["url"], "/chapter/1");
+        assert_eq!(items[0]["isVolume"], false);
+        assert_eq!(items[1]["isVolume"], true);
     }
 
     #[test]

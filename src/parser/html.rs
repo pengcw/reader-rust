@@ -78,6 +78,14 @@ fn legado_to_css(selector: &str) -> String {
         return selector.to_string();
     }
 
+    // Preserve standard CSS syntax instead of treating descendant whitespace as class chaining.
+    if selector
+        .chars()
+        .any(|ch| matches!(ch, '.' | '#' | '[' | ':' | '>' | '+' | '~' | ',' | '*'))
+    {
+        return selector.to_string();
+    }
+
     // Default: treat as class if it doesn't look like a tag
     if selector
         .chars()
@@ -93,6 +101,113 @@ fn legado_to_css(selector: &str) -> String {
     }
 
     selector.to_string()
+}
+
+fn quote_unquoted_colon_attribute_value(attribute: &str) -> Option<String> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut equals = None;
+    for (index, ch) in attribute.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '=' => {
+                equals = Some(index);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let value_start = equals? + 1;
+    let leading_space = attribute[value_start..].len() - attribute[value_start..].trim_start().len();
+    let value_start = value_start + leading_space;
+    let value_end = attribute[value_start..]
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map_or(attribute.len(), |(index, _)| value_start + index);
+    let value = &attribute[value_start..value_end];
+    if value.is_empty()
+        || !value.contains(':')
+        || value.chars().any(|ch| matches!(ch, '\\' | '\'' | '"'))
+    {
+        return None;
+    }
+
+    let mut normalized = String::with_capacity(attribute.len() + 2);
+    normalized.push_str(&attribute[..value_start]);
+    normalized.push('"');
+    normalized.push_str(value);
+    normalized.push('"');
+    normalized.push_str(&attribute[value_end..]);
+    Some(normalized)
+}
+
+fn quote_unquoted_colon_attribute_values(selector: &str) -> Option<String> {
+    let mut output = String::with_capacity(selector.len());
+    let mut copied_until = 0;
+    let mut bracket_start = None;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut changed = false;
+
+    for (index, ch) in selector.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '\'' | '"' => quote = Some(ch),
+            '[' if bracket_start.is_none() => bracket_start = Some(index),
+            ']' => {
+                if let Some(start) = bracket_start.take() {
+                    if let Some(attribute) =
+                        quote_unquoted_colon_attribute_value(&selector[start + 1..index])
+                    {
+                        output.push_str(&selector[copied_until..start + 1]);
+                        output.push_str(&attribute);
+                        output.push(']');
+                        copied_until = index + 1;
+                        changed = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !changed {
+        return None;
+    }
+    output.push_str(&selector[copied_until..]);
+    Some(output)
+}
+
+fn parse_css_selector(css_selector: &str) -> Option<Selector> {
+    Selector::parse(css_selector).ok().or_else(|| {
+        let normalized = quote_unquoted_colon_attribute_values(css_selector)?;
+        Selector::parse(&normalized).ok()
+    })
 }
 
 fn parse_selector_with_index(selector: &str) -> ParsedSelector {
@@ -135,7 +250,7 @@ pub(crate) fn css_rule_is_valid(rule: &str) -> bool {
                 .next()
                 .unwrap_or_default();
             match parse_selector_with_index(&selector).base {
-                SelectorBase::Css(css) => Selector::parse(&css).is_ok(),
+                SelectorBase::Css(css) => parse_css_selector(&css).is_some(),
                 SelectorBase::Children | SelectorBase::Text(_) => true,
             }
         })
@@ -258,17 +373,19 @@ fn collect_matches_from_element<'a>(
 }
 
 fn select_css<'a>(doc: &'a Html, css_selector: &str) -> Vec<ElementRef<'a>> {
-    let sel = match Selector::parse(css_selector) {
-        Ok(s) => s,
-        Err(_) => return vec![],
+    let Some(sel) = parse_css_selector(css_selector) else {
+        return vec![];
     };
     doc.select(&sel).collect()
 }
 
+pub(crate) fn select_css_list<'a>(doc: &'a Html, css_selector: &str) -> Vec<ElementRef<'a>> {
+    select_css(doc, css_selector)
+}
+
 fn select_css_from_element<'a>(el: ElementRef<'a>, css_selector: &str) -> Vec<ElementRef<'a>> {
-    let sel = match Selector::parse(css_selector) {
-        Ok(s) => s,
-        Err(_) => return vec![],
+    let Some(sel) = parse_css_selector(css_selector) else {
+        return vec![];
     };
     el.select(&sel).collect()
 }
@@ -1280,6 +1397,36 @@ mod tests {
             vec!["/cover.jpg"]
         );
         assert_eq!(select_xpath("<td>Cell</td>", "//td"), vec!["Cell"]);
+    }
+
+    #[test]
+    fn css_attribute_selector_accepts_unquoted_colon_values() {
+        let doc =
+            parse_document(r#"<meta property="og:novel:read_url" content="/novel/3805/catalog">"#);
+        let rule = "meta[property=og:novel:read_url]@content";
+
+        assert!(css_rule_is_valid(rule));
+        assert_eq!(
+            select_text(&doc, rule),
+            Some("/novel/3805/catalog".to_string())
+        );
+    }
+
+    #[test]
+    fn standard_css_descendant_selectors_keep_tag_and_pseudo_syntax() {
+        let doc = parse_document(
+            r#"<div class="book-cell"><p>Other</p><p>169 万字</p></div>
+<section id="bookSummary"><content>简介内容</content></section>"#,
+        );
+
+        assert_eq!(
+            select_text(&doc, "div.book-cell p:nth-of-type(2)@text"),
+            Some("169 万字".to_string())
+        );
+        assert_eq!(
+            select_text(&doc, "section#bookSummary content@html"),
+            Some("简介内容".to_string())
+        );
     }
 
     #[test]

@@ -876,8 +876,18 @@ impl RuleEngine {
             }
             ParseMode::Css => {
                 let doc = html::parse_document(&content_body);
-                html::select_all_text(&doc, self.strip_mode_prefix(&content_rule))
+                if extract_js(&content_rule).1.is_some() {
+                    eval_field_html_doc_with_ctx(
+                        &content_rule,
+                        &doc,
+                        base_url,
+                        context,
+                    )
                     .unwrap_or_default()
+                } else {
+                    html::select_all_text(&doc, self.strip_mode_prefix(&content_rule))
+                        .unwrap_or_default()
+                }
             }
             ParseMode::Js => String::new(),
         };
@@ -3211,8 +3221,15 @@ fn apply_toc_format_js(
 
 fn parse_js_output_items(output: &str) -> Option<Vec<Value>> {
     let value = serde_json::from_str::<Value>(output.trim()).ok()?;
+    let parse_stringified_object = |item: Value| match item {
+        Value::String(raw) => match serde_json::from_str::<Value>(&raw) {
+            Ok(value @ (Value::Object(_) | Value::Array(_))) => value,
+            _ => Value::String(raw),
+        },
+        other => other,
+    };
     match value {
-        Value::Array(items) => Some(items),
+        Value::Array(items) => Some(items.into_iter().map(parse_stringified_object).collect()),
         Value::Object(_) => Some(vec![value]),
         _ => None,
     }
@@ -3852,6 +3869,83 @@ mod tests {
     }
 
     #[test]
+    fn compat_content_css_extractor_can_chain_javascript_transform() {
+        let source = BookSource {
+            rule_content: Some(ContentRule {
+                content: Some(
+                    r#"#acontent@html@js:
+var html = result;
+html = html.replace(/data-src="([^"]+)"/g, 'src="$1"');
+html = html.replace(/style="display:none;"/g, '');
+html;"#
+                        .to_string(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let body = r#"<div id="acontent"><p>正文</p><img data-src="/img/a.png" style="display:none;"></div>"#;
+
+        let content = RuleEngine::new()
+            .unwrap()
+            .content(&source, body, "https://example.test/chapter");
+
+        assert!(content.contains("正文"));
+        assert!(content.contains("src=\"https://example.test/img/a.png\""));
+        assert!(!content.contains("data-src"));
+        assert!(!content.contains("display:none"));
+    }
+
+    #[test]
+    fn compat_js_toc_parses_stringified_json_items_from_jsoup_rules() {
+        let source = BookSource {
+            book_source_name: "Jsoup TOC".to_string(),
+            book_source_url: "https://source.example".to_string(),
+            rule_toc: Some(TocRule {
+                chapter_list: Some(
+                    r#"@js:
+var doc = org.jsoup.Jsoup.parse(result);
+var items = doc.select('ul.volume-chapters li.chapter-li:not(.volume-cover)');
+var arr = [];
+for (var i = 0; i < items.size(); i++) {
+    var it = items.get(i);
+    var isVol = it.hasClass('chapter-bar');
+    var a = it.select('a').first();
+    var t = a != null ? a.text() : '';
+    var u = a != null ? a.attr('href') : '';
+    arr.push(JSON.stringify({title: t, url: u, isVolume: isVol}));
+}
+arr;"#
+                        .to_string(),
+                ),
+                chapter_name: Some("$.title".to_string()),
+                chapter_url: Some(
+                    "@js:var c = JSON.parse(result); c.isVolume ? '' : c.url;".to_string(),
+                ),
+                is_volume: Some("$.isVolume".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let body = r#"<ul class="volume-chapters">
+<li class="chapter-li"><a href="/chapter/1">Chapter 1</a></li>
+<li class="chapter-li chapter-bar"><a href="/volume/1">Volume 1</a></li>
+<li class="chapter-li volume-cover"><a href="/cover">Cover</a></li>
+</ul>"#;
+
+        let (chapters, _) = RuleEngine::new()
+            .unwrap()
+            .chapter_list(&source, body, "https://source.example/book");
+
+        assert_eq!(chapters.len(), 2);
+        assert_eq!(chapters[0].title, "Chapter 1");
+        assert_eq!(chapters[0].url, "https://source.example/chapter/1");
+        assert!(!chapters[0].is_volume);
+        assert_eq!(chapters[1].title, "Volume 1");
+        assert!(chapters[1].is_volume);
+    }
+
+    #[test]
     fn compat_regex_search_put_values_are_scoped_per_item() {
         let source = BookSource {
             rule_search: Some(SearchRule {
@@ -4265,6 +4359,41 @@ mod tests {
         let results = engine.search_books(&source, "<html></html>", "https://books.example");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "Alpha-lib");
+    }
+
+    #[test]
+    fn html_book_info_reads_unquoted_colon_meta_selectors() {
+        let source = BookSource {
+            rule_book_info: Some(BookInfoRule {
+                name: Some("meta[property=og:novel:book_name]@content".to_string()),
+                author: Some("meta[property=og:novel:author]@content".to_string()),
+                last_chapter: Some(
+                    "meta[property=og:novel:latest_chapter_name]@content".to_string(),
+                ),
+                toc_url: Some("meta[property=og:novel:read_url]@content".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let body = r#"<meta property="og:novel:book_name" content="测试作品">
+<meta property="og:novel:author" content="测试作者">
+<meta property="og:novel:latest_chapter_name" content="第1话 测试章节">
+<meta property="og:novel:read_url" content="https://books.example/novel/1/catalog">"#;
+
+        let book = RuleEngine::new().unwrap().book_info(
+            &source,
+            body,
+            "https://books.example/novel/1.html",
+            "https://books.example/novel/1.html",
+        );
+
+        assert_eq!(book.name, "测试作品");
+        assert_eq!(book.author, "测试作者");
+        assert_eq!(book.latest_chapter_title.as_deref(), Some("第1话 测试章节"));
+        assert_eq!(
+            book.toc_url.as_deref(),
+            Some("https://books.example/novel/1/catalog")
+        );
     }
 
     #[test]
