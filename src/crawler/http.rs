@@ -143,10 +143,13 @@ impl HttpClient {
     }
 
     pub(crate) fn standalone() -> Self {
+        let timeout = Duration::from_secs(15);
         let config = Agent::config_builder()
             .http_status_as_error(false)
             .max_redirects(0)
             .max_redirects_will_error(false)
+            .timeout_global(Some(timeout))
+            .timeout_connect(Some(timeout.min(Duration::from_secs(5))))
             .user_agent(DEFAULT_USER_AGENT)
             .accept_encoding("gzip, deflate")
             .build();

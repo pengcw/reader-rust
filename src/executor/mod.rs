@@ -1518,14 +1518,37 @@ mod tests {
     use base64::Engine;
     use serde_json::Value;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::thread;
+    use std::time::{Duration, Instant};
+
+    fn accept_with_timeout(listener: &TcpListener) -> (TcpStream, SocketAddr) {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((stream, address)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    return (stream, address);
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("test HTTP server did not receive request: {error}"),
+            }
+        }
+    }
 
     fn serve_once(body: &'static str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = accept_with_timeout(&listener);
             let mut request = [0u8; 2048];
             let _ = stream.read(&mut request);
             write!(
@@ -1544,7 +1567,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         thread::spawn(move || {
             for _ in 0..request_count {
-                let (mut stream, _) = listener.accept().unwrap();
+                let (mut stream, _) = accept_with_timeout(&listener);
                 let mut request = [0u8; 4096];
                 let bytes_read = stream.read(&mut request).unwrap();
                 let request = String::from_utf8_lossy(&request[..bytes_read]);
@@ -1671,7 +1694,7 @@ mod tests {
         let server = thread::spawn(move || {
             let mut requests = Vec::new();
             for _ in 0..2 {
-                let (mut stream, _) = listener.accept().unwrap();
+                let (mut stream, _) = accept_with_timeout(&listener);
                 let mut request = [0u8; 4096];
                 let bytes_read = stream.read(&mut request).unwrap();
                 let request = String::from_utf8_lossy(&request[..bytes_read]).into_owned();
@@ -1779,7 +1802,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let base_url = format!("http://{address}");
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = accept_with_timeout(&listener);
             let mut request = [0u8; 4096];
             let bytes_read = stream.read(&mut request).unwrap();
             let request = String::from_utf8_lossy(&request[..bytes_read]).into_owned();
@@ -1863,7 +1886,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let base_url = format!("http://{address}");
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = accept_with_timeout(&listener);
             let mut request = [0u8; 4096];
             let bytes_read = stream.read(&mut request).unwrap();
             let request = String::from_utf8_lossy(&request[..bytes_read]).into_owned();
@@ -2050,7 +2073,7 @@ mod tests {
         let response_body_for_server = response_body.to_string();
         thread::spawn(move || {
             for call_index in 0..2 {
-                let (mut stream, _) = listener.accept().unwrap();
+                let (mut stream, _) = accept_with_timeout(&listener);
                 let mut request = [0u8; 4096];
                 let bytes_read = stream.read(&mut request).unwrap();
                 let request = String::from_utf8_lossy(&request[..bytes_read]);
