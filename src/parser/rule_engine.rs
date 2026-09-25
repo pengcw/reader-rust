@@ -1209,17 +1209,25 @@ impl RuleEngine {
         };
 
         if let Some(items) = parse_js_output_items(&output) {
-            let mut out = Vec::with_capacity(items.len());
-            let mut seen_urls = std::collections::HashSet::new();
+            let mut out: Vec<BookChapter> = Vec::with_capacity(items.len());
+            let mut url_positions = HashMap::new();
             for item in items {
                 let mut chapter_ctx =
                     ctx.for_chapter(item.get("variable").and_then(Value::as_str), "");
-                if let Some(chapter) =
+                if let Some(mut chapter) =
                     build_chapter_from_json(&item, base_url, rule, &mut chapter_ctx, out.len())
                 {
-                    if seen_urls.insert(chapter.url.clone()) {
-                        out.push(chapter);
+                    // Match Android's last-wins behavior for repeated placeholder chapter URLs.
+                    if let Some(previous) = url_positions.remove(&chapter.url) {
+                        out.remove(previous);
+                        for (index, existing) in out.iter_mut().enumerate().skip(previous) {
+                            existing.index = index as i32;
+                            url_positions.insert(existing.url.clone(), index);
+                        }
                     }
+                    chapter.index = out.len() as i32;
+                    url_positions.insert(chapter.url.clone(), out.len());
+                    out.push(chapter);
                 }
             }
             return (out, next_urls);
@@ -3943,6 +3951,37 @@ arr;"#
         assert!(!chapters[0].is_volume);
         assert_eq!(chapters[1].title, "Volume 1");
         assert!(chapters[1].is_volume);
+    }
+
+    #[test]
+    fn compat_js_toc_duplicate_urls_keep_last_occurrence_in_order() {
+        let source = BookSource {
+            rule_toc: Some(TocRule {
+                chapter_list: Some(
+                    r#"@js:
+var arr = [];
+arr.push(JSON.stringify({title:'First alias',url:'cid(1)'}));
+arr.push(JSON.stringify({title:'Middle chapter',url:'/chapter/middle'}));
+arr.push(JSON.stringify({title:'Last alias',url:'cid(1)'}));
+arr;"#
+                        .to_string(),
+                ),
+                chapter_name: Some("$.title".to_string()),
+                chapter_url: Some("$.url".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let (chapters, _) = RuleEngine::new()
+            .unwrap()
+            .chapter_list(&source, "", "https://source.example/book");
+
+        assert_eq!(chapters.len(), 2);
+        assert_eq!(chapters[0].title, "Middle chapter");
+        assert_eq!(chapters[1].title, "Last alias");
+        assert_eq!(chapters[0].index, 0);
+        assert_eq!(chapters[1].index, 1);
     }
 
     #[test]
