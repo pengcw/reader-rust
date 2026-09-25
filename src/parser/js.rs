@@ -1565,12 +1565,22 @@ fn java_get_elements_json_with_mode(
     }
 
     if !raw_css
-        && (rule.starts_with("@xpath:")
-            || rule.starts_with("@XPath:")
-            || rule.starts_with("@XPATH:")
+        && (lower_rule.starts_with("@xpath:")
             || rule.starts_with('/')
             || rule.starts_with("./")
-            || rule.starts_with("@regex:")
+            || rule.starts_with("id("))
+    {
+        let pure = if lower_rule.starts_with("@xpath:") {
+            &rule[7..]
+        } else {
+            rule
+        }
+        .trim();
+        return html::select_xpath_elements_json(content, pure);
+    }
+
+    if !raw_css
+        && (rule.starts_with("@regex:")
             || rule.starts_with(':')
             || rule.starts_with("@js:")
             || rule.starts_with("js:"))
@@ -2244,4 +2254,83 @@ mod tests {
             Some("updated_val")
         );
     }
+
+    #[test]
+    fn compat_java_get_elements_supports_xpath_element_chaining() {
+        let body = r#"<div id="catalog"><a href="/ch1" class="c-link">Chapter One</a><a href="/ch2" class="c-link">Chapter Two</a></div>"#;
+        let script = r#"
+            const items = java.getElements('//div[@id="catalog"]//a', result);
+            const first = items.first();
+            const last = items.get(1);
+            [items.size(), first.attr('href'), first.text(), first.hasClass('c-link'), last.attr('href'), last.text()].join('|')
+        "#;
+        let output = eval_js(script, body, "https://example.com").unwrap();
+        assert_eq!(output, "2|/ch1|Chapter One|true|/ch2|Chapter Two");
+    }
+
+    #[test]
+    fn compat_java_get_elements_advanced_xpath_chaining() {
+        let body = r#"
+            <div id="catalog">
+                <div class="header">
+                    <img src="/cover.jpg" alt="Cover Image" />
+                    <span class="count">Total: 2</span>
+                </div>
+                <ul class="chapters">
+                    <li><a href="/ch1" class="c-link">Chapter One</a></li>
+                    <li><a href="/ch2" class="c-link">Chapter Two</a></li>
+                </ul>
+            </div>
+            <div id="footer">The End</div>
+        "#;
+
+        // 1. Test getElement singular, id() function, select() chaining with XPath
+        let script = r#"
+            const root = java.getElement('id("catalog")', result);
+            const img = root.select('.//img').first();
+            const links = root.select('.//ul/li/a');
+            const footer = java.getElement('id("footer")', result);
+            const missing = java.getElement('id("nonexistent")', result);
+
+            [
+                root.attr('id'),
+                img.attr('src'),
+                img.attr('alt'),
+                links.size(),
+                links.get(0).attr('href'),
+                links.get(0).text(),
+                links.get(1).attr('href'),
+                links.get(1).text(),
+                footer.text(),
+                missing === null
+            ].join('|')
+        "#;
+        let output = eval_js(script, body, "https://example.com").unwrap();
+        assert_eq!(
+            output,
+            "catalog|/cover.jpg|Cover Image|2|/ch1|Chapter One|/ch2|Chapter Two|The End|true"
+        );
+
+        // 2. Test XPath direct attribute query and text node query in java.getElements
+        let script_attrs = r#"
+            const hrefs = java.getElements('//ul[@class="chapters"]//a/@href', result);
+            const texts = java.getElements('//ul[@class="chapters"]//a/text()', result);
+            [hrefs.size(), hrefs.get(0), hrefs.get(1), texts.size(), texts.get(0), texts.get(1)].join('|')
+        "#;
+        let output_attrs = eval_js(script_attrs, body, "https://example.com").unwrap();
+        assert_eq!(
+            output_attrs,
+            "2|/ch1|/ch2|2|Chapter One|Chapter Two"
+        );
+
+        // 3. Test mixed XPath and CSS chaining: select XPath root then select CSS
+        let script_mixed = r#"
+            const catalog = java.getElement('//div[@id="catalog"]', result);
+            const span = catalog.select('span.count').first();
+            [span.text(), span.attr('class')].join('|')
+        "#;
+        let output_mixed = eval_js(script_mixed, body, "https://example.com").unwrap();
+        assert_eq!(output_mixed, "Total: 2|count");
+    }
 }
+

@@ -1035,6 +1035,94 @@ fn xpath_html_entity(entity: &str) -> Option<&'static str> {
     }
 }
 
+/// XPath id() function implementation for HTML/XML documents
+struct HtmlIdFunction;
+
+impl sxd_xpath::function::Function for HtmlIdFunction {
+    fn evaluate<'c, 'd>(
+        &self,
+        context: &sxd_xpath::context::Evaluation<'c, 'd>,
+        mut args: Vec<sxd_xpath::Value<'d>>,
+    ) -> Result<sxd_xpath::Value<'d>, sxd_xpath::function::Error> {
+        if args.is_empty() {
+            return Err(sxd_xpath::function::Error::NotEnoughArguments {
+                expected: 1,
+                actual: 0,
+            });
+        }
+        if args.len() > 1 {
+            return Err(sxd_xpath::function::Error::TooManyArguments {
+                expected: 1,
+                actual: args.len(),
+            });
+        }
+        let arg = args.pop().unwrap();
+        let id_targets: Vec<String> = match arg {
+            sxd_xpath::Value::Nodeset(ns) => ns
+                .document_order()
+                .into_iter()
+                .flat_map(|n| {
+                    n.string_value()
+                        .split_whitespace()
+                        .map(String::from)
+                        .collect::<Vec<_>>()
+                })
+                .collect(),
+            val => val.string().split_whitespace().map(String::from).collect(),
+        };
+
+        let mut matched = sxd_xpath::nodeset::Nodeset::new();
+        if !id_targets.is_empty() {
+            fn collect_element<'d>(
+                elem: sxd_document::dom::Element<'d>,
+                targets: &[String],
+                matched: &mut sxd_xpath::nodeset::Nodeset<'d>,
+            ) {
+                if let Some(id_val) = elem.attribute("id").map(|a| a.value()) {
+                    if targets.iter().any(|t| t == id_val) {
+                        matched.add(elem);
+                    }
+                }
+                for child in elem.children() {
+                    if let sxd_document::dom::ChildOfElement::Element(e) = child {
+                        collect_element(e, targets, matched);
+                    }
+                }
+            }
+
+            for child in context.node.document().root().children() {
+                if let sxd_document::dom::ChildOfRoot::Element(e) = child {
+                    collect_element(e, &id_targets, &mut matched);
+                }
+            }
+        }
+
+        Ok(sxd_xpath::Value::Nodeset(matched))
+    }
+}
+
+pub(crate) fn new_xpath_context<'d>() -> sxd_xpath::Context<'d> {
+    let mut context = sxd_xpath::Context::new();
+    context.set_function("id", HtmlIdFunction);
+    context
+}
+
+pub(crate) fn normalize_xpath_query(xpath: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = xpath.trim();
+    if !trimmed.contains("allText()") && !trimmed.contains("/@text") && !trimmed.contains("/html()") {
+        return std::borrow::Cow::Borrowed(trimmed);
+    }
+    let mut replaced = trimmed
+        .replace("/allText()", "")
+        .replace("allText()", ".")
+        .replace("/@text", "/text()")
+        .replace("/html()", "");
+    if replaced.is_empty() {
+        replaced = ".".to_string();
+    }
+    std::borrow::Cow::Owned(replaced)
+}
+
 /// XPath support using sxd-xpath
 pub fn select_xpath(html: &str, xpath: &str) -> Vec<String> {
     select_xpath_values(html, xpath, false)
@@ -1045,18 +1133,56 @@ pub(crate) fn select_xpath_content(html: &str, xpath: &str) -> Vec<String> {
 }
 
 fn select_xpath_values(html: &str, xpath: &str, format_nodes: bool) -> Vec<String> {
+    let wants_html = xpath.trim().ends_with("/html()");
+    let norm = normalize_xpath_query(xpath);
+    let xpath = norm.as_ref();
     let package = match parse_xpath_package(html) {
         Ok(package) => package,
         Err(_) => return vec![],
     };
     let document = package.as_document();
-    let context = sxd_xpath::Context::new();
+    let context = new_xpath_context();
 
+    let results = evaluate_xpath_nodes(&document, &context, xpath, format_nodes, wants_html);
+    if results.is_empty()
+        && xpath.starts_with('/')
+        && !xpath.starts_with("//")
+        && !xpath.starts_with("/html")
+        && !xpath.starts_with("/reader-root")
+    {
+        let fallback_html = if xpath.starts_with("/body") {
+            format!("/html{xpath}")
+        } else {
+            format!("/html/body{xpath}")
+        };
+        let fb_results = evaluate_xpath_nodes(&document, &context, &fallback_html, format_nodes, wants_html);
+        if !fb_results.is_empty() {
+            return fb_results;
+        }
+        let fallback_frag = format!("/reader-root{xpath}");
+        return evaluate_xpath_nodes(&document, &context, &fallback_frag, format_nodes, wants_html);
+    }
+    results
+}
+
+fn evaluate_xpath_nodes(
+    document: &sxd_document::dom::Document<'_>,
+    context: &sxd_xpath::Context<'_>,
+    xpath: &str,
+    format_nodes: bool,
+    wants_html: bool,
+) -> Vec<String> {
     match sxd_xpath::Factory::new().build(xpath) {
-        Ok(Some(expression)) => match expression.evaluate(&context, document.root()) {
+        Ok(Some(expression)) => match expression.evaluate(context, document.root()) {
             Ok(sxd_xpath::Value::Nodeset(nodes)) => nodes
+                .document_order()
                 .into_iter()
                 .map(|node| {
+                    if wants_html {
+                        if let sxd_xpath::nodeset::Node::Element(el) = node {
+                            return sxd_element_to_html(el, false);
+                        }
+                    }
                     if format_nodes {
                         xpath_formatted_text(node)
                     } else {
@@ -1071,6 +1197,132 @@ fn select_xpath_values(html: &str, xpath: &str, format_nodes: bool) -> Vec<Strin
         },
         _ => vec![],
     }
+}
+
+pub(crate) fn select_xpath_elements_json(html: &str, xpath: &str) -> String {
+    let norm = normalize_xpath_query(xpath);
+    let xpath = norm.as_ref();
+    let package = match parse_xpath_package(html) {
+        Ok(package) => package,
+        Err(_) => return "[]".to_string(),
+    };
+    let document = package.as_document();
+    let context = new_xpath_context();
+
+    let mut nodes = match sxd_xpath::Factory::new().build(xpath) {
+        Ok(Some(expression)) => match expression.evaluate(&context, document.root()) {
+            Ok(sxd_xpath::Value::Nodeset(nodes)) => nodes.document_order(),
+            _ => vec![],
+        },
+        _ => vec![],
+    };
+
+    if nodes.is_empty()
+        && xpath.starts_with('/')
+        && !xpath.starts_with("//")
+        && !xpath.starts_with("/html")
+        && !xpath.starts_with("/reader-root")
+    {
+        let fallback_html = if xpath.starts_with("/body") {
+            format!("/html{xpath}")
+        } else {
+            format!("/html/body{xpath}")
+        };
+        if let Ok(Some(expression)) = sxd_xpath::Factory::new().build(&fallback_html) {
+            if let Ok(sxd_xpath::Value::Nodeset(ns)) = expression.evaluate(&context, document.root()) {
+                nodes = ns.document_order();
+            }
+        }
+    }
+
+    let items: Vec<serde_json::Value> = nodes
+        .into_iter()
+        .map(|node| {
+            let text = node.string_value();
+            match node {
+                sxd_xpath::nodeset::Node::Element(el) => {
+                    let attrs = el
+                        .attributes()
+                        .iter()
+                        .map(|a| {
+                            (
+                                a.name().local_part().to_string(),
+                                serde_json::Value::String(a.value().to_string()),
+                            )
+                        })
+                        .collect::<serde_json::Map<_, _>>();
+                    serde_json::json!({
+                        "__readerHtmlElement": true,
+                        "attrs": attrs,
+                        "html": sxd_element_to_html(el, false),
+                        "outerHtml": sxd_element_to_html(el, true),
+                        "text": text,
+                    })
+                }
+                sxd_xpath::nodeset::Node::Attribute(attr) => {
+                    serde_json::Value::String(attr.value().to_string())
+                }
+                _ => serde_json::Value::String(text),
+            }
+        })
+        .collect();
+
+    serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+}
+
+pub(crate) fn sxd_element_to_html(element: sxd_document::dom::Element<'_>, outer: bool) -> String {
+    let mut out = String::new();
+    append_sxd_element(element, &mut out, outer);
+    out
+}
+
+fn append_sxd_element(element: sxd_document::dom::Element<'_>, out: &mut String, outer: bool) {
+    let name = element.name().local_part();
+    let is_void = matches!(
+        name,
+        "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" | "meta" | "param" | "source" | "track" | "wbr"
+    );
+    if outer {
+        out.push('<');
+        out.push_str(name);
+        for attr in element.attributes() {
+            out.push(' ');
+            out.push_str(attr.name().local_part());
+            out.push_str("=\"");
+            out.push_str(&html_escape_attribute(attr.value()));
+            out.push('"');
+        }
+        if is_void {
+            out.push_str(" />");
+            return;
+        }
+        out.push('>');
+    }
+
+    for child in element.children() {
+        match child {
+            sxd_document::dom::ChildOfElement::Element(e) => {
+                append_sxd_element(e, out, true);
+            }
+            sxd_document::dom::ChildOfElement::Text(t) => {
+                out.push_str(t.text());
+            }
+            _ => {}
+        }
+    }
+
+    if outer {
+        out.push_str("</");
+        out.push_str(name);
+        out.push('>');
+    }
+}
+
+fn html_escape_attribute(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn xpath_formatted_text(node: sxd_xpath::nodeset::Node<'_>) -> String {
@@ -1608,5 +1860,74 @@ mod tests {
             ),
             " 文字\"双引号\"'单引号'&和<小于>大于\u{a0}"
         );
+    }
+
+    #[test]
+    fn test_xpath_id_function_and_normalization() {
+        let html = r#"<!DOCTYPE html>
+<html>
+    <body>
+        <div id="intro"><p>Hello World</p></div>
+        <div id="list">
+            <dl id="target-dl">
+                <dd><a href="/chapter1">Chapter 1</a></dd>
+            </dl>
+        </div>
+    </body>
+</html>"#;
+        // Test id("list")
+        let res = select_xpath(html, "id('list')//a/@href");
+        assert_eq!(res, vec!["/chapter1"]);
+
+        // Test id(//dl/@id)
+        let res2 = select_xpath(html, "id(//dl/@id)//a/text()");
+        assert_eq!(res2, vec!["Chapter 1"]);
+
+        // Test normalize /allText() and /@text
+        let res3 = select_xpath(html, "//div[@id='intro']/allText()");
+        assert_eq!(res3, vec!["Hello World"]);
+
+        // Test flat root query fallback /body/div[@id='intro']
+        let res4 = select_xpath(html, "/body/div[@id='intro']/p");
+        assert_eq!(res4, vec!["Hello World"]);
+    }
+
+    #[test]
+    fn test_xpath_advanced_edge_cases() {
+        let html = r#"<!DOCTYPE html>
+<html>
+    <body>
+        <div id="c1" class="ch">Chapter 1</div>
+        <div id="c2" class="ch">Chapter 2</div>
+        <div id="intro"><p>Hello World</p><span>Extra Text</span></div>
+    </body>
+</html>"#;
+
+        // 1. W3C multi-ID whitespace separation
+        let multi = select_xpath(html, "id('c1 c2')/text()");
+        assert_eq!(multi, vec!["Chapter 1", "Chapter 2"]);
+
+        // 2. Non-existent ID returns empty cleanly
+        let not_found = select_xpath(html, "id('non-existent')");
+        assert!(not_found.is_empty());
+
+        // 3. JsoupXpath /@text rewrite
+        let text_attr = select_xpath(html, "//p/@text");
+        assert_eq!(text_attr, vec!["Hello World"]);
+
+        // 4. JsoupXpath /html() rewrite
+        let html_fn = select_xpath(html, "//div[@id='c1']/html()");
+        assert_eq!(html_fn, vec!["Chapter 1"]);
+
+        // 5. Flat root without /body (direct /div)
+        let direct_div = select_xpath(html, "/div[@id='intro']/p");
+        assert_eq!(direct_div, vec!["Hello World"]);
+
+        // 6. Pure multi-root HTML fragment
+        let frag = "<p>Frag 1</p><p>Frag 2</p>";
+        assert_eq!(select_xpath(frag, "/p"), vec!["Frag 1", "Frag 2"]);
+
+        // 7. Non-existent path returns empty without panic
+        assert_eq!(select_xpath(html, "/unknown/nonexistent/path"), Vec::<String>::new());
     }
 }

@@ -12,7 +12,7 @@ use crate::util::text::normalize_source_url;
 use serde_json::{json, Value};
 use std::borrow::Cow;
 use std::collections::HashMap;
-use sxd_xpath::{Context as XPathContext, Factory as XPathFactory, Value as XPathValue};
+use sxd_xpath::{Factory as XPathFactory, Value as XPathValue};
 
 #[derive(Clone, Default)]
 pub struct RuleEngine;
@@ -384,7 +384,7 @@ fn classify_rule_mode(
     if content_is_json || rule.starts_with("$.") || rule.starts_with("$[") {
         return (ParseMode::JsonPath, rule.to_string());
     }
-    if rule.starts_with('/') || rule.starts_with("./") {
+    if rule.starts_with('/') || rule.starts_with("./") || rule.starts_with("id(") {
         return (ParseMode::XPath, rule.to_string());
     }
     if rule.starts_with(':') {
@@ -1485,42 +1485,30 @@ impl RuleEngine {
                 base_url,
                 &mut context,
             );
-            let cover_url = eval_field_xpath_with_ctx(
-                rule.cover_url.as_deref().unwrap_or(""),
-                item,
-                base_url,
-                &mut context,
-            );
-            let intro = eval_field_xpath_with_ctx(
-                rule.intro.as_deref().unwrap_or(""),
-                item,
-                base_url,
-                &mut context,
-            );
-            let kind = eval_field_xpath_with_ctx(
-                rule.kind.as_deref().unwrap_or(""),
-                item,
-                base_url,
-                &mut context,
-            );
-            let last_chapter = eval_field_xpath_with_ctx(
-                rule.last_chapter.as_deref().unwrap_or(""),
-                item,
-                base_url,
-                &mut context,
-            );
-            let update_time = eval_field_xpath_with_ctx(
-                rule.update_time.as_deref().unwrap_or(""),
-                item,
-                base_url,
-                &mut context,
-            );
-            let word_count = eval_field_xpath_with_ctx(
-                rule.word_count.as_deref().unwrap_or(""),
-                item,
-                base_url,
-                &mut context,
-            );
+            let cover_url = rule
+                .cover_url
+                .as_deref()
+                .and_then(|r| eval_field_xpath_with_ctx(r, item, base_url, &mut context));
+            let intro = rule
+                .intro
+                .as_deref()
+                .and_then(|r| eval_field_xpath_with_ctx(r, item, base_url, &mut context));
+            let kind = rule
+                .kind
+                .as_deref()
+                .and_then(|r| eval_field_xpath_with_ctx(r, item, base_url, &mut context));
+            let last_chapter = rule
+                .last_chapter
+                .as_deref()
+                .and_then(|r| eval_field_xpath_with_ctx(r, item, base_url, &mut context));
+            let update_time = rule
+                .update_time
+                .as_deref()
+                .and_then(|r| eval_field_xpath_with_ctx(r, item, base_url, &mut context));
+            let word_count = rule
+                .word_count
+                .as_deref()
+                .and_then(|r| eval_field_xpath_with_ctx(r, item, base_url, &mut context));
             out.push(SearchBook {
                 name: name.unwrap_or_default(),
                 author: author.unwrap_or_default(),
@@ -2863,6 +2851,9 @@ fn eval_field_xpath_with_ctx(
     base_url: &str,
     ctx: &mut RuleVariableContext,
 ) -> Option<String> {
+    if rule.trim().is_empty() {
+        return None;
+    }
     if let Some(key) = direct_get_key(rule) {
         return ctx.get(key);
     }
@@ -2908,7 +2899,8 @@ fn eval_field_xpath_with_ctx(
         }
     }
     text = source_rule.apply_replacement(&text);
-    (!text.is_empty()).then_some(text)
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn select_xpath_scope<'a>(
@@ -2928,39 +2920,101 @@ fn xpath_select_nodes<'a>(
     node: sxd_xpath::nodeset::Node<'a>,
     xpath: &str,
 ) -> Vec<sxd_xpath::nodeset::Node<'a>> {
-    let xpath = xpath.trim();
+    let norm = html::normalize_xpath_query(xpath);
+    let xpath = norm.trim();
     if xpath.is_empty() {
         return vec![];
     }
-    let context = XPathContext::new();
-    match XPathFactory::new().build(xpath) {
+    let context = html::new_xpath_context();
+    let mut nodes = match XPathFactory::new().build(xpath) {
         Ok(Some(expr)) => match expr.evaluate(&context, node) {
             Ok(XPathValue::Nodeset(ns)) => ns.document_order(),
             _ => vec![],
         },
         _ => vec![],
+    };
+
+    if nodes.is_empty()
+        && matches!(node, sxd_xpath::nodeset::Node::Root(_))
+        && xpath.starts_with('/')
+        && !xpath.starts_with("//")
+        && !xpath.starts_with("/html")
+        && !xpath.starts_with("/reader-root")
+    {
+        let fallback_html = if xpath.starts_with("/body") {
+            format!("/html{xpath}")
+        } else {
+            format!("/html/body{xpath}")
+        };
+        if let Ok(Some(expr)) = XPathFactory::new().build(&fallback_html) {
+            if let Ok(XPathValue::Nodeset(ns)) = expr.evaluate(&context, node) {
+                nodes = ns.document_order();
+            }
+        }
     }
+
+    nodes
 }
 
 fn xpath_eval_strings(node: sxd_xpath::nodeset::Node<'_>, xpath: &str) -> Vec<String> {
-    let xpath = xpath.trim();
+    let wants_html = xpath.trim().ends_with("/html()");
+    let norm = html::normalize_xpath_query(xpath);
+    let xpath = norm.trim();
     if xpath.is_empty() {
         return vec![];
     }
-    let context = XPathContext::new();
-    match XPathFactory::new().build(xpath) {
+    let context = html::new_xpath_context();
+    let res = match XPathFactory::new().build(xpath) {
         Ok(Some(expr)) => match expr.evaluate(&context, node) {
-            Ok(XPathValue::Nodeset(ns)) => ns
-                .document_order()
-                .into_iter()
-                .map(|n| n.string_value())
-                .collect(),
-            Ok(XPathValue::String(s)) => vec![s],
-            Ok(XPathValue::Number(n)) => vec![n.to_string()],
-            Ok(XPathValue::Boolean(b)) => vec![b.to_string()],
-            Err(_) => vec![],
+            Ok(val) => Some(val),
+            Err(_) => None,
         },
-        _ => vec![],
+        _ => None,
+    };
+
+    let val = match res {
+        Some(XPathValue::Nodeset(ns)) if ns.size() == 0 => {
+            if matches!(node, sxd_xpath::nodeset::Node::Root(_))
+                && xpath.starts_with('/')
+                && !xpath.starts_with("//")
+                && !xpath.starts_with("/html")
+                && !xpath.starts_with("/reader-root")
+            {
+                let fallback = if xpath.starts_with("/body") {
+                    format!("/html{xpath}")
+                } else {
+                    format!("/html/body{xpath}")
+                };
+                XPathFactory::new()
+                    .build(&fallback)
+                    .ok()
+                    .flatten()
+                    .and_then(|expr| expr.evaluate(&context, node).ok())
+                    .unwrap_or(XPathValue::Nodeset(ns))
+            } else {
+                XPathValue::Nodeset(ns)
+            }
+        }
+        Some(val) => val,
+        None => return vec![],
+    };
+
+    match val {
+        XPathValue::Nodeset(ns) => ns
+            .document_order()
+            .into_iter()
+            .map(|n| {
+                if wants_html {
+                    if let sxd_xpath::nodeset::Node::Element(el) = n {
+                        return html::sxd_element_to_html(el, false);
+                    }
+                }
+                n.string_value()
+            })
+            .collect(),
+        XPathValue::String(s) => vec![s],
+        XPathValue::Number(n) => vec![n.to_string()],
+        XPathValue::Boolean(b) => vec![b.to_string()],
     }
 }
 
@@ -5070,5 +5124,118 @@ chapter_id='{{$.chapter_id}}'
         }"#;
         let content = engine.content(&source, content_body, "https://novel.html5.qq.com/be-api/content/ads-read");
         assert!(content.contains("标准泰拉历.912.M41"));
+    }
+
+    #[test]
+    fn test_xpath_book_info_with_id_and_normalization() {
+        let engine = RuleEngine::new().unwrap();
+        let source = BookSource {
+            book_source_name: "XPath Info".to_string(),
+            book_source_url: "https://books.example".to_string(),
+            rule_book_info: Some(BookInfoRule {
+                init: Some("id('detail-box')".to_string()),
+                name: Some(".//h1/allText()".to_string()),
+                author: Some(".//span[@class='author']/@text".to_string()),
+                intro: Some(".//div[@class='intro']/html()".to_string()),
+                toc_url: Some("id('toc-link')/@href".to_string()),
+                kind: Some(".//span[@class='tag']/text()".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let body = r#"
+            <div id="detail-box">
+                <h1> 斗破 <span>苍穹</span> </h1>
+                <span class="author">天蚕土豆</span>
+                <div class="intro"><p>这里是<b>属于斗气</b>的大陆</p></div>
+                <a id="toc-link" href="/book/1/toc">目录</a>
+                <span class="tag">玄幻</span>
+            </div>
+        "#;
+        let book = engine.book_info(&source, body, "https://books.example/book/1", "https://books.example/book/1");
+        assert_eq!(book.name, "斗破 苍穹");
+        assert_eq!(book.author, "天蚕土豆");
+        assert!(book.intro.as_ref().unwrap().contains("<b>属于斗气</b>"));
+        assert_eq!(book.toc_url.as_deref(), Some("https://books.example/book/1/toc"));
+        assert_eq!(book.kind.as_deref(), Some("玄幻"));
+    }
+
+    #[test]
+    fn test_xpath_toc_with_id_and_flat_fallback() {
+        let engine = RuleEngine::new().unwrap();
+        let source = BookSource {
+            book_source_name: "XPath Toc".to_string(),
+            book_source_url: "https://books.example".to_string(),
+            rule_toc: Some(TocRule {
+                chapter_list: Some("/div[@id='chapter-list']//a".to_string()),
+                chapter_name: Some("./text()".to_string()),
+                chapter_url: Some("./@href".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let body = r#"
+            <html>
+                <body>
+                    <div id="chapter-list">
+                        <li><a href="/ch1">第一章 陨落的天才</a></li>
+                        <li><a href="/ch2">第二章 斗之气三段</a></li>
+                    </div>
+                </body>
+            </html>
+        "#;
+        let (chapters, _) = engine.chapter_list_with_context(
+            &source,
+            body,
+            "https://books.example/book/1/toc",
+            None,
+            Some("斗破苍穹"),
+            None,
+        );
+        assert_eq!(chapters.len(), 2);
+        assert_eq!(chapters[0].title, "第一章 陨落的天才");
+        assert_eq!(chapters[0].url, "https://books.example/ch1");
+        assert_eq!(chapters[1].title, "第二章 斗之气三段");
+        assert_eq!(chapters[1].url, "https://books.example/ch2");
+    }
+
+    #[test]
+    fn test_xpath_search_books_with_normalization_and_id() {
+        let engine = RuleEngine::new().unwrap();
+        let source = BookSource {
+            book_source_name: "XPath Search".to_string(),
+            book_source_url: "https://books.example".to_string(),
+            rule_search: Some(SearchRule {
+                book_list: Some("id('search-list')/div[contains(@class, 'item')]".to_string()),
+                name: Some("./h2/allText()".to_string()),
+                book_url: Some("./h2/a/@href".to_string()),
+                author: Some(".//span[@class='author']/@text".to_string()),
+                intro: Some(".//p[@class='desc']/allText()".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let body = r#"
+            <div id="search-list">
+                <div class="item">
+                    <h2><a href="/book/101"> <b>诡秘</b>之主 </a></h2>
+                    <span class="author">爱潜水的乌贼</span>
+                    <p class="desc">蒸汽与 机械的浪潮中</p>
+                </div>
+                <div class="item">
+                    <h2><a href="/book/102">宿命之环</a></h2>
+                    <span class="author">爱潜水的乌贼</span>
+                    <p class="desc">诡秘世界第二部</p>
+                </div>
+            </div>
+        "#;
+        let books = engine.search_books(&source, body, "https://books.example");
+        assert_eq!(books.len(), 2);
+        assert_eq!(books[0].name, "诡秘之主");
+        assert_eq!(books[0].book_url, "https://books.example/book/101");
+        assert_eq!(books[0].author, "爱潜水的乌贼");
+        assert_eq!(books[0].intro.as_deref(), Some("蒸汽与 机械的浪潮中"));
+        assert_eq!(books[1].name, "宿命之环");
+        assert_eq!(books[1].book_url, "https://books.example/book/102");
     }
 }
