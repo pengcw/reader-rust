@@ -12,7 +12,9 @@ use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8};
 use once_cell::sync::Lazy;
 mod http;
 pub mod session;
-pub(crate) use http::{HttpClient, HttpClientError, SharedCookieStore, DEFAULT_USER_AGENT};
+pub(crate) use http::{
+    HttpClient, HttpClientError, RawHttpResponse, SharedCookieStore, DEFAULT_USER_AGENT,
+};
 pub use session::{current_active_session, with_active_session, ActiveSession, ExecuteSession};
 
 use serde_json::Value;
@@ -314,6 +316,44 @@ impl HttpSession {
     }
 }
 
+/// Execute an AnalyzeUrl request for JavaScript APIs while preserving its request
+/// options and the source-bound cookie session. Unlike `fetch`, this returns
+/// non-2xx HTTP responses instead of converting their status into an error.
+pub(crate) fn execute_request_spec(
+    client: &HttpClient,
+    spec: &RequestSpec,
+) -> Result<RawHttpResponse, HttpClientError> {
+    let client = match spec
+        .proxy
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(proxy) => client.with_proxy(proxy)?,
+        None => client.clone(),
+    };
+    let retries = spec.retry.min(3);
+    let mut last_error = None;
+
+    for attempt in 0..=retries {
+        match client.execute(
+            spec.method.clone(),
+            &spec.url,
+            &spec.headers,
+            spec.body.as_deref(),
+            None,
+        ) {
+            Ok(response) if response.status >= 500 && attempt < retries => continue,
+            Ok(response) => return Ok(response),
+            Err(error @ HttpClientError::InvalidUrl(_))
+            | Err(error @ HttpClientError::ResponseTooLarge { .. }) => return Err(error),
+            Err(error) if attempt < retries => last_error = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| HttpClientError::Network("request failed".to_string())))
+}
+
 fn response_body_snippet(body: &str) -> &str {
     let mut end = body.len().min(4096);
     while !body.is_char_boundary(end) {
@@ -522,14 +562,16 @@ fn compile_url_request(
     }
     ensure_user_agent(&mut headers);
 
-    let method = if options
+    let method = match options
         .get("method")
         .and_then(Value::as_str)
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("POST"))
+        .map(str::trim)
+        .map(str::to_ascii_uppercase)
+        .as_deref()
     {
-        Method::POST
-    } else {
-        Method::GET
+        Some("POST") => Method::POST,
+        Some("HEAD") => Method::HEAD,
+        _ => Method::GET,
     };
     let body = options.get("body").and_then(value_to_string);
     let charset = options
@@ -566,7 +608,7 @@ fn compile_url_request(
     })
 }
 
-fn strip_js_prefix(value: &str) -> Option<&str> {
+pub(crate) fn strip_js_prefix(value: &str) -> Option<&str> {
     value
         .strip_prefix("@js:")
         .or_else(|| value.strip_prefix("js:"))
@@ -822,6 +864,10 @@ fn escape_control_chars_in_json_strings(raw: &str) -> String {
         }
     }
     output
+}
+
+pub(crate) fn resolve_source_headers(source: &BookSource) -> Result<Vec<(String, String)>, String> {
+    with_js_lib(source.js_lib.as_deref(), || source_headers(source))
 }
 
 fn source_headers(source: &BookSource) -> Result<Vec<(String, String)>, String> {
@@ -1144,7 +1190,11 @@ fn is_xml_content_type(content_type: &str) -> bool {
     mime == "text/xml" || mime == "application/xml" || mime.ends_with("+xml")
 }
 
-fn decode_body(bytes: &[u8], charset: Option<&str>, content_type: Option<&str>) -> String {
+pub(crate) fn decode_body(
+    bytes: &[u8],
+    charset: Option<&str>,
+    content_type: Option<&str>,
+) -> String {
     // An explicitly supplied URL charset is authoritative when it is known.
     if let Some(encoding) = charset.and_then(|label| Encoding::for_label(label.as_bytes())) {
         return decode_with_encoding(bytes, encoding).0;

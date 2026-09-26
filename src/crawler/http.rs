@@ -111,6 +111,7 @@ pub(crate) struct RawHttpResponse {
 pub(crate) struct HttpClient {
     agent: Agent,
     cookies: Option<SharedCookieStore>,
+    timeout_ms: u64,
 }
 
 impl HttpClient {
@@ -139,6 +140,7 @@ impl HttpClient {
         Ok(Self {
             agent: Agent::new_with_config(config.build()),
             cookies,
+            timeout_ms,
         })
     }
 
@@ -156,7 +158,16 @@ impl HttpClient {
         Self {
             agent: Agent::new_with_config(config),
             cookies: Some(SharedCookieStore::default()),
+            timeout_ms: 15_000,
         }
+    }
+
+    pub(crate) fn with_proxy(&self, proxy: &str) -> Result<Self, HttpClientError> {
+        Self::new(self.timeout_ms, self.cookies.clone(), Some(proxy))
+    }
+
+    pub(crate) fn with_timeout(&self, timeout_ms: u64) -> Result<Self, HttpClientError> {
+        Self::new(timeout_ms.max(1), self.cookies.clone(), None)
     }
 
     pub(crate) fn request_text(

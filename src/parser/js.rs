@@ -1,4 +1,8 @@
-use crate::crawler::{HttpClient, HttpClientError};
+use crate::crawler::{
+    analyze_url, decode_body, execute_request_spec, resolve_source_headers, strip_js_prefix,
+    HttpClient, HttpClientError,
+};
+use crate::model::book_source::BookSource;
 use crate::parser::html;
 use crate::parser::jsonpath;
 use crate::parser::rule_analyzer;
@@ -62,6 +66,8 @@ thread_local! {
     // reader_execute installs its source-bound HTTP session here so JavaScript
     // java.ajax/get/post shares the same cookies and request policy as Rust HTTP.
     static ACTIVE_JS_HTTP_CLIENT: RefCell<Option<HttpClient>> = const { RefCell::new(None) };
+    static ACTIVE_JS_BOOK_SOURCE: RefCell<Option<BookSource>> = const { RefCell::new(None) };
+    static ACTIVE_JS_SOURCE_HEADER_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
 
     static JS_ENV: (Runtime, Context, Arc<AtomicU64>) = {
         let rt = Runtime::new().expect("Failed to create JS Runtime");
@@ -108,6 +114,38 @@ pub(crate) fn with_js_http_client<T>(client: &HttpClient, f: impl FnOnce() -> T)
         cell.replace(previous);
         result
     })
+}
+
+pub(crate) fn with_js_http_context<T>(
+    client: &HttpClient,
+    source: &BookSource,
+    f: impl FnOnce() -> T,
+) -> T {
+    let mut js_source = source.clone();
+    let mut source_header_error = None;
+    if source.header.as_deref().and_then(strip_js_prefix).is_some() {
+        match with_js_http_client(client, || resolve_source_headers(source)) {
+            Ok(headers) => {
+                let headers = headers
+                    .into_iter()
+                    .map(|(name, value)| (name, JsonValue::String(value)))
+                    .collect::<serde_json::Map<_, _>>();
+                js_source.header = Some(JsonValue::Object(headers).to_string());
+            }
+            Err(error) => {
+                js_source.header = Some("{}".to_string());
+                source_header_error = Some(error);
+            }
+        }
+    }
+
+    let previous_source = ACTIVE_JS_BOOK_SOURCE.with(|cell| cell.replace(Some(js_source)));
+    let previous_error =
+        ACTIVE_JS_SOURCE_HEADER_ERROR.with(|cell| cell.replace(source_header_error));
+    let result = with_js_http_client(client, f);
+    ACTIVE_JS_SOURCE_HEADER_ERROR.with(|cell| cell.replace(previous_error));
+    ACTIVE_JS_BOOK_SOURCE.with(|cell| cell.replace(previous_source));
+    result
 }
 
 fn active_js_http_client() -> HttpClient {
@@ -512,8 +550,22 @@ fn eval_js_inner_with_source(
             java_obj.set("deviceID", Func::new(|| -> String { JS_DEVICE_ID.clone() }))?;
             java_obj.set(
                 "__nativeConnect",
-                Func::new(|url: String, headers_json: String| -> String {
-                    java_request_simple_response("GET", &url, None, &headers_json)
+                Func::new(
+                    |url: String,
+                     headers_json: String,
+                     call_timeout_ms: rquickjs::function::Opt<i64>| -> String {
+                        java_analyzed_request_response(
+                            &url,
+                            &headers_json,
+                            call_timeout_ms.0,
+                        )
+                    },
+                ),
+            )?;
+            java_obj.set(
+                "__nativeAjaxAllItem",
+                Func::new(|url: String| -> String {
+                    java_analyzed_request_response(&url, "{}", None)
                 }),
             )?;
             java_obj.set(
@@ -1014,9 +1066,13 @@ fn eval_js_inner_with_source(
                         return response;
                     };
                     globalThis.__readerMakeStrResponse = strResponseFromJson;
-                    java.connect = (url, headers) => strResponseFromJson(
-                        java.__nativeConnect(String(url), headersJson(headers)));
-                    java.ajaxAll = urls => Array.from(urls || [], url => java.connect(String(url)));
+                    java.connect = (url, headers, callTimeout) => {
+                        const args = [String(url), headersJson(headers)];
+                        if (callTimeout != null) args.push(Number(callTimeout));
+                        return strResponseFromJson(java.__nativeConnect(...args));
+                    };
+                    java.ajaxAll = (urls, skipRateLimit) => Array.from(urls || [], url =>
+                        strResponseFromJson(java.__nativeAjaxAllItem(String(url))));
                     java.strToBytes = (value, charset) => JSON.parse(
                         java.__strToBytes(String(value), charset == null ? '' : String(charset)));
                     java.bytesToStr = (bytes, charset) => java.__bytesToStr(
@@ -2187,9 +2243,25 @@ fn java_request_simple_response(
     body: Option<String>,
     headers_json: &str,
 ) -> String {
+    java_request_simple_response_with_client(
+        method,
+        url,
+        body,
+        headers_json,
+        &active_js_http_client(),
+    )
+}
+
+fn java_request_simple_response_with_client(
+    method: &str,
+    url: &str,
+    body: Option<String>,
+    headers_json: &str,
+    client: &HttpClient,
+) -> String {
     let started = Instant::now();
     let method = Method::from_bytes(method.as_bytes()).unwrap_or(Method::GET);
-    let response = active_js_http_client().execute(
+    let response = client.execute(
         method,
         url.trim(),
         &java_request_headers(headers_json),
@@ -2242,6 +2314,111 @@ fn java_request_simple_response(
         }
     };
     payload.to_string()
+}
+
+fn java_analyzed_request_response(
+    url: &str,
+    headers_json: &str,
+    call_timeout_ms: Option<i64>,
+) -> String {
+    let started = Instant::now();
+    let active_client = active_js_http_client();
+    let client = match call_timeout_ms.filter(|timeout| *timeout > 0) {
+        Some(timeout) => match active_client.with_timeout(timeout as u64) {
+            Ok(client) => client,
+            Err(error) => return java_error_response(url, &error.to_string(), false),
+        },
+        None => active_client,
+    };
+
+    if let Some(error) = ACTIVE_JS_SOURCE_HEADER_ERROR.with(|cell| cell.borrow().clone()) {
+        return java_error_response(url, &error, false);
+    }
+    let source = ACTIVE_JS_BOOK_SOURCE.with(|cell| cell.borrow().clone());
+    let Some(source) = source else {
+        return java_request_simple_response_with_client("GET", url, None, headers_json, &client);
+    };
+    let mut spec = match analyze_url(url, "", 0, "", &source) {
+        Ok(spec) => spec,
+        Err(error) => return java_error_response(url, &error, false),
+    };
+    for (name, value) in java_request_headers(headers_json) {
+        if let Some((_, old_value)) = spec
+            .headers
+            .iter_mut()
+            .find(|(old_name, _)| old_name.eq_ignore_ascii_case(&name))
+        {
+            *old_value = value;
+        } else {
+            spec.headers.push((name, value));
+        }
+    }
+
+    let response = match execute_request_spec(&client, &spec) {
+        Ok(response) => response,
+        Err(error) => {
+            let is_timeout = matches!(error, HttpClientError::Timeout(_));
+            return java_error_response(url, &error.to_string(), is_timeout);
+        }
+    };
+
+    let headers = response
+        .headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value.to_str().ok().map(|value| {
+                (
+                    name.as_str().to_string(),
+                    JsonValue::String(value.to_string()),
+                )
+            })
+        })
+        .collect::<serde_json::Map<String, JsonValue>>();
+    let content_type = response
+        .headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok());
+    let decoded_body = decode_body(&response.body, spec.charset.as_deref(), content_type);
+    let body = if spec
+        .response_type
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        response
+            .body
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    } else {
+        decoded_body
+    };
+    serde_json::json!({
+        "__ffiStrResponse": true,
+        "raw": null,
+        "body": body,
+        "url": response.url,
+        "code": response.status,
+        "message": "",
+        "headers": headers,
+        "isSuccessful": (200..300).contains(&response.status),
+        "callTime": started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+    })
+    .to_string()
+}
+
+fn java_error_response(url: &str, error: &str, timeout: bool) -> String {
+    serde_json::json!({
+        "__ffiStrResponse": true,
+        "raw": null,
+        "body": error,
+        "url": url.trim(),
+        "code": 0,
+        "message": "",
+        "headers": {},
+        "isSuccessful": false,
+        "callTime": if timeout { -2 } else { -7 },
+    })
+    .to_string()
 }
 
 fn java_request_headers(headers_json: &str) -> Vec<(String, String)> {
@@ -2544,6 +2721,75 @@ mod tests {
         assert!(requests[0].starts_with("get /first "));
         assert!(requests[1].starts_with("get /last "));
         assert!(requests[1].contains("cookie: sid=ordered"));
+    }
+
+    #[test]
+    fn java_connect_and_ajax_all_share_source_request_configuration() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line
+                        .strip_prefix("Content-Length: ")
+                        .or_else(|| line.strip_prefix("content-length: "))
+                    {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                    request.push_str(&line);
+                }
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 201 Created\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                )
+                .unwrap();
+                requests.push((
+                    request.to_ascii_lowercase(),
+                    String::from_utf8(body).unwrap(),
+                ));
+            }
+            requests
+        });
+
+        let url = format!(
+            "http://{address}/ajax,{{\"method\":\"POST\",\"headers\":{{\"X-Url\":\"configured\"}},\"body\":\"payload\"}}"
+        );
+        let script = format!(
+            "(() => {{ const all = java.ajaxAll([{}])[0]; const one = java.connect({}); return [all.code(), one.code(), all.body().string(), one.body().string(), all.isSuccessful(), one.isSuccessful()].join('|'); }})()",
+            serde_json::to_string(&url).unwrap(),
+            serde_json::to_string(&url).unwrap()
+        );
+        let source = BookSource {
+            book_source_url: format!("http://{address}/source"),
+            header: Some(r#"js:JSON.stringify({"X-Source":"configured"})"#.to_string()),
+            ..Default::default()
+        };
+        let client = HttpClient::standalone();
+        let result = with_js_http_context(&client, &source, || {
+            eval_js(&script, "", &source.book_source_url).unwrap()
+        });
+        assert_eq!(result, "201|201|ok|ok|true|true");
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        for (request, body) in requests {
+            assert!(request.starts_with("post /ajax "));
+            assert!(request.contains("x-source: configured"));
+            assert!(request.contains("x-url: configured"));
+            assert_eq!(body, "payload");
+        }
     }
 
     #[test]

@@ -9,7 +9,7 @@ use crate::crawler::{
 };
 use crate::model::book_source::{book_source_from_value, BookSource};
 use crate::model::replace_rule::ReplaceRule;
-use crate::parser::js::{eval_js, eval_js_with_bindings, with_js_http_client, with_js_lib};
+use crate::parser::js::{eval_js, eval_js_with_bindings, with_js_http_context, with_js_lib};
 use crate::parser::rule_engine::{
     apply_legado_regex, dedupe_chapters_last_wins, RuleEngine,
 };
@@ -225,18 +225,24 @@ fn execute_inner(source_json: &str, request_json: &str) -> ExecuteResult<Value> 
         &source.book_source_url,
         |_active_session| {
             let http_session = HttpSession::new(&source, options.timeout_ms)?;
-            with_js_http_client(http_session.client(), || match operation.as_str() {
-                "search" => execute_search(&source, &engine, &http_session, &params, &options),
-                "explore" => execute_explore(&source, &engine, &http_session, &params, &options),
-                "info" => execute_info(&source, &engine, &http_session, &params, &options),
-                "toc" => execute_toc(&source, &engine, &http_session, &params, &options),
-                "content" => execute_content(&source, &engine, &http_session, &params, &options),
-                "login_ui" => execute_login_ui(&source),
-                "login" => execute_login(&source, &http_session, &params, &options),
-                // `parse_request` guards this too; keep this branch in case a future caller bypasses it.
-                _ => Err(ExecuteError::invalid_request(format!(
-                    "unsupported op: {operation}"
-                ))),
+            with_js_http_context(http_session.client(), &source, || {
+                match operation.as_str() {
+                    "search" => execute_search(&source, &engine, &http_session, &params, &options),
+                    "explore" => {
+                        execute_explore(&source, &engine, &http_session, &params, &options)
+                    }
+                    "info" => execute_info(&source, &engine, &http_session, &params, &options),
+                    "toc" => execute_toc(&source, &engine, &http_session, &params, &options),
+                    "content" => {
+                        execute_content(&source, &engine, &http_session, &params, &options)
+                    }
+                    "login_ui" => execute_login_ui(&source),
+                    "login" => execute_login(&source, &http_session, &params, &options),
+                    // `parse_request` guards this too; keep this branch in case a future caller bypasses it.
+                    _ => Err(ExecuteError::invalid_request(format!(
+                        "unsupported op: {operation}"
+                    ))),
+                }
             })
         },
     );
