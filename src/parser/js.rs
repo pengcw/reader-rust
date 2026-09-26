@@ -651,6 +651,12 @@ fn eval_js_inner_with_source(
                 }),
             )?;
             java_obj.set(
+                "__importScript",
+                Func::new(|ctx: rquickjs::Ctx<'_>, path: String| -> Option<String> {
+                    with_js_reentrant_ctx(&ctx, || java_import_script(&path))
+                }),
+            )?;
+            java_obj.set(
                 "md5Encode",
                 Func::new(|input: String| -> String { md5_hex(&input) }),
             )?;
@@ -1314,6 +1320,13 @@ fn eval_js_inner_with_source(
                     java.ajax = value => {
                         const target = Array.isArray(value) ? value[0] : value;
                         return java.__nativeAjax(String(target == null ? '' : target));
+                    };
+                    java.importScript = path => {
+                        const value = java.__importScript(String(path == null ? '' : path));
+                        if (value == null) {
+                            throw new Error('importScript: content is empty or local paths are unsupported by this host');
+                        }
+                        return value;
                     };
                     java.get = function(url, headers) {
                         const target = String(url == null ? '' : url);
@@ -2589,6 +2602,34 @@ fn resolve_js_lib_entry(entry: &str) -> anyhow::Result<String> {
         return Ok(active_js_http_client().request_text(Method::GET, value, &[], None)?);
     }
     Ok(value.to_string())
+}
+
+fn java_import_script(path: &str) -> Option<String> {
+    let path = path.trim();
+    if path.is_empty() || !is_absolute_http_url(path) {
+        return None;
+    }
+
+    let cache_key = format!("import_script:{}", md5_hex(path));
+    if let Some(cached) = JS_LIB_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&cache_key)
+        .cloned()
+    {
+        return Some(cached);
+    }
+
+    let body = java_analyzed_request_body(path);
+    if body.is_empty() {
+        return None;
+    }
+
+    JS_LIB_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(cache_key, body.clone());
+    Some(body)
 }
 
 fn java_time_format(timestamp_ms: i64) -> String {
@@ -3877,6 +3918,61 @@ mod tests {
             Some(&json!("value"))
         );
         assert!(!variables.contains_key("userInfo_https://source.example"));
+    }
+
+    #[test]
+    fn import_script_returns_remote_text_without_auto_eval() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = accept_with_timeout(&listener);
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "
+" || line.is_empty() {
+                    break;
+                }
+            }
+            let body = "globalThis.__importedValue = 42;";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK
+Content-Length: {}
+Connection: close
+
+{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let source = BookSource {
+            book_source_url: format!("http://{address}/"),
+            ..Default::default()
+        };
+        let client = HttpClient::standalone();
+        let url = format!("http://{address}/script.js");
+        let script = format!(
+            "(() => {{ const imported = java.importScript('{}'); const before = typeof globalThis.__importedValue; eval(String(imported)); return [before, globalThis.__importedValue, imported.includes('__importedValue')].join('|'); }})()",
+            url
+        );
+        let result = with_js_http_context(&client, &source, || {
+            eval_js(&script, "", &source.book_source_url).unwrap()
+        });
+        assert_eq!(result, "undefined|42|true");
+        server.join().unwrap();
+
+        assert!(with_js_http_context(&client, &source, || {
+            eval_js(
+                "java.importScript('./local.js')",
+                "",
+                &source.book_source_url,
+            )
+        })
+        .is_err());
     }
 
     #[test]
