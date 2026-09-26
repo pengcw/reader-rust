@@ -966,9 +966,9 @@ fn eval_js_inner_with_source(
             )?;
             java_obj.set(
                 "log",
-                Func::new(|msg: rquickjs::function::Opt<String>| {
+                Func::new(|msg: rquickjs::function::Opt<rquickjs::Coerced<String>>| {
                     if let Some(m) = msg.0 {
-                        eprintln!("[legado::js] {}", m);
+                        eprintln!("[legado::js] {}", m.0);
                     }
                 }),
             )?;
@@ -2865,6 +2865,17 @@ mod tests {
             compile_js_lib(r#"{"inline":"var notLoaded=1"}"#).unwrap(),
             ""
         );
+    }
+
+    #[test]
+    fn java_log_coerces_numbers_and_other_values_to_strings() {
+        let result = eval_js(
+            r#"java.log(1700000000.125); java.log(true); java.log({ timestamp: 1700000000 }); java.log(null); java.log(); 'ok'"#,
+            "",
+            "https://example.com",
+        )
+        .unwrap();
+        assert_eq!(result, "ok");
     }
 
     #[test]
