@@ -166,10 +166,6 @@ impl HttpClient {
         Self::new(self.timeout_ms, self.cookies.clone(), Some(proxy))
     }
 
-    pub(crate) fn with_timeout(&self, timeout_ms: u64) -> Result<Self, HttpClientError> {
-        Self::new(timeout_ms.max(1), self.cookies.clone(), None)
-    }
-
     pub(crate) fn request_text(
         &self,
         method: Method,

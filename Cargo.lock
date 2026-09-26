@@ -1340,6 +1340,7 @@ dependencies = [
  "once_cell",
  "rand",
  "regex",
+ "ring",
  "rquickjs",
  "safer-ffi",
  "scraper",

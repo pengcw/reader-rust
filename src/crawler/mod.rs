@@ -486,7 +486,20 @@ pub fn analyze_url_with_context(
     context: Option<&UrlRuleContext>,
 ) -> Result<RequestSpec, String> {
     with_js_lib(source.js_lib.as_deref(), || {
-        compile_url_request(raw_rule, key, page, base_url, source, context)
+        compile_url_request(raw_rule, key, page, base_url, source, context, None)
+    })
+}
+
+pub(crate) fn analyze_url_with_headers(
+    raw_rule: &str,
+    key: &str,
+    page: i32,
+    base_url: &str,
+    source: &BookSource,
+    headers: Option<Vec<(String, String)>>,
+) -> Result<RequestSpec, String> {
+    with_js_lib(source.js_lib.as_deref(), || {
+        compile_url_request(raw_rule, key, page, base_url, source, None, headers)
     })
 }
 
@@ -497,18 +510,27 @@ fn compile_url_request(
     base_url: &str,
     source: &BookSource,
     context: Option<&UrlRuleContext>,
+    initial_headers: Option<Vec<(String, String)>>,
 ) -> Result<RequestSpec, String> {
     let raw_rule = raw_rule.trim();
     if raw_rule.is_empty() {
         return Err("URL rule is empty".to_string());
     }
 
-    // Stage 1: initialize source/login headers and pull transport proxy out of headers.
-    let mut headers = source_headers(source)?;
+    // Stage 1: initialize headers and pull transport proxy out of them.
+    // Legado's AnalyzeUrl uses headerMapF instead of source/login headers when
+    // JsExtensions.connect(url, header) supplies an explicit header map.
+    let has_initial_headers = initial_headers.is_some();
+    let mut headers = match initial_headers {
+        Some(headers) => headers,
+        None => source_headers(source)?,
+    };
     let mut proxy = take_proxy_header(&mut headers).filter(|value| !value.trim().is_empty());
-    if let Some(active) = current_active_session() {
-        if let Some(login_header) = active.get_login_header() {
-            merge_headers(&mut headers, headers_from_value(&login_header));
+    if !has_initial_headers {
+        if let Some(active) = current_active_session() {
+            if let Some(login_header) = active.get_login_header() {
+                merge_headers(&mut headers, headers_from_value(&login_header));
+            }
         }
     }
     ensure_user_agent(&mut headers);
@@ -608,7 +630,7 @@ fn compile_url_request(
     })
 }
 
-pub(crate) fn strip_js_prefix(value: &str) -> Option<&str> {
+fn strip_js_prefix(value: &str) -> Option<&str> {
     value
         .strip_prefix("@js:")
         .or_else(|| value.strip_prefix("js:"))
@@ -864,10 +886,6 @@ fn escape_control_chars_in_json_strings(raw: &str) -> String {
         }
     }
     output
-}
-
-pub(crate) fn resolve_source_headers(source: &BookSource) -> Result<Vec<(String, String)>, String> {
-    with_js_lib(source.js_lib.as_deref(), || source_headers(source))
 }
 
 fn source_headers(source: &BookSource) -> Result<Vec<(String, String)>, String> {
@@ -1460,7 +1478,7 @@ mod tests {
             ..Default::default()
         };
         let spec = analyze_url_with_context(
-            "/{{book.kind}}/{{book.variableMap.kind}},{"js":"result + '?direct=' + book.kind + '&variable=' + book.variableMap.kind"}",
+            "/{{book.kind}}/{{book.variableMap.kind}},{\"js\":\"result + '?direct=' + book.kind + '&variable=' + book.variableMap.kind\"}",
             "",
             1,
             "https://a.test",

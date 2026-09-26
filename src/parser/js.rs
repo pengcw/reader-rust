@@ -1,6 +1,5 @@
 use crate::crawler::{
-    analyze_url, decode_body, execute_request_spec, resolve_source_headers, strip_js_prefix,
-    HttpClient, HttpClientError,
+    analyze_url_with_headers, decode_body, execute_request_spec, HttpClient,
 };
 use crate::model::book_source::BookSource;
 use crate::parser::html;
@@ -17,12 +16,14 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use once_cell::sync::Lazy;
+use ring::hmac;
 use rquickjs::function::Func;
 use rquickjs::{Context, Object, Runtime, Value};
 use serde_json::Value as JsonValue;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -67,7 +68,10 @@ thread_local! {
     // java.ajax/get/post shares the same cookies and request policy as Rust HTTP.
     static ACTIVE_JS_HTTP_CLIENT: RefCell<Option<HttpClient>> = const { RefCell::new(None) };
     static ACTIVE_JS_BOOK_SOURCE: RefCell<Option<BookSource>> = const { RefCell::new(None) };
-    static ACTIVE_JS_SOURCE_HEADER_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+    // Native JS callbacks may need AnalyzeUrl to evaluate nested header/URL JavaScript.
+    // Reuse the currently borrowed QuickJS context instead of entering Context::with again.
+    static ACTIVE_JS_REENTRANT_CTX: RefCell<Option<NonNull<rquickjs::qjs::JSContext>>> =
+        const { RefCell::new(None) };
 
     static JS_ENV: (Runtime, Context, Arc<AtomicU64>) = {
         let rt = Runtime::new().expect("Failed to create JS Runtime");
@@ -121,29 +125,8 @@ pub(crate) fn with_js_http_context<T>(
     source: &BookSource,
     f: impl FnOnce() -> T,
 ) -> T {
-    let mut js_source = source.clone();
-    let mut source_header_error = None;
-    if source.header.as_deref().and_then(strip_js_prefix).is_some() {
-        match with_js_http_client(client, || resolve_source_headers(source)) {
-            Ok(headers) => {
-                let headers = headers
-                    .into_iter()
-                    .map(|(name, value)| (name, JsonValue::String(value)))
-                    .collect::<serde_json::Map<_, _>>();
-                js_source.header = Some(JsonValue::Object(headers).to_string());
-            }
-            Err(error) => {
-                js_source.header = Some("{}".to_string());
-                source_header_error = Some(error);
-            }
-        }
-    }
-
-    let previous_source = ACTIVE_JS_BOOK_SOURCE.with(|cell| cell.replace(Some(js_source)));
-    let previous_error =
-        ACTIVE_JS_SOURCE_HEADER_ERROR.with(|cell| cell.replace(source_header_error));
+    let previous_source = ACTIVE_JS_BOOK_SOURCE.with(|cell| cell.replace(Some(source.clone())));
     let result = with_js_http_client(client, f);
-    ACTIVE_JS_SOURCE_HEADER_ERROR.with(|cell| cell.replace(previous_error));
     ACTIVE_JS_BOOK_SOURCE.with(|cell| cell.replace(previous_source));
     result
 }
@@ -152,6 +135,18 @@ fn active_js_http_client() -> HttpClient {
     ACTIVE_JS_HTTP_CLIENT
         .with(|cell| cell.borrow().clone())
         .unwrap_or_else(|| JS_HTTP_CLIENT.clone())
+}
+
+fn with_js_reentrant_ctx<T>(
+    ctx: &rquickjs::Ctx<'_>,
+    f: impl FnOnce() -> T,
+) -> T {
+    ACTIVE_JS_REENTRANT_CTX.with(|cell| {
+        let previous = cell.replace(Some(ctx.as_raw()));
+        let result = f();
+        cell.replace(previous);
+        result
+    })
 }
 
 pub fn eval_js(script: &str, input: &str, base_url: &str) -> anyhow::Result<String> {
@@ -308,6 +303,23 @@ fn eval_js_inner_with_source(
     bindings: Option<&HashMap<String, JsonValue>>,
     template_result: bool,
 ) -> anyhow::Result<String> {
+    if let Some(raw_ctx) = ACTIVE_JS_REENTRANT_CTX.with(|cell| *cell.borrow()) {
+        // SAFETY: the pointer is installed only for the duration of a native
+        // callback invoked by this same QuickJS context and thread.
+        let ctx = unsafe { rquickjs::Ctx::from_raw(raw_ctx) };
+        return eval_js_reentrant(
+            ctx,
+            script,
+            input,
+            base_url,
+            key,
+            page,
+            source_key,
+            bindings,
+            template_result,
+        );
+    }
+
     JS_ENV.with(|(_, ctx, start_time)| {
         let now = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -548,24 +560,21 @@ fn eval_js_inner_with_source(
                 Func::new(|| -> String { JS_DEVICE_ID.clone() }),
             )?;
             java_obj.set("deviceID", Func::new(|| -> String { JS_DEVICE_ID.clone() }))?;
+            java_obj.set("randomUUID", Func::new(|| -> String { Uuid::new_v4().to_string() }))?;
             java_obj.set(
                 "__nativeConnect",
                 Func::new(
-                    |url: String,
-                     headers_json: String,
-                     call_timeout_ms: rquickjs::function::Opt<i64>| -> String {
-                        java_analyzed_request_response(
-                            &url,
-                            &headers_json,
-                            call_timeout_ms.0,
-                        )
+                    |ctx: rquickjs::Ctx<'_>, url: String, headers_json: String| -> String {
+                        with_js_reentrant_ctx(&ctx, || {
+                            java_analyzed_request_response(&url, &headers_json)
+                        })
                     },
                 ),
             )?;
             java_obj.set(
                 "__nativeAjaxAllItem",
-                Func::new(|url: String| -> String {
-                    java_analyzed_request_response(&url, "{}", None)
+                Func::new(|ctx: rquickjs::Ctx<'_>, url: String| -> String {
+                    with_js_reentrant_ctx(&ctx, || java_analyzed_request_response(&url, ""))
                 }),
             )?;
             java_obj.set(
@@ -609,13 +618,25 @@ fn eval_js_inner_with_source(
             java_obj.set(
                 "base64DecodeBytes",
                 Func::new(|input: String| -> String {
-                    let bytes = base64::engine::general_purpose::STANDARD
-                        .decode(input.trim())
-                        .or_else(|_| {
-                            base64::engine::general_purpose::STANDARD_NO_PAD.decode(input.trim())
-                        })
-                        .unwrap_or_default();
-                    serde_json::to_string(&bytes).unwrap_or_else(|_| "[]".to_string())
+                    java_base64_decode_bytes(&input, 0)
+                }),
+            )?;
+            java_obj.set(
+                "__base64EncodeBytes",
+                Func::new(|bytes_json: String, flags: i32| -> String {
+                    java_base64_encode_bytes(&bytes_json, flags)
+                }),
+            )?;
+            java_obj.set(
+                "__base64DecodeBytes",
+                Func::new(|input: String, flags: i32| -> String {
+                    java_base64_decode_bytes(&input, flags)
+                }),
+            )?;
+            java_obj.set(
+                "__hmacBytes",
+                Func::new(|algorithm: String, key_json: String, data_json: String| -> String {
+                    java_hmac_bytes(&algorithm, &key_json, &data_json)
                 }),
             )?;
             java_obj.set(
@@ -670,6 +691,13 @@ fn eval_js_inner_with_source(
             java_obj.set(
                 "aesDecryptBytes",
                 Func::new(|input: String| -> String { java_aes_decrypt_bytes(&input) }),
+            )?;
+            java_obj.set(
+                "__aesDecryptByteArray",
+                Func::new(|input: String| -> String {
+                    serde_json::to_string(&java_aes_decrypt_byte_array(&input))
+                        .unwrap_or_else(|_| "[]".to_string())
+                }),
             )?;
             java_obj.set(
                 "aesBase64Encode",
@@ -1025,9 +1053,9 @@ fn eval_js_inner_with_source(
                         try { raw = typeof value === 'string' ? JSON.parse(value) : value || {}; }
                         catch (_) { raw = {}; }
                         const bodyText = String(raw.body == null ? '' : raw.body);
-                        const bodyValue = new String(bodyText);
-                        bodyValue.string = () => bodyText;
-                        bodyValue.close = () => {};
+                        const url = String(raw.url || '');
+                        const code = Number(raw.code ?? raw.status ?? 200);
+                        const message = String(raw.message == null ? 'OK' : raw.message);
                         const headers = Object.assign({}, raw.headers || {});
                         const responseHeaders = Object.assign({}, headers, {
                             get(name) {
@@ -1037,41 +1065,49 @@ fn eval_js_inner_with_source(
                             names: () => Object.keys(headers),
                             toMultimap: () => Object.assign({}, headers)
                         });
-                        const code = Number(raw.code || raw.status || 0);
                         const isSuccessful = raw.isSuccessful == null
                             ? code >= 200 && code < 300 : !!raw.isSuccessful;
-                        const callTime = Number(raw.callTime || 0);
-                        const response = {
-                            __ffiStrResponse: true,
-                            raw: raw.raw == null ? null : raw.raw,
-                            body: () => bodyValue,
-                            url: () => String(raw.url || ''),
+                        const rawResponseBody = () => {
+                            const value = new String(bodyText);
+                            value.string = () => bodyText;
+                            value.close = () => {};
+                            return value;
+                        };
+                        const rawResponse = {
+                            body: rawResponseBody,
+                            url: () => url,
                             code: () => code,
-                            message: () => String(raw.message || ''),
+                            message: () => message,
                             headers: () => responseHeaders,
                             isSuccessful: () => isSuccessful,
-                            callTime: () => callTime,
+                            toString: () => `Response{code=${code}, message=${message}, url=${url}}`
+                        };
+                        return {
+                            __ffiStrResponse: true,
+                            body: () => bodyText,
+                            url: () => url,
+                            code: () => code,
+                            message: () => message,
+                            headers: () => responseHeaders,
+                            raw: () => rawResponse,
+                            isSuccessful: () => isSuccessful,
+                            toString: () => rawResponse.toString(),
                             toJSON: () => ({
                                 __ffiStrResponse: true,
-                                raw: raw.raw == null ? null : raw.raw,
                                 body: bodyText,
-                                url: String(raw.url || ''),
+                                url,
                                 code,
-                                message: String(raw.message || ''),
+                                message,
                                 headers,
-                                isSuccessful,
-                                callTime
+                                isSuccessful
                             })
                         };
-                        return response;
                     };
                     globalThis.__readerMakeStrResponse = strResponseFromJson;
-                    java.connect = (url, headers, callTimeout) => {
-                        const args = [String(url), headersJson(headers)];
-                        if (callTimeout != null) args.push(Number(callTimeout));
-                        return strResponseFromJson(java.__nativeConnect(...args));
-                    };
-                    java.ajaxAll = (urls, skipRateLimit) => Array.from(urls || [], url =>
+                    java.connect = (url, headers) => strResponseFromJson(
+                        java.__nativeConnect(
+                            String(url), headers == null ? '' : headersJson(headers)));
+                    java.ajaxAll = urls => Array.from(urls || [], url =>
                         strResponseFromJson(java.__nativeAjaxAllItem(String(url))));
                     java.strToBytes = (value, charset) => JSON.parse(
                         java.__strToBytes(String(value), charset == null ? '' : String(charset)));
@@ -1279,80 +1315,186 @@ fn eval_js_inner_with_source(
                         d(tag, message) { java.log(`[D] ${String(tag)}: ${String(message)}`); return 0; },
                         e(tag, message) { java.log(`[E] ${String(tag)}: ${String(message)}`); return 0; }
                     };
+                    const toBytes = value => {
+                        if (Array.isArray(value)) return value.map(byte => Number(byte) & 0xff);
+                        if (value instanceof Uint8Array) return Array.from(value);
+                        return java.strToBytes(String(value == null ? '' : value), 'UTF-8');
+                    };
                     const base64 = {
-                        DEFAULT: 0, NO_WRAP: 2, URL_SAFE: 8, NO_PADDING: 1,
-                        encodeToString(value) { return java.base64Encode(String(value)); },
-                        decode(value) { return java.base64Decode(String(value).replace(/\s/g, '')); }
+                        DEFAULT: 0, NO_PADDING: 1, NO_WRAP: 2, URL_SAFE: 8,
+                        encodeToString(value, flags) {
+                            return java.__base64EncodeBytes(
+                                JSON.stringify(toBytes(value)), Number(flags || 0));
+                        },
+                        decode(value, flags) {
+                            const input = Array.isArray(value) || value instanceof Uint8Array
+                                ? String.fromCharCode(...toBytes(value))
+                                : String(value == null ? '' : value);
+                            return JSON.parse(java.__base64DecodeBytes(
+                                input, Number(flags || 0)));
+                        }
+                    };
+                    const javaBase64Encoder = flags => ({
+                        encodeToString(value) { return base64.encodeToString(value, flags); },
+                        withoutPadding() { return javaBase64Encoder(flags | base64.NO_PADDING); }
+                    });
+                    const javaBase64 = {
+                        getEncoder() { return javaBase64Encoder(0); },
+                        getDecoder() { return { decode: value => base64.decode(value, 0) }; },
+                        getUrlEncoder() { return javaBase64Encoder(base64.URL_SAFE); },
+                        getUrlDecoder() { return { decode: value => base64.decode(value, base64.URL_SAFE) }; }
                     };
                     globalThis.System = Object.assign(globalThis.System || {}, {
                         currentTimeMillis: () => java.now()
                     });
                     const randomUuid = () => {
-                        const value = java.uuid();
+                        const value = java.randomUUID();
                         return { toString: () => value };
                     };
                     globalThis.UUID = { randomUUID: randomUuid };
                     java.util = java.util || {};
                     java.util.UUID = { randomUUID: randomUuid };
-                    java.util.Base64 = {
-                        getEncoder() { return { encodeToString: base64.encodeToString, withoutPadding() { return this; } }; },
-                        getDecoder() { return { decode: base64.decode }; },
-                        getUrlEncoder() { return { encodeToString: value => java.base64Encode(String(value)).replace(/\+/g, '-').replace(/\//g, '_') }; }
+                    java.util.Base64 = javaBase64;
+
+                    if (!String.prototype.getBytes) {
+                        Object.defineProperty(String.prototype, 'getBytes', {
+                            value(charset) {
+                                return java.strToBytes(
+                                    String(this), charset == null ? 'UTF-8' : String(charset));
+                            }
+                        });
+                    }
+
+                    const JsString = globalThis.String;
+                    function JavaString(value, charset) {
+                        const text = Array.isArray(value) || value instanceof Uint8Array
+                            ? java.bytesToStr(
+                                value, charset == null ? 'UTF-8' : JsString(charset))
+                            : JsString(value == null ? '' : value);
+                        return new.target ? new JsString(text) : text;
+                    }
+                    function SecretKeySpec(key, algorithm) {
+                        return { key: toBytes(key), algorithm: JsString(algorithm) };
+                    }
+                    function IvParameterSpec(iv) {
+                        return { iv: toBytes(iv) };
+                    }
+                    const Arrays = {
+                        copyOfRange(value, start, end) {
+                            const bytes = Array.from(value == null ? [] : value).slice(start, end);
+                            while (bytes.length < end - start) bytes.push(0);
+                            return bytes;
+                        }
                     };
+                    const Cipher = {
+                        DECRYPT_MODE: 2,
+                        getInstance: algorithm => ({
+                            init(mode, key, iv) { this.mode = mode; this.key = key; this.iv = iv; },
+                            doFinal(data) {
+                                return JSON.parse(java.__aesDecryptByteArray(JSON.stringify({
+                                    algorithm, mode: this.mode, key: this.key.key,
+                                    iv: this.iv.iv, data: toBytes(data)
+                                })));
+                            }
+                        })
+                    };
+                    const Mac = {
+                        getInstance: algorithm => ({
+                            init(key) { this.key = key; },
+                            doFinal(data) {
+                                return JSON.parse(java.__hmacBytes(
+                                    String(algorithm),
+                                    JSON.stringify(this.key ? this.key.key : []),
+                                    JSON.stringify(toBytes(data))));
+                            }
+                        })
+                    };
+                    const URLEncoder = {
+                        encode(value, charset) {
+                            return java.encodeURI(
+                                String(value), charset == null ? 'UTF-8' : String(charset))
+                                .replace(/%20/g, '+')
+                                .replace(/%2A/gi, '*')
+                                .replace(/~/g, '%7E');
+                        }
+                    };
+                    const URLDecoder = {
+                        decode(value) {
+                            return decodeURIComponent(String(value).replace(/\+/g, ' '));
+                        }
+                    };
+                    const DatatypeConverter = {
+                        printHexBinary(value) {
+                            return toBytes(value)
+                                .map(byte => byte.toString(16).padStart(2, '0'))
+                                .join('')
+                                .toUpperCase();
+                        },
+                        parseHexBinary(value) {
+                            return JSON.parse(java.__hexDecodeBytes(String(value)));
+                        }
+                    };
+                    const markClass = (name, value) => {
+                        try {
+                            Object.defineProperty(value, '__javaName', {
+                                value: name, configurable: true
+                            });
+                        } catch (_) {}
+                        return value;
+                    };
+
                     globalThis.Packages = globalThis.Packages || {};
                     Packages.java = Packages.java || {};
                     Packages.java.lang = Packages.java.lang || {};
+                    Packages.java.net = Packages.java.net || {};
                     Packages.java.util = Packages.java.util || {};
                     Packages.javax = Packages.javax || {};
                     Packages.javax.crypto = Packages.javax.crypto || {};
                     Packages.javax.crypto.spec = Packages.javax.crypto.spec || {};
-                    const utf8Bytes = value => {
-                        const encoded = encodeURIComponent(String(value));
-                        const bytes = [];
-                        for (let i = 0; i < encoded.length;) {
-                            if (encoded[i] === '%') {
-                                bytes.push(parseInt(encoded.slice(i + 1, i + 3), 16));
-                                i += 3;
-                            } else {
-                                bytes.push(encoded.charCodeAt(i++));
+                    Packages.javax.xml = Packages.javax.xml || {};
+                    Packages.javax.xml.bind = Packages.javax.xml.bind || {};
+                    Packages.android = Packages.android || {};
+                    Packages.android.util = Packages.android.util || {};
+
+                    Packages.java.lang.String = markClass('String', JavaString);
+                    Packages.java.net.URLEncoder = markClass('URLEncoder', URLEncoder);
+                    Packages.java.net.URLDecoder = markClass('URLDecoder', URLDecoder);
+                    Packages.java.util.Arrays = markClass('Arrays', Arrays);
+                    Packages.java.util.Base64 = markClass('Base64', javaBase64);
+                    Packages.java.util.UUID = markClass('UUID', java.util.UUID);
+                    Packages.javax.crypto.Mac = markClass('Mac', Mac);
+                    Packages.javax.crypto.Cipher = markClass('Cipher', Cipher);
+                    Packages.javax.crypto.spec.SecretKeySpec =
+                        markClass('SecretKeySpec', SecretKeySpec);
+                    Packages.javax.crypto.spec.IvParameterSpec =
+                        markClass('IvParameterSpec', IvParameterSpec);
+                    Packages.javax.xml.bind.DatatypeConverter =
+                        markClass('DatatypeConverter', DatatypeConverter);
+                    Packages.android.util.Base64 = markClass('Base64', base64);
+
+                    const exposeJavaValue = (target, value) => {
+                        if (!value) return;
+                        if (value.__javaName) {
+                            target[value.__javaName] = value;
+                            return;
+                        }
+                        if (typeof value === 'object') {
+                            for (const candidate of Object.values(value)) {
+                                if (candidate && candidate.__javaName) {
+                                    target[candidate.__javaName] = candidate;
+                                }
                             }
                         }
-                        return bytes;
                     };
-                    if (!String.prototype.getBytes) {
-                        Object.defineProperty(String.prototype, 'getBytes', {
-                            value() { return utf8Bytes(String(this)); }
-                        });
-                    }
-                    globalThis.JavaImporter = function() {
-                        this.importPackage = function() {};
-                        this.Base64 = { getDecoder() { return { decode: value => JSON.parse(java.base64DecodeBytes(String(value))) }; } };
-                        this.SecretKeySpec = (key, algorithm) => ({ key: Array.from(key), algorithm: String(algorithm) });
-                        this.IvParameterSpec = iv => ({ iv: Array.from(iv) });
-                        this.Arrays = { copyOfRange(value, start, end) {
-                            const bytes = Array.from(value).slice(start, end);
-                            while (bytes.length < end - start) bytes.push(0);
-                            return bytes;
-                        } };
-                        this.Cipher = {
-                            DECRYPT_MODE: 2,
-                            getInstance: algorithm => ({
-                                init(mode, key, iv) { this.mode = mode; this.key = key; this.iv = iv; },
-                                doFinal(data) {
-                                    return java.aesDecryptBytes(JSON.stringify({
-                                        algorithm, mode: this.mode, key: this.key.key,
-                                        iv: this.iv.iv, data: Array.from(data)
-                                    }));
-                                }
-                            })
+                    globalThis.JavaImporter = function(...values) {
+                        values.forEach(value => exposeJavaValue(this, value));
+                        this.importPackage = (...packages) => {
+                            packages.forEach(pkg => exposeJavaValue(this, pkg));
+                            return this;
                         };
                     };
-                    globalThis.URLEncoder = {
-                        encode(value) { return encodeURIComponent(String(value)).replace(/%20/g, '+').replace(/[!'()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`); }
-                    };
-                    globalThis.URLDecoder = {
-                        decode(value) { return decodeURIComponent(String(value).replace(/\+/g, ' ')); }
-                    };
+                    globalThis.URLEncoder = URLEncoder;
+                    globalThis.URLDecoder = URLDecoder;
                     globalThis.Log = log;
                     globalThis.android = globalThis.android || {};
                     globalThis.android.util = globalThis.android.util || {};
@@ -1425,6 +1567,107 @@ fn eval_js_inner_with_source(
             Ok(result)
         }) // closes ctx.with
     }) // closes JS_ENV.with
+}
+
+fn eval_js_reentrant<'js>(
+    ctx: rquickjs::Ctx<'js>,
+    script: &str,
+    input: Option<&str>,
+    base_url: Option<&str>,
+    key: Option<&str>,
+    page: Option<i32>,
+    _source_key: Option<&str>,
+    bindings: Option<&HashMap<String, JsonValue>>,
+    template_result: bool,
+) -> anyhow::Result<String> {
+    let globals = ctx.globals();
+    let mut saved = Vec::<(String, Option<Value<'js>>)>::new();
+
+    let mut save_global = |name: &str| -> anyhow::Result<()> {
+        if saved.iter().any(|(saved_name, _)| saved_name == name) {
+            return Ok(());
+        }
+        let value = if globals.contains_key(name)? {
+            Some(globals.get::<_, Value<'js>>(name)?)
+        } else {
+            None
+        };
+        saved.push((name.to_string(), value));
+        Ok(())
+    };
+
+    for name in ["input", "result", "src", "base_url", "baseUrl", "url", "key", "page"] {
+        save_global(name)?;
+    }
+    if let Some(bindings) = bindings {
+        for name in bindings.keys() {
+            save_global(name)?;
+        }
+    }
+
+    let result = (|| -> anyhow::Result<String> {
+        let input_value = input.unwrap_or("");
+        let base_url_value = base_url.unwrap_or("");
+        globals.set("input", input_value)?;
+        globals.set("result", input_value)?;
+        globals.set("src", input_value)?;
+        globals.set("base_url", base_url_value)?;
+        globals.set("baseUrl", base_url_value)?;
+        globals.set("url", base_url_value)?;
+        if let Some(key) = key {
+            globals.set("key", key)?;
+        }
+        if let Some(page) = page {
+            globals.set("page", page)?;
+        }
+        if let Some(bindings) = bindings {
+            for (name, value) in bindings {
+                globals.set(name.as_str(), ctx.json_parse(value.to_string())?)?;
+            }
+        }
+
+        let scoped_script = format!("{{\n{script}\n}}");
+        let value = eval_script(ctx.clone(), &scoped_script)?;
+        if value.is_null() || value.is_undefined() {
+            if template_result {
+                return Ok(String::new());
+            }
+            let result_value = globals.get::<_, Value<'js>>("result")?;
+            if result_value.is_null() || result_value.is_undefined() {
+                return Ok(String::new());
+            }
+            if let Some(string) = result_value.clone().into_string() {
+                return Ok(string.to_string().unwrap_or_default());
+            }
+            return Ok(ctx
+                .json_stringify(result_value)?
+                .and_then(|json| json.to_string().ok())
+                .unwrap_or_default());
+        }
+        if template_result {
+            let value: rquickjs::Coerced<String> = rquickjs::FromJs::from_js(&ctx, value)?;
+            return Ok(value.0);
+        }
+        if let Some(string) = value.clone().into_string() {
+            return Ok(string.to_string().unwrap_or_default());
+        }
+        Ok(ctx
+            .json_stringify(value)?
+            .and_then(|json| json.to_string().ok())
+            .unwrap_or_default())
+    })();
+
+    for (name, value) in saved.into_iter().rev() {
+        match value {
+            Some(value) => {
+                let _ = globals.set(name.as_str(), value);
+            }
+            None => {
+                let _ = globals.remove(name.as_str());
+            }
+        }
+    }
+    result
 }
 
 pub(crate) fn java_get_string(
@@ -1852,9 +2095,9 @@ fn java_aes_base64_decode_to_string(input: &str, key: &str, algorithm: &str, iv:
         .unwrap_or_default()
 }
 
-fn java_aes_decrypt_bytes(input: &str) -> String {
+fn java_aes_decrypt_byte_array(input: &str) -> Vec<u8> {
     let Ok(value) = serde_json::from_str::<JsonValue>(input) else {
-        return String::new();
+        return Vec::new();
     };
     let bytes = |key: &str| -> Option<Vec<u8>> {
         value
@@ -1875,20 +2118,23 @@ fn java_aes_decrypt_bytes(input: &str) -> String {
             "AES/CBC/PKCS5PADDING" | "AES/CBC/PKCS7PADDING"
         )
     {
-        return String::new();
+        return Vec::new();
     }
     let (Some(key), Some(iv), Some(mut encrypted)) = (bytes("key"), bytes("iv"), bytes("data"))
     else {
-        return String::new();
+        return Vec::new();
     };
     let Ok(cipher) = Aes128CbcDecryptor::new_from_slices(&key, &iv) else {
-        return String::new();
+        return Vec::new();
     };
     cipher
         .decrypt_padded_mut::<Pkcs7>(&mut encrypted)
-        .ok()
-        .and_then(|plaintext| String::from_utf8(plaintext.to_vec()).ok())
+        .map(|plaintext| plaintext.to_vec())
         .unwrap_or_default()
+}
+
+fn java_aes_decrypt_bytes(input: &str) -> String {
+    String::from_utf8(java_aes_decrypt_byte_array(input)).unwrap_or_default()
 }
 
 fn java_aes_base64_encode(input: &str, key: &str, algorithm: &str, iv: &str) -> String {
@@ -2137,6 +2383,55 @@ fn java_base64_decode(input: &str, charset: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
+fn json_byte_array(input: &str) -> Vec<u8> {
+    serde_json::from_str::<Vec<i64>>(input)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|byte| byte.rem_euclid(256) as u8)
+        .collect()
+}
+
+fn java_base64_encode_bytes(input_json: &str, flags: i32) -> String {
+    let bytes = json_byte_array(input_json);
+    let url_safe = flags & 8 != 0;
+    let no_padding = flags & 1 != 0;
+    match (url_safe, no_padding) {
+        (true, true) => base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes),
+        (true, false) => base64::engine::general_purpose::URL_SAFE.encode(bytes),
+        (false, true) => base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes),
+        (false, false) => base64::engine::general_purpose::STANDARD.encode(bytes),
+    }
+}
+
+fn java_base64_decode_bytes(input: &str, flags: i32) -> String {
+    let input = input.chars().filter(|ch| !ch.is_whitespace()).collect::<String>();
+    let url_safe = flags & 8 != 0;
+    let decoded = if url_safe {
+        base64::engine::general_purpose::URL_SAFE
+            .decode(&input)
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&input))
+    } else {
+        base64::engine::general_purpose::STANDARD
+            .decode(&input)
+            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&input))
+    }
+    .unwrap_or_default();
+    serde_json::to_string(&decoded).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn java_hmac_bytes(algorithm: &str, key_json: &str, data_json: &str) -> String {
+    let algorithm = match algorithm.to_ascii_uppercase().as_str() {
+        "HMACSHA1" => hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
+        "HMACSHA256" => hmac::HMAC_SHA256,
+        "HMACSHA384" => hmac::HMAC_SHA384,
+        "HMACSHA512" => hmac::HMAC_SHA512,
+        _ => return "[]".to_string(),
+    };
+    let key = hmac::Key::new(algorithm, &json_byte_array(key_json));
+    let tag = hmac::sign(&key, &json_byte_array(data_json));
+    serde_json::to_string(tag.as_ref()).unwrap_or_else(|_| "[]".to_string())
+}
+
 fn java_encode_uri(input: &str, charset: Option<&str>) -> String {
     let bytes = java_str_to_bytes(input, charset);
     urlencoding::encode_binary(&bytes).into_owned()
@@ -2259,7 +2554,6 @@ fn java_request_simple_response_with_client(
     headers_json: &str,
     client: &HttpClient,
 ) -> String {
-    let started = Instant::now();
     let method = Method::from_bytes(method.as_bytes()).unwrap_or(Method::GET);
     let response = client.execute(
         method,
@@ -2285,81 +2579,61 @@ fn java_request_simple_response_with_client(
             let status = response.status;
             serde_json::json!({
                 "__ffiStrResponse": true,
-                "raw": null,
                 "body": String::from_utf8_lossy(&response.body).into_owned(),
                 "url": response.url,
                 "code": status,
-                "message": "",
+                "message": http_status_message(status),
                 "headers": headers,
                 "isSuccessful": (200..300).contains(&status),
-                "callTime": started.elapsed().as_millis().min(i64::MAX as u128) as i64,
             })
         }
-        Err(error) => {
-            let call_time = match &error {
-                HttpClientError::Timeout(_) => -2,
-                _ => -7,
-            };
-            serde_json::json!({
-                "__ffiStrResponse": true,
-                "raw": null,
-                "body": error.to_string(),
-                "url": url.trim(),
-                "code": 0,
-                "message": "",
-                "headers": {},
-                "isSuccessful": false,
-                "callTime": call_time,
-            })
-        }
+        Err(error) => serde_json::json!({
+            "__ffiStrResponse": true,
+            "body": error.to_string(),
+            "url": url.trim(),
+            "code": 0,
+            "message": "",
+            "headers": {},
+            "isSuccessful": false,
+        })
     };
     payload.to_string()
 }
 
-fn java_analyzed_request_response(
-    url: &str,
-    headers_json: &str,
-    call_timeout_ms: Option<i64>,
-) -> String {
-    let started = Instant::now();
-    let active_client = active_js_http_client();
-    let client = match call_timeout_ms.filter(|timeout| *timeout > 0) {
-        Some(timeout) => match active_client.with_timeout(timeout as u64) {
-            Ok(client) => client,
-            Err(error) => return java_error_response(url, &error.to_string(), false),
-        },
-        None => active_client,
-    };
-
-    if let Some(error) = ACTIVE_JS_SOURCE_HEADER_ERROR.with(|cell| cell.borrow().clone()) {
-        return java_error_response(url, &error, false);
-    }
+fn java_analyzed_request_response(url: &str, headers_json: &str) -> String {
+    let client = active_js_http_client();
     let source = ACTIVE_JS_BOOK_SOURCE.with(|cell| cell.borrow().clone());
     let Some(source) = source else {
-        return java_request_simple_response_with_client("GET", url, None, headers_json, &client);
-    };
-    let mut spec = match analyze_url(url, "", 0, "", &source) {
-        Ok(spec) => spec,
-        Err(error) => return java_error_response(url, &error, false),
-    };
-    for (name, value) in java_request_headers(headers_json) {
-        if let Some((_, old_value)) = spec
-            .headers
-            .iter_mut()
-            .find(|(old_name, _)| old_name.eq_ignore_ascii_case(&name))
-        {
-            *old_value = value;
-        } else {
-            spec.headers.push((name, value));
+        let payload =
+            java_request_simple_response_with_client("GET", url, None, headers_json, &client);
+        if let Ok(value) = serde_json::from_str::<JsonValue>(&payload) {
+            if value.get("code").and_then(JsonValue::as_u64) == Some(0) {
+                let error = value
+                    .get("body")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("request failed");
+                return java_error_response(url, error);
+            }
         }
-    }
+        return payload;
+    };
+    let explicit_headers =
+        (!headers_json.is_empty()).then(|| java_request_headers(headers_json));
+    let spec = match analyze_url_with_headers(
+        url,
+        "",
+        0,
+        &source.book_source_url,
+        &source,
+        explicit_headers,
+    ) {
+        Ok(spec) => spec,
+        Err(error) => return java_error_response(url, &error),
+    };
 
     let response = match execute_request_spec(&client, &spec) {
         Ok(response) => response,
-        Err(error) => {
-            let is_timeout = matches!(error, HttpClientError::Timeout(_));
-            return java_error_response(url, &error.to_string(), is_timeout);
-        }
+        Err(error) => return java_error_response(&spec.url, &error.to_string()),
     };
 
     let headers = response
@@ -2394,29 +2668,39 @@ fn java_analyzed_request_response(
     };
     serde_json::json!({
         "__ffiStrResponse": true,
-        "raw": null,
         "body": body,
         "url": response.url,
         "code": response.status,
-        "message": "",
+        "message": http_status_message(response.status),
         "headers": headers,
         "isSuccessful": (200..300).contains(&response.status),
-        "callTime": started.elapsed().as_millis().min(i64::MAX as u128) as i64,
     })
     .to_string()
 }
 
-fn java_error_response(url: &str, error: &str, timeout: bool) -> String {
+fn http_status_message(status: u16) -> String {
+    ureq::http::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|status| status.canonical_reason())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn java_error_response(url: &str, error: &str) -> String {
+    let raw_url = split_ajax_spec(url).0.trim();
+    let response_url = url::Url::parse(raw_url)
+        .ok()
+        .filter(|parsed| matches!(parsed.scheme(), "http" | "https"))
+        .map(|parsed| parsed.to_string())
+        .unwrap_or_else(|| "http://localhost/".to_string());
     serde_json::json!({
         "__ffiStrResponse": true,
-        "raw": null,
         "body": error,
-        "url": url.trim(),
-        "code": 0,
-        "message": "",
+        "url": response_url,
+        "code": 200,
+        "message": "OK",
         "headers": {},
-        "isSuccessful": false,
-        "callTime": if timeout { -2 } else { -7 },
+        "isSuccessful": true,
     })
     .to_string()
 }
@@ -2521,8 +2805,30 @@ mod tests {
     use crate::crawler::session::{with_active_session, ExecuteSession};
     use serde_json::json;
     use std::io::BufRead;
-    use std::net::TcpListener;
+    use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::thread;
+
+    fn accept_with_timeout(listener: &TcpListener) -> (TcpStream, SocketAddr) {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((stream, address)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    return (stream, address);
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("test HTTP server did not receive request: {error}"),
+            }
+        }
+    }
 
     #[test]
     fn js_lib_json_object_loads_only_absolute_urls_and_uses_cache() {
@@ -2532,7 +2838,7 @@ mod tests {
         let marker = format!("shared_lib_{}", address.port());
         let script = format!("globalThis.{marker}=41;");
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = accept_with_timeout(&listener);
             let mut request = [0u8; 2048];
             let _ = stream.read(&mut request);
             write!(
@@ -2613,7 +2919,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = accept_with_timeout(&listener);
             let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
             let mut request = String::new();
             loop {
@@ -2633,30 +2939,38 @@ mod tests {
         });
 
         let url = format!("http://{address}/connect");
+        let source = BookSource {
+            book_source_url: url.clone(),
+            ..Default::default()
+        };
         let client = HttpClient::standalone();
         let script = format!(
             r#"
                 const response = java.connect('{url}', {{'X-Request':'connect'}});
                 [response.__ffiStrResponse, response.code(), response.message(),
-                 response.url(), response.body().string(), response.isSuccessful(),
-                 response.headers().get('x-connect'), response.callTime() >= 0,
-                 response.raw === null].join('|');
+                 response.url(), response.body(), response.isSuccessful(),
+                 response.headers().get('x-connect'), response.raw().code(),
+                 String(response).includes('code=418')].join('|');
             "#
         );
-        let result = with_js_http_client(&client, || eval_js(&script, "", &url).unwrap());
+        let result = with_js_http_context(&client, &source, || {
+            eval_js(&script, "", &url).unwrap()
+        });
         assert_eq!(
             result,
-            format!("true|418||{url}|denied|false|yes|true|true")
+            format!("true|418|I'm a teapot|{url}|denied|false|yes|418|true")
         );
         assert!(server.join().unwrap().contains("x-request: connect"));
 
-        let invalid = eval_js(
-            "(() => { const response = java.connect('not-a-url'); return [response.code(), response.isSuccessful(), response.callTime() < 0, response.body().string().length > 0].join('|'); })()",
-            "",
-            "https://example.com",
-        )
-        .unwrap();
-        assert_eq!(invalid, "0|false|true|true");
+        let invalid = with_js_http_context(&client, &source, || {
+            eval_js(
+                "(() => { const response = java.connect('ftp://invalid'); return [response.code(), response.message(), response.isSuccessful(), response.url(), response.body().length > 0, response.raw().code()].join('|'); })()",
+                "",
+                &url,
+            )
+            .unwrap()
+        });
+        assert_eq!(invalid, "200|OK|true|http://localhost/|true|200");
     }
 
     #[test]
@@ -2666,7 +2980,7 @@ mod tests {
         let server = thread::spawn(move || {
             let mut requests = Vec::new();
             for (status, cookie, body) in [(201, true, "first"), (502, false, "last")] {
-                let (mut stream, _) = listener.accept().unwrap();
+                let (mut stream, _) = accept_with_timeout(&listener);
                 let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
                 let mut request = String::new();
                 loop {
@@ -2699,15 +3013,19 @@ mod tests {
 
         let first = format!("http://{address}/first");
         let last = format!("http://{address}/last");
+        let source = BookSource {
+            book_source_url: first.clone(),
+            ..Default::default()
+        };
         let client = HttpClient::standalone();
-        let result = with_js_http_client(&client, || {
+        let result = with_js_http_context(&client, &source, || {
             eval_js(
                 &format!(
                     r#"(() => {{
-                        const responses = java.ajaxAll(['{first}', 'not-a-url', '{last}']);
-                        return [responses.length, responses[0].code(), responses[0].body().string(),
-                            responses[1].code(), responses[1].isSuccessful(), responses[1].callTime() < 0,
-                            responses[2].code(), responses[2].body().string()].join('|');
+                        const responses = java.ajaxAll(['{first}', 'ftp://invalid', '{last}']);
+                        return [responses.length, responses[0].code(), responses[0].body(),
+                            responses[1].code(), responses[1].isSuccessful(), responses[1].body().length > 0,
+                            responses[2].code(), responses[2].body()].join('|');
                     }})()"#
                 ),
                 "",
@@ -2715,7 +3033,7 @@ mod tests {
             )
             .unwrap()
         });
-        assert_eq!(result, "3|201|first|0|false|true|502|last");
+        assert_eq!(result, "3|201|first|200|true|true|502|last");
 
         let requests = server.join().unwrap();
         assert!(requests[0].starts_with("get /first "));
@@ -2724,13 +3042,13 @@ mod tests {
     }
 
     #[test]
-    fn java_connect_and_ajax_all_share_source_request_configuration() {
+    fn java_connect_and_ajax_all_follow_analyze_url_header_precedence() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let mut requests = Vec::new();
-            for _ in 0..2 {
-                let (mut stream, _) = listener.accept().unwrap();
+            for _ in 0..3 {
+                let (mut stream, _) = accept_with_timeout(&listener);
                 let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
                 let mut request = String::new();
                 let mut content_length = 0usize;
@@ -2763,33 +3081,45 @@ mod tests {
             requests
         });
 
-        let url = format!(
-            "http://{address}/ajax,{{\"method\":\"POST\",\"headers\":{{\"X-Url\":\"configured\"}},\"body\":\"payload\"}}"
-        );
+        let url =
+            r#"/ajax,{"method":"POST","headers":{"X-Url":"configured","X-Order":"url"},"body":"payload","js":"result"}"#
+                .to_string();
         let script = format!(
-            "(() => {{ const all = java.ajaxAll([{}])[0]; const one = java.connect({}); return [all.code(), one.code(), all.body().string(), one.body().string(), all.isSuccessful(), one.isSuccessful()].join('|'); }})()",
+            "(() => {{ globalThis.__sourceHeaderCounter = 0; const all = java.ajaxAll([{}, {}]); const one = java.connect({}, {{'X-Order':'connect','X-Connect':'configured'}}); return [all[0].code(), all[1].code(), one.code(), all[0].body(), all[1].body(), one.body()].join('|'); }})()",
+            serde_json::to_string(&url).unwrap(),
             serde_json::to_string(&url).unwrap(),
             serde_json::to_string(&url).unwrap()
         );
         let source = BookSource {
             book_source_url: format!("http://{address}/source"),
-            header: Some(r#"js:JSON.stringify({"X-Source":"configured"})"#.to_string()),
+            header: Some(
+                r#"js:globalThis.__sourceHeaderCounter=(globalThis.__sourceHeaderCounter||0)+1;JSON.stringify({"X-Source":String(globalThis.__sourceHeaderCounter),"X-Order":"source"})"#
+                    .to_string(),
+            ),
             ..Default::default()
         };
         let client = HttpClient::standalone();
         let result = with_js_http_context(&client, &source, || {
             eval_js(&script, "", &source.book_source_url).unwrap()
         });
-        assert_eq!(result, "201|201|ok|ok|true|true");
+        assert_eq!(result, "201|201|201|ok|ok|ok");
 
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 2);
-        for (request, body) in requests {
+        assert_eq!(requests.len(), 3);
+        for (index, (request, body)) in requests[..2].iter().enumerate() {
             assert!(request.starts_with("post /ajax "));
-            assert!(request.contains("x-source: configured"));
+            assert!(request.contains(&format!("x-source: {}", index + 1)));
             assert!(request.contains("x-url: configured"));
+            assert!(request.contains("x-order: url"));
             assert_eq!(body, "payload");
         }
+
+        assert!(requests[2].0.starts_with("post /ajax "));
+        assert!(!requests[2].0.contains("x-source:"));
+        assert!(requests[2].0.contains("x-connect: configured"));
+        assert!(requests[2].0.contains("x-url: configured"));
+        assert!(requests[2].0.contains("x-order: url"));
+        assert_eq!(requests[2].1, "payload");
     }
 
     #[test]
@@ -2799,7 +3129,7 @@ mod tests {
         let server = thread::spawn(move || {
             let mut requests = Vec::new();
             for _ in 0..3 {
-                let (mut stream, _) = listener.accept().unwrap();
+                let (mut stream, _) = accept_with_timeout(&listener);
                 let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
                 let mut request = String::new();
                 loop {
@@ -2889,6 +3219,59 @@ mod tests {
     }
 
     #[test]
+    fn java_importer_supports_legado_hmac_sha1_fixture() {
+        let script = r#"
+            var aly = new JavaImporter(
+                Packages.javax.crypto.Mac,
+                Packages.javax.crypto.spec.SecretKeySpec,
+                Packages.javax.xml.bind.DatatypeConverter,
+                Packages.java.net.URLEncoder,
+                Packages.java.lang.String,
+                Packages.android.util.Base64
+            );
+            with (aly) {
+                function percentEncode(value) {
+                    return URLEncoder.encode(value, "UTF-8")
+                        .replace("+", "%20")
+                        .replace("*", "%2A")
+                        .replace("%7E", "~");
+                }
+                function sign(stringToSign, accessKeySecret) {
+                    var mac = Mac.getInstance("HmacSHA1");
+                    mac.init(new SecretKeySpec(
+                        String(accessKeySecret + "&").getBytes("UTF-8"), "HmacSHA1"));
+                    var signData = mac.doFinal(String(stringToSign).getBytes("UTF-8"));
+                    var signBase64 = Base64.encodeToString(signData, Base64.NO_WRAP);
+                    return percentEncode(signBase64);
+                }
+            }
+            sign("reader", "secret");
+        "#;
+        assert_eq!(
+            eval_js(script, "", "https://example.com").unwrap(),
+            "%2BziHIM45rqfvezm%2F4BidN45XHvo%3D"
+        );
+    }
+
+    #[test]
+    fn base64_shims_preserve_byte_array_semantics() {
+        let script = r#"
+            const bytes = [97, 98, 99];
+            const standard = android.util.Base64.encodeToString(
+                bytes, android.util.Base64.NO_WRAP);
+            const decoded = java.util.Base64.getDecoder().decode(standard).join(',');
+            const urlSafe = java.util.Base64.getUrlEncoder()
+                .withoutPadding()
+                .encodeToString([251, 255]);
+            [standard, decoded, urlSafe].join('|');
+        "#;
+        assert_eq!(
+            eval_js(script, "", "https://example.com").unwrap(),
+            "YWJj|97,98,99|-_8"
+        );
+    }
+
+    #[test]
     fn legado_android_compat_shims_use_session_and_safe_host_objects() {
         let initial = ExecuteSession::default();
         let script = r#"
@@ -2899,13 +3282,15 @@ mod tests {
             const encoded = URLEncoder.encode('reader rust');
             const decoded = URLDecoder.decode(encoded);
             const base64 = java.util.Base64.getEncoder().encodeToString('reader');
-            const decodedBase64 = android.util.Base64.decode(base64, android.util.Base64.DEFAULT);
+            const decodedBase64 = java.bytesToStr(
+                android.util.Base64.decode(base64, android.util.Base64.DEFAULT), 'UTF-8');
             const uuid = UUID.randomUUID().toString();
             const javaUuid = java.util.UUID.randomUUID().toString();
+            const helperUuid = java.randomUUID();
             if (preferences.getString('token', '') !== 'saved' ||
                 preferences.getString('temporary', 'fallback') !== 'fallback' ||
                 decoded !== 'reader rust' || decodedBase64 !== 'reader' ||
-                uuid.length !== 36 || javaUuid.length !== 36 ||
+                uuid.length !== 36 || javaUuid.length !== 36 || helperUuid.length !== 36 ||
                 System.currentTimeMillis() <= 0 ||
                 !application || !context || !activity || !app ||
                 !android.util.Log || Log.d('compat', 'ok') !== 0) {
