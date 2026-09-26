@@ -2170,7 +2170,7 @@ mod tests {
         let source = serde_json::json!({
             "bookSourceName": "login script fixture",
             "bookSourceUrl": "https://login.example/",
-            "loginUrl": "@js:function login() { return source.getLoginInfo().username + ':' + source.getLoginInfoMap().get('password'); }",
+            "loginUrl": "@js:function login() { return JSON.parse(source.getLoginInfo()).username + ':' + source.getLoginInfoMap().get('password'); }",
             "loginUi": r#"[{"name":"username","type":"text"},{"name":"password","type":"password"}]"#
         });
         let login: Value = serde_json::from_str(&execute(

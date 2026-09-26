@@ -1187,18 +1187,71 @@ pub(crate) fn xpath_eval_strings(
     }
 }
 
+fn normalize_html_xpath_attribute_names<'a>(
+    html: &str,
+    xpath: &'a str,
+) -> std::borrow::Cow<'a, str> {
+    if html
+        .trim_start()
+        .get(.."<?xml".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("<?xml"))
+    {
+        return std::borrow::Cow::Borrowed(xpath);
+    }
+
+    let mut normalized = String::with_capacity(xpath.len());
+    let mut characters = xpath.char_indices().peekable();
+    let mut quote = None;
+    let mut changed = false;
+
+    while let Some((_, character)) = characters.next() {
+        if let Some(active_quote) = quote {
+            normalized.push(character);
+            if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            normalized.push(character);
+            continue;
+        }
+
+        normalized.push(character);
+        if character == '@' {
+            while let Some((_, next)) = characters.peek().copied() {
+                if !(next.is_ascii_alphanumeric() || matches!(next, '_' | ':' | '-' | '.')) {
+                    break;
+                }
+                characters.next();
+                changed |= next.is_ascii_uppercase();
+                normalized.push(next.to_ascii_lowercase());
+            }
+        }
+    }
+
+    if changed {
+        std::borrow::Cow::Owned(normalized)
+    } else {
+        std::borrow::Cow::Borrowed(xpath)
+    }
+}
+
 fn select_xpath_values(html: &str, xpath: &str, format_nodes: bool) -> Vec<String> {
     let package = match parse_xpath_package(html) {
         Ok(package) => package,
         Err(_) => return vec![],
     };
+    let xpath = normalize_html_xpath_attribute_names(html, xpath);
     let node = sxd_xpath::nodeset::Node::Root(package.as_document().root());
     if !format_nodes {
-        return xpath_eval_strings(node, xpath);
+        return xpath_eval_strings(node, xpath.as_ref());
     }
 
     let wants_html = xpath.trim() == "html()" || xpath.trim().ends_with("/html()");
-    match evaluate_xpath_with_fallback(node, xpath) {
+    match evaluate_xpath_with_fallback(node, xpath.as_ref()) {
         Some(sxd_xpath::Value::Nodeset(nodes)) => nodes
             .document_order()
             .into_iter()
@@ -1223,9 +1276,10 @@ pub(crate) fn select_xpath_elements_json(html: &str, xpath: &str) -> String {
         Ok(package) => package,
         Err(_) => return "[]".to_string(),
     };
+    let xpath = normalize_html_xpath_attribute_names(html, xpath);
     let nodes = xpath_select_nodes(
         sxd_xpath::nodeset::Node::Root(package.as_document().root()),
-        xpath,
+        xpath.as_ref(),
     );
 
     let items: Vec<serde_json::Value> = nodes
@@ -1943,6 +1997,10 @@ mod tests {
             select_xpath(attr_html, "//div/@textContent"),
             vec!["raw-value"]
         );
+
+        let xml = r#"<?xml version="1.0"?><root textContent="raw-value"/>"#;
+        assert_eq!(select_xpath(xml, "//root/@textContent"), vec!["raw-value"]);
+        assert!(select_xpath(xml, "//root/@textcontent").is_empty());
 
         // 9. XPath html() must re-escape text when serializing inner HTML.
         let entity_html = r#"<div id="entity">1 &lt; 2 &amp; 3</div>"#;

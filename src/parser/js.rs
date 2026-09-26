@@ -1717,7 +1717,7 @@ fn eval_js_inner_with_source(
                             const dataBytes = Array.isArray(data) || data instanceof Uint8Array
                                 ? toBytes(data)
                                 : mode.startsWith('decrypt')
-                                    ? java.__decodeSymmetricInput(String(data == null ? '' : data))
+                                    ? JSON.parse(java.__decodeSymmetricInput(String(data == null ? '' : data)))
                                     : toBytes(data);
                             const result = java.__symmetricCrypto(
                                 mode,
@@ -1752,7 +1752,7 @@ fn eval_js_inner_with_source(
                         };
                     };
                     const base64 = {
-                        DEFAULT: 0, NO_PADDING: 1, NO_WRAP: 2, URL_SAFE: 8,
+                        DEFAULT: 0, NO_PADDING: 1, NO_WRAP: 2, CRLF: 4, URL_SAFE: 8,
                         encodeToString(value, flags) {
                             return java.__base64EncodeBytes(
                                 JSON.stringify(toBytes(value)), Number(flags || 0));
@@ -1770,9 +1770,9 @@ fn eval_js_inner_with_source(
                         withoutPadding() { return javaBase64Encoder(flags | base64.NO_PADDING); }
                     });
                     const javaBase64 = {
-                        getEncoder() { return javaBase64Encoder(0); },
+                        getEncoder() { return javaBase64Encoder(base64.NO_WRAP); },
                         getDecoder() { return { decode: value => base64.decode(value, 0) }; },
-                        getUrlEncoder() { return javaBase64Encoder(base64.URL_SAFE); },
+                        getUrlEncoder() { return javaBase64Encoder(base64.URL_SAFE | base64.NO_WRAP); },
                         getUrlDecoder() { return { decode: value => base64.decode(value, base64.URL_SAFE) }; }
                     };
                     globalThis.System = Object.assign(globalThis.System || {}, {
@@ -2615,7 +2615,7 @@ fn java_aes_encode(input: &str, key: &str, algorithm: &str, iv: &str) -> String 
 fn java_decode_symmetric_input(input: &str) -> Vec<u8> {
     let input = input.trim();
     if !input.is_empty()
-        && input.len() % 2 == 0
+        && input.len().is_multiple_of(2)
         && input.chars().all(|ch| ch.is_ascii_hexdigit())
     {
         if let Ok(bytes) = hex::decode(input) {
@@ -4379,19 +4379,14 @@ mod tests {
             loop {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
-                if line == "
-" || line.is_empty() {
+                if line == "\r\n" || line.is_empty() {
                     break;
                 }
             }
             let body = "globalThis.__importedValue = 42;";
             write!(
                 stream,
-                "HTTP/1.1 200 OK
-Content-Length: {}
-Connection: close
-
-{}",
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             )
