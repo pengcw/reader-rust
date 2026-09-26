@@ -16,7 +16,7 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use once_cell::sync::Lazy;
-use ring::hmac;
+use ring::{digest, hmac};
 use rquickjs::function::Func;
 use rquickjs::{Context, Object, Runtime, Value};
 use serde_json::Value as JsonValue;
@@ -370,6 +370,66 @@ fn eval_js_inner_with_source(
             source_obj.set("key", source_key_val.clone())?;
             source_obj.set("getKey", Func::new(move || sk_clone.clone()))?;
 
+            let source_key_for_get = source_key_val.clone();
+            source_obj.set(
+                "get",
+                Func::new(move |key: String| -> String {
+                    let storage_key = format!("v_{}_{}", source_key_for_get, key);
+                    if let Some(active) = crate::crawler::session::current_active_session() {
+                        return active
+                            .get_variable(&storage_key)
+                            .map(|value| match value {
+                                serde_json::Value::String(value) => value,
+                                serde_json::Value::Null => String::new(),
+                                other => other.to_string(),
+                            })
+                            .unwrap_or_default();
+                    }
+                    JS_KV
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .get(&storage_key)
+                        .cloned()
+                        .unwrap_or_default()
+                }),
+            )?;
+
+            let source_key_for_put = source_key_val.clone();
+            source_obj.set(
+                "put",
+                Func::new(move |key: String, value: String| -> String {
+                    let storage_key = format!("v_{}_{}", source_key_for_put, key);
+                    if let Some(active) = crate::crawler::session::current_active_session() {
+                        active.set_variable_exact(
+                            &storage_key,
+                            serde_json::Value::String(value.clone()),
+                        );
+                    } else {
+                        JS_KV
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .insert(storage_key, value.clone());
+                    }
+                    value
+                }),
+            )?;
+
+            let source_key_for_login_info = source_key_val.clone();
+            source_obj.set(
+                "__removeLoginInfo",
+                Func::new(move || {
+                    let storage_key = format!("userInfo_{}", source_key_for_login_info);
+                    if let Some(active) = crate::crawler::session::current_active_session() {
+                        active.remove_variable(&storage_key);
+                    } else {
+                        JS_KV
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .remove(&storage_key);
+                    }
+                }),
+            )?;
+
             let source_variable_storage_key = format!("__source_variable:{source_key_val}");
             let source_variable_storage_key_for_get = source_variable_storage_key.clone();
             source_obj.set(
@@ -604,6 +664,50 @@ fn eval_js_inner_with_source(
             };
             java_obj.set("md5To16", Func::new(md5_to_16))?;
             java_obj.set("md5Encode16", Func::new(md5_to_16))?;
+            java_obj.set(
+                "__digestHex",
+                Func::new(|data: String, algorithm: String| -> Option<String> {
+                    java_digest_bytes(&data, &algorithm).map(hex::encode)
+                }),
+            )?;
+            java_obj.set(
+                "__digestBase64",
+                Func::new(|data: String, algorithm: String| -> Option<String> {
+                    java_digest_bytes(&data, &algorithm)
+                        .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
+                }),
+            )?;
+            java_obj.set(
+                "__hmacHexString",
+                Func::new(
+                    |data: String, algorithm: String, key: String| -> Option<String> {
+                        java_hmac_string_bytes(&data, &algorithm, &key).map(hex::encode)
+                    },
+                ),
+            )?;
+            java_obj.set(
+                "__hmacBase64String",
+                Func::new(
+                    |data: String, algorithm: String, key: String| -> Option<String> {
+                        java_hmac_string_bytes(&data, &algorithm, &key)
+                            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
+                    },
+                ),
+            )?;
+            java_obj.set(
+                "__toURL",
+                Func::new(
+                    |url: String, base_url: rquickjs::function::Opt<String>| -> String {
+                        java_to_url_json(&url, base_url.0.as_deref())
+                    },
+                ),
+            )?;
+            java_obj.set(
+                "getWebViewUA",
+                Func::new(|| -> String {
+                    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/120.0.0.0 Mobile Safari/537.36".to_string()
+                }),
+            )?;
             java_obj.set(
                 "timeFormat",
                 Func::new(|timestamp: i64| -> String { java_time_format(timestamp) }),
@@ -1091,7 +1195,12 @@ fn eval_js_inner_with_source(
                     const java = globalThis.java;
                     const nativeSourceSetVariable = globalThis.source.setVariable;
                     const nativeSourceRemoveVariable = globalThis.source.__removeVariable;
+                    const nativeSourceRemoveLoginInfo = globalThis.source.__removeLoginInfo;
                     const nativeSourceGetLoginHeader = globalThis.source.getLoginHeader;
+                    globalThis.source.removeLoginInfo = function() {
+                        nativeSourceRemoveLoginInfo();
+                        globalThis.loginInfo = null;
+                    };
                     globalThis.source.getLoginHeader = function() {
                         const value = nativeSourceGetLoginHeader();
                         return value == null ? null : value;
@@ -1111,6 +1220,53 @@ fn eval_js_inner_with_source(
                     };
                     const nativeBase64Encode = java.base64Encode;
                     const nativeBase64Decode = java.base64Decode;
+                    const cryptoResult = (name, algorithm, value) => {
+                        if (value == null) {
+                            throw new Error(name + ': unsupported algorithm ' + algorithm);
+                        }
+                        return value;
+                    };
+                    java.digestHex = (data, algorithm) => cryptoResult(
+                        'digestHex', algorithm,
+                        java.__digestHex(String(data), String(algorithm)));
+                    java.digestBase64Str = (data, algorithm) => cryptoResult(
+                        'digestBase64Str', algorithm,
+                        java.__digestBase64(String(data), String(algorithm)));
+                    java.HMacHex = (data, algorithm, key) => cryptoResult(
+                        'HMacHex', algorithm,
+                        java.__hmacHexString(
+                            String(data), String(algorithm), String(key)));
+                    java.HMacBase64 = (data, algorithm, key) => cryptoResult(
+                        'HMacBase64', algorithm,
+                        java.__hmacBase64String(
+                            String(data), String(algorithm), String(key)));
+                    java.toURL = function(url, baseUrl) {
+                        const payload = baseUrl == null
+                            ? java.__toURL(String(url))
+                            : java.__toURL(String(url), String(baseUrl));
+                        const raw = JSON.parse(payload);
+                        if (raw.error) throw new Error(raw.error);
+                        return {
+                            searchParams: raw.searchParams == null
+                                ? null
+                                : new Map(Object.entries(raw.searchParams)),
+                            host: String(raw.host || ''),
+                            origin: String(raw.origin || ''),
+                            pathname: String(raw.pathname || '')
+                        };
+                    };
+                    java.logType = value => {
+                        let type;
+                        if (value === null || value === undefined) type = 'null';
+                        else if (typeof value === 'string') type = 'java.lang.String';
+                        else if (typeof value === 'boolean') type = 'java.lang.Boolean';
+                        else if (typeof value === 'number') type = 'java.lang.Double';
+                        else if (value instanceof Uint8Array) type = '[B';
+                        else if (Array.isArray(value)) type = 'org.mozilla.javascript.NativeArray';
+                        else if (typeof value === 'function') type = 'org.mozilla.javascript.NativeFunction';
+                        else type = 'org.mozilla.javascript.NativeObject';
+                        java.log(type);
+                    };
                     const headersJson = headers => {
                         if (headers == null) return '{}';
                         if (typeof headers === 'string') {
@@ -2588,17 +2744,109 @@ fn java_base64_decode_bytes(input: &str, flags: i32) -> String {
     serde_json::to_string(&decoded).unwrap_or_else(|_| "[]".to_string())
 }
 
+fn normalize_crypto_algorithm(algorithm: &str) -> String {
+    algorithm
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_uppercase())
+        .collect()
+}
+
+fn java_digest_bytes(data: &str, algorithm: &str) -> Option<Vec<u8>> {
+    let normalized = normalize_crypto_algorithm(algorithm);
+    match normalized.as_str() {
+        "MD5" => hex::decode(md5_hex(data)).ok(),
+        "SHA1" => Some(
+            digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, data.as_bytes())
+                .as_ref()
+                .to_vec(),
+        ),
+        "SHA256" => Some(
+            digest::digest(&digest::SHA256, data.as_bytes())
+                .as_ref()
+                .to_vec(),
+        ),
+        "SHA384" => Some(
+            digest::digest(&digest::SHA384, data.as_bytes())
+                .as_ref()
+                .to_vec(),
+        ),
+        "SHA512" => Some(
+            digest::digest(&digest::SHA512, data.as_bytes())
+                .as_ref()
+                .to_vec(),
+        ),
+        _ => None,
+    }
+}
+
+fn java_hmac_algorithm(algorithm: &str) -> Option<hmac::Algorithm> {
+    match normalize_crypto_algorithm(algorithm).as_str() {
+        "HMACSHA1" => Some(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY),
+        "HMACSHA256" => Some(hmac::HMAC_SHA256),
+        "HMACSHA384" => Some(hmac::HMAC_SHA384),
+        "HMACSHA512" => Some(hmac::HMAC_SHA512),
+        _ => None,
+    }
+}
+
+fn java_hmac_string_bytes(data: &str, algorithm: &str, key: &str) -> Option<Vec<u8>> {
+    let algorithm = java_hmac_algorithm(algorithm)?;
+    let key = hmac::Key::new(algorithm, key.as_bytes());
+    Some(hmac::sign(&key, data.as_bytes()).as_ref().to_vec())
+}
+
 fn java_hmac_bytes(algorithm: &str, key_json: &str, data_json: &str) -> String {
-    let algorithm = match algorithm.to_ascii_uppercase().as_str() {
-        "HMACSHA1" => hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
-        "HMACSHA256" => hmac::HMAC_SHA256,
-        "HMACSHA384" => hmac::HMAC_SHA384,
-        "HMACSHA512" => hmac::HMAC_SHA512,
-        _ => return "[]".to_string(),
+    let Some(algorithm) = java_hmac_algorithm(algorithm) else {
+        return "[]".to_string();
     };
     let key = hmac::Key::new(algorithm, &json_byte_array(key_json));
     let tag = hmac::sign(&key, &json_byte_array(data_json));
     serde_json::to_string(tag.as_ref()).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn java_to_url_json(raw_url: &str, base_url: Option<&str>) -> String {
+    let parsed = match base_url.filter(|base| !base.trim().is_empty()) {
+        Some(base_url) => url::Url::parse(base_url)
+            .and_then(|base| base.join(raw_url)),
+        None => url::Url::parse(raw_url),
+    };
+    let url = match parsed {
+        Ok(url) => url,
+        Err(error) => {
+            return serde_json::json!({
+                "error": error.to_string(),
+            })
+            .to_string();
+        }
+    };
+
+    let search_params = if let Some(query) = url.query() {
+        let mut values = serde_json::Map::new();
+        for item in query.split('&') {
+            let Some((key, value)) = item.split_once('=') else {
+                return serde_json::json!({
+                    "error": format!("invalid query parameter: {item}"),
+                })
+                .to_string();
+            };
+            let decoded = urlencoding::decode(&value.replace('+', " "))
+                .map(|value| value.into_owned())
+                .unwrap_or_else(|_| value.to_string());
+            values.insert(key.to_string(), JsonValue::String(decoded));
+        }
+        JsonValue::Object(values)
+    } else {
+        JsonValue::Null
+    };
+
+    serde_json::json!({
+        "searchParams": search_params,
+        "host": url.host_str().unwrap_or_default(),
+        "origin": url.origin().ascii_serialization(),
+        "pathname": url.path(),
+    })
+    .to_string()
 }
 
 fn java_encode_uri(input: &str, charset: Option<&str>) -> String {
@@ -3573,13 +3821,19 @@ mod tests {
         let client = HttpClient::standalone();
         let initial = ExecuteSession {
             variables: Some(
-                [("sourceVariable".to_string(), json!("initial"))]
-                    .into_iter()
-                    .collect(),
+                [
+                    ("sourceVariable".to_string(), json!("initial")),
+                    (
+                        "userInfo_https://source.example".to_string(),
+                        json!("encrypted"),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
             ),
             ..Default::default()
         };
-        let result = with_active_session(
+        let (result, delta) = with_active_session(
             Some(&initial),
             &source.book_source_url,
             |_| {
@@ -3589,15 +3843,21 @@ mod tests {
                             const initialValue = source.getVariable();
                             const setResult = source.setVariable('saved');
                             const saved = source.getVariable();
+                            const putResult = source.put('token', 'value');
+                            const sourceValue = source.get('token');
+                            const removeLoginResult = source.removeLoginInfo();
                             source.setVariable(null);
                             [
                                 source.getKey(),
                                 initialValue,
                                 saved,
                                 source.getVariable(),
+                                putResult,
+                                sourceValue,
                                 source.getLoginHeader() === null,
                                 source.getLoginInfo() === null,
-                                typeof setResult === 'undefined'
+                                typeof setResult === 'undefined',
+                                typeof removeLoginResult === 'undefined'
                             ].join('|')
                         "#,
                         "",
@@ -3606,12 +3866,51 @@ mod tests {
                     .unwrap()
                 })
             },
-        )
-        .0;
+        );
         assert_eq!(
             result,
-            "https://source.example|initial|saved||true|true|true"
+            "https://source.example|initial|saved||value|value|true|true|true|true"
         );
+        let variables = delta.unwrap().variables.unwrap();
+        assert_eq!(
+            variables.get("v_https://source.example_token"),
+            Some(&json!("value"))
+        );
+        assert!(!variables.contains_key("userInfo_https://source.example"));
+    }
+
+    #[test]
+    fn digest_hmac_url_and_system_helpers_match_legado_shapes() {
+        let script = r#"
+            const parsed = java.toURL(
+                '../p?q=first&q=last&name=a+b',
+                'https://example.com/base/x'
+            );
+            const logTypeResult = java.logType('reader');
+            [
+                java.digestHex('abc', 'SHA-256'),
+                java.digestBase64Str('abc', 'SHA-256'),
+                java.HMacHex('abc', 'HmacSHA256', 'key'),
+                java.HMacBase64('abc', 'HmacSHA256', 'key'),
+                parsed.host,
+                parsed.origin,
+                parsed.pathname,
+                parsed.searchParams.get('q'),
+                parsed.searchParams.get('name'),
+                java.getWebViewUA().startsWith('Mozilla/5.0'),
+                typeof logTypeResult === 'undefined'
+            ].join('|')
+        "#;
+        assert_eq!(
+            eval_js(script, "", "https://example.com").unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad|ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=|9c196e32dc0175f86f4b1cb89289d6619de6bee699e4c378e68309ed97a1a6ab|nBluMtwBdfhvSxy4konWYZ3mvuaZ5MN45oMJ7Zehpqs=|example.com|https://example.com|/p|last|a b|true|true"
+        );
+        assert!(eval_js(
+            "java.digestHex('abc', 'unsupported')",
+            "",
+            "https://example.com"
+        )
+        .is_err());
     }
 
     #[test]
