@@ -889,6 +889,32 @@ fn eval_js_inner_with_source(
                 ),
             )?;
             java_obj.set(
+                "__symmetricCrypto",
+                Func::new(
+                    |mode: String,
+                     transformation: String,
+                     key_json: String,
+                     iv_json: String,
+                     data_json: String|
+                     -> Option<String> {
+                        java_symmetric_crypto(
+                            &mode,
+                            &transformation,
+                            &key_json,
+                            &iv_json,
+                            &data_json,
+                        )
+                    },
+                ),
+            )?;
+            java_obj.set(
+                "__decodeSymmetricInput",
+                Func::new(|input: String| -> String {
+                    serde_json::to_string(&java_decode_symmetric_input(&input))
+                        .unwrap_or_else(|_| "[]".to_string())
+                }),
+            )?;
+            java_obj.set(
                 "escape",
                 Func::new(|input: String| -> String {
                     input
@@ -1666,6 +1692,54 @@ fn eval_js_inner_with_source(
                         if (Array.isArray(value)) return value.map(byte => Number(byte) & 0xff);
                         if (value instanceof Uint8Array) return Array.from(value);
                         return java.strToBytes(String(value == null ? '' : value), 'UTF-8');
+                    };
+                    java.createSymmetricCrypto = function(transformation, key, iv) {
+                        const algorithm = String(transformation == null ? '' : transformation);
+                        const normalized = algorithm.toUpperCase();
+                        if (normalized !== 'AES/CBC/PKCS5PADDING'
+                            && normalized !== 'AES/CBC/PKCS7PADDING') {
+                            throw new Error(
+                                'createSymmetricCrypto: unsupported transformation ' + algorithm);
+                        }
+                        const keyBytes = toBytes(key);
+                        const ivBytes = iv == null ? [] : toBytes(iv);
+                        const invoke = (mode, data) => {
+                            const dataBytes = Array.isArray(data) || data instanceof Uint8Array
+                                ? toBytes(data)
+                                : mode.startsWith('decrypt')
+                                    ? java.__decodeSymmetricInput(String(data == null ? '' : data))
+                                    : toBytes(data);
+                            const result = java.__symmetricCrypto(
+                                mode,
+                                algorithm,
+                                JSON.stringify(keyBytes),
+                                JSON.stringify(ivBytes),
+                                JSON.stringify(dataBytes));
+                            if (result == null) {
+                                throw new Error('createSymmetricCrypto: invalid key, iv, or data');
+                            }
+                            return JSON.parse(result);
+                        };
+                        return {
+                            encrypt(data) {
+                                return invoke('encrypt', data);
+                            },
+                            encryptBase64(data) {
+                                return java.__base64EncodeBytes(
+                                    JSON.stringify(invoke('encrypt', data)), 2);
+                            },
+                            encryptHex(data) {
+                                return invoke('encrypt', data)
+                                    .map(byte => byte.toString(16).padStart(2, '0'))
+                                    .join('');
+                            },
+                            decrypt(data) {
+                                return invoke('decrypt', data);
+                            },
+                            decryptStr(data) {
+                                return java.bytesToStr(invoke('decrypt', data), 'UTF-8');
+                            }
+                        };
                     };
                     const base64 = {
                         DEFAULT: 0, NO_PADDING: 1, NO_WRAP: 2, URL_SAFE: 8,
@@ -2516,6 +2590,62 @@ fn java_aes_encode(input: &str, key: &str, algorithm: &str, iv: &str) -> String 
     } else {
         String::new()
     }
+}
+
+fn java_decode_symmetric_input(input: &str) -> Vec<u8> {
+    let input = input.trim();
+    if !input.is_empty()
+        && input.len() % 2 == 0
+        && input.chars().all(|ch| ch.is_ascii_hexdigit())
+    {
+        if let Ok(bytes) = hex::decode(input) {
+            return bytes;
+        }
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(input)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(input))
+        .unwrap_or_default()
+}
+
+fn java_symmetric_crypto(
+    mode: &str,
+    transformation: &str,
+    key_json: &str,
+    iv_json: &str,
+    data_json: &str,
+) -> Option<String> {
+    let normalized = transformation.to_ascii_uppercase();
+    if normalized != "AES/CBC/PKCS5PADDING" && normalized != "AES/CBC/PKCS7PADDING" {
+        return None;
+    }
+
+    let key = json_byte_array(key_json);
+    let iv = json_byte_array(iv_json);
+    let data = json_byte_array(data_json);
+    if key.len() != 16 || iv.len() != 16 {
+        return None;
+    }
+
+    let output = match mode {
+        "encrypt" => {
+            let cipher = Aes128CbcEncryptor::new_from_slices(&key, &iv).ok()?;
+            let mut buffer = vec![0u8; data.len() + 16];
+            buffer[..data.len()].copy_from_slice(&data);
+            cipher
+                .encrypt_padded_mut::<Pkcs7>(&mut buffer, data.len())
+                .ok()?
+                .to_vec()
+        }
+        "decrypt" => {
+            let cipher = Aes128CbcDecryptor::new_from_slices(&key, &iv).ok()?;
+            let mut buffer = data;
+            cipher.decrypt_padded_mut::<Pkcs7>(&mut buffer).ok()?.to_vec()
+        }
+        _ => return None,
+    };
+
+    serde_json::to_string(&output).ok()
 }
 
 // 修复：sloppy 全局模式（见下）
@@ -4090,6 +4220,47 @@ mod tests {
             Some(&json!("value"))
         );
         assert!(!variables.contains_key("userInfo_https://source.example"));
+    }
+
+    #[test]
+    fn symmetric_crypto_matches_legado_aes_cbc_shapes() {
+        let script = r#"
+            const cipher = java.createSymmetricCrypto(
+                'AES/CBC/PKCS5Padding',
+                '1234567890abcdef',
+                'abcdef1234567890'
+            );
+            const encryptedBytes = cipher.encrypt('reader');
+            const encryptedBase64 = cipher.encryptBase64('reader');
+            const encryptedHex = cipher.encryptHex('reader');
+            const decryptedFromBytes = cipher.decryptStr(encryptedBytes);
+            const decryptedFromBase64 = cipher.decryptStr(encryptedBase64);
+            const decryptedFromHex = cipher.decryptStr(encryptedHex);
+            [
+                Array.isArray(encryptedBytes),
+                encryptedBytes.length > 0,
+                decryptedFromBytes,
+                decryptedFromBase64,
+                decryptedFromHex
+            ].join('|')
+        "#;
+        assert_eq!(
+            eval_js(script, "", "https://example.com").unwrap(),
+            "true|true|reader|reader|reader"
+        );
+
+        assert!(eval_js(
+            "java.createSymmetricCrypto('AES/ECB/PKCS5Padding', '1234567890abcdef')",
+            "",
+            "https://example.com"
+        )
+        .is_err());
+        assert!(eval_js(
+            "java.createSymmetricCrypto('AES/CBC/PKCS5Padding', 'short', 'abcdef1234567890').encryptBase64('reader')",
+            "",
+            "https://example.com"
+        )
+        .is_err());
     }
 
     #[test]
