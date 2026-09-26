@@ -2775,8 +2775,8 @@ fn java_import_script(path: &str) -> Option<String> {
 }
 
 fn java_to_num_chapter(input: &str) -> String {
-    static TITLE_NUM_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"(第)(.+?)(章)").expect("valid title number regex"));
+    static TITLE_NUM_RE: Lazy<regex::Regex> =
+        Lazy::new(|| regex::Regex::new(r"(第)(.+?)(章)").expect("valid title number regex"));
 
     let Some(captures) = TITLE_NUM_RE.captures(input) else {
         return input.to_string();
@@ -3668,7 +3668,7 @@ mod tests {
                 const hexText = java.hexDecodeToString(hex);
                 const digestAlias = java.md5Encode16('reader') === java.md5To16('reader');
                 const utc = java.timeFormatUTC(0, "yyyy-MM-dd HH:mm:ss.SSS", 28800000);
-                const localFormat = /^\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}$/.test(java.timeFormat(0));
+                const localFormat = /^\d{{4}}\/\d{{2}}\/\d{{2}} \d{{2}}:\d{{2}}$/.test(java.timeFormat(0));
                 cache.put('{cache_key}', 'cached', 60);
                 const cached = cache.get('{cache_key}');
                 const removed = cache.delete('{cache_key}');
