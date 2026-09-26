@@ -6,8 +6,9 @@ use crate::parser::html;
 use crate::parser::jsonpath;
 use crate::parser::rule_analyzer;
 use crate::parser::rule_engine;
+use crate::parser::source_regex;
 use crate::util::hash::md5_hex;
-use crate::util::text::{apply_regex_replace, strip_whitespace};
+use crate::util::text::strip_whitespace;
 use aes::Aes128;
 use base64::Engine;
 use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
@@ -1511,7 +1512,8 @@ fn eval_js_inner_with_source(
                 "regex_replace",
                 Func::new(
                     |input: String, pattern: String, replace: String| -> String {
-                        apply_regex_replace(&input, &pattern, &replace)
+                        source_regex::replace_all(&input, &pattern, &replace)
+                            .unwrap_or(input)
                     },
                 ),
             )?;
@@ -2166,10 +2168,7 @@ pub(crate) fn java_get_string(
         let script = rule_engine::strip_js_rule(main_rule);
         eval_js(script, target_content, base_url).unwrap_or_default()
     } else if let Some(pure) = html::xpath_rule(main_rule) {
-        html::select_xpath(target_content, pure)
-            .into_iter()
-            .next()
-            .unwrap_or_default()
+        html::select_xpath(target_content, pure).join("\n")
     } else if main_rule.starts_with("@json:")
         || main_rule.starts_with("@Json:")
         || main_rule.starts_with("@JSON:")
@@ -2208,19 +2207,14 @@ pub(crate) fn java_get_string(
         } else {
             &main_rule[1..]
         };
-        if let Ok(re) = regex::Regex::new(pure) {
-            if let Some(caps) = re.captures(target_content) {
-                if let Some(m) = caps.get(1).or_else(|| caps.get(0)) {
-                    m.as_str().to_string()
-                } else {
-                    String::new()
-                }
-            } else {
-                String::new()
-            }
-        } else {
-            String::new()
-        }
+        source_regex::captures_first(pure, target_content)
+            .and_then(|captures| {
+                captures
+                    .get(1)
+                    .and_then(Clone::clone)
+                    .or_else(|| captures.first().and_then(Clone::clone))
+            })
+            .unwrap_or_default()
     } else {
         // 默认 CSS / HTML 模式
         let pure = if let Some(stripped) = main_rule
@@ -2280,14 +2274,33 @@ pub(crate) fn java_get_string_list(
                 }
             }
             return Vec::new();
-        } else if delim == "&&" || delim == "%%" {
+        } else if delim == "&&" {
             let mut results = Vec::new();
             for part in split.parts {
-                let res =
-                    java_get_string_list(Some(&part), content, default_content, base_url, is_url);
-                results.extend(res);
+                results.extend(java_get_string_list(
+                    Some(&part),
+                    content,
+                    default_content,
+                    base_url,
+                    is_url,
+                ));
             }
             return results;
+        } else if delim == "%%" {
+            let groups = split
+                .parts
+                .iter()
+                .map(|part| {
+                    java_get_string_list(
+                        Some(part),
+                        content,
+                        default_content,
+                        base_url,
+                        is_url,
+                    )
+                })
+                .collect();
+            return rule_analyzer::interleave_result_groups(groups);
         }
     }
 
@@ -2358,17 +2371,16 @@ pub(crate) fn java_get_string_list(
         } else {
             &main_rule[1..]
         };
-        if let Ok(re) = regex::Regex::new(pure) {
-            re.captures_iter(target_content)
-                .filter_map(|caps| {
-                    caps.get(1)
-                        .or_else(|| caps.get(0))
-                        .map(|m| m.as_str().to_string())
-                })
-                .collect()
-        } else {
-            Vec::new()
-        }
+        source_regex::captures_all(pure, target_content)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|captures| {
+                captures
+                    .get(1)
+                    .and_then(Clone::clone)
+                    .or_else(|| captures.first().and_then(Clone::clone))
+            })
+            .collect()
     } else {
         let pure = if let Some(stripped) = main_rule
             .strip_prefix("@css:")
@@ -4589,6 +4601,33 @@ Connection: close
                 .get("myVar")
                 .and_then(JsonValue::as_str),
             Some("updated_val")
+        );
+    }
+
+    #[test]
+    fn compat_java_xpath_strings_join_and_interleave() {
+        let body = "<root><a>A1</a><a>A2</a><b>B1</b><b>B2</b><b>B3</b><c>C1</c></root>";
+
+        assert_eq!(
+            java_get_string(
+                Some("@XPath://a"),
+                Some(body),
+                "",
+                "https://example.com",
+                false,
+                false,
+            ),
+            "A1\nA2"
+        );
+        assert_eq!(
+            java_get_string_list(
+                Some("@XPath://a/text()%%@XPath://b/text()%%@XPath://c/text()"),
+                Some(body),
+                "",
+                "https://example.com",
+                false,
+            ),
+            vec!["A1", "B1", "C1", "A2", "B2"]
         );
     }
 

@@ -6,7 +6,7 @@ use crate::model::{
 use crate::parser::{
     html,
     js::{eval_js_template_with_bindings, eval_js_with_bindings, with_js_lib},
-    jsonpath, rule_analyzer,
+    jsonpath, rule_analyzer, source_regex,
 };
 use crate::util::text::normalize_source_url;
 use serde_json::{json, Value};
@@ -398,7 +398,7 @@ fn classify_rule_mode_with_css_regex_fallback(
     if mode == ParseMode::Css
         && !explicit_css
         && !html::css_rule_is_valid(&rule)
-        && regex::Regex::new(&rule).is_ok()
+        && source_regex::is_valid(&rule)
     {
         (ParseMode::Regex, rule)
     } else {
@@ -863,18 +863,14 @@ impl RuleEngine {
                     .cloned()
                     .unwrap_or_default()
             }
-            ParseMode::Regex => {
-                let rows = regex_capture_rows(
-                    self.strip_mode_prefix(&content_rule)
-                        .trim_start_matches(':')
-                        .trim(),
-                    &content_body,
-                );
-                rows.first()
-                    .and_then(|row| row.get(1).or_else(|| row.first()))
-                    .and_then(Clone::clone)
-                    .unwrap_or_default()
-            }
+            ParseMode::Regex => regex_capture_first(
+                self.strip_mode_prefix(&content_rule)
+                    .trim_start_matches(':')
+                    .trim(),
+                &content_body,
+            )
+            .and_then(|row| row.get(1).or_else(|| row.first()).and_then(Clone::clone))
+            .unwrap_or_default(),
             ParseMode::Css => {
                 let doc = html::parse_document(&content_body);
                 if extract_js(&content_rule).1.is_some() {
@@ -1089,7 +1085,7 @@ impl RuleEngine {
         let (list_rule, list_js) = extract_js(list_rule);
         let list_context = RuleVariableContext::for_search_item();
         let rows = apply_regex_list_js(
-            regex_capture_rows(self.strip_mode_prefix(list_rule), body),
+            regex_capture_all(self.strip_mode_prefix(list_rule), body),
             list_js,
             base_url,
             &list_context,
@@ -1180,7 +1176,7 @@ impl RuleEngine {
                     .unwrap_or_else(|| vec![output])
             })
             .unwrap_or_default(),
-            ParseMode::Regex => regex_capture_rows(
+            ParseMode::Regex => regex_capture_all(
                 self.strip_mode_prefix(&expanded)
                     .trim_start_matches(':')
                     .trim(),
@@ -1301,7 +1297,7 @@ impl RuleEngine {
         let next_urls = self.parse_next_toc_urls(body, base_url, rule, ctx);
         let (list_rule, list_js) = extract_js(list_rule);
         let rows = apply_regex_list_js(
-            regex_capture_rows(self.strip_mode_prefix(list_rule), body),
+            regex_capture_all(self.strip_mode_prefix(list_rule), body),
             list_js,
             base_url,
             ctx,
@@ -2707,11 +2703,8 @@ fn evaluate_template_expression(
             .unwrap_or_default();
     }
     if let Some(pattern) = strip_prefix_ascii_case(expression, "@regex:") {
-        let rows = regex_capture_rows(pattern, input);
-        return rows
-            .first()
-            .and_then(|row| row.get(1).or_else(|| row.first()))
-            .and_then(Clone::clone)
+        return regex_capture_first(pattern, input)
+            .and_then(|row| row.get(1).or_else(|| row.first()).and_then(Clone::clone))
             .unwrap_or_default();
     }
     if expression.starts_with('@') {
@@ -2970,13 +2963,12 @@ fn eval_field_html_with_ctx(
             .into_iter()
             .next()
             .unwrap_or_default(),
-        ParseMode::Regex => {
-            let rows = regex_capture_rows(pure.trim_start_matches(':').trim(), &input);
-            rows.first()
-                .and_then(|row| row.get(1).or_else(|| row.first()))
-                .and_then(Clone::clone)
-                .unwrap_or_default()
-        }
+        ParseMode::Regex => regex_capture_first(
+            pure.trim_start_matches(':').trim(),
+            &input,
+        )
+        .and_then(|row| row.get(1).or_else(|| row.first()).and_then(Clone::clone))
+        .unwrap_or_default(),
         ParseMode::Js => {
             eval_js_with_bindings(strip_js_rule(pure), &input, base_url, &ctx.js_bindings())
                 .unwrap_or_default()
@@ -3020,13 +3012,12 @@ fn eval_field_html_doc_with_ctx(
             .first()
             .cloned()
             .unwrap_or_default(),
-        ParseMode::Regex => {
-            let rows = regex_capture_rows(pure.trim_start_matches(':').trim(), &input);
-            rows.first()
-                .and_then(|row| row.get(1).or_else(|| row.first()))
-                .and_then(Clone::clone)
-                .unwrap_or_default()
-        }
+        ParseMode::Regex => regex_capture_first(
+            pure.trim_start_matches(':').trim(),
+            &input,
+        )
+        .and_then(|row| row.get(1).or_else(|| row.first()).and_then(Clone::clone))
+        .unwrap_or_default(),
         ParseMode::Js => {
             eval_js_with_bindings(strip_js_rule(pure), &input, base_url, &ctx.js_bindings())
                 .unwrap_or_default()
@@ -3073,13 +3064,12 @@ fn eval_field_xpath_with_ctx(
             .into_iter()
             .next()
             .unwrap_or_default(),
-        ParseMode::Regex => {
-            let rows = regex_capture_rows(pure.trim_start_matches(':').trim(), &input);
-            rows.first()
-                .and_then(|row| row.get(1).or_else(|| row.first()))
-                .and_then(Clone::clone)
-                .unwrap_or_default()
-        }
+        ParseMode::Regex => regex_capture_first(
+            pure.trim_start_matches(':').trim(),
+            &input,
+        )
+        .and_then(|row| row.get(1).or_else(|| row.first()).and_then(Clone::clone))
+        .unwrap_or_default(),
         ParseMode::Js => {
             eval_js_with_bindings(strip_js_rule(pure), &input, base_url, &ctx.js_bindings())
                 .unwrap_or_default()
@@ -3144,13 +3134,12 @@ fn eval_field_json_with_ctx(
                 pick_json_field(v, Some(pure)).unwrap_or_else(|| pure.to_string())
             }
         }
-        ParseMode::Regex => {
-            let rows = regex_capture_rows(pure.trim_start_matches(':').trim(), &input);
-            rows.first()
-                .and_then(|row| row.get(1).or_else(|| row.first()))
-                .and_then(Clone::clone)
-                .unwrap_or_default()
-        }
+        ParseMode::Regex => regex_capture_first(
+            pure.trim_start_matches(':').trim(),
+            &input,
+        )
+        .and_then(|row| row.get(1).or_else(|| row.first()).and_then(Clone::clone))
+        .unwrap_or_default(),
         ParseMode::Js => {
             eval_js_with_bindings(strip_js_rule(pure), &input, base_url, &ctx.js_bindings())
                 .unwrap_or_default()
@@ -3219,21 +3208,16 @@ fn apply_content_replacement(
 }
 
 fn apply_regex_replace_all(text: &str, pattern: &str, replacement: &str) -> String {
-    crate::util::text::get_cached_regex(pattern)
-        .map(|regex| regex.replace_all(text, replacement).into_owned())
-        .unwrap_or_else(|| text.replace(pattern, replacement))
+    source_regex::replace_all(text, pattern, replacement)
+        .unwrap_or_else(|_| text.replace(pattern, replacement))
 }
 
 fn apply_regex_replace_first(text: &str, pattern: &str, replacement: &str) -> String {
-    let Some(regex) = crate::util::text::get_cached_regex(pattern) else {
-        return replacement.to_string();
-    };
-    let Some(found) = regex.find(text) else {
-        return String::new();
-    };
-    regex
-        .replace(&text[found.start()..found.end()], replacement)
-        .into_owned()
+    match source_regex::replace_first_match(text, pattern, replacement) {
+        Ok(Some(value)) => value,
+        Ok(None) => String::new(),
+        Err(()) => replacement.to_string(),
+    }
 }
 
 fn normalize_list_rule(rule: &str) -> (&str, bool) {
@@ -3408,8 +3392,7 @@ fn book_url_pattern_matches(pattern: Option<&str>, url: &str) -> bool {
     else {
         return false;
     };
-    let anchored = format!(r"\A(?:{pattern})\z");
-    crate::util::text::get_cached_regex(&anchored).is_some_and(|regex| regex.is_match(url))
+    source_regex::is_full_match(pattern, url)
 }
 
 fn dedupe_search_books(books: &mut Vec<SearchBook>) {
@@ -3549,46 +3532,55 @@ fn build_chapter_from_json(
     })
 }
 
-fn regex_capture_rows(rule: &str, input: &str) -> Vec<Vec<Option<String>>> {
-    let patterns = rule_analyzer::split_top_level(rule, &["&&"]).parts;
-    let mut inputs = vec![input.to_string()];
+fn regex_chain_patterns(rule: &str) -> Vec<String> {
+    rule_analyzer::split_top_level(rule, &["&&"])
+        .parts
+        .into_iter()
+        .filter_map(|pattern| {
+            let pattern = pattern.trim().trim_start_matches(':').trim();
+            let pattern = strip_prefix_ascii_case(pattern, "@regex:").unwrap_or(pattern);
+            (!pattern.trim().is_empty()).then(|| pattern.trim().to_string())
+        })
+        .collect()
+}
 
-    for (stage, pattern) in patterns.iter().enumerate() {
-        let pattern = pattern.trim().trim_start_matches(':').trim();
-        let pattern = strip_prefix_ascii_case(pattern, "@regex:").unwrap_or(pattern);
-        let Some(regex) = crate::util::text::get_cached_regex(pattern.trim()) else {
-            return Vec::new();
-        };
-
-        if stage + 1 == patterns.len() {
-            return inputs
-                .iter()
-                .flat_map(|input| {
-                    regex.captures_iter(input).map(|captures| {
-                        (0..captures.len())
-                            .map(|index| {
-                                captures.get(index).map(|value| value.as_str().to_string())
-                            })
-                            .collect()
-                    })
-                })
-                .collect();
+fn regex_chain_last_input(patterns: &[String], input: &str) -> Option<String> {
+    let mut current = input.to_string();
+    for pattern in patterns.iter().take(patterns.len().saturating_sub(1)) {
+        let matches = source_regex::find_all(pattern, &current)?;
+        if matches.is_empty() {
+            return None;
         }
-
-        inputs = inputs
-            .iter()
-            .flat_map(|input| {
-                regex
-                    .captures_iter(input)
-                    .filter_map(|captures| captures.get(0).map(|value| value.as_str().to_string()))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        if inputs.is_empty() {
-            return Vec::new();
-        }
+        current = matches.concat();
     }
-    Vec::new()
+    Some(current)
+}
+
+fn regex_capture_first(rule: &str, input: &str) -> Option<Vec<Option<String>>> {
+    let patterns = regex_chain_patterns(rule);
+    let last = patterns.last()?;
+    let input = regex_chain_last_input(&patterns, input)?;
+    source_regex::captures_first(last, &input)
+}
+
+fn regex_capture_all(rule: &str, input: &str) -> Vec<Vec<Option<String>>> {
+    let patterns = regex_chain_patterns(rule);
+    let Some(last) = patterns.last() else {
+        return Vec::new();
+    };
+    let Some(input) = regex_chain_last_input(&patterns, input) else {
+        return Vec::new();
+    };
+
+    source_regex::captures_all(last, &input)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|value| Some(value.unwrap_or_default()))
+                .collect()
+        })
+        .collect()
 }
 
 fn capture_rule_values_with_ctx(
@@ -3781,7 +3773,7 @@ mod tests {
 
     #[test]
     fn compat_all_in_one_regex_chains_stages_and_preserves_literal_groups() {
-        let rows = regex_capture_rows(r":([a-z]\d)&&([a-z])(\d)", "a1 b2");
+        let rows = regex_capture_all(r":([a-z]\d)&&([a-z])(\d)", "a1 b2");
         assert_eq!(rows.len(), 2);
         assert_eq!(
             rows[0],
@@ -3790,6 +3782,40 @@ mod tests {
         assert_eq!(
             capture_rule_values(Some("$1/$2/$0/$99"), &rows[0]).as_deref(),
             Some("a/1/$0/$99")
+        );
+
+        let concatenated = regex_capture_all(r"([ab])&&ab", "a b");
+        assert_eq!(
+            concatenated,
+            vec![vec![Some("ab".into())]],
+            "intermediate matches must be concatenated before the next regex"
+        );
+
+        let class_intersection = regex_capture_all(r"[a-z&&[^bc]]+", "abcd");
+        assert_eq!(
+            class_intersection,
+            vec![vec![Some("a".into())], vec![Some("d".into())]],
+            "Java character-class intersection must not be split as a Legado && chain"
+        );
+    }
+
+    #[test]
+    fn compat_regex_optional_groups_distinguish_element_and_elements() {
+        let all = regex_capture_all(r"(a)?b", "b ab");
+        assert_eq!(
+            all,
+            vec![
+                vec![Some("b".into()), Some(String::new())],
+                vec![Some("ab".into()), Some("a".into())],
+            ]
+        );
+        assert_eq!(capture_rule_values(Some("$1"), &all[0]), None);
+
+        let first = regex_capture_first(r"(a)?b", "b ab").unwrap();
+        assert_eq!(first, vec![Some("b".into()), None]);
+        assert_eq!(
+            capture_rule_values(Some("$1"), &first).as_deref(),
+            Some("$1")
         );
     }
 

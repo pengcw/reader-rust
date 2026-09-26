@@ -2,7 +2,7 @@ use once_cell::sync::Lazy;
 use scraper::{ElementRef, Html, Selector};
 use std::collections::HashSet;
 
-use crate::parser::rule_analyzer::split_top_level;
+use crate::parser::rule_analyzer::{self, split_top_level};
 
 #[derive(Clone, Debug, PartialEq)]
 enum SelectorBase {
@@ -580,34 +580,19 @@ fn select_with_combination<'a>(doc: &'a Html, rule: &str) -> Vec<ElementRef<'a>>
         return vec![];
     }
 
-    let mut result = select_chain(doc, &rules[0]);
     let operator = split.delimiter.as_deref().unwrap_or("");
+    if operator == "%%" {
+        return rule_analyzer::interleave_result_groups(
+            rules.iter().map(|rule| select_chain(doc, rule)).collect(),
+        );
+    }
 
+    let mut result = select_chain(doc, &rules[0]);
     for next_rule in rules.iter().skip(1) {
         let next_results = select_chain(doc, next_rule);
-
         match operator {
-            "&&" => {
-                result.extend(next_results);
-            }
-            "||" => {
-                if result.is_empty() {
-                    result = next_results;
-                }
-            }
-            "%%" => {
-                let mut zipped = Vec::new();
-                let max_len = result.len().max(next_results.len());
-                for j in 0..max_len {
-                    if j < result.len() {
-                        zipped.push(result[j]);
-                    }
-                    if j < next_results.len() {
-                        zipped.push(next_results[j]);
-                    }
-                }
-                result = zipped;
-            }
+            "&&" => result.extend(next_results),
+            "||" if result.is_empty() => result = next_results,
             _ => {}
         }
     }
@@ -796,30 +781,22 @@ pub fn select_text(doc: &Html, rule: &str) -> Option<String> {
 pub fn select_text_list(doc: &Html, rule: &str) -> Vec<String> {
     let combo = split_top_level(rule, &["&&", "||", "%%"]);
     if let Some(operator) = combo.delimiter.as_deref() {
+        if operator == "%%" {
+            return rule_analyzer::interleave_result_groups(
+                combo.parts
+                    .iter()
+                    .map(|part| select_text_list(doc, part))
+                    .collect(),
+            );
+        }
+
         let mut result =
             select_text_list(doc, combo.parts.first().map(String::as_str).unwrap_or(""));
         for part in combo.parts.iter().skip(1) {
             let next = select_text_list(doc, part);
             match operator {
                 "&&" => result.extend(next),
-                "||" => {
-                    if result.is_empty() {
-                        result = next;
-                    }
-                }
-                "%%" => {
-                    let mut zipped = Vec::new();
-                    let max_len = result.len().max(next.len());
-                    for idx in 0..max_len {
-                        if idx < result.len() {
-                            zipped.push(result[idx].clone());
-                        }
-                        if idx < next.len() {
-                            zipped.push(next[idx].clone());
-                        }
-                    }
-                    result = zipped;
-                }
+                "||" if result.is_empty() => result = next,
                 _ => {}
             }
         }
@@ -878,38 +855,36 @@ pub fn select_text_list(doc: &Html, rule: &str) -> Vec<String> {
 
 /// Parse XML/XHTML or HTML-like input for XPath evaluation.
 ///
-/// HTML-only named entities are normalized without touching XML entities, and
-/// multiple-root fragments are wrapped only when parsing the original input fails.
+/// Match Legado's parser choice: only an explicit XML declaration selects XML
+/// mode; all other strings are repaired through the HTML parser first.
 pub(crate) fn parse_xpath_package(
     input: &str,
 ) -> Result<sxd_document::Package, sxd_document::parser::Error> {
-    let normalized = normalize_xpath_entities(input);
-    if let Ok(package) = sxd_document::parser::parse(normalized.as_ref()) {
-        return Ok(package);
+    // Legado only chooses XML mode when the trimmed input starts with an XML
+    // declaration. Everything else goes through the HTML parser, even if it is
+    // otherwise well-formed XML.
+    let mut prepared = input.to_string();
+    if prepared.ends_with("</td>") {
+        prepared = format!("<tr>{prepared}</tr>");
+    }
+    if prepared.ends_with("</tr>") || prepared.ends_with("</tbody>") {
+        prepared = format!("<table>{prepared}</table>");
     }
 
-    // Preserve XML fragment semantics before falling back to HTML5 recovery.
-    let fragment = format!("<reader-root>{normalized}</reader-root>");
-    if let Ok(package) = sxd_document::parser::parse(&fragment) {
-        return Ok(package);
-    }
-
-    // Ordinary web pages are HTML, not XML: html5ever repairs unclosed/mismatched
-    // tags and normalizes attributes first. Match Legado's fragment wrappers for
-    // table cells/rows before parsing so HTML5 error recovery does not discard them.
-    let trimmed = input.trim();
-    let html_input = if trimmed.to_ascii_lowercase().ends_with("</td>") {
-        format!("<table><tbody><tr>{trimmed}</tr></tbody></table>")
-    } else if trimmed.to_ascii_lowercase().ends_with("</tr>")
-        || trimmed.to_ascii_lowercase().ends_with("</tbody>")
+    if prepared
+        .trim_start()
+        .get(.."<?xml".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("<?xml"))
     {
-        format!("<table>{trimmed}</table>")
-    } else {
-        input.to_string()
-    };
-    // Scraper serializes HTML void elements without a closing slash, so make
-    // only those elements XML-safe afterwards.
-    let document = Html::parse_document(&html_input);
+        let normalized = normalize_xpath_entities(prepared.trim_start());
+        if let Ok(package) = sxd_document::parser::parse(normalized.as_ref()) {
+            return Ok(package);
+        }
+    }
+
+    // HTML mode mirrors JXDocument.create(String): repair malformed HTML first,
+    // then bridge the resulting DOM into the XML-only XPath evaluator.
+    let document = Html::parse_document(&prepared);
     let repaired = html_to_xpath_xml(&document.html());
     sxd_document::parser::parse(&repaired)
 }
@@ -1105,18 +1080,21 @@ fn normalize_xpath_query(xpath: &str) -> std::borrow::Cow<'_, str> {
 
 fn xpath_candidates(xpath: &str, root: bool) -> Vec<String> {
     let mut candidates = vec![xpath.to_string()];
-    if root
-        && xpath.starts_with('/')
-        && !xpath.starts_with("//")
-        && !xpath.starts_with("/html")
-        && !xpath.starts_with("/reader-root")
-    {
+    if !root {
+        return candidates;
+    }
+
+    if let Some(rest) = xpath.strip_prefix("/reader-root/") {
+        candidates.push(format!("/html/body/{rest}"));
+        return candidates;
+    }
+
+    if xpath.starts_with('/') && !xpath.starts_with("//") && !xpath.starts_with("/html") {
         candidates.push(if xpath.starts_with("/body") {
             format!("/html{xpath}")
         } else {
             format!("/html/body{xpath}")
         });
-        candidates.push(format!("/reader-root{xpath}"));
     }
     candidates
 }
@@ -1155,6 +1133,29 @@ pub(crate) fn xpath_select_nodes<'d>(
     node: sxd_xpath::nodeset::Node<'d>,
     xpath: &str,
 ) -> Vec<sxd_xpath::nodeset::Node<'d>> {
+    let split = split_top_level(xpath, &["&&", "||", "%%"]);
+    if let Some(operator) = split.delimiter.as_deref() {
+        if operator == "||" {
+            for part in split.parts {
+                let result = xpath_select_nodes(node, &part);
+                if !result.is_empty() {
+                    return result;
+                }
+            }
+            return Vec::new();
+        }
+
+        let groups = split
+            .parts
+            .iter()
+            .map(|part| xpath_select_nodes(node, part))
+            .collect::<Vec<_>>();
+        if operator == "%%" {
+            return rule_analyzer::interleave_result_groups(groups);
+        }
+        return groups.into_iter().flatten().collect();
+    }
+
     match evaluate_xpath_with_fallback(node, xpath) {
         Some(sxd_xpath::Value::Nodeset(nodes)) => nodes.document_order(),
         _ => Vec::new(),
@@ -1606,10 +1607,17 @@ mod tests {
     #[test]
     fn xpath_parser_preserves_xml_and_numeric_entities() {
         let values = select_xpath(
-            "<root>&amp;|&lt;|&gt;|&quot;|&apos;|&#65;|&#x42;</root>",
+            "<?xml version=\"1.0\"?><root>&amp;|&lt;|&gt;|&quot;|&apos;|&#65;|&#x42;</root>",
             "string(/root)",
         );
         assert_eq!(values, vec!["&|<|>|\"|'|A|B"]);
+    }
+
+    #[test]
+    fn xpath_parser_uses_html_mode_without_xml_declaration() {
+        let input = "<Root><Item>X</Item></Root>";
+        assert_eq!(select_xpath(input, "//item"), vec!["X"]);
+        assert!(select_xpath(input, "//Item").is_empty());
     }
 
     #[test]
@@ -1947,5 +1955,20 @@ mod tests {
         let fragment_elements: serde_json::Value =
             serde_json::from_str(&select_xpath_elements_json(frag, "/p")).unwrap();
         assert_eq!(fragment_elements.as_array().unwrap().len(), 2);
+
+        // 11. XPath element combinations use Legado's one-pass %% interleave.
+        let combined_html =
+            "<root><a>A1</a><a>A2</a><b>B1</b><b>B2</b><b>B3</b><c>C1</c></root>";
+        let combined: serde_json::Value = serde_json::from_str(
+            &select_xpath_elements_json(combined_html, "//a%%//b%%//c"),
+        )
+        .unwrap();
+        let texts = combined
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item.get("text").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(texts, vec!["A1", "B1", "C1", "A2", "B2"]);
     }
 }

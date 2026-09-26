@@ -28,6 +28,27 @@ pub fn split_top_level(rule: &str, delimiters: &[&str]) -> SplitResult {
     }
 }
 
+pub fn interleave_result_groups<T>(groups: Vec<Vec<T>>) -> Vec<T> {
+    let Some(first_len) = groups.first().map(Vec::len) else {
+        return Vec::new();
+    };
+    let mut iterators = groups
+        .into_iter()
+        .map(|group| group.into_iter())
+        .collect::<Vec<_>>();
+    let mut result = Vec::new();
+
+    for _ in 0..first_len {
+        for iterator in &mut iterators {
+            if let Some(item) = iterator.next() {
+                result.push(item);
+            }
+        }
+    }
+
+    result
+}
+
 fn find_next_delimiter<'a>(
     rule: &'a str,
     delimiters: &[&'a str],
@@ -95,5 +116,17 @@ mod tests {
 
         assert_eq!(result.delimiter.as_deref(), Some("&&"));
         assert_eq!(result.parts, vec![r#"div[a="x&&y"]"#, "span"]);
+    }
+
+    #[test]
+    fn interleave_uses_first_group_length_and_all_groups_per_index() {
+        assert_eq!(
+            interleave_result_groups(vec![
+                vec!["A1", "A2"],
+                vec!["B1", "B2", "B3"],
+                vec!["C1"],
+            ]),
+            vec!["A1", "B1", "C1", "A2", "B2"]
+        );
     }
 }
