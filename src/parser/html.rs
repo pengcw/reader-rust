@@ -860,6 +860,12 @@ pub fn select_text_list(doc: &Html, rule: &str) -> Vec<String> {
 pub(crate) fn parse_xpath_package(
     input: &str,
 ) -> Result<sxd_document::Package, sxd_document::parser::Error> {
+    parse_xpath_package_with_mode(input).map(|(package, _)| package)
+}
+
+pub(crate) fn parse_xpath_package_with_mode(
+    input: &str,
+) -> Result<(sxd_document::Package, bool), sxd_document::parser::Error> {
     // Legado only chooses XML mode when the trimmed input starts with an XML
     // declaration. Everything else goes through the HTML parser, even if it is
     // otherwise well-formed XML.
@@ -878,7 +884,7 @@ pub(crate) fn parse_xpath_package(
     {
         let normalized = normalize_xpath_entities(prepared.trim_start());
         if let Ok(package) = sxd_document::parser::parse(normalized.as_ref()) {
-            return Ok(package);
+            return Ok((package, false));
         }
     }
 
@@ -886,7 +892,7 @@ pub(crate) fn parse_xpath_package(
     // then bridge the resulting DOM into the XML-only XPath evaluator.
     let document = Html::parse_document(&prepared);
     let repaired = html_to_xpath_xml(&document.html());
-    sxd_document::parser::parse(&repaired)
+    sxd_document::parser::parse(&repaired).map(|package| (package, true))
 }
 
 fn html_to_xpath_xml(html: &str) -> String {
@@ -1162,6 +1168,15 @@ pub(crate) fn xpath_select_nodes<'d>(
     }
 }
 
+pub(crate) fn xpath_select_nodes_in_mode<'d>(
+    node: sxd_xpath::nodeset::Node<'d>,
+    xpath: &str,
+    html_mode: bool,
+) -> Vec<sxd_xpath::nodeset::Node<'d>> {
+    let xpath = normalize_html_xpath_attribute_names(xpath, html_mode);
+    xpath_select_nodes(node, xpath.as_ref())
+}
+
 pub(crate) fn xpath_eval_strings(
     node: sxd_xpath::nodeset::Node<'_>,
     xpath: &str,
@@ -1187,15 +1202,20 @@ pub(crate) fn xpath_eval_strings(
     }
 }
 
-fn normalize_html_xpath_attribute_names<'a>(
-    html: &str,
-    xpath: &'a str,
-) -> std::borrow::Cow<'a, str> {
-    if html
-        .trim_start()
-        .get(.."<?xml".len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("<?xml"))
-    {
+pub(crate) fn xpath_eval_strings_in_mode(
+    node: sxd_xpath::nodeset::Node<'_>,
+    xpath: &str,
+    html_mode: bool,
+) -> Vec<String> {
+    let xpath = normalize_html_xpath_attribute_names(xpath, html_mode);
+    xpath_eval_strings(node, xpath.as_ref())
+}
+
+fn normalize_html_xpath_attribute_names(
+    xpath: &str,
+    html_mode: bool,
+) -> std::borrow::Cow<'_, str> {
+    if !html_mode {
         return std::borrow::Cow::Borrowed(xpath);
     }
 
@@ -1240,11 +1260,11 @@ fn normalize_html_xpath_attribute_names<'a>(
 }
 
 fn select_xpath_values(html: &str, xpath: &str, format_nodes: bool) -> Vec<String> {
-    let package = match parse_xpath_package(html) {
-        Ok(package) => package,
+    let (package, html_mode) = match parse_xpath_package_with_mode(html) {
+        Ok(parsed) => parsed,
         Err(_) => return vec![],
     };
-    let xpath = normalize_html_xpath_attribute_names(html, xpath);
+    let xpath = normalize_html_xpath_attribute_names(xpath, html_mode);
     let node = sxd_xpath::nodeset::Node::Root(package.as_document().root());
     if !format_nodes {
         return xpath_eval_strings(node, xpath.as_ref());
@@ -1272,11 +1292,11 @@ fn select_xpath_values(html: &str, xpath: &str, format_nodes: bool) -> Vec<Strin
 }
 
 pub(crate) fn select_xpath_elements_json(html: &str, xpath: &str) -> String {
-    let package = match parse_xpath_package(html) {
-        Ok(package) => package,
+    let (package, html_mode) = match parse_xpath_package_with_mode(html) {
+        Ok(parsed) => parsed,
         Err(_) => return "[]".to_string(),
     };
-    let xpath = normalize_html_xpath_attribute_names(html, xpath);
+    let xpath = normalize_html_xpath_attribute_names(xpath, html_mode);
     let nodes = xpath_select_nodes(
         sxd_xpath::nodeset::Node::Root(package.as_document().root()),
         xpath.as_ref(),
@@ -2001,6 +2021,29 @@ mod tests {
         let xml = r#"<?xml version="1.0"?><root textContent="raw-value"/>"#;
         assert_eq!(select_xpath(xml, "//root/@textContent"), vec!["raw-value"]);
         assert!(select_xpath(xml, "//root/@textcontent").is_empty());
+
+        let (html_package, html_mode) = parse_xpath_package_with_mode(attr_html).unwrap();
+        assert!(html_mode);
+        let html_root =
+            sxd_xpath::nodeset::Node::Root(html_package.as_document().root());
+        assert_eq!(
+            xpath_eval_strings_in_mode(html_root, "//div/@textContent", html_mode),
+            vec!["raw-value"]
+        );
+
+        let (xml_package, xml_mode) = parse_xpath_package_with_mode(xml).unwrap();
+        assert!(!xml_mode);
+        let xml_root = sxd_xpath::nodeset::Node::Root(xml_package.as_document().root());
+        assert_eq!(
+            xpath_eval_strings_in_mode(xml_root, "//root/@textContent", xml_mode),
+            vec!["raw-value"]
+        );
+        assert!(xpath_eval_strings_in_mode(
+            xml_root,
+            "//root/@textcontent",
+            xml_mode
+        )
+        .is_empty());
 
         // 9. XPath html() must re-escape text when serializing inner HTML.
         let entity_html = r#"<div id="entity">1 &lt; 2 &amp; 3</div>"#;

@@ -1450,17 +1450,18 @@ impl RuleEngine {
         rule: &SearchRule,
         list_rule: &str,
     ) -> Vec<SearchBook> {
-        let package = match html::parse_xpath_package(body) {
-            Ok(p) => p,
+        let (package, html_mode) = match html::parse_xpath_package_with_mode(body) {
+            Ok(parsed) => parsed,
             Err(_) => return vec![],
         };
         let document = package.as_document();
         let (list_rule, list_js) = extract_js(list_rule);
         let list_context = RuleVariableContext::for_search_item();
         let items = apply_xpath_list_js(
-            html::xpath_select_nodes(
+            html::xpath_select_nodes_in_mode(
                 sxd_xpath::nodeset::Node::Root(document.root()),
                 self.strip_mode_prefix(list_rule),
+                html_mode,
             ),
             list_js,
             base_url,
@@ -1475,6 +1476,7 @@ impl RuleEngine {
                 item,
                 base_url,
                 &mut context,
+                html_mode,
             );
             if name.as_deref().is_none_or(|value| value.trim().is_empty()) {
                 continue;
@@ -1484,37 +1486,33 @@ impl RuleEngine {
                 item,
                 base_url,
                 &mut context,
+                html_mode,
             );
             let book_url = eval_field_xpath_with_ctx(
                 rule.book_url.as_deref().unwrap_or(""),
                 item,
                 base_url,
                 &mut context,
+                html_mode,
             );
-            let cover_url = rule
-                .cover_url
-                .as_deref()
-                .and_then(|r| eval_field_xpath_with_ctx(r, item, base_url, &mut context));
-            let intro = rule
-                .intro
-                .as_deref()
-                .and_then(|r| eval_field_xpath_with_ctx(r, item, base_url, &mut context));
-            let kind = rule
-                .kind
-                .as_deref()
-                .and_then(|r| eval_field_xpath_with_ctx(r, item, base_url, &mut context));
-            let last_chapter = rule
-                .last_chapter
-                .as_deref()
-                .and_then(|r| eval_field_xpath_with_ctx(r, item, base_url, &mut context));
-            let update_time = rule
-                .update_time
-                .as_deref()
-                .and_then(|r| eval_field_xpath_with_ctx(r, item, base_url, &mut context));
-            let word_count = rule
-                .word_count
-                .as_deref()
-                .and_then(|r| eval_field_xpath_with_ctx(r, item, base_url, &mut context));
+            let cover_url = rule.cover_url.as_deref().and_then(|r| {
+                eval_field_xpath_with_ctx(r, item, base_url, &mut context, html_mode)
+            });
+            let intro = rule.intro.as_deref().and_then(|r| {
+                eval_field_xpath_with_ctx(r, item, base_url, &mut context, html_mode)
+            });
+            let kind = rule.kind.as_deref().and_then(|r| {
+                eval_field_xpath_with_ctx(r, item, base_url, &mut context, html_mode)
+            });
+            let last_chapter = rule.last_chapter.as_deref().and_then(|r| {
+                eval_field_xpath_with_ctx(r, item, base_url, &mut context, html_mode)
+            });
+            let update_time = rule.update_time.as_deref().and_then(|r| {
+                eval_field_xpath_with_ctx(r, item, base_url, &mut context, html_mode)
+            });
+            let word_count = rule.word_count.as_deref().and_then(|r| {
+                eval_field_xpath_with_ctx(r, item, base_url, &mut context, html_mode)
+            });
             out.push(SearchBook {
                 name: name.unwrap_or_default(),
                 author: author.unwrap_or_default(),
@@ -1816,33 +1814,56 @@ fn parse_book_info_xpath(
     book_url: &str,
     ctx: &mut RuleVariableContext,
 ) -> Book {
-    let package = match html::parse_xpath_package(body) {
-        Ok(p) => p,
+    let (package, html_mode) = match html::parse_xpath_package_with_mode(body) {
+        Ok(parsed) => parsed,
         Err(_) => return parse_book_info_html(source, body, base_url, rule, book_url, ctx),
     };
     let document = package.as_document();
     let scope = select_xpath_scope(
         sxd_xpath::nodeset::Node::Root(document.root()),
         rule.init.as_deref(),
+        html_mode,
     );
 
-    let name = eval_field_xpath_with_ctx(rule.name.as_deref().unwrap_or(""), scope, base_url, ctx)
-        .unwrap_or_default();
+    let name = eval_field_xpath_with_ctx(
+        rule.name.as_deref().unwrap_or(""),
+        scope,
+        base_url,
+        ctx,
+        html_mode,
+    )
+    .unwrap_or_default();
     if !name.is_empty() {
         ctx.set_book_field("name", &name);
     }
-    let author =
-        eval_field_xpath_with_ctx(rule.author.as_deref().unwrap_or(""), scope, base_url, ctx)
-            .unwrap_or_default();
+    let author = eval_field_xpath_with_ctx(
+        rule.author.as_deref().unwrap_or(""),
+        scope,
+        base_url,
+        ctx,
+        html_mode,
+    )
+    .unwrap_or_default();
     if !author.is_empty() {
         ctx.set_book_field("author", &author);
     }
-    let intro =
-        eval_field_xpath_with_ctx(rule.intro.as_deref().unwrap_or(""), scope, base_url, ctx);
+    let intro = eval_field_xpath_with_ctx(
+        rule.intro.as_deref().unwrap_or(""),
+        scope,
+        base_url,
+        ctx,
+        html_mode,
+    );
     if let Some(val) = &intro {
         ctx.set_book_field("intro", val);
     }
-    let kind = eval_field_xpath_with_ctx(rule.kind.as_deref().unwrap_or(""), scope, base_url, ctx);
+    let kind = eval_field_xpath_with_ctx(
+        rule.kind.as_deref().unwrap_or(""),
+        scope,
+        base_url,
+        ctx,
+        html_mode,
+    );
     if let Some(val) = &kind {
         ctx.set_book_field("kind", val);
     }
@@ -1851,6 +1872,7 @@ fn parse_book_info_xpath(
         scope,
         base_url,
         ctx,
+        html_mode,
     );
     if let Some(val) = &last_chapter {
         ctx.set_book_field("lastChapter", val);
@@ -1860,6 +1882,7 @@ fn parse_book_info_xpath(
         scope,
         base_url,
         ctx,
+        html_mode,
     );
     if let Some(val) = &update_time {
         ctx.set_book_field("updateTime", val);
@@ -1869,6 +1892,7 @@ fn parse_book_info_xpath(
         scope,
         base_url,
         ctx,
+        html_mode,
     )
     .map(|u| resolve_url(base_url, &u));
     if let Some(val) = &cover_url {
@@ -1879,13 +1903,19 @@ fn parse_book_info_xpath(
         scope,
         base_url,
         ctx,
+        html_mode,
     );
     if let Some(val) = &word_count {
         ctx.set_book_field("wordCount", val);
     }
-    let toc_url =
-        eval_field_xpath_with_ctx(rule.toc_url.as_deref().unwrap_or(""), scope, base_url, ctx)
-            .map(|u| resolve_url(base_url, &u));
+    let toc_url = eval_field_xpath_with_ctx(
+        rule.toc_url.as_deref().unwrap_or(""),
+        scope,
+        base_url,
+        ctx,
+        html_mode,
+    )
+    .map(|u| resolve_url(base_url, &u));
     if let Some(val) = &toc_url {
         ctx.set_book_field("tocUrl", val);
     }
@@ -1894,12 +1924,14 @@ fn parse_book_info_xpath(
         scope,
         base_url,
         ctx,
+        html_mode,
     );
     let download_urls = eval_field_xpath_with_ctx(
         rule.download_urls.as_deref().unwrap_or(""),
         scope,
         base_url,
         ctx,
+        html_mode,
     );
 
     Book {
@@ -2120,18 +2152,19 @@ fn parse_chapter_list_xpath(
     list_rule: &str,
     ctx: &mut RuleVariableContext,
 ) -> (Vec<BookChapter>, Vec<String>) {
-    let package = match html::parse_xpath_package(body) {
-        Ok(p) => p,
+    let (package, html_mode) = match html::parse_xpath_package_with_mode(body) {
+        Ok(parsed) => parsed,
         Err(_) => return parse_chapter_list_html(body, base_url, rule, list_rule, ctx),
     };
     let document = package.as_document();
     let scope = select_xpath_scope(
         sxd_xpath::nodeset::Node::Root(document.root()),
         rule.init.as_deref(),
+        html_mode,
     );
     let (list_rule, list_js) = extract_js(list_rule);
     let items = apply_xpath_list_js(
-        html::xpath_select_nodes(scope, strip_mode_prefix(list_rule)),
+        html::xpath_select_nodes_in_mode(scope, strip_mode_prefix(list_rule), html_mode),
         list_js,
         base_url,
         ctx,
@@ -2145,6 +2178,7 @@ fn parse_chapter_list_xpath(
             item,
             base_url,
             &mut chapter_ctx,
+            html_mode,
         )
         .unwrap_or_default();
         chapter_ctx.chapter_title = Some(title.clone());
@@ -2153,6 +2187,7 @@ fn parse_chapter_list_xpath(
             item,
             base_url,
             &mut chapter_ctx,
+            html_mode,
         )
         .unwrap_or_default();
         let tag = eval_field_xpath_with_ctx(
@@ -2160,12 +2195,14 @@ fn parse_chapter_list_xpath(
             item,
             base_url,
             &mut chapter_ctx,
+            html_mode,
         );
         let is_volume = eval_field_xpath_with_ctx(
             rule.is_volume.as_deref().unwrap_or(""),
             item,
             base_url,
             &mut chapter_ctx,
+            html_mode,
         )
         .map(is_truthy)
         .unwrap_or(false);
@@ -2174,6 +2211,7 @@ fn parse_chapter_list_xpath(
             item,
             base_url,
             &mut chapter_ctx,
+            html_mode,
         )
         .map(is_truthy)
         .unwrap_or(false);
@@ -2182,6 +2220,7 @@ fn parse_chapter_list_xpath(
             item,
             base_url,
             &mut chapter_ctx,
+            html_mode,
         )
         .map(is_truthy)
         .unwrap_or(false);
@@ -2201,7 +2240,7 @@ fn parse_chapter_list_xpath(
     let next_urls = rule
         .next_toc_url
         .as_deref()
-        .map(|xpath| html::xpath_eval_strings(scope, xpath))
+        .map(|xpath| html::xpath_eval_strings_in_mode(scope, xpath, html_mode))
         .unwrap_or_default();
     let next_urls = normalize_toc_next_urls(base_url, next_urls);
 
@@ -3041,6 +3080,7 @@ fn eval_field_xpath_with_ctx(
     node: sxd_xpath::nodeset::Node<'_>,
     base_url: &str,
     ctx: &mut RuleVariableContext,
+    html_mode: bool,
 ) -> Option<String> {
     if rule.trim().is_empty() {
         return None;
@@ -3051,7 +3091,7 @@ fn eval_field_xpath_with_ctx(
     let input = node.string_value();
     let mut source_rule = SourceRule::compile(rule, ParseMode::XPath, false);
     evaluate_put_entries(&source_rule.put_entries, ctx, |put_rule, ctx| {
-        eval_field_xpath_with_ctx(put_rule, node, base_url, ctx)
+        eval_field_xpath_with_ctx(put_rule, node, base_url, ctx, html_mode)
     });
     let expanded = interpolate_common_templates(&source_rule.rule, &input, base_url, ctx);
     let had_templates = expanded != source_rule.rule;
@@ -3060,7 +3100,7 @@ fn eval_field_xpath_with_ctx(
 
     let mut text = match source_rule.mode {
         ParseMode::XPath if pure.trim().is_empty() => input.clone(),
-        ParseMode::XPath => html::xpath_eval_strings(node, pure)
+        ParseMode::XPath => html::xpath_eval_strings_in_mode(node, pure, html_mode)
             .into_iter()
             .next()
             .unwrap_or_default(),
@@ -3096,11 +3136,12 @@ fn eval_field_xpath_with_ctx(
 fn select_xpath_scope<'a>(
     node: sxd_xpath::nodeset::Node<'a>,
     init_rule: Option<&str>,
+    html_mode: bool,
 ) -> sxd_xpath::nodeset::Node<'a> {
     let Some(init_rule) = init_rule.map(str::trim).filter(|s| !s.is_empty()) else {
         return node;
     };
-    html::xpath_select_nodes(node, init_rule)
+    html::xpath_select_nodes_in_mode(node, init_rule, html_mode)
         .into_iter()
         .next()
         .unwrap_or(node)
