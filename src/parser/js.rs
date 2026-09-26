@@ -579,7 +579,15 @@ fn eval_js_inner_with_source(
                 "replaceCookie",
                 Func::new(|url: String, cookie: String| {
                     if let Some(active) = crate::crawler::session::current_active_session() {
-                        active.set_cookie(&url, &cookie);
+                        let mut merged = parse_cookie_pairs(
+                            &active.get_cookie(&url).unwrap_or_default(),
+                        );
+                        for (key, value) in parse_cookie_pairs(&cookie) {
+                            merged.insert(key, value);
+                        }
+                        if !merged.is_empty() {
+                            active.set_cookie(&url, &cookie_pairs_to_string(&merged));
+                        }
                     }
                 }),
             )?;
@@ -3063,12 +3071,28 @@ fn java_base64_encode_bytes(input_json: &str, flags: i32) -> String {
     let bytes = json_byte_array(input_json);
     let url_safe = flags & 8 != 0;
     let no_padding = flags & 1 != 0;
-    match (url_safe, no_padding) {
+    let no_wrap = flags & 2 != 0;
+    let crlf = flags & 4 != 0;
+    let encoded = match (url_safe, no_padding) {
         (true, true) => base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes),
         (true, false) => base64::engine::general_purpose::URL_SAFE.encode(bytes),
         (false, true) => base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes),
         (false, false) => base64::engine::general_purpose::STANDARD.encode(bytes),
+    };
+    if no_wrap || encoded.is_empty() {
+        return encoded;
     }
+
+    let separator = if crlf { "\r\n" } else { "\n" };
+    let mut wrapped = String::with_capacity(encoded.len() + encoded.len() / 76 + 2);
+    for (index, chunk) in encoded.as_bytes().chunks(76).enumerate() {
+        if index > 0 {
+            wrapped.push_str(separator);
+        }
+        wrapped.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+    }
+    wrapped.push_str(separator);
+    wrapped
 }
 
 fn java_base64_decode_bytes(input: &str, flags: i32) -> String {
@@ -3167,12 +3191,7 @@ fn java_to_url_json(raw_url: &str, base_url: Option<&str>) -> String {
     let search_params = if let Some(query) = url.query() {
         let mut values = serde_json::Map::new();
         for item in query.split('&') {
-            let Some((key, value)) = item.split_once('=') else {
-                return serde_json::json!({
-                    "error": format!("invalid query parameter: {item}"),
-                })
-                .to_string();
-            };
+            let (key, value) = item.split_once('=').unwrap_or((item, ""));
             let decoded = urlencoding::decode(&value.replace('+', " "))
                 .map(|value| value.into_owned())
                 .unwrap_or_else(|_| value.to_string());
@@ -3209,6 +3228,29 @@ fn java_encode_uri(input: &str, charset: Option<&str>) -> String {
         }
     }
     encoded
+}
+
+fn parse_cookie_pairs(input: &str) -> HashMap<String, String> {
+    input
+        .split(';')
+        .filter_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            let key = key.trim();
+            let value = value.trim();
+            if key.is_empty() || value.is_empty() {
+                return None;
+            }
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+fn cookie_pairs_to_string(pairs: &HashMap<String, String>) -> String {
+    pairs
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn js_cache_get(key: &str) -> Option<String> {
@@ -3280,7 +3322,7 @@ fn java_request_simple_response_with_client(
     client: &HttpClient,
 ) -> String {
     let method = Method::from_bytes(method.as_bytes()).unwrap_or(Method::GET);
-    let response = client.execute(
+    let response = client.execute_once(
         method,
         url.trim(),
         &java_request_headers(headers_json),
@@ -4011,11 +4053,24 @@ mod tests {
             const urlSafe = java.util.Base64.getUrlEncoder()
                 .withoutPadding()
                 .encodeToString([251, 255]);
-            [standard, decoded, urlSafe].join('|');
+            const long = Array.from({length: 60}, (_, i) => i);
+            const wrapped = android.util.Base64.encodeToString(
+                long, android.util.Base64.DEFAULT);
+            const crlf = android.util.Base64.encodeToString(
+                long, android.util.Base64.CRLF);
+            [
+                standard,
+                decoded,
+                urlSafe,
+                wrapped.includes('\n'),
+                wrapped.endsWith('\n'),
+                crlf.includes('\r\n'),
+                crlf.endsWith('\r\n')
+            ].join('|');
         "#;
         assert_eq!(
             eval_js(script, "", "https://example.com").unwrap(),
-            "YWJj|97,98,99|-_8"
+            "YWJj|97,98,99|-_8|true|true|true|true"
         );
     }
 
@@ -4112,6 +4167,24 @@ mod tests {
         .0;
 
         assert_eq!(result, "initial_token|a=b=c|");
+    }
+
+    #[test]
+    fn compat_cookie_replace_merges_existing_values() {
+        let initial = ExecuteSession {
+            cookies: Some("sid=old; keep=yes".to_string()),
+            ..Default::default()
+        };
+        let (result, _) = with_active_session(Some(&initial), "https://example.com", |_| {
+            eval_js(
+                "cookie.replaceCookie('https://example.com/path', 'sid=new; added=1'); [cookie.getKey('example.com','sid'), cookie.getKey('example.com','keep'), cookie.getKey('example.com','added')].join('|')",
+                "",
+                "https://example.com",
+            )
+            .unwrap()
+        });
+
+        assert_eq!(result, "new|yes|1");
     }
 
     #[test]
@@ -4340,10 +4413,47 @@ Connection: close
     }
 
     #[test]
+    fn simple_http_methods_do_not_follow_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = accept_with_timeout(&listener);
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+
+        let url = format!("http://{address}/redirect");
+        let client = HttpClient::standalone();
+        let result = with_js_http_client(&client, || {
+            eval_js(
+                &format!(
+                    "(() => {{ const response = java.get('{url}', {{}}); return [response.code(), response.header('location'), response.url()].join('|'); }})()"
+                ),
+                "",
+                &url,
+            )
+            .unwrap()
+        });
+        assert_eq!(result, format!("302|/final|{url}"));
+        server.join().unwrap();
+    }
+
+    #[test]
     fn digest_hmac_url_and_system_helpers_match_legado_shapes() {
         let script = r#"
             const parsed = java.toURL(
-                '../p?q=first&q=last&name=a+b',
+                '../p?q=first&q=last&name=a+b&flag',
                 'https://example.com/base/x'
             );
             const logTypeResult = java.logType('reader');
@@ -4357,13 +4467,14 @@ Connection: close
                 parsed.pathname,
                 parsed.searchParams.get('q'),
                 parsed.searchParams.get('name'),
+                parsed.searchParams.get('flag'),
                 java.getWebViewUA().startsWith('Mozilla/5.0'),
                 typeof logTypeResult === 'undefined'
             ].join('|')
         "#;
         assert_eq!(
             eval_js(script, "", "https://example.com").unwrap(),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad|ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=|9c196e32dc0175f86f4b1cb89289d6619de6bee699e4c378e68309ed97a1a6ab|nBluMtwBdfhvSxy4konWYZ3mvuaZ5MN45oMJ7Zehpqs=|example.com|https://example.com|/p|last|a b|true|true"
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad|ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=|9c196e32dc0175f86f4b1cb89289d6619de6bee699e4c378e68309ed97a1a6ab|nBluMtwBdfhvSxy4konWYZ3mvuaZ5MN45oMJ7Zehpqs=|example.com|https://example.com|/p|last|a b||true|true"
         );
         assert!(eval_js(
             "java.digestHex('abc', 'unsupported')",

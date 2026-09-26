@@ -179,11 +179,34 @@ impl HttpClient {
 
     pub(crate) fn execute(
         &self,
+        method: Method,
+        url: &str,
+        headers: &[(String, String)],
+        body: Option<&str>,
+        max_response_bytes: Option<usize>,
+    ) -> Result<RawHttpResponse, HttpClientError> {
+        self.execute_with_redirects(method, url, headers, body, max_response_bytes, true)
+    }
+
+    pub(crate) fn execute_once(
+        &self,
+        method: Method,
+        url: &str,
+        headers: &[(String, String)],
+        body: Option<&str>,
+        max_response_bytes: Option<usize>,
+    ) -> Result<RawHttpResponse, HttpClientError> {
+        self.execute_with_redirects(method, url, headers, body, max_response_bytes, false)
+    }
+
+    fn execute_with_redirects(
+        &self,
         mut method: Method,
         url: &str,
         headers: &[(String, String)],
         body: Option<&str>,
         max_response_bytes: Option<usize>,
+        follow_redirects: bool,
     ) -> Result<RawHttpResponse, HttpClientError> {
         let mut current_url =
             Url::parse(url).map_err(|error| HttpClientError::InvalidUrl(error.to_string()))?;
@@ -218,38 +241,40 @@ impl HttpClient {
             }
 
             let status = response.status().as_u16();
-            if let Some(location) = redirect_location(status, response.headers()) {
-                if redirect_count == MAX_REDIRECTS {
-                    return Err(HttpClientError::Network(
-                        "too many redirects (maximum 5)".to_string(),
-                    ));
-                }
-
-                let next_url = current_url
-                    .join(&location)
-                    .map_err(|error| HttpClientError::InvalidUrl(error.to_string()))?;
-                ensure_http_url(&next_url)?;
-
-                if !same_origin(&current_url, &next_url) {
-                    strip_sensitive_headers(&mut base_headers);
-                }
-
-                match status {
-                    301 | 302 if method == Method::POST => {
-                        method = Method::GET;
-                        body = None;
-                        strip_body_headers(&mut base_headers);
+            if follow_redirects {
+                if let Some(location) = redirect_location(status, response.headers()) {
+                    if redirect_count == MAX_REDIRECTS {
+                        return Err(HttpClientError::Network(
+                            "too many redirects (maximum 5)".to_string(),
+                        ));
                     }
-                    303 if method != Method::HEAD => {
-                        method = Method::GET;
-                        body = None;
-                        strip_body_headers(&mut base_headers);
-                    }
-                    _ => {}
-                }
 
-                current_url = next_url;
-                continue;
+                    let next_url = current_url
+                        .join(&location)
+                        .map_err(|error| HttpClientError::InvalidUrl(error.to_string()))?;
+                    ensure_http_url(&next_url)?;
+
+                    if !same_origin(&current_url, &next_url) {
+                        strip_sensitive_headers(&mut base_headers);
+                    }
+
+                    match status {
+                        301 | 302 if method == Method::POST => {
+                            method = Method::GET;
+                            body = None;
+                            strip_body_headers(&mut base_headers);
+                        }
+                        303 if method != Method::HEAD => {
+                            method = Method::GET;
+                            body = None;
+                            strip_body_headers(&mut base_headers);
+                        }
+                        _ => {}
+                    }
+
+                    current_url = next_url;
+                    continue;
+                }
             }
 
             let response_headers = response.headers().clone();
