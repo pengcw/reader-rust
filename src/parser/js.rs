@@ -671,6 +671,10 @@ fn eval_js_inner_with_source(
             java_obj.set("md5To16", Func::new(md5_to_16))?;
             java_obj.set("md5Encode16", Func::new(md5_to_16))?;
             java_obj.set(
+                "toNumChapter",
+                Func::new(|input: String| -> String { java_to_num_chapter(&input) }),
+            )?;
+            java_obj.set(
                 "__digestHex",
                 Func::new(|data: String, algorithm: String| -> Option<String> {
                     java_digest_bytes(&data, &algorithm).map(hex::encode)
@@ -2632,6 +2636,174 @@ fn java_import_script(path: &str) -> Option<String> {
     Some(body)
 }
 
+fn java_to_num_chapter(input: &str) -> String {
+    static TITLE_NUM_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(第)(.+?)(章)").expect("valid title number regex"));
+
+    let Some(captures) = TITLE_NUM_RE.captures(input) else {
+        return input.to_string();
+    };
+    let Some(number) = captures.get(2) else {
+        return input.to_string();
+    };
+
+    let value = legado_string_to_int(number.as_str());
+    let whole = captures.get(0).expect("full regex match");
+    let mut output = String::with_capacity(input.len());
+    output.push_str(&input[..whole.start()]);
+    output.push('第');
+    output.push_str(&value.to_string());
+    output.push('章');
+    output.push_str(&input[whole.end()..]);
+    output
+}
+
+fn legado_string_to_int(input: &str) -> i32 {
+    let normalized = input
+        .chars()
+        .map(fullwidth_to_halfwidth)
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    normalized
+        .parse::<i32>()
+        .unwrap_or_else(|_| legado_chinese_num_to_int(&normalized))
+}
+
+fn fullwidth_to_halfwidth(ch: char) -> char {
+    match ch {
+        '　' => ' ',
+        '！'..='～' => {
+            char::from_u32(ch as u32 - 0xFEE0).unwrap_or(ch)
+        }
+        _ => ch,
+    }
+}
+
+fn chinese_digit_value(ch: char) -> Option<i32> {
+    match ch {
+        '零' | '〇' => Some(0),
+        '一' | '壹' => Some(1),
+        '二' | '贰' | '两' => Some(2),
+        '三' | '叁' => Some(3),
+        '四' | '肆' => Some(4),
+        '五' | '伍' => Some(5),
+        '六' | '陆' => Some(6),
+        '七' | '柒' => Some(7),
+        '八' | '捌' => Some(8),
+        '九' | '玖' => Some(9),
+        '十' | '拾' => Some(10),
+        '百' | '佰' => Some(100),
+        '千' | '仟' => Some(1000),
+        '万' => Some(10_000),
+        '亿' => Some(100_000_000),
+        _ => None,
+    }
+}
+
+fn is_plain_chinese_digits(input: &str) -> bool {
+    !input.is_empty()
+        && input.chars().all(|ch| {
+            matches!(
+                ch,
+                '〇'
+                    | '零'
+                    | '一'
+                    | '二'
+                    | '三'
+                    | '四'
+                    | '五'
+                    | '六'
+                    | '七'
+                    | '八'
+                    | '九'
+                    | '壹'
+                    | '贰'
+                    | '叁'
+                    | '肆'
+                    | '伍'
+                    | '陆'
+                    | '柒'
+                    | '捌'
+                    | '玖'
+            )
+        })
+}
+
+fn legado_chinese_num_to_int(input: &str) -> i32 {
+    if input.is_empty() {
+        return -1;
+    }
+
+    if is_plain_chinese_digits(input) {
+        let mut value: i64 = 0;
+        for ch in input.chars() {
+            let Some(digit) = chinese_digit_value(ch) else {
+                return -1;
+            };
+            value = value.saturating_mul(10).saturating_add(digit as i64);
+            if value > i32::MAX as i64 {
+                return -1;
+            }
+        }
+        return value as i32;
+    }
+
+    let chars = input.chars().collect::<Vec<_>>();
+    let mut result: i64 = 0;
+    let mut tmp: i64 = 0;
+    let mut billion: i64 = 0;
+
+    for (index, ch) in chars.iter().copied().enumerate() {
+        let Some(value) = chinese_digit_value(ch).map(i64::from) else {
+            return -1;
+        };
+
+        match value {
+            100_000_000 => {
+                result = result.saturating_add(tmp);
+                result = result.saturating_mul(value);
+                billion = billion.saturating_add(result);
+                result = 0;
+                tmp = 0;
+            }
+            10_000 => {
+                result = result.saturating_add(tmp);
+                result = result.saturating_mul(value);
+                tmp = 0;
+            }
+            10.. => {
+                if tmp == 0 {
+                    tmp = 1;
+                }
+                result = result.saturating_add(value.saturating_mul(tmp));
+                tmp = 0;
+            }
+            digit => {
+                if index + 1 == chars.len() && index > 0 {
+                    if let Some(previous) = chinese_digit_value(chars[index - 1]).map(i64::from) {
+                        if previous >= 10 {
+                            tmp = digit.saturating_mul(previous / 10);
+                            continue;
+                        }
+                    }
+                }
+                tmp = tmp.saturating_mul(10).saturating_add(digit);
+            }
+        }
+
+        if result > i32::MAX as i64 || tmp > i32::MAX as i64 || billion > i32::MAX as i64 {
+            return -1;
+        }
+    }
+
+    let total = result.saturating_add(tmp).saturating_add(billion);
+    if total > i32::MAX as i64 {
+        -1
+    } else {
+        total as i32
+    }
+}
+
 fn java_time_format(timestamp_ms: i64) -> String {
     match Local.timestamp_millis_opt(timestamp_ms).single() {
         Some(dt) => dt.format("%Y/%m/%d %H:%M").to_string(),
@@ -3918,6 +4090,27 @@ mod tests {
             Some(&json!("value"))
         );
         assert!(!variables.contains_key("userInfo_https://source.example"));
+    }
+
+    #[test]
+    fn to_num_chapter_matches_legado_number_normalization() {
+        let script = r#"
+            [
+                java.toNumChapter('第123章'),
+                java.toNumChapter('第１２３章'),
+                java.toNumChapter('第一二三章'),
+                java.toNumChapter('第一百零二章'),
+                java.toNumChapter('第十二章'),
+                java.toNumChapter('第二十章'),
+                java.toNumChapter('第一千二章'),
+                java.toNumChapter('前言'),
+                java.toNumChapter('第abc章')
+            ].join('|')
+        "#;
+        assert_eq!(
+            eval_js(script, "", "https://example.com").unwrap(),
+            "第123章|第123章|第123章|第102章|第12章|第20章|第1200章|前言|第-1章"
+        );
     }
 
     #[test]
