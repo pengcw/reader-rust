@@ -1,4 +1,4 @@
-use crate::crawler::HttpClient;
+use crate::crawler::{HttpClient, HttpClientError};
 use crate::parser::html;
 use crate::parser::jsonpath;
 use crate::parser::rule_analyzer;
@@ -511,24 +511,27 @@ fn eval_js_inner_with_source(
             )?;
             java_obj.set("deviceID", Func::new(|| -> String { JS_DEVICE_ID.clone() }))?;
             java_obj.set(
+                "__nativeConnect",
+                Func::new(|url: String, headers_json: String| -> String {
+                    java_request_simple_response("GET", &url, None, &headers_json)
+                }),
+            )?;
+            java_obj.set(
                 "__nativeGet",
                 Func::new(|url: String, headers_json: String| -> String {
                     java_request_simple_response("GET", &url, None, &headers_json)
-                        .unwrap_or_default()
                 }),
             )?;
             java_obj.set(
                 "__nativePost",
                 Func::new(|url: String, body: String, headers_json: String| -> String {
                     java_request_simple_response("POST", &url, Some(body), &headers_json)
-                        .unwrap_or_default()
                 }),
             )?;
             java_obj.set(
                 "__nativeHead",
                 Func::new(|url: String, headers_json: String| -> String {
                     java_request_simple_response("HEAD", &url, None, &headers_json)
-                        .unwrap_or_default()
                 }),
             )?;
             java_obj.set(
@@ -965,6 +968,54 @@ fn eval_js_inner_with_source(
                         String(url), String(body == null ? '' : body), headersJson(headers)));
                     java.head = (url, headers) => responseFromJson(java.__nativeHead(
                         String(url), headersJson(headers)));
+                    const strResponseFromJson = value => {
+                        let raw;
+                        try { raw = typeof value === 'string' ? JSON.parse(value) : value || {}; }
+                        catch (_) { raw = {}; }
+                        const bodyText = String(raw.body == null ? '' : raw.body);
+                        const bodyValue = new String(bodyText);
+                        bodyValue.string = () => bodyText;
+                        bodyValue.close = () => {};
+                        const headers = Object.assign({}, raw.headers || {});
+                        const responseHeaders = Object.assign({}, headers, {
+                            get(name) {
+                                const key = Object.keys(headers).find(k => k.toLowerCase() === String(name).toLowerCase());
+                                return key === undefined ? null : headers[key];
+                            },
+                            names: () => Object.keys(headers),
+                            toMultimap: () => Object.assign({}, headers)
+                        });
+                        const code = Number(raw.code || raw.status || 0);
+                        const isSuccessful = raw.isSuccessful == null
+                            ? code >= 200 && code < 300 : !!raw.isSuccessful;
+                        const callTime = Number(raw.callTime || 0);
+                        const response = {
+                            __ffiStrResponse: true,
+                            raw: raw.raw == null ? null : raw.raw,
+                            body: () => bodyValue,
+                            url: () => String(raw.url || ''),
+                            code: () => code,
+                            message: () => String(raw.message || ''),
+                            headers: () => responseHeaders,
+                            isSuccessful: () => isSuccessful,
+                            callTime: () => callTime,
+                            toJSON: () => ({
+                                __ffiStrResponse: true,
+                                raw: raw.raw == null ? null : raw.raw,
+                                body: bodyText,
+                                url: String(raw.url || ''),
+                                code,
+                                message: String(raw.message || ''),
+                                headers,
+                                isSuccessful,
+                                callTime
+                            })
+                        };
+                        return response;
+                    };
+                    globalThis.__readerMakeStrResponse = strResponseFromJson;
+                    java.connect = (url, headers) => strResponseFromJson(
+                        java.__nativeConnect(String(url), headersJson(headers)));
                     java.strToBytes = (value, charset) => JSON.parse(
                         java.__strToBytes(String(value), charset == null ? '' : String(charset)));
                     java.bytesToStr = (bytes, charset) => java.__bytesToStr(
@@ -1264,35 +1315,7 @@ fn eval_js_inner_with_source(
             eval_script(
                 ctx.clone(),
                 r#"if (globalThis.result && globalThis.result.__ffiStrResponse === true) {
-                    const raw = globalThis.result;
-                    const responseHeaders = Object.assign({}, raw.headers || {});
-                    responseHeaders.get = function(name) {
-                        const key = Object.keys(raw.headers || {}).find(k => k.toLowerCase() === String(name).toLowerCase());
-                        return key === undefined ? null : raw.headers[key];
-                    };
-                    responseHeaders.names = function() { return Object.keys(raw.headers || {}); };
-                    responseHeaders.toMultimap = function() { return Object.assign({}, raw.headers || {}); };
-                    const bodyText = String(raw.body == null ? "" : raw.body);
-                    const statusCode = Number(raw.code || raw.status || 0);
-                    const strResponse = {
-                        __ffiStrResponse: true,
-                        raw: raw.raw || null,
-                        body: function() { return { string: function() { return bodyText; }, toString: function() { return bodyText; } }; },
-                        url: function() { return String(raw.url || ""); },
-                        code: function() { return statusCode; },
-                        headers: function() { return responseHeaders; },
-                        isSuccessful: function() { return raw.isSuccessful == null ? statusCode >= 200 && statusCode < 300 : !!raw.isSuccessful; },
-                        toJSON: function() { return {
-                            __ffiStrResponse: true,
-                            raw: raw.raw || null,
-                            body: bodyText,
-                            url: String(raw.url || ""),
-                            code: statusCode,
-                            headers: raw.headers || {},
-                            isSuccessful: raw.isSuccessful == null ? statusCode >= 200 && statusCode < 300 : !!raw.isSuccessful
-                        }; }
-                    };
-                    globalThis.result = strResponse;
+                    globalThis.result = globalThis.__readerMakeStrResponse(globalThis.result);
                 }"#,
             )?;
 
@@ -2162,7 +2185,8 @@ fn java_request_simple_response(
     url: &str,
     body: Option<String>,
     headers_json: &str,
-) -> anyhow::Result<String> {
+) -> String {
+    let started = Instant::now();
     let method = Method::from_bytes(method.as_bytes()).unwrap_or(Method::GET);
     let response = active_js_http_client().execute(
         method,
@@ -2170,26 +2194,53 @@ fn java_request_simple_response(
         &java_request_headers(headers_json),
         body.as_deref(),
         None,
-    )?;
-    let headers = response
-        .headers
-        .iter()
-        .filter_map(|(name, value)| {
-            value.to_str().ok().map(|value| {
-                (
-                    name.as_str().to_string(),
-                    JsonValue::String(value.to_string()),
-                )
+    );
+    let payload = match response {
+        Ok(response) => {
+            let headers = response
+                .headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    value.to_str().ok().map(|value| {
+                        (
+                            name.as_str().to_string(),
+                            JsonValue::String(value.to_string()),
+                        )
+                    })
+                })
+                .collect::<serde_json::Map<String, JsonValue>>();
+            let status = response.status;
+            serde_json::json!({
+                "__ffiStrResponse": true,
+                "raw": null,
+                "body": String::from_utf8_lossy(&response.body).into_owned(),
+                "url": response.url,
+                "code": status,
+                "message": "",
+                "headers": headers,
+                "isSuccessful": (200..300).contains(&status),
+                "callTime": started.elapsed().as_millis().min(i64::MAX as u128) as i64,
             })
-        })
-        .collect::<serde_json::Map<String, JsonValue>>();
-    Ok(serde_json::json!({
-        "body": String::from_utf8_lossy(&response.body).into_owned(),
-        "url": response.url,
-        "code": response.status,
-        "headers": headers,
-    })
-    .to_string())
+        }
+        Err(error) => {
+            let call_time = match &error {
+                HttpClientError::Timeout(_) => -2,
+                _ => -7,
+            };
+            serde_json::json!({
+                "__ffiStrResponse": true,
+                "raw": null,
+                "body": error.to_string(),
+                "url": url.trim(),
+                "code": 0,
+                "message": "",
+                "headers": {},
+                "isSuccessful": false,
+                "callTime": call_time,
+            })
+        }
+    };
+    payload.to_string()
 }
 
 fn java_request_headers(headers_json: &str) -> Vec<(String, String)> {
@@ -2377,6 +2428,57 @@ mod tests {
         )
         .unwrap();
         assert_eq!(expired, "true");
+    }
+
+    #[test]
+    fn java_connect_returns_str_response_for_http_and_transport_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            write!(
+                stream,
+                "HTTP/1.1 418 I'm a teapot\r\nContent-Type: application/json\r\nX-Connect: yes\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndenied"
+            )
+            .unwrap();
+            request.to_ascii_lowercase()
+        });
+
+        let url = format!("http://{address}/connect");
+        let client = HttpClient::standalone();
+        let script = format!(
+            r#"
+                const response = java.connect('{url}', {{'X-Request':'connect'}});
+                [response.__ffiStrResponse, response.code(), response.message(),
+                 response.url(), response.body().string(), response.isSuccessful(),
+                 response.headers().get('x-connect'), response.callTime() >= 0,
+                 response.raw === null].join('|');
+            "#
+        );
+        let result = with_js_http_client(&client, || eval_js(&script, "", &url).unwrap());
+        assert_eq!(
+            result,
+            format!("true|418||{url}|denied|false|yes|true|true")
+        );
+        assert!(server.join().unwrap().contains("x-request: connect"));
+
+        let invalid = eval_js(
+            "(() => { const response = java.connect('not-a-url'); return [response.code(), response.isSuccessful(), response.callTime() < 0, response.body().string().length > 0].join('|'); })()",
+            "",
+            "https://example.com",
+        )
+        .unwrap();
+        assert_eq!(invalid, "0|false|true|true");
     }
 
     #[test]
