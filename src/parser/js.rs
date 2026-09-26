@@ -333,12 +333,14 @@ fn eval_js_inner_with_source(
             let input_value = input.unwrap_or("");
             let content_state = Arc::new(Mutex::new(input_value.to_string()));
             let base_url_value = base_url.unwrap_or("");
+            let base_url_state = Arc::new(Mutex::new(base_url_value.to_string()));
+            let variable_overrides = Arc::new(Mutex::new(HashMap::<String, String>::new()));
             let shared_js = active_js_lib_script()?;
 
             globals.set("input", input_value)?;
             globals.set("result", input_value)?;
             globals.set("src", input_value)?;
-            globals.set("loginInfo", ctx.json_parse("{}")?)?;
+            globals.set("loginInfo", ctx.json_parse("null")?)?;
             globals.set("base_url", base_url_value)?;
             globals.set("baseUrl", base_url_value)?;
             if let Some(key) = key {
@@ -352,81 +354,125 @@ fn eval_js_inner_with_source(
             globals.set("url", base_url_value)?;
 
             // Stubs for Legado compatibility
-            let source_key_val = source_key.unwrap_or("").to_string();
+            let source_key_val = source_key
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    ACTIVE_JS_BOOK_SOURCE.with(|cell| {
+                        cell.borrow()
+                            .as_ref()
+                            .map(|source| source.book_source_url.clone())
+                    })
+                })
+                .unwrap_or_default();
             let source_obj = Object::new(ctx.clone())?;
             let sk_clone = source_key_val.clone();
             source_obj.set("key", source_key_val.clone())?;
             source_obj.set("getKey", Func::new(move || sk_clone.clone()))?;
 
+            let source_variable_storage_key = format!("__source_variable:{source_key_val}");
+            let source_variable_storage_key_for_get = source_variable_storage_key.clone();
             source_obj.set(
                 "getVariable",
-                Func::new(|key: rquickjs::function::Opt<String>| -> String {
-                    let key_str = key.0.unwrap_or_default();
+                Func::new(move |key: rquickjs::function::Opt<String>| -> String {
                     if let Some(active) = crate::crawler::session::current_active_session() {
-                        if let Some(val) = active.get_variable(&key_str) {
-                            return match val {
+                        let value = match key.0.as_deref() {
+                            Some(key) => active.get_variable(key),
+                            None => active.get_variable(""),
+                        };
+                        return value
+                            .map(|val| match val {
                                 serde_json::Value::String(s) => s,
+                                serde_json::Value::Null => String::new(),
                                 other => other.to_string(),
-                            };
-                        }
+                            })
+                            .unwrap_or_default();
                     }
-                    "".to_string()
+                    let key = key
+                        .0
+                        .unwrap_or_else(|| source_variable_storage_key_for_get.clone());
+                    JS_KV
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_default()
                 }),
             )?;
 
+            let source_variable_storage_key_for_set = source_variable_storage_key.clone();
             source_obj.set(
                 "setVariable",
                 Func::new(
-                    |first: String, second: rquickjs::function::Opt<String>| -> String {
+                    move |first: String, second: rquickjs::function::Opt<String>| {
                         if let Some(active) = crate::crawler::session::current_active_session() {
-                            if let Some(sec) = second.0 {
-                                active.set_variable(&first, serde_json::Value::String(sec.clone()));
-                                sec
-                            } else {
-                                active.set_variable("", serde_json::Value::String(first.clone()));
-                                first
+                            match second.0 {
+                                Some(value) => active.set_variable_exact(
+                                    &first,
+                                    serde_json::Value::String(value),
+                                ),
+                                None => active.set_variable(
+                                    "",
+                                    serde_json::Value::String(first),
+                                ),
                             }
                         } else {
-                            "".to_string()
+                            let (key, value) = match second.0 {
+                                Some(value) => (first, value),
+                                None => (source_variable_storage_key_for_set.clone(), first),
+                            };
+                            JS_KV
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(key, value);
                         }
                     },
                 ),
             )?;
+            let source_variable_storage_key_for_remove = source_variable_storage_key.clone();
+            source_obj.set(
+                "__removeVariable",
+                Func::new(move || {
+                    if let Some(active) = crate::crawler::session::current_active_session() {
+                        active.remove_variable("");
+                    } else {
+                        JS_KV
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&source_variable_storage_key_for_remove);
+                    }
+                }),
+            )?;
 
             source_obj.set(
                 "getLoginHeader",
-                Func::new(|| -> String {
-                    if let Some(active) = crate::crawler::session::current_active_session() {
-                        if let Some(val) = active.get_login_header() {
-                            return match val {
-                                serde_json::Value::String(s) => s,
-                                other => other.to_string(),
-                            };
-                        }
-                    }
-                    "".to_string()
+                Func::new(|| -> Option<String> {
+                    crate::crawler::session::current_active_session()
+                        .and_then(|active| active.get_login_header())
+                        .map(|value| match value {
+                            serde_json::Value::String(s) => s,
+                            other => other.to_string(),
+                        })
                 }),
             )?;
 
             source_obj.set(
                 "putLoginHeader",
-                Func::new(|val: String| -> String {
+                Func::new(|val: String| {
                     if let Some(active) = crate::crawler::session::current_active_session() {
                         let json_val = serde_json::from_str::<serde_json::Value>(&val)
-                            .unwrap_or_else(|_| serde_json::Value::String(val.clone()));
+                            .unwrap_or_else(|_| serde_json::Value::String(val));
                         active.put_login_header(json_val);
                     }
-                    val
                 }),
             )?;
 
             source_obj.set(
                 "removeLoginHeader",
-                Func::new(|| -> String {
+                Func::new(|| {
                     if let Some(active) = crate::crawler::session::current_active_session() {
                         active.remove_login_header();
                     }
-                    "".to_string()
                 }),
             )?;
 
@@ -463,38 +509,42 @@ fn eval_js_inner_with_source(
             )?;
             cookie_obj.set(
                 "setCookie",
-                Func::new(|url: String, cookie: String| -> String {
+                Func::new(|url: String, cookie: String| {
                     if let Some(active) = crate::crawler::session::current_active_session() {
                         active.set_cookie(&url, &cookie);
                     }
-                    cookie
+                }),
+            )?;
+            cookie_obj.set(
+                "replaceCookie",
+                Func::new(|url: String, cookie: String| {
+                    if let Some(active) = crate::crawler::session::current_active_session() {
+                        active.set_cookie(&url, &cookie);
+                    }
                 }),
             )?;
             cookie_obj.set(
                 "set",
-                Func::new(|url: String, cookie: String| -> String {
+                Func::new(|url: String, cookie: String| {
                     if let Some(active) = crate::crawler::session::current_active_session() {
                         active.set_cookie(&url, &cookie);
                     }
-                    cookie
                 }),
             )?;
             cookie_obj.set(
                 "removeCookie",
-                Func::new(|url: String| -> String {
+                Func::new(|url: String| {
                     if let Some(active) = crate::crawler::session::current_active_session() {
                         active.remove_cookie(&url);
                     }
-                    "".to_string()
                 }),
             )?;
             cookie_obj.set(
                 "remove",
-                Func::new(|url: String| -> String {
+                Func::new(|url: String| {
                     if let Some(active) = crate::crawler::session::current_active_session() {
                         active.remove_cookie(&url);
                     }
-                    "".to_string()
                 }),
             )?;
             globals.set("cookie", cookie_obj)?;
@@ -507,29 +557,38 @@ fn eval_js_inner_with_source(
             cache_obj.set(
                 "put",
                 Func::new(
-                    |key: String, val: String, save_time: rquickjs::function::Opt<i64>| -> bool {
-                        js_cache_put(&key, val, save_time.0)
+                    |key: String, val: String, save_time: rquickjs::function::Opt<i64>| {
+                        let _ = js_cache_put(&key, val, save_time.0);
                     },
                 ),
             )?;
             cache_obj.set(
                 "delete",
-                Func::new(|key: String| -> bool { js_cache_delete(&key) }),
+                Func::new(|key: String| {
+                    let _ = js_cache_delete(&key);
+                }),
             )?;
             globals.set("cache", cache_obj)?;
 
             let java_obj = Object::new(ctx.clone())?;
             let content_for_set = content_state.clone();
+            let base_url_for_set = base_url_state.clone();
             java_obj.set(
-                "setContent",
-                Func::new(move |content: String| -> String {
-                    *content_for_set.lock().unwrap_or_else(|e| e.into_inner()) = content.clone();
-                    content
-                }),
+                "__setContent",
+                Func::new(
+                    move |content: String, new_base_url: rquickjs::function::Opt<String>| {
+                        *content_for_set.lock().unwrap_or_else(|e| e.into_inner()) = content;
+                        if let Some(base_url) = new_base_url.0 {
+                            *base_url_for_set.lock().unwrap_or_else(|e| e.into_inner()) = base_url;
+                        }
+                    },
+                ),
             )?;
             java_obj.set(
-                "ajax",
-                Func::new(|spec: String| -> String { java_ajax(&spec).unwrap_or_default() }),
+                "__nativeAjax",
+                Func::new(|ctx: rquickjs::Ctx<'_>, url: String| -> String {
+                    with_js_reentrant_ctx(&ctx, || java_analyzed_request_body(&url))
+                }),
             )?;
             java_obj.set(
                 "md5Encode",
@@ -850,7 +909,7 @@ fn eval_js_inner_with_source(
             )?;
 
             let default_content_for_get_string = content_state.clone();
-            let base_url_for_get_string = base_url_value.to_string();
+            let base_url_for_get_string = base_url_state.clone();
             java_obj.set(
                 "getString",
                 Func::new(
@@ -863,11 +922,15 @@ fn eval_js_inner_with_source(
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .clone();
+                        let base_url = base_url_for_get_string
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
                         java_get_string(
                             rule.as_deref(),
                             content.as_deref(),
                             &default_content,
-                            &base_url_for_get_string,
+                            &base_url,
                             is_url.unwrap_or(false),
                             unescape.unwrap_or(true),
                         )
@@ -876,7 +939,7 @@ fn eval_js_inner_with_source(
             )?;
 
             let default_content_for_get_string_list = content_state.clone();
-            let base_url_for_get_string_list = base_url_value.to_string();
+            let base_url_for_get_string_list = base_url_state.clone();
             java_obj.set(
                 "getStringList",
                 Func::new(
@@ -888,11 +951,15 @@ fn eval_js_inner_with_source(
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .clone();
+                        let base_url = base_url_for_get_string_list
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
                         java_get_string_list(
                             rule.as_deref(),
                             content.as_deref(),
                             &default_content,
-                            &base_url_for_get_string_list,
+                            &base_url,
                             is_url.unwrap_or(false),
                         )
                     },
@@ -900,7 +967,7 @@ fn eval_js_inner_with_source(
             )?;
 
             let content_for_elements = content_state.clone();
-            let base_url_for_elements = base_url_value.to_string();
+            let base_url_for_elements = base_url_state.clone();
             java_obj.set(
                 "getElements",
                 Func::new(
@@ -909,17 +976,21 @@ fn eval_js_inner_with_source(
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .clone();
+                        let base_url = base_url_for_elements
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
                         java_get_elements_json_with_mode(
                             &rule,
                             content.as_deref().unwrap_or(&default_content),
-                            &base_url_for_elements,
+                            &base_url,
                             raw_css.unwrap_or(false),
                         )
                     },
                 ),
             )?;
             let content_for_element = content_state.clone();
-            let base_url_for_element = base_url_value.to_string();
+            let base_url_for_element = base_url_state.clone();
             java_obj.set(
                 "getElement",
                 Func::new(move |rule: String, content: Option<String>| -> String {
@@ -927,27 +998,48 @@ fn eval_js_inner_with_source(
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .clone();
+                    let base_url = base_url_for_element
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
                     java_get_elements_json(
                         &rule,
                         content.as_deref().unwrap_or(&default_content),
-                        &base_url_for_element,
+                        &base_url,
                     )
                 }),
             )?;
 
+            let variable_overrides_for_put = variable_overrides.clone();
             java_obj.set(
                 "put",
-                Func::new(|key: String, val: String| -> bool {
-                    let mut map = JS_KV.lock().unwrap_or_else(|e| e.into_inner());
-                    map.insert(key, val);
-                    true
+                Func::new(move |key: String, val: String| -> String {
+                    variable_overrides_for_put
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(key.clone(), val.clone());
+                    if let Some(active) = crate::crawler::session::current_active_session() {
+                        active.set_variable_exact(&key, serde_json::Value::String(val.clone()));
+                    } else {
+                        JS_KV
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(key, val.clone());
+                    }
+                    val
                 }),
             )?;
             let rule_bindings = bindings.cloned().unwrap_or_default();
+            let variable_overrides_for_get = variable_overrides.clone();
             java_obj.set(
                 "__nativeVariableGet",
                 Func::new(move |key: String| -> String {
-                    scoped_java_variable(&rule_bindings, &key)
+                    variable_overrides_for_get
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&key)
+                        .cloned()
+                        .or_else(|| scoped_java_variable(&rule_bindings, &key))
                         .or_else(|| {
                             crate::crawler::session::current_active_session()
                                 .and_then(|session| session.get_variable(&key))
@@ -980,11 +1072,15 @@ fn eval_js_inner_with_source(
                 "longToast",
                 Func::new(|_msg: rquickjs::function::Opt<String>| {}),
             )?;
-            let base_url_for_html_format = base_url_value.to_string();
+            let base_url_for_html_format = base_url_state.clone();
             java_obj.set(
                 "htmlFormat",
                 Func::new(move |html: String| -> String {
-                    crate::parser::html::format_keep_img(&html, &base_url_for_html_format)
+                    let base_url = base_url_for_html_format
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    crate::parser::html::format_keep_img(&html, &base_url)
                 }),
             )?;
 
@@ -993,6 +1089,28 @@ fn eval_js_inner_with_source(
                 ctx.clone(),
                 r#"(function() {
                     const java = globalThis.java;
+                    const nativeSourceSetVariable = globalThis.source.setVariable;
+                    const nativeSourceRemoveVariable = globalThis.source.__removeVariable;
+                    const nativeSourceGetLoginHeader = globalThis.source.getLoginHeader;
+                    globalThis.source.getLoginHeader = function() {
+                        const value = nativeSourceGetLoginHeader();
+                        return value == null ? null : value;
+                    };
+                    globalThis.source.setVariable = function(value, extendedValue) {
+                        if (arguments.length > 1) {
+                            nativeSourceSetVariable(
+                                String(value == null ? '' : value),
+                                String(extendedValue == null ? '' : extendedValue));
+                            return;
+                        }
+                        if (value == null) {
+                            nativeSourceRemoveVariable();
+                            return;
+                        }
+                        nativeSourceSetVariable(String(value));
+                    };
+                    const nativeBase64Encode = java.base64Encode;
+                    const nativeBase64Decode = java.base64Decode;
                     const headersJson = headers => {
                         if (headers == null) return '{}';
                         if (typeof headers === 'string') {
@@ -1037,6 +1155,10 @@ fn eval_js_inner_with_source(
                         };
                     };
                     const nativeVariableGet = java.__nativeVariableGet;
+                    java.ajax = value => {
+                        const target = Array.isArray(value) ? value[0] : value;
+                        return java.__nativeAjax(String(target == null ? '' : target));
+                    };
                     java.get = function(url, headers) {
                         const target = String(url == null ? '' : url);
                         if (arguments.length < 2 && !/^https?:\/\//i.test(target)) {
@@ -1116,10 +1238,49 @@ fn eval_js_inner_with_source(
                         charset == null ? '' : String(charset));
                     java.hexDecodeToByteArray = value => JSON.parse(
                         java.__hexDecodeBytes(String(value)));
+                    java.base64Encode = function(value, flags) {
+                        const text = String(value == null ? '' : value);
+                        if (arguments.length < 2) return nativeBase64Encode(text);
+                        return java.__base64EncodeBytes(
+                            JSON.stringify(java.strToBytes(text, 'UTF-8')),
+                            Number(flags || 0));
+                    };
+                    java.base64Decode = function(value, charsetOrFlags) {
+                        const text = String(value == null ? '' : value);
+                        if (typeof charsetOrFlags === 'number') {
+                            const bytes = JSON.parse(java.__base64DecodeBytes(
+                                text, Number(charsetOrFlags)));
+                            return java.bytesToStr(bytes, 'UTF-8');
+                        }
+                        return charsetOrFlags == null
+                            ? nativeBase64Decode(text)
+                            : nativeBase64Decode(text, String(charsetOrFlags));
+                    };
+                    java.base64DecodeToByteArray = function(value, flags) {
+                        if (value == null || String(value).trim() === '') return null;
+                        return JSON.parse(java.__base64DecodeBytes(
+                            String(value), Number(flags || 0)));
+                    };
                     const nativeCacheGet = globalThis.cache.get;
+                    const nativeCachePut = globalThis.cache.put;
+                    const nativeCacheDelete = globalThis.cache.delete;
                     globalThis.cache.get = key => {
                         const value = nativeCacheGet(String(key));
                         return value == null ? null : value;
+                    };
+                    globalThis.cache.put = (key, value, saveTime) => {
+                        let stored;
+                        if (typeof value === 'string') stored = value;
+                        else {
+                            try { stored = JSON.stringify(value); }
+                            catch (_) { stored = String(value); }
+                        }
+                        if (stored === undefined) stored = String(value);
+                        if (saveTime == null) nativeCachePut(String(key), stored);
+                        else nativeCachePut(String(key), stored, Number(saveTime));
+                    };
+                    globalThis.cache.delete = key => {
+                        nativeCacheDelete(String(key));
                     };
                 })();"#,
             )?;
@@ -1167,7 +1328,7 @@ fn eval_js_inner_with_source(
             }
             eval_script(
                 ctx.clone(),
-                "source.getLoginInfo = function() { return globalThis.loginInfo || {}; }; source.getLoginInfoMap = function() { return new Map(Object.entries(globalThis.loginInfo || {}).map(([key, value]) => [key, String(value)])); }; java.reGetBook = function() { if (globalThis.__allowTocRefresh !== true) throw new Error('java.reGetBook is only available in preUpdateJs'); return false; }; java.refreshTocUrl = function() { if (globalThis.__allowTocRefresh !== true) throw new Error('java.refreshTocUrl is only available in preUpdateJs'); return false; };",
+                "source.getLoginInfo = function() { if (globalThis.loginInfo == null) return null; return typeof globalThis.loginInfo === 'string' ? globalThis.loginInfo : JSON.stringify(globalThis.loginInfo); }; source.getLoginInfoMap = function() { const raw = source.getLoginInfo(); if (raw == null) return null; let value; try { value = JSON.parse(raw); } catch (_) { return null; } return value && typeof value === 'object' ? new Map(Object.entries(value).map(([key, item]) => [key, String(item)])) : null; }; java.reGetBook = function() { if (globalThis.__allowTocRefresh !== true) throw new Error('java.reGetBook is only available in preUpdateJs'); throw new Error('java.reGetBook is not supported by this host'); }; java.refreshTocUrl = function() { if (globalThis.__allowTocRefresh !== true) throw new Error('java.refreshTocUrl is only available in preUpdateJs'); throw new Error('java.refreshTocUrl is not supported by this host'); };",
             )?;
 
             eval_script(
@@ -1175,28 +1336,41 @@ fn eval_js_inner_with_source(
                 r#"if (globalThis.java && globalThis.java.getString) {
                     const _orig_getString = globalThis.java.getString;
                     globalThis.java.getString = function(rule, content, isUrl, unescape) {
+                        const r = (rule !== undefined && rule !== null) ? String(rule) : undefined;
+                        if (typeof content === 'boolean' && arguments.length === 2) {
+                            return _orig_getString(r, undefined, false, content);
+                        }
                         if (typeof content === 'object' && content !== null) {
                             try { content = JSON.stringify(content); } catch (e) {}
                         }
-                        const r = (rule !== undefined && rule !== null) ? String(rule) : undefined;
                         const c = (content !== undefined && content !== null) ? String(content) : undefined;
                         return _orig_getString(r, c, isUrl, unescape);
                     };
                     const _orig_getStringList = globalThis.java.getStringList;
                     globalThis.java.getStringList = function(rule, content, isUrl) {
+                        if (rule == null || String(rule) === '') return null;
                         if (typeof content === 'object' && content !== null) {
                             try { content = JSON.stringify(content); } catch (e) {}
                         }
-                        const r = (rule !== undefined && rule !== null) ? String(rule) : undefined;
+                        const r = String(rule);
                         const c = (content !== undefined && content !== null) ? String(content) : undefined;
                         return _orig_getStringList(r, c, isUrl);
                     };
-                    const _origSetContent = globalThis.java.setContent;
-                    globalThis.java.setContent = function(content) {
-                        if (typeof content === 'object' && content !== null) {
+                    const _nativeSetContent = globalThis.java.__setContent;
+                    globalThis.java.setContent = function(content, newBaseUrl) {
+                        if (content == null) throw new Error('content cannot be null');
+                        if (typeof content === 'object') {
                             try { content = JSON.stringify(content); } catch (e) {}
                         }
-                        return _origSetContent(String(content == null ? '' : content));
+                        const normalized = String(content);
+                        const base = newBaseUrl == null ? undefined : String(newBaseUrl);
+                        if (base === undefined) _nativeSetContent(normalized);
+                        else _nativeSetContent(normalized, base);
+                        if (base !== undefined) {
+                            globalThis.baseUrl = base;
+                            globalThis.base_url = base;
+                        }
+                        return globalThis.java;
                     };
                     const _nativeGetElements = globalThis.java.getElements;
                     const _decorateItems = (values, rawCss = false) => {
@@ -2261,14 +2435,9 @@ fn resolve_js_lib_entry(entry: &str) -> anyhow::Result<String> {
     Ok(value.to_string())
 }
 
-fn java_time_format(timestamp: i64) -> String {
-    let secs = if timestamp > 1_000_000_000_000 {
-        timestamp / 1000
-    } else {
-        timestamp
-    };
-    match Local.timestamp_opt(secs, 0).single() {
-        Some(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
+fn java_time_format(timestamp_ms: i64) -> String {
+    match Local.timestamp_millis_opt(timestamp_ms).single() {
+        Some(dt) => dt.format("%Y/%m/%d %H:%M").to_string(),
         None => String::new(),
     }
 }
@@ -2434,7 +2603,21 @@ fn java_hmac_bytes(algorithm: &str, key_json: &str, data_json: &str) -> String {
 
 fn java_encode_uri(input: &str, charset: Option<&str>) -> String {
     let bytes = java_str_to_bytes(input, charset);
-    urlencoding::encode_binary(&bytes).into_owned()
+    let mut encoded = String::with_capacity(bytes.len());
+    for byte in bytes {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'*' => encoded.push(byte as char),
+            b' ' => encoded.push('+'),
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 fn js_cache_get(key: &str) -> Option<String> {
@@ -2466,55 +2649,6 @@ fn js_cache_delete(key: &str) -> bool {
         .unwrap_or_else(|error| error.into_inner())
         .remove(key)
         .is_some()
-}
-
-fn java_ajax(spec: &str) -> anyhow::Result<String> {
-    let (url, options) = split_ajax_spec(spec);
-    if url.trim().is_empty() {
-        return Ok(String::new());
-    }
-
-    let options_json = options
-        .and_then(|raw| serde_json::from_str::<JsonValue>(raw).ok())
-        .unwrap_or(JsonValue::Null);
-
-    let method = options_json
-        .get("method")
-        .and_then(|v| v.as_str())
-        .unwrap_or("GET")
-        .to_uppercase();
-    let method = Method::from_bytes(method.as_bytes()).unwrap_or(Method::GET);
-
-    let headers = options_json
-        .get("headers")
-        .and_then(|value| value.as_object())
-        .map(|headers| {
-            headers
-                .iter()
-                .filter_map(|(key, value)| {
-                    if let Some(value) = value.as_str() {
-                        Some((key.clone(), value.to_string()))
-                    } else if !value.is_null() {
-                        Some((key.clone(), value.to_string()))
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    let body = options_json.get("body").and_then(|value| {
-        if let Some(value) = value.as_str() {
-            Some(value.to_string())
-        } else if !value.is_null() {
-            Some(value.to_string())
-        } else {
-            None
-        }
-    });
-
-    Ok(active_js_http_client().request_text(method, url.trim(), &headers, body.as_deref())?)
 }
 
 fn java_request_simple(
@@ -2598,6 +2732,14 @@ fn java_request_simple_response_with_client(
         })
     };
     payload.to_string()
+}
+
+fn java_analyzed_request_body(url: &str) -> String {
+    let payload = java_analyzed_request_response(url, "");
+    serde_json::from_str::<JsonValue>(&payload)
+        .ok()
+        .and_then(|value| value.get("body").map(json_value_to_string))
+        .unwrap_or_default()
 }
 
 fn java_analyzed_request_response(url: &str, headers_json: &str) -> String {
@@ -2886,23 +3028,26 @@ mod tests {
                 const bytes = java.strToBytes('中文', 'GBK');
                 const decoded = java.bytesToStr(bytes, 'GBK');
                 const encoded = java.encodeURI('中文', 'GBK');
+                const formEncoded = java.encodeURI('a b/c~');
                 const b64 = java.base64Decode('5Lit5paH', 'UTF-8');
                 const hex = java.hexEncodeToString('reader');
                 const hexBytes = java.hexDecodeToByteArray(hex).join(',');
                 const hexText = java.hexDecodeToString(hex);
                 const digestAlias = java.md5Encode16('reader') === java.md5To16('reader');
                 const utc = java.timeFormatUTC(0, "yyyy-MM-dd HH:mm:ss.SSS", 28800000);
+                const localFormat = /^\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}$/.test(java.timeFormat(0));
                 cache.put('{cache_key}', 'cached', 60);
                 const cached = cache.get('{cache_key}');
                 const removed = cache.delete('{cache_key}');
-                [decoded, encoded, b64, hex, hexBytes, hexText, digestAlias, utc,
-                 cached, removed, cache.get('{cache_key}') === null].join('|');
+                [decoded, encoded, formEncoded, b64, hex, hexBytes, hexText, digestAlias, utc,
+                 localFormat, cached, typeof removed === 'undefined',
+                 cache.get('{cache_key}') === null].join('|');
             "#
         );
         let output = eval_js(&script, "", "https://example.com").unwrap();
         assert_eq!(
             output,
-            "中文|%D6%D0%CE%C4|中文|726561646572|114,101,97,100,101,114|reader|true|1970-01-01 08:00:00.000|cached|true|true"
+            "中文|%D6%D0%CE%C4|a+b%2Fc%7E|中文|726561646572|114,101,97,100,101,114|reader|true|1970-01-01 08:00:00.000|true|cached|true|true"
         );
 
         let expired_key = format!("js-expired-{}", Uuid::new_v4());
@@ -3053,12 +3198,12 @@ mod tests {
     }
 
     #[test]
-    fn java_connect_and_ajax_all_follow_analyze_url_header_precedence() {
+    fn java_network_helpers_follow_analyze_url_header_precedence() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let mut requests = Vec::new();
-            for _ in 0..3 {
+            for _ in 0..4 {
                 let (mut stream, _) = accept_with_timeout(&listener);
                 let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
                 let mut request = String::new();
@@ -3096,7 +3241,8 @@ mod tests {
             r#"/ajax,{"method":"POST","headers":{"X-Url":"configured","X-Order":"url"},"body":"payload","js":"result"}"#
                 .to_string();
         let script = format!(
-            "(() => {{ globalThis.__sourceHeaderCounter = 0; const all = java.ajaxAll([{}, {}]); const one = java.connect({}, {{'X-Order':'connect','X-Connect':'configured'}}); return [all[0].code(), all[1].code(), one.code(), all[0].body(), all[1].body(), one.body()].join('|'); }})()",
+            "(() => {{ globalThis.__sourceHeaderCounter = 0; const ajax = java.ajax([{}]); const all = java.ajaxAll([{}, {}]); const one = java.connect({}, {{'X-Order':'connect','X-Connect':'configured'}}); return [ajax, all[0].code(), all[1].code(), one.code(), all[0].body(), all[1].body(), one.body()].join('|'); }})()",
+            serde_json::to_string(&url).unwrap(),
             serde_json::to_string(&url).unwrap(),
             serde_json::to_string(&url).unwrap(),
             serde_json::to_string(&url).unwrap()
@@ -3113,11 +3259,11 @@ mod tests {
         let result = with_js_http_context(&client, &source, || {
             eval_js(&script, "", &source.book_source_url).unwrap()
         });
-        assert_eq!(result, "201|201|201|ok|ok|ok");
+        assert_eq!(result, "ok|201|201|201|ok|ok|ok");
 
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 3);
-        for (index, (request, body)) in requests[..2].iter().enumerate() {
+        assert_eq!(requests.len(), 4);
+        for (index, (request, body)) in requests[..3].iter().enumerate() {
             assert!(request.starts_with("post /ajax "));
             assert!(request.contains(&format!("x-source: {}", index + 1)));
             assert!(request.contains("x-url: configured"));
@@ -3125,12 +3271,12 @@ mod tests {
             assert_eq!(body, "payload");
         }
 
-        assert!(requests[2].0.starts_with("post /ajax "));
-        assert!(!requests[2].0.contains("x-source:"));
-        assert!(requests[2].0.contains("x-connect: configured"));
-        assert!(requests[2].0.contains("x-url: configured"));
-        assert!(requests[2].0.contains("x-order: url"));
-        assert_eq!(requests[2].1, "payload");
+        assert!(requests[3].0.starts_with("post /ajax "));
+        assert!(!requests[3].0.contains("x-source:"));
+        assert!(requests[3].0.contains("x-connect: configured"));
+        assert!(requests[3].0.contains("x-url: configured"));
+        assert!(requests[3].0.contains("x-order: url"));
+        assert_eq!(requests[3].1, "payload");
     }
 
     #[test]
@@ -3394,6 +3540,81 @@ mod tests {
     }
 
     #[test]
+    fn analyze_rule_overloads_and_base64_public_api_match_legado_shapes() {
+        let script = r#"
+            const twoArg = java.getString('$.value', false);
+            const blankList = java.getStringList('') === null;
+            const chained = java
+                .setContent('{"path":"/next"}', 'https://new.example/base/')
+                .getString('$.path', undefined, true);
+            const bytes = java.base64DecodeToByteArray('YWJj').join(',');
+            const flagsDecode = java.base64Decode('YWJj', 0);
+            const flagsEncode = java.base64Encode('abc', 2);
+            [twoArg, blankList, chained, bytes, flagsDecode, flagsEncode].join('|')
+        "#;
+        let result = eval_js(
+            script,
+            r#"{"value":"ok"}"#,
+            "https://example.com/old/",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            "ok|true|https://new.example/next|97,98,99|abc|YWJj"
+        );
+    }
+
+    #[test]
+    fn source_contract_uses_book_source_key_and_single_source_variable() {
+        let source = BookSource {
+            book_source_url: "https://source.example".to_string(),
+            ..Default::default()
+        };
+        let client = HttpClient::standalone();
+        let initial = ExecuteSession {
+            variables: Some(
+                [("sourceVariable".to_string(), json!("initial"))]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let result = with_active_session(
+            Some(&initial),
+            &source.book_source_url,
+            |_| {
+                with_js_http_context(&client, &source, || {
+                    eval_js(
+                        r#"
+                            const initialValue = source.getVariable();
+                            const setResult = source.setVariable('saved');
+                            const saved = source.getVariable();
+                            source.setVariable(null);
+                            [
+                                source.getKey(),
+                                initialValue,
+                                saved,
+                                source.getVariable(),
+                                source.getLoginHeader() === null,
+                                source.getLoginInfo() === null,
+                                typeof setResult === 'undefined'
+                            ].join('|')
+                        "#,
+                        "",
+                        &source.book_source_url,
+                    )
+                    .unwrap()
+                })
+            },
+        )
+        .0;
+        assert_eq!(
+            result,
+            "https://source.example|initial|saved||true|true|true"
+        );
+    }
+
+    #[test]
     fn java_get_reads_legado_book_and_chapter_variable_scopes() {
         let bindings = HashMap::from([
             (
@@ -3421,7 +3642,7 @@ mod tests {
         ]);
 
         let result = eval_js_with_bindings(
-            "[java.get('bookOnly'), java.get('chapterOnly'), java.get('shadowed'), java.get('headers'), java.get('bookName'), java.get('title')].join('|')",
+            "[java.get('bookOnly'), java.get('chapterOnly'), java.get('shadowed'), java.put('shadowed', 'updated'), java.get('shadowed'), java.get('headers'), java.get('bookName'), java.get('title')].join('|')",
             "",
             "https://example.com",
             &bindings,
@@ -3429,7 +3650,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             result,
-            r#"book-value|chapter-value|chapter-value|{"headers":{"X-Test":"ok"}}|Book|Chapter"#
+            r#"book-value|chapter-value|chapter-value|updated|updated|{"headers":{"X-Test":"ok"}}|Book|Chapter"#
         );
     }
 
@@ -3459,7 +3680,11 @@ mod tests {
                     "https://example.com",
                 )
                 .unwrap();
-                assert_eq!(res, "updated_val");
+                assert_eq!(res, "");
+                assert_eq!(
+                    eval_js("source.getVariable('myVar')", "", "https://example.com").unwrap(),
+                    "updated_val"
+                );
 
                 // Read login header
                 let h = eval_js("source.getLoginHeader()", "", "https://example.com").unwrap();

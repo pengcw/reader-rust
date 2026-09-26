@@ -134,6 +134,23 @@ impl ActiveSession {
         }
     }
 
+    pub fn set_variable_exact(&self, key: &str, value: Value) {
+        self.variables
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_string(), value);
+    }
+
+    pub fn remove_variable(&self, key: &str) {
+        let mut map = self.variables.lock().unwrap_or_else(|e| e.into_inner());
+        if key.is_empty() {
+            map.remove("variable");
+            map.remove("sourceVariable");
+        } else {
+            map.remove(key);
+        }
+    }
+
     pub fn get_login_header(&self) -> Option<Value> {
         self.header
             .lock()
