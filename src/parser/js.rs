@@ -1016,6 +1016,7 @@ fn eval_js_inner_with_source(
                     globalThis.__readerMakeStrResponse = strResponseFromJson;
                     java.connect = (url, headers) => strResponseFromJson(
                         java.__nativeConnect(String(url), headersJson(headers)));
+                    java.ajaxAll = urls => Array.from(urls || [], url => java.connect(String(url)));
                     java.strToBytes = (value, charset) => JSON.parse(
                         java.__strToBytes(String(value), charset == null ? '' : String(charset)));
                     java.bytesToStr = (bytes, charset) => java.__bytesToStr(
@@ -2479,6 +2480,70 @@ mod tests {
         )
         .unwrap();
         assert_eq!(invalid, "0|false|true|true");
+    }
+
+    #[test]
+    fn java_ajax_all_runs_sequentially_preserves_order_and_isolates_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, cookie, body) in [(201, true, "first"), (502, false, "last")] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    request.push_str(&line);
+                }
+                requests.push(request.to_ascii_lowercase());
+                if cookie {
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status} Created\r\nSet-Cookie: sid=ordered; Path=/\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                } else {
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status} Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                }
+            }
+            requests
+        });
+
+        let first = format!("http://{address}/first");
+        let last = format!("http://{address}/last");
+        let client = HttpClient::standalone();
+        let result = with_js_http_client(&client, || {
+            eval_js(
+                &format!(
+                    r#"(() => {{
+                        const responses = java.ajaxAll(['{first}', 'not-a-url', '{last}']);
+                        return [responses.length, responses[0].code(), responses[0].body().string(),
+                            responses[1].code(), responses[1].isSuccessful(), responses[1].callTime() < 0,
+                            responses[2].code(), responses[2].body().string()].join('|');
+                    }})()"#
+                ),
+                "",
+                &first,
+            )
+            .unwrap()
+        });
+        assert_eq!(result, "3|201|first|0|false|true|502|last");
+
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("get /first "));
+        assert!(requests[1].starts_with("get /last "));
+        assert!(requests[1].contains("cookie: sid=ordered"));
     }
 
     #[test]
