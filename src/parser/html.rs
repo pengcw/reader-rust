@@ -664,6 +664,34 @@ fn parse_attr_extractor(extractor: &str) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// Match Jsoup `TextNode.text()` followed by Legado's `trim { it <= ' ' }`.
+///
+/// Jsoup collapses its "actual whitespace" set (ASCII whitespace plus NBSP) to
+/// a single regular space and removes zero-width spaces / soft hyphens. Keep
+/// other Unicode whitespace, such as U+3000 IDEOGRAPHIC SPACE, untouched.
+fn normalize_jsoup_text_node(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut last_was_whitespace = false;
+
+    for ch in text.chars() {
+        if matches!(ch, ' ' | '\t' | '\n' | '\r' | '\x0C' | '\u{00A0}') {
+            if !last_was_whitespace {
+                normalized.push(' ');
+                last_was_whitespace = true;
+            }
+        } else if matches!(ch, '\u{200B}' | '\u{00AD}') {
+            continue;
+        } else {
+            normalized.push(ch);
+            last_was_whitespace = false;
+        }
+    }
+
+    normalized
+        .trim_matches(|ch| ch <= '\u{0020}')
+        .to_string()
+}
+
 /// Extract direct text nodes, matching Legado's Jsoup `Element.textNodes()` behavior.
 fn get_text_nodes(el: &ElementRef) -> String {
     let tag = el.value().name();
@@ -673,7 +701,7 @@ fn get_text_nodes(el: &ElementRef) -> String {
 
     el.children()
         .filter_map(|node| node.value().as_text())
-        .map(|text_node| text_node.text.trim().to_string())
+        .map(|text_node| normalize_jsoup_text_node(&text_node.text))
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
@@ -1801,6 +1829,23 @@ mod tests {
         let recursive_input = get_descendant_text_nodes(&element);
         assert!(recursive_input.contains("nested"));
         assert!(recursive_input.contains("read2();"));
+    }
+
+    #[test]
+    fn text_nodes_match_jsoup_whitespace_normalization() {
+        let doc = parse_document(
+            "<div id=\"content\">  alpha   \t beta&nbsp;&nbsp;gamma  <span>nested</span>　　正文　 </div>",
+        );
+        let element = select_list(&doc, "#content").into_iter().next().unwrap();
+
+        assert_eq!(
+            extract_text(&element, "textNodes"),
+            Some("alpha beta gamma\n　　正文　".to_string())
+        );
+        assert_eq!(
+            normalize_jsoup_text_node(" a\u{200B}\u{00AD}b "),
+            "ab".to_string()
+        );
     }
 
     #[test]
