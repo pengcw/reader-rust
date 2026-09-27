@@ -19,7 +19,7 @@ pub struct RuleEngine;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ContentPageResult {
     pub content: String,
-    pub next_url: Option<String>,
+    pub next_urls: Vec<String>,
     pub book_variable: Option<String>,
     pub chapter_variable: Option<String>,
 }
@@ -758,6 +758,31 @@ impl RuleEngine {
         chapter_title: Option<&str>,
         book_fields: Option<&HashMap<String, String>>,
     ) -> ContentPageResult {
+        self.content_page_with_context_follow(
+            source,
+            body,
+            base_url,
+            book_variable,
+            chapter_variable,
+            book_name,
+            chapter_title,
+            book_fields,
+            true,
+        )
+    }
+
+    pub(crate) fn content_page_with_context_follow(
+        &self,
+        source: &BookSource,
+        body: &str,
+        base_url: &str,
+        book_variable: Option<&str>,
+        chapter_variable: Option<&str>,
+        book_name: Option<&str>,
+        chapter_title: Option<&str>,
+        book_fields: Option<&HashMap<String, String>>,
+        follow_next: bool,
+    ) -> ContentPageResult {
         with_js_lib(source.js_lib.as_deref(), || {
             let mut context = RuleVariableContext::for_content_with_fields(
                 book_variable,
@@ -767,10 +792,14 @@ impl RuleEngine {
                 book_fields,
             );
             let content = self.content_with_context(source, body, base_url, &mut context);
-            let next_url = self.next_content_url_with_context(source, body, base_url, &mut context);
+            let next_urls = if follow_next {
+                self.next_content_urls_with_context(source, body, base_url, &mut context)
+            } else {
+                Vec::new()
+            };
             ContentPageResult {
                 content,
-                next_url,
+                next_urls,
                 book_variable: context.book_variable(),
                 chapter_variable: context.chapter_variable(),
             }
@@ -971,25 +1000,68 @@ impl RuleEngine {
                 book_name,
                 chapter_title,
             );
-            self.next_content_url_with_context(source, body, base_url, &mut context)
+            self.next_content_urls_with_context(source, body, base_url, &mut context)
+                .into_iter()
+                .next()
         })
     }
 
-    fn next_content_url_with_context(
+    fn next_content_urls_with_context(
         &self,
         source: &BookSource,
         body: &str,
         base_url: &str,
         context: &mut RuleVariableContext,
-    ) -> Option<String> {
-        let rule = source.rule_content.clone().unwrap_or_default();
-        let next_rule = rule.next_content_url.as_deref()?.trim();
-        if next_rule.is_empty() {
-            return None;
-        }
-
-        let next_url = self.eval_body_rule_with_context(next_rule, body, base_url, context)?;
-        (!next_url.is_empty()).then(|| resolve_url(base_url, &next_url))
+    ) -> Vec<String> {
+        let Some(next_rule) = source
+            .rule_content
+            .as_ref()
+            .and_then(|rule| rule.next_content_url.as_deref())
+            .map(str::trim)
+            .filter(|rule| !rule.is_empty())
+        else {
+            return Vec::new();
+        };
+        let simple_rule = !next_rule.contains("{{")
+            && !next_rule.contains("@js")
+            && !next_rule.contains("##")
+            && !next_rule.contains("@put:")
+            && !next_rule.contains("@get:");
+        let values = if simple_rule && next_rule.starts_with('$') {
+            serde_json::from_str::<Value>(body).ok().map(|value| {
+                jsonpath::jsonpath_query(&value, next_rule)
+                    .into_iter()
+                    .filter_map(|value| jsonpath::value_to_string(&value))
+                    .collect::<Vec<_>>()
+            })
+        } else if simple_rule && self.detect_mode(next_rule, body) == ParseMode::Css {
+            html::select_all_text(
+                &html::parse_document(body),
+                self.strip_mode_prefix(next_rule),
+            )
+            .map(|text| text.lines().map(str::to_owned).collect())
+        } else if simple_rule && self.detect_mode(next_rule, body) == ParseMode::XPath {
+            Some(html::select_xpath(body, self.strip_mode_prefix(next_rule)))
+        } else {
+            None
+        };
+        let values = values.unwrap_or_else(|| {
+            let Some(raw) = self.eval_body_rule_with_context(next_rule, body, base_url, context)
+            else {
+                return Vec::new();
+            };
+            if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&raw) {
+                items.iter().filter_map(jsonpath::value_to_string).collect()
+            } else {
+                raw.lines().map(str::to_owned).collect()
+            }
+        });
+        values
+            .into_iter()
+            .map(|url| url.trim().to_string())
+            .filter(|url| !url.is_empty())
+            .map(|url| resolve_url(base_url, &url))
+            .collect()
     }
 
     fn search_detail_fallback(
@@ -4087,7 +4159,7 @@ mod tests {
 
         assert_eq!(page.content, "正文");
         assert_eq!(
-            page.next_url.as_deref(),
+            page.next_urls.first().map(String::as_str),
             Some("https://books.example/chapter/next/NEXT")
         );
         let chapter_vars = serde_json::from_str::<HashMap<String, String>>(

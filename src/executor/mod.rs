@@ -935,7 +935,7 @@ fn execute_content(
         return Ok(success_without_http(json!({"content": content})));
     }
 
-    let mut current_url = initial_url.clone();
+    let mut pending = VecDeque::from([(initial_url.clone(), true)]);
     let mut visited_urls = HashSet::new();
     let mut fragments = Vec::new();
     let mut initial_response_url = None;
@@ -950,7 +950,10 @@ fn execute_content(
         .unwrap_or_else(|| source.book_source_type.unwrap_or(0) == 0);
     let mut truncated = false;
 
-    while !visited_urls.contains(&current_url) {
+    while let Some((current_url, follow_next)) = pending.pop_front() {
+        if visited_urls.contains(&current_url) {
+            continue;
+        }
         if visited_urls.len() >= options.max_pages {
             truncated = true;
             break;
@@ -979,7 +982,7 @@ fn execute_content(
         }
         let response_url = response.url.clone();
         let chapter_url = initial_response_url.get_or_insert_with(|| response_url.clone());
-        let page = engine.content_page_with_context(
+        let page = engine.content_page_with_context_follow(
             source,
             &response.body,
             &response.url,
@@ -988,23 +991,32 @@ fn execute_content(
             book_name.as_deref(),
             chapter_title.as_deref(),
             Some(&book_fields),
+            follow_next,
         );
         if !page.content.is_empty() {
             fragments.push(page.content);
         }
         book_variable = page.book_variable;
         chapter_variable = page.chapter_variable;
-        let next_url = page.next_url;
         final_response = Some(response);
 
-        match next_url {
-            Some(next_url)
-                if should_follow_content_page(chapter_url, &response_url, &next_url)
-                    && !visited_urls.contains(&next_url) =>
+        let recursive = page.next_urls.len() == 1;
+        for next_url in page.next_urls {
+            let allowed = if recursive {
+                should_follow_content_page(chapter_url, &response_url, &next_url)
+            } else {
+                same_origin_url(chapter_url, &next_url)
+            };
+            if allowed
+                && !visited_urls.contains(&next_url)
+                && !pending.iter().any(|(url, _)| url == &next_url)
             {
-                current_url = next_url;
+                if pending.len() + visited_urls.len() >= options.max_pages {
+                    truncated = true;
+                    break;
+                }
+                pending.push_back((next_url, recursive));
             }
-            Some(_) | None => break,
         }
     }
 
@@ -1559,6 +1571,17 @@ fn success(
 }
 
 // 复用主分支 BookService 的启发式，避免把章节翻页规则误判为下一章。
+fn same_origin_url(left: &str, right: &str) -> bool {
+    match (url::Url::parse(left), url::Url::parse(right)) {
+        (Ok(left), Ok(right)) => {
+            left.scheme() == right.scheme()
+                && left.host_str() == right.host_str()
+                && left.port_or_known_default() == right.port_or_known_default()
+        }
+        _ => false,
+    }
+}
+
 fn should_follow_content_page(chapter_url: &str, current_url: &str, next_url: &str) -> bool {
     let chapter_url = strip_fragment(chapter_url);
     let current_url = strip_fragment(current_url);
@@ -1898,6 +1921,148 @@ mod tests {
         assert!(uses_js_ajax_content_rule(&source(
             "@js: java.ajax(baseUrl)"
         )));
+    }
+
+    #[test]
+    fn multiple_next_content_urls_are_fetched_serially_in_order_without_recursing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut paths = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut buf = [0u8; 2048];
+                let size = stream.read(&mut buf).unwrap();
+                let path = String::from_utf8_lossy(&buf[..size])
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_string();
+                let body = match path.as_str() {
+                    "/chapter/1" => {
+                        r#"{"content":"first","next":["/part-two","/part-three","/part-two","/chapter/1"]}"#
+                    }
+                    "/part-two" => r#"{"content":"second","next":["/part-four"]}"#,
+                    "/part-three" => r#"{"content":"third","next":["/part-four"]}"#,
+                    _ => panic!("unexpected page: {path}"),
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                paths.push(path);
+            }
+            paths
+        });
+        let source = serde_json::json!({"bookSourceName":"multi-page", "bookSourceUrl":base,
+            "ruleContent":{"content":"$.content","nextContentUrl":"$.next[*]"}});
+        let request = serde_json::json!({"api":2,"op":"content","params":{"url":format!("{base}/chapter/1")}});
+        let result: Value =
+            serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["content"], "first\nsecond\nthird");
+        assert_eq!(result["data"]["pages"], 3);
+        assert_eq!(
+            server.join().unwrap(),
+            ["/chapter/1", "/part-two", "/part-three"]
+        );
+    }
+
+    #[test]
+    fn next_content_rule_preserves_css_and_js_url_lists() {
+        let engine = crate::parser::rule_engine::RuleEngine::new().unwrap();
+        let base = "https://example.com/chapter/1";
+        for (rule, body) in [
+            ("@css:.pages a@href", "<div class='pages'><a href='/chapter/1-2'>two</a><a href='/chapter/1-3'>three</a></div>"),
+            ("@js:JSON.stringify(['/chapter/1-2','/chapter/1-3'])", "<p>main</p>"),
+        ] {
+            let source: BookSource = serde_json::from_value(serde_json::json!({
+                "bookSourceName":"list rules", "bookSourceUrl":base,
+                "ruleContent":{"content":"body@text", "nextContentUrl":rule}
+            })).unwrap();
+            let page = engine.content_page_with_variables(&source, body, base, None, None, None, None);
+            assert_eq!(page.next_urls, ["https://example.com/chapter/1-2", "https://example.com/chapter/1-3"], "{rule}");
+        }
+    }
+
+    #[test]
+    fn failed_content_sibling_stops_remaining_pages() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for index in 0..2 {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut buf = [0u8; 2048];
+                stream.read(&mut buf).unwrap();
+                let (status, body) = if index == 0 {
+                    (
+                        "200 OK",
+                        r#"{"content":"first","next":["/chapter/1-2","/chapter/1-3"]}"#,
+                    )
+                } else {
+                    ("404 Not Found", "missing")
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let source = serde_json::json!({"bookSourceName":"failed sibling", "bookSourceUrl":base,
+            "ruleContent":{"content":"$.content","nextContentUrl":"$.next[*]"}});
+        let request = serde_json::json!({"api":2,"op":"content","params":{"url":format!("{base}/chapter/1")}});
+        let result: Value =
+            serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["error"]["status"], 404);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn multiple_content_pages_share_a_total_page_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut paths = Vec::new();
+            for index in 0..2 {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut buf = [0u8; 2048];
+                let size = stream.read(&mut buf).unwrap();
+                paths.push(
+                    String::from_utf8_lossy(&buf[..size])
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap()
+                        .to_string(),
+                );
+                let body = if index == 0 {
+                    r#"{"content":"first","next":["/chapter/1-2","/chapter/1-3"]}"#
+                } else {
+                    r#"{"content":"second"}"#
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+            paths
+        });
+        let source = serde_json::json!({"bookSourceName":"bounded pages", "bookSourceUrl":base,
+            "ruleContent":{"content":"$.content","nextContentUrl":"$.next[*]"}});
+        let request = serde_json::json!({"api":2,"op":"content","params":{
+            "url":format!("{base}/chapter/1")},"options":{"maxPages":2}});
+        let result: Value =
+            serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["content"], "first\nsecond");
+        assert_eq!(result["data"]["truncated"], true);
+        assert_eq!(server.join().unwrap(), ["/chapter/1", "/chapter/1-2"]);
     }
 
     #[test]
