@@ -1795,6 +1795,12 @@ fn eval_js_inner_with_source(
                 }"#,
             )?;
 
+            globals.get::<_, Object<'_>>("java")?.set(
+                "__jsoupRemove",
+                Func::new(|source: String, selector: String| -> Option<String> {
+                    jsoup_remove_elements(&source, &selector)
+                }),
+            )?;
             eval_script(
                 ctx.clone(),
                 r#"(function() {
@@ -1805,10 +1811,18 @@ fn eval_js_inner_with_source(
                     globalThis.org.jsoup.Jsoup = asObject(globalThis.org.jsoup.Jsoup);
                     if (typeof globalThis.org.jsoup.Jsoup.parse !== 'function') {
                         globalThis.org.jsoup.Jsoup.parse = function(html) {
-                            const source = String(html == null ? '' : html);
+                            let source = String(html == null ? '' : html);
                             return {
                                 select(selector) {
-                                    return globalThis.java.getElements(String(selector), source, true);
+                                    const rule = String(selector);
+                                    const items = globalThis.java.getElements(rule, source, true);
+                                    items.remove = function() {
+                                        const updated = globalThis.java.__jsoupRemove(source, rule);
+                                        if (updated == null) throw new Error('invalid jsoup remove selector');
+                                        source = updated;
+                                        return items;
+                                    };
+                                    return items;
                                 }
                             };
                         };
@@ -2569,6 +2583,23 @@ pub(crate) fn java_get_string_list(
     }
 
     list
+}
+
+fn jsoup_remove_elements(source: &str, selector: &str) -> Option<String> {
+    if !html::css_rule_is_valid(selector) {
+        return None;
+    }
+    let mut document = html::parse_document(source);
+    let ids = html::select_css_list(&document, selector)
+        .iter()
+        .map(|element| element.id())
+        .collect::<Vec<_>>();
+    for id in ids {
+        if let Some(mut node) = document.tree.get_mut(id) {
+            node.detach();
+        }
+    }
+    Some(document.html())
 }
 
 fn java_get_elements_json(rule: &str, content: &str, base_url: &str) -> String {
@@ -4285,6 +4316,48 @@ mod tests {
         assert!(requests[3].0.contains("x-url: configured"));
         assert!(requests[3].0.contains("x-order: url"));
         assert_eq!(requests[3].1, "payload");
+    }
+
+    #[test]
+    fn jsoup_document_remove_updates_later_select_without_leaking() {
+        // Core of the local 菠萝猫 content rule: remove hidden nodes, then read paragraphs.
+        let script = r#"
+            var doc = org.jsoup.Jsoup.parse(result);
+            doc.select("[style*='display:none']").remove();
+            doc.select("[style*='display: none']").remove();
+            doc.select("[style*='font-size:0']").remove();
+            doc.select("[style*='font-size: 0']").remove();
+            doc.select("[style*='visibility:hidden']").remove();
+            doc.select("[style*='visibility: hidden']").remove();
+            var paragraphs = doc.select("div.content p").toArray();
+            var textList = [];
+            for (var i = 0; i < paragraphs.length; i++) {
+                var txt = paragraphs[i].text().trim();
+                if (txt) textList.push(txt);
+            }
+            textList.join('\n\n');
+        "#;
+        let html = r#"<div class="content"><p>first</p><p style="display:none">hidden</p><p style="font-size: 0">tiny</p><div style="visibility: hidden"><p>also hidden</p></div><p>second</p></div>"#;
+        assert_eq!(
+            eval_js(script, html, "https://example.com").unwrap(),
+            "first\n\nsecond"
+        );
+        let next = r#"<div class="content"><p style="display:none">secret</p><p>another</p></div>"#;
+        assert_eq!(
+            eval_js(script, next, "https://example.com").unwrap(),
+            "another"
+        );
+        assert_eq!(
+            eval_js("var a=org.jsoup.Jsoup.parse(result), b=org.jsoup.Jsoup.parse(result); a.select('p').remove(); a.select('p').size() + '|' + b.select('p').size()", "<p>fresh</p>", "https://example.com").unwrap(),
+            "0|1"
+        );
+        assert!(eval_js(
+            "org.jsoup.Jsoup.parse(result).select('p').first().text()",
+            "<p>fresh</p>",
+            "https://example.com"
+        )
+        .unwrap()
+        .contains("fresh"));
     }
 
     #[test]
