@@ -4283,7 +4283,7 @@ mod tests {
     }
 
     #[test]
-    fn java_connect_and_normal_url_share_header_plan() {
+    fn java_connect_and_ajax_share_normal_url_header_plan() {
         use crate::crawler::session::{with_active_session, ExecuteSession};
         use crate::crawler::{analyze_url, HttpSession};
 
@@ -4291,7 +4291,7 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
             let mut requests = Vec::new();
-            for _ in 0..3 {
+            for _ in 0..4 {
                 let (mut stream, _) = accept_with_timeout(&listener);
                 let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
                 let mut request = String::new();
@@ -4343,6 +4343,17 @@ mod tests {
                 )
                 .unwrap()
             });
+            let ajax = with_js_http_context(&client, &source, || {
+                eval_js(
+                    &format!(
+                        "(() => {{ const body = java.ajax({}); return body + '|' + (java.headerMap === undefined); }})()",
+                        serde_json::to_string(&target).unwrap()
+                    ),
+                    "",
+                    &base,
+                )
+                .unwrap()
+            });
             let explicit = with_js_http_context(&client, &source, || {
                 eval_js(
                     &format!(
@@ -4354,24 +4365,25 @@ mod tests {
                 )
                 .unwrap()
             });
-            (normal, connect, explicit)
+            (normal, connect, ajax, explicit)
         });
         assert_eq!(
             result,
             (
-                "ok".to_string(),
-                "ok|true".to_string(),
-                "ok|true".to_string()
+                "ok".into(),
+                "ok|true".into(),
+                "ok|true".into(),
+                "ok|true".into()
             )
         );
         let requests = server.join().unwrap();
-        for request in &requests[..2] {
+        for request in &requests[..3] {
             assert!(request.contains("x-source: source\r\n"), "{request}");
             assert!(request.contains("x-login: login\r\n"), "{request}");
             assert!(request.contains("x-order: js\r\n"), "{request}");
             assert!(request.contains("x-js: signed\r\n"), "{request}");
         }
-        let explicit = &requests[2];
+        let explicit = &requests[3];
         assert!(!explicit.contains("x-source:"), "{explicit}");
         assert!(!explicit.contains("x-login:"), "{explicit}");
         assert!(explicit.contains("x-explicit: yes\r\n"), "{explicit}");
