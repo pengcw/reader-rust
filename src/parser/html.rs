@@ -174,10 +174,59 @@ fn quote_unquoted_colon_attribute_values(selector: &str) -> Option<String> {
     Some(output)
 }
 
+// Jsoup's :eq(n) tests the zero-based *element sibling* index, not the
+// position in the complete query result. CSS :nth-child is one-based.
+fn normalize_jsoup_eq(selector: &str) -> Option<String> {
+    let mut output = String::with_capacity(selector.len());
+    let mut cursor = 0;
+    let mut quote = None;
+    let mut bracket_depth = 0usize;
+    let mut escaped = false;
+    for (index, ch) in selector.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active) = quote {
+            if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            ':' if bracket_depth == 0 && selector[index..].starts_with(":eq(") => {
+                let start = index + 4;
+                let end = start
+                    + selector[start..]
+                        .bytes()
+                        .take_while(u8::is_ascii_digit)
+                        .count();
+                if end > start && selector[end..].starts_with(')') {
+                    let nth = selector[start..end].parse::<usize>().ok()?.checked_add(1)?;
+                    output.push_str(&selector[cursor..index]);
+                    output.push_str(&format!(":nth-child({nth})"));
+                    cursor = end + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    output.push_str(&selector[cursor..]);
+    Some(output)
+}
+
 fn parse_css_selector(css_selector: &str) -> Option<Selector> {
-    Selector::parse(css_selector).ok().or_else(|| {
-        let normalized = quote_unquoted_colon_attribute_values(css_selector)?;
-        Selector::parse(&normalized).ok()
+    let normalized = normalize_jsoup_eq(css_selector)?;
+    Selector::parse(&normalized).ok().or_else(|| {
+        let quoted = quote_unquoted_colon_attribute_values(&normalized)?;
+        Selector::parse(&quoted).ok()
     })
 }
 
@@ -1885,6 +1934,28 @@ mod tests {
         assert_eq!(legado_to_css("id.main"), "#main");
         assert_eq!(legado_to_css("tag.div"), "div");
         assert_eq!(legado_to_css("ul li"), "ul li");
+    }
+
+    #[test]
+    fn jsoup_eq_uses_element_sibling_index_not_result_index() {
+        let doc = parse_document(
+            r#"<div class="item"><a>first</a></div><div>other</div><div class="item"><a>third</a></div><section><div class="item"><a>nested first</a></div></section>"#,
+        );
+        let texts = select_css_list(&doc, ".item:eq(2) a")
+            .iter()
+            .map(|el| el.text().collect::<String>())
+            .collect::<Vec<_>>();
+        assert_eq!(texts, vec!["third"]);
+        let first = select_css_list(&doc, ".item:eq(0) a")
+            .iter()
+            .map(|el| el.text().collect::<String>())
+            .collect::<Vec<_>>();
+        assert_eq!(first, vec!["first", "nested first"]);
+        assert!(css_rule_is_valid(".item:eq(1) a@text"));
+        assert_eq!(select_text_list(&doc, ".item:eq(2) a@text"), vec!["third"]);
+        assert_eq!(select_css_list(&doc, ".item:eq(1) a").len(), 0);
+        assert!(parse_css_selector(r#"[data-name=":eq(0)"]"#).is_some());
+        assert_eq!(select_css_list(&doc, ".item:eq(-1)").len(), 0);
     }
 
     #[test]
