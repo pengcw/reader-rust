@@ -50,6 +50,7 @@ pub struct UrlRuleContext {
     pub book_name: Option<String>,
     pub chapter_title: Option<String>,
     pub book_fields: HashMap<String, String>,
+    pub chapter_fields: serde_json::Map<String, Value>,
 }
 
 impl UrlRuleContext {
@@ -73,6 +74,7 @@ impl UrlRuleContext {
 
         let chapter_variables = Self::variable_map(self.chapter_variable.as_deref());
         let mut chapter = chapter_variables.clone();
+        chapter.extend(self.chapter_fields.clone());
         chapter.insert("variableMap".to_string(), Value::Object(chapter_variables));
         if let Some(title) = self.chapter_title.as_deref() {
             chapter.insert("title".to_string(), Value::String(title.to_string()));
@@ -1683,6 +1685,7 @@ mod tests {
             book_name: Some("Book Name".to_string()),
             chapter_title: Some("Chapter Title".to_string()),
             book_fields: HashMap::new(),
+            chapter_fields: serde_json::Map::new(),
         };
         let spec = analyze_url_with_context(
             "/{{book.variableMap.token}}/{{chapter.variableMap.cid}}/{{@get:{cid}}}/{{title}},{\"js\":\"result + '?name=' + encodeURIComponent(book.bookName)\"}",

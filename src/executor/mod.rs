@@ -547,7 +547,23 @@ fn url_rule_context_with_fields(
         book_name: book_name.map(str::to_string),
         chapter_title: chapter_title.map(str::to_string),
         book_fields: book_fields.cloned().unwrap_or_default(),
+        chapter_fields: serde_json::Map::new(),
     }
+}
+
+fn input_chapter_fields(params: &Value, url: &str) -> serde_json::Map<String, Value> {
+    let mut fields = params
+        .get("chapter")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    fields.entry("url").or_insert_with(|| json!(url));
+    if let Some(is_volume) = params.get("isVolume") {
+        fields
+            .entry("isVolume")
+            .or_insert_with(|| is_volume.clone());
+    }
+    fields
 }
 
 fn input_chapter_is_volume(params: &Value) -> bool {
@@ -931,13 +947,14 @@ fn execute_content(
             truncated = true;
             break;
         }
-        let request_context = url_rule_context_with_fields(
+        let mut request_context = url_rule_context_with_fields(
             book_variable.as_deref(),
             chapter_variable.as_deref(),
             book_name.as_deref(),
             chapter_title.as_deref(),
             Some(&book_fields),
         );
+        request_context.chapter_fields = input_chapter_fields(params, &initial_url);
         let response = fetch_rule_with_context(
             session,
             source,
@@ -1824,6 +1841,48 @@ mod tests {
         assert!(uses_js_ajax_content_rule(&source(
             "@js: java.ajax(baseUrl)"
         )));
+    }
+
+    #[test]
+    fn content_url_js_receives_chapter_fields_without_changing_source_header_scope() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = accept_with_timeout(&listener);
+            let mut request = [0u8; 4096];
+            let size = stream.read(&mut request).unwrap();
+            let head = String::from_utf8_lossy(&request[..size]).into_owned();
+            let body = r#"{"data":{"content":"chapter text"}}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            head
+        });
+        let source = serde_json::json!({
+            "bookSourceName":"chapter context",
+            "bookSourceUrl":base,
+            "header":"@js: JSON.stringify({'X-Source': source.getKey()})",
+            "ruleContent":{"content":"$.data.content"}
+        });
+        let request = serde_json::json!({
+            "api":2,"op":"content","params":{
+                "url":format!(r#"{base}/chapter,{{"js":"result + '?id=' + chapter.index + '&volume=' + chapter.isVolume + '&url=' + encodeURIComponent(chapter.url) + '&book=' + book.name + '&token=' + chapter.variableMap.token"}}"#),
+                "book":{"name":"Book"},
+                "chapter":{"url":"/chapter/42","index":7,"isVolume":false,"title":"Chapter","variableMap":{"token":"T"}}
+            }
+        });
+        let result: Value =
+            serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["content"], "chapter text");
+        let head = server.join().unwrap();
+        assert!(
+            head.contains("GET /chapter?id=7&volume=false&url=%2Fchapter%2F42&book=Book&token=T "),
+            "{head}"
+        );
+        assert!(
+            head.to_ascii_lowercase()
+                .contains(&format!("x-source: {base}")),
+            "{head}"
+        );
     }
 
     #[test]
