@@ -3499,6 +3499,8 @@ fn http_status_message(status: u16) -> String {
 }
 
 fn java_error_response(url: &str, error: &str) -> String {
+    // Android returns a JVM stack trace for request failures; preserve the
+    // string/StrResponse contract without inventing a Java stack in the SO.
     let raw_url = split_ajax_spec(url).0.trim();
     let response_url = url::Url::parse(raw_url)
         .ok()
@@ -3875,6 +3877,76 @@ mod tests {
             .unwrap()
         });
         assert_eq!(invalid, "200|OK|true|http://localhost/|true|200");
+    }
+
+    #[test]
+    fn java_ajax_and_connect_keep_http_errors_separate_from_transport_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/missing", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 7\r\nConnection: close\r\n\r\nmissing").unwrap();
+            }
+        });
+        let source = BookSource {
+            book_source_url: url.clone(),
+            ..Default::default()
+        };
+        let client = HttpClient::standalone();
+        let script = format!(
+            "(() => {{ const body = java.ajax({url:?}); const response = java.connect({url:?}); return [body, response.code(), response.body(), response.isSuccessful()].join('|'); }})()"
+        );
+        let result = with_js_http_context(&client, &source, || eval_js(&script, "", &url).unwrap());
+        assert_eq!(result, "missing|404|missing|false");
+        server.join().unwrap();
+
+        let result = with_js_http_context(&client, &source, || {
+            eval_js(
+                "(() => { const body = java.ajax('ftp://invalid'); const response = java.connect('ftp://invalid'); return [typeof body, body.length > 0, response.code(), response.body().length > 0].join('|'); })()",
+                "", &url,
+            ).unwrap()
+        });
+        assert_eq!(result, "string|true|200|true");
+    }
+
+    #[test]
+    fn java_ajax_and_connect_return_values_on_broken_transport() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/broken", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                write!(stream, "not an HTTP response\r\n").unwrap();
+            }
+        });
+        let source = BookSource {
+            book_source_url: url.clone(),
+            ..Default::default()
+        };
+        let client = HttpClient::standalone();
+        let script = format!(
+            "(() => {{ const body = java.ajax({url:?}); const response = java.connect({url:?}); return [typeof body, body.length > 0, response.code(), response.body().length > 0].join('|'); }})()"
+        );
+        let result = with_js_http_context(&client, &source, || eval_js(&script, "", &url).unwrap());
+        assert_eq!(result, "string|true|200|true");
+        server.join().unwrap();
     }
 
     #[test]
