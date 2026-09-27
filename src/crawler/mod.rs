@@ -103,7 +103,10 @@ impl UrlRuleContext {
             values.get(key).and_then(value_to_string)
         };
         match key {
-            "bookName" => self.book_name.clone().or_else(|| self.book_fields.get("name").cloned()),
+            "bookName" => self
+                .book_name
+                .clone()
+                .or_else(|| self.book_fields.get("name").cloned()),
             "title" => self.chapter_title.clone(),
             _ => lookup(self.chapter_variable.as_deref())
                 .or_else(|| lookup(self.book_variable.as_deref()))
@@ -127,6 +130,17 @@ pub struct RequestSpec {
     pub retry: usize,
     pub proxy: Option<String>,
     pub response_type: Option<String>,
+    pub(crate) body_js: Option<BodyJs>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BodyJs {
+    script: String,
+    key: String,
+    page: i32,
+    source_key: String,
+    js_lib: Option<String>,
+    bindings: Option<HashMap<String, Value>>,
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +154,7 @@ pub struct HttpResponse {
 #[derive(Debug, Clone)]
 pub enum FetchError {
     InvalidUrl(String),
+    Rule(String),
     Network(String),
     Timeout {
         url: Option<String>,
@@ -281,12 +296,14 @@ impl HttpSession {
                         return Err(FetchError::HttpStatus { status, url });
                     }
 
-                    let body = format_response_body(
+                    let body = format_analyzed_body(
+                        spec,
                         &response.body,
                         decoded_body,
                         content_type.as_deref(),
-                        spec.response_type.as_deref(),
-                    );
+                        &url,
+                    )
+                    .map_err(FetchError::Rule)?;
                     return Ok(HttpResponse {
                         url,
                         status,
@@ -611,6 +628,18 @@ fn compile_url_request(
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned);
+    let body_js = options
+        .get("bodyJs")
+        .and_then(Value::as_str)
+        .filter(|script| !script.trim().is_empty())
+        .map(|script| BodyJs {
+            script: script.to_string(),
+            key: key.to_string(),
+            page,
+            source_key: source.book_source_url.clone(),
+            js_lib: source.js_lib.clone(),
+            bindings: bindings.clone(),
+        });
     let body = prepare_request_body(
         method == Method::POST,
         body,
@@ -627,6 +656,7 @@ fn compile_url_request(
         retry,
         proxy,
         response_type,
+        body_js,
     })
 }
 
@@ -1183,19 +1213,41 @@ fn is_encoded_form(body: &str) -> bool {
     true
 }
 
-fn format_response_body(
+pub(crate) fn format_analyzed_body(
+    spec: &RequestSpec,
     raw_body: &[u8],
     decoded_body: String,
     content_type: Option<&str>,
-    response_type: Option<&str>,
-) -> String {
-    if response_type.is_some_and(|value| !value.trim().is_empty()) {
-        return raw_body.iter().map(|byte| format!("{byte:02x}")).collect();
+    response_url: &str,
+) -> Result<String, String> {
+    if spec
+        .response_type
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Ok(raw_body.iter().map(|byte| format!("{byte:02x}")).collect());
     }
-    if content_type.is_some_and(is_xml_content_type) && !decoded_body.starts_with("<?xml") {
-        return format!("<?xml version=\"1.0\"?>{decoded_body}");
+    // Android AnalyzeUrl's XML declaration branch precedes bodyJs.
+    if content_type.is_some_and(is_xml_content_type)
+        && !decoded_body.trim_start().starts_with("<?xml")
+    {
+        return Ok(format!("<?xml version=\"1.0\"?>{decoded_body}"));
     }
-    decoded_body
+    let Some(body_js) = &spec.body_js else {
+        return Ok(decoded_body);
+    };
+    with_js_lib(body_js.js_lib.as_deref(), || {
+        eval_js_url_with_bindings(
+            &body_js.script,
+            &decoded_body,
+            &body_js.key,
+            body_js.page,
+            &body_js.source_key,
+            response_url,
+            body_js.bindings.as_ref(),
+        )
+    })
+    .map_err(|error| format!("URL option bodyJs failed: {error}"))
 }
 
 fn is_xml_content_type(content_type: &str) -> bool {
@@ -1364,6 +1416,141 @@ mod tests {
             header: header.map(str::to_owned),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn android_url_methods_send_expected_requests() {
+        use std::io::{BufRead, Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let source = BookSource {
+            book_source_url: base.clone(),
+            enabled_cookie_jar: Some(false),
+            ..Default::default()
+        };
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut first_line = String::new();
+                reader.read_line(&mut first_line).unwrap();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                requests.push((first_line, String::from_utf8(body).unwrap()));
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+            }
+            requests
+        });
+        let session = HttpSession::new(&source, 3000).unwrap();
+        for (method, body) in [
+            ("GET", ""),
+            ("POST", "q=hello"),
+            ("HEAD", ""),
+            ("PUT", ""), // Android's unknown URL method falls back to GET.
+        ] {
+            let rule = format!(r#"/method,{{"method":"{method}","body":"{body}"}}"#);
+            let spec = analyze_url(&rule, "", 1, &base, &source).unwrap();
+            assert_eq!(
+                spec.method.to_string(),
+                if method == "PUT" { "GET" } else { method }
+            );
+            session.fetch(&spec, 1024).unwrap();
+        }
+        let requests = server.join().unwrap();
+        for (index, method) in ["GET", "POST", "HEAD", "GET"].into_iter().enumerate() {
+            assert!(requests[index].0.starts_with(&format!("{method} /method ")));
+        }
+        assert_eq!(requests[1].1, "q=hello");
+        assert_eq!(requests[3].1, "");
+    }
+
+    #[test]
+    fn android_body_js_transforms_response_unless_xml_header_is_inserted() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let source = BookSource {
+            book_source_url: base.clone(),
+            enabled_cookie_jar: Some(false),
+            ..Default::default()
+        };
+        let server = std::thread::spawn(move || {
+            for (content_type, body) in [
+                ("text/plain", "original"),
+                ("application/xml", "<root/>"),
+                ("application/xml", "<?xml version=\"1.0\"?><root/>"),
+                ("text/plain", "original"),
+                ("text/plain", "original"),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 4096];
+                stream.read(&mut request).unwrap();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let session = HttpSession::new(&source, 3000).unwrap();
+        let context = UrlRuleContext {
+            chapter_title: Some("Chapter".to_string()),
+            ..Default::default()
+        };
+        let script = "result + ':' + title + ':' + key + ':' + page";
+        let rule = format!(r#"/page,{{"bodyJs":"{script}"}}"#);
+        let spec =
+            analyze_url_with_context(&rule, "word", 2, &base, &source, Some(&context)).unwrap();
+        let plain = session.fetch(&spec, 1024).unwrap();
+        assert_eq!(plain.body, "original:Chapter:word:2");
+        assert_eq!(plain.status, 200);
+        assert_eq!(
+            session.fetch(&spec, 1024).unwrap().body,
+            "<?xml version=\"1.0\"?><root/>"
+        );
+        assert_eq!(
+            session.fetch(&spec, 1024).unwrap().body,
+            "<?xml version=\"1.0\"?><root/>:Chapter:word:2"
+        );
+
+        let hex_spec = analyze_url(
+            &format!(r#"/page,{{"type":"hex","bodyJs":"{script}"}}"#),
+            "",
+            1,
+            &base,
+            &source,
+        )
+        .unwrap();
+        assert_eq!(
+            session.fetch(&hex_spec, 1024).unwrap().body,
+            "6f726967696e616c"
+        );
+        let bad_spec = analyze_url(
+            r#"/page,{"bodyJs":"throw new Error('boom')"}"#,
+            "",
+            1,
+            &base,
+            &source,
+        )
+        .unwrap();
+        assert!(
+            matches!(session.fetch(&bad_spec, 1024), Err(FetchError::Rule(message)) if message.contains("bodyJs") && message.contains("boom"))
+        );
+        server.join().unwrap();
     }
 
     #[test]
@@ -1613,20 +1800,36 @@ mod tests {
         }));
 
         assert_eq!(
-            format_response_body(b"<root/>", "<root/>".into(), Some("application/xml"), None),
+            format_analyzed_body(
+                &xml,
+                b"<root/>",
+                "<root/>".into(),
+                Some("application/xml"),
+                "https://a.test/submit",
+            )
+            .unwrap(),
             "<?xml version=\"1.0\"?><root/>"
         );
         assert_eq!(
-            format_response_body(&[0, 255], String::new(), None, Some("hex")),
+            format_analyzed_body(
+                &json,
+                &[0, 255],
+                String::new(),
+                None,
+                "https://a.test/submit"
+            )
+            .unwrap(),
             "00ff"
         );
         assert_eq!(
-            format_response_body(
+            format_analyzed_body(
+                &xml,
                 b"<?xml version='1.0'?>",
                 "<?xml version='1.0'?>".into(),
                 Some("text/xml"),
-                None
-            ),
+                "https://a.test/submit",
+            )
+            .unwrap(),
             "<?xml version='1.0'?>"
         );
     }

@@ -1,5 +1,5 @@
 use crate::crawler::{
-    analyze_url_with_headers, decode_body, execute_request_spec, HttpClient,
+    analyze_url_with_headers, decode_body, execute_request_spec, format_analyzed_body, HttpClient,
 };
 use crate::model::book_source::BookSource;
 use crate::parser::html;
@@ -138,10 +138,7 @@ fn active_js_http_client() -> HttpClient {
         .unwrap_or_else(|| JS_HTTP_CLIENT.clone())
 }
 
-fn with_js_reentrant_ctx<T>(
-    ctx: &rquickjs::Ctx<'_>,
-    f: impl FnOnce() -> T,
-) -> T {
+fn with_js_reentrant_ctx<T>(ctx: &rquickjs::Ctx<'_>, f: impl FnOnce() -> T) -> T {
     ACTIVE_JS_REENTRANT_CTX.with(|cell| {
         let previous = cell.replace(Some(ctx.as_raw()));
         let result = f();
@@ -2027,7 +2024,9 @@ fn eval_js_reentrant<'js>(
         Ok(())
     };
 
-    for name in ["input", "result", "src", "base_url", "baseUrl", "url", "key", "page"] {
+    for name in [
+        "input", "result", "src", "base_url", "baseUrl", "url", "key", "page",
+    ] {
         save_global(name)?;
     }
     if let Some(bindings) = bindings {
@@ -2291,13 +2290,7 @@ pub(crate) fn java_get_string_list(
                 .parts
                 .iter()
                 .map(|part| {
-                    java_get_string_list(
-                        Some(part),
-                        content,
-                        default_content,
-                        base_url,
-                        is_url,
-                    )
+                    java_get_string_list(Some(part), content, default_content, base_url, is_url)
                 })
                 .collect();
             return rule_analyzer::interleave_result_groups(groups);
@@ -2660,7 +2653,10 @@ fn java_symmetric_crypto(
         "decrypt" => {
             let cipher = Aes128CbcDecryptor::new_from_slices(&key, &iv).ok()?;
             let mut buffer = data;
-            cipher.decrypt_padded_mut::<Pkcs7>(&mut buffer).ok()?.to_vec()
+            cipher
+                .decrypt_padded_mut::<Pkcs7>(&mut buffer)
+                .ok()?
+                .to_vec()
         }
         _ => return None,
     };
@@ -2822,9 +2818,7 @@ fn legado_string_to_int(input: &str) -> i32 {
 fn fullwidth_to_halfwidth(ch: char) -> char {
     match ch {
         '　' => ' ',
-        '！'..='～' => {
-            char::from_u32(ch as u32 - 0xFEE0).unwrap_or(ch)
-        }
+        '！'..='～' => char::from_u32(ch as u32 - 0xFEE0).unwrap_or(ch),
         _ => ch,
     }
 }
@@ -2855,8 +2849,7 @@ fn is_plain_chinese_digits(input: &str) -> bool {
         && input.chars().all(|ch| {
             matches!(
                 ch,
-                '〇'
-                    | '零'
+                '〇' | '零'
                     | '一'
                     | '二'
                     | '三'
@@ -3108,7 +3101,10 @@ fn java_base64_encode_bytes(input_json: &str, flags: i32) -> String {
 }
 
 fn java_base64_decode_bytes(input: &str, flags: i32) -> String {
-    let input = input.chars().filter(|ch| !ch.is_whitespace()).collect::<String>();
+    let input = input
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
     let url_safe = flags & 8 != 0;
     let decoded = if url_safe {
         base64::engine::general_purpose::URL_SAFE
@@ -3186,8 +3182,7 @@ fn java_hmac_bytes(algorithm: &str, key_json: &str, data_json: &str) -> String {
 
 fn java_to_url_json(raw_url: &str, base_url: Option<&str>) -> String {
     let parsed = match base_url.filter(|base| !base.trim().is_empty()) {
-        Some(base_url) => url::Url::parse(base_url)
-            .and_then(|base| base.join(raw_url)),
+        Some(base_url) => url::Url::parse(base_url).and_then(|base| base.join(raw_url)),
         None => url::Url::parse(raw_url),
     };
     let url = match parsed {
@@ -3228,13 +3223,9 @@ fn java_encode_uri(input: &str, charset: Option<&str>) -> String {
     let mut encoded = String::with_capacity(bytes.len());
     for byte in bytes {
         match byte {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'_'
-            | b'.'
-            | b'*' => encoded.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'*' => {
+                encoded.push(byte as char)
+            }
             b' ' => encoded.push('+'),
             _ => encoded.push_str(&format!("%{byte:02X}")),
         }
@@ -3374,7 +3365,7 @@ fn java_request_simple_response_with_client(
             "message": "",
             "headers": {},
             "isSuccessful": false,
-        })
+        }),
     };
     payload.to_string()
 }
@@ -3404,8 +3395,7 @@ fn java_analyzed_request_response(url: &str, headers_json: &str) -> String {
         }
         return payload;
     };
-    let explicit_headers =
-        (!headers_json.is_empty()).then(|| java_request_headers(headers_json));
+    let explicit_headers = (!headers_json.is_empty()).then(|| java_request_headers(headers_json));
     let spec = match analyze_url_with_headers(
         url,
         "",
@@ -3440,18 +3430,15 @@ fn java_analyzed_request_response(url: &str, headers_json: &str) -> String {
         .get("content-type")
         .and_then(|value| value.to_str().ok());
     let decoded_body = decode_body(&response.body, spec.charset.as_deref(), content_type);
-    let body = if spec
-        .response_type
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
-    {
-        response
-            .body
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
-    } else {
-        decoded_body
+    let body = match format_analyzed_body(
+        &spec,
+        &response.body,
+        decoded_body,
+        content_type,
+        &response.url,
+    ) {
+        Ok(body) => body,
+        Err(error) => return java_error_response(&response.url, &error),
     };
     serde_json::json!({
         "__ffiStrResponse": true,
@@ -3754,9 +3741,7 @@ mod tests {
                  String(response).includes('code=418')].join('|');
             "#
         );
-        let result = with_js_http_context(&client, &source, || {
-            eval_js(&script, "", &url).unwrap()
-        });
+        let result = with_js_http_context(&client, &source, || eval_js(&script, "", &url).unwrap());
         assert_eq!(
             result,
             format!("true|418|I'm a teapot|{url}|denied|false|yes|418|true")
@@ -3772,6 +3757,36 @@ mod tests {
             .unwrap()
         });
         assert_eq!(invalid, "200|OK|true|http://localhost/|true|200");
+    }
+
+    #[test]
+    fn java_connect_applies_analyze_url_body_js_without_changing_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = accept_with_timeout(&listener);
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            write!(stream, "HTTP/1.1 418 Teapot\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntest").unwrap();
+        });
+        let url = format!("http://{address}/test");
+        let source = BookSource {
+            book_source_url: url.clone(),
+            ..Default::default()
+        };
+        let client = HttpClient::standalone();
+        let script = format!(
+            r#"(() => {{ const response = java.connect('{url},{{"bodyJs":"result.toUpperCase()"}}'); return response.code() + '|' + response.body(); }})()"#
+        );
+        let result = with_js_http_context(&client, &source, || eval_js(&script, "", &url).unwrap());
+        assert_eq!(result, "418|TEST");
+        server.join().unwrap();
     }
 
     #[test]
@@ -4228,16 +4243,8 @@ mod tests {
             const flagsEncode = java.base64Encode('abc', 2);
             [twoArg, blankList, chained, bytes, flagsDecode, flagsEncode].join('|')
         "#;
-        let result = eval_js(
-            script,
-            r#"{"value":"ok"}"#,
-            "https://example.com/old/",
-        )
-        .unwrap();
-        assert_eq!(
-            result,
-            "ok|true|https://new.example/next|97,98,99|abc|YWJj"
-        );
+        let result = eval_js(script, r#"{"value":"ok"}"#, "https://example.com/old/").unwrap();
+        assert_eq!(result, "ok|true|https://new.example/next|97,98,99|abc|YWJj");
     }
 
     #[test]
@@ -4261,13 +4268,10 @@ mod tests {
             ),
             ..Default::default()
         };
-        let (result, delta) = with_active_session(
-            Some(&initial),
-            &source.book_source_url,
-            |_| {
-                with_js_http_context(&client, &source, || {
-                    eval_js(
-                        r#"
+        let (result, delta) = with_active_session(Some(&initial), &source.book_source_url, |_| {
+            with_js_http_context(&client, &source, || {
+                eval_js(
+                    r#"
                             const initialValue = source.getVariable();
                             const setResult = source.setVariable('saved');
                             const saved = source.getVariable();
@@ -4288,13 +4292,12 @@ mod tests {
                                 typeof removeLoginResult === 'undefined'
                             ].join('|')
                         "#,
-                        "",
-                        &source.book_source_url,
-                    )
-                    .unwrap()
-                })
-            },
-        );
+                    "",
+                    &source.book_source_url,
+                )
+                .unwrap()
+            })
+        });
         assert_eq!(
             result,
             "https://source.example|initial|saved||value|value|true|true|true|true"

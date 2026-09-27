@@ -10,9 +10,7 @@ use crate::crawler::{
 use crate::model::book_source::{book_source_from_value, BookSource};
 use crate::model::replace_rule::ReplaceRule;
 use crate::parser::js::{eval_js, eval_js_with_bindings, with_js_http_context, with_js_lib};
-use crate::parser::rule_engine::{
-    apply_legado_regex, dedupe_chapters_last_wins, RuleEngine,
-};
+use crate::parser::rule_engine::{apply_legado_regex, dedupe_chapters_last_wins, RuleEngine};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -144,7 +142,7 @@ impl ExecuteError {
 impl From<FetchError> for ExecuteError {
     fn from(error: FetchError) -> Self {
         match error {
-            FetchError::InvalidUrl(message) => Self::url_rule(message),
+            FetchError::InvalidUrl(message) | FetchError::Rule(message) => Self::url_rule(message),
             FetchError::Network(message) => Self {
                 kind: "network",
                 message,
@@ -277,8 +275,18 @@ fn is_loc_book(source_json: &str, request_json: &str) -> bool {
         }
         if let Some(params) = req.get("params") {
             if is_loc(params.get("origin").and_then(Value::as_str))
-                || is_loc(params.get("book").and_then(|b| b.get("origin")).and_then(Value::as_str))
-                || is_loc(params.get("chapter").and_then(|c| c.get("origin")).and_then(Value::as_str))
+                || is_loc(
+                    params
+                        .get("book")
+                        .and_then(|b| b.get("origin"))
+                        .and_then(Value::as_str),
+                )
+                || is_loc(
+                    params
+                        .get("chapter")
+                        .and_then(|c| c.get("origin"))
+                        .and_then(Value::as_str),
+                )
             {
                 return true;
             }
@@ -308,7 +316,11 @@ fn parse_source(raw: &str) -> ExecuteResult<BookSource> {
     if source.book_source_url.trim().is_empty() {
         return Err(ExecuteError::invalid_source("bookSourceUrl is required"));
     }
-    if source.book_source_url.trim().eq_ignore_ascii_case("loc_book") {
+    if source
+        .book_source_url
+        .trim()
+        .eq_ignore_ascii_case("loc_book")
+    {
         return Err(ExecuteError::unsupported("不支持远程本地书籍"));
     }
     Ok(source)
@@ -513,7 +525,13 @@ fn url_rule_context(
     book_name: Option<&str>,
     chapter_title: Option<&str>,
 ) -> UrlRuleContext {
-    url_rule_context_with_fields(book_variable, chapter_variable, book_name, chapter_title, None)
+    url_rule_context_with_fields(
+        book_variable,
+        chapter_variable,
+        book_name,
+        chapter_title,
+        None,
+    )
 }
 
 fn url_rule_context_with_fields(
@@ -552,7 +570,9 @@ fn execute_info(
     let (variable, name) = input_book_state(params);
     let mut book_fields = input_book_fields(params);
     if let Some(name_str) = &name {
-        book_fields.entry("name".to_string()).or_insert_with(|| name_str.clone());
+        book_fields
+            .entry("name".to_string())
+            .or_insert_with(|| name_str.clone());
     }
     let request_context = url_rule_context_with_fields(
         variable.as_deref(),
@@ -595,7 +615,9 @@ fn execute_toc(
     let (variable, name) = input_book_state(params);
     let mut book_fields = input_book_fields(params);
     if let Some(name_str) = &name {
-        book_fields.entry("name".to_string()).or_insert_with(|| name_str.clone());
+        book_fields
+            .entry("name".to_string())
+            .or_insert_with(|| name_str.clone());
     }
     let detail_context = url_rule_context_with_fields(
         variable.as_deref(),
@@ -871,7 +893,9 @@ fn execute_content(
     let (mut book_variable, book_name) = input_book_state(params);
     let mut book_fields = input_book_fields(params);
     if let Some(name_str) = &book_name {
-        book_fields.entry("name".to_string()).or_insert_with(|| name_str.clone());
+        book_fields
+            .entry("name".to_string())
+            .or_insert_with(|| name_str.clone());
     }
     let (mut chapter_variable, chapter_title) = input_chapter_state(params);
     let is_volume = input_chapter_is_volume(params);
