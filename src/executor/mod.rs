@@ -221,32 +221,53 @@ fn execute_inner(source_json: &str, request_json: &str) -> ExecuteResult<Value> 
     let (result, session_delta) = with_active_session(
         request_session.as_ref(),
         &source.book_source_url,
-        |_active_session| {
-            let http_session = HttpSession::new(&source, options.timeout_ms)?;
-            with_js_http_context(http_session.client(), &source, || {
-                match operation.as_str() {
-                    "search" => execute_search(&source, &engine, &http_session, &params, &options),
-                    "explore" => {
-                        execute_explore(&source, &engine, &http_session, &params, &options)
+        |active_session| {
+            let result = (|| -> ExecuteResult<Value> {
+                let http_session = HttpSession::new(&source, options.timeout_ms)?;
+                with_js_http_context(http_session.client(), &source, || {
+                    match operation.as_str() {
+                        "search" => {
+                            execute_search(&source, &engine, &http_session, &params, &options)
+                        }
+                        "explore" => {
+                            execute_explore(&source, &engine, &http_session, &params, &options)
+                        }
+                        "info" => execute_info(&source, &engine, &http_session, &params, &options),
+                        "toc" => execute_toc(&source, &engine, &http_session, &params, &options),
+                        "content" => {
+                            execute_content(&source, &engine, &http_session, &params, &options)
+                        }
+                        "login_ui" => execute_login_ui(&source),
+                        "login" => execute_login(&source, &http_session, &params, &options),
+                        // `parse_request` guards this too; keep this branch in case a future caller bypasses it.
+                        _ => Err(ExecuteError::invalid_request(format!(
+                            "unsupported op: {operation}"
+                        ))),
                     }
-                    "info" => execute_info(&source, &engine, &http_session, &params, &options),
-                    "toc" => execute_toc(&source, &engine, &http_session, &params, &options),
-                    "content" => {
-                        execute_content(&source, &engine, &http_session, &params, &options)
-                    }
-                    "login_ui" => execute_login_ui(&source),
-                    "login" => execute_login(&source, &http_session, &params, &options),
-                    // `parse_request` guards this too; keep this branch in case a future caller bypasses it.
-                    _ => Err(ExecuteError::invalid_request(format!(
-                        "unsupported op: {operation}"
-                    ))),
-                }
-            })
+                })
+            })();
+            (result, active_session.had_unknown_method_fallback())
         },
     );
-    let mut response = result?;
-    if let Some(object) = response.as_object_mut() {
-        object.insert("session".to_string(), json!(session_delta));
+    let (result, unknown_method_fallback) = result;
+    let succeeded = result.is_ok();
+    let mut response = match result {
+        Ok(response) => response,
+        Err(error) if unknown_method_fallback => error.into_json(),
+        Err(error) => return Err(error),
+    };
+    if succeeded {
+        if let Some(object) = response.as_object_mut() {
+            object.insert("session".to_string(), json!(session_delta));
+        }
+    }
+    if unknown_method_fallback {
+        let meta = response
+            .as_object_mut()
+            .expect("execution response is an object")
+            .entry("meta")
+            .or_insert_with(|| json!({}));
+        meta["diagnostics"] = json!(["unknown_method_fallback_get"]);
     }
     Ok(response)
 }
@@ -1951,6 +1972,88 @@ mod tests {
         assert!(uses_js_ajax_content_rule(&source(
             "@js: java.ajax(baseUrl)"
         )));
+    }
+
+    #[test]
+    fn android_request_methods_and_unknown_fallback_are_observable() {
+        for (requested, expected, fallback) in [
+            (serde_json::json!("get"), "GET", false),
+            (serde_json::json!("post"), "POST", false),
+            (serde_json::json!("head"), "HEAD", false),
+            (serde_json::json!("PATCH"), "GET", true),
+            (serde_json::json!(42), "GET", true),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut buf = [0u8; 2048];
+                let size = stream.read(&mut buf).unwrap();
+                let method = String::from_utf8_lossy(&buf[..size])
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .to_string();
+                let body = if method == "HEAD" {
+                    ""
+                } else {
+                    r#"{"data":[]}"#
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                method
+            });
+            let source = serde_json::json!({"bookSourceName":"method fixture", "bookSourceUrl":base,
+                "searchUrl": format!("/search,{}", serde_json::json!({"method":requested})),
+                "ruleSearch":{"bookList":"$.data[*]","name":"$.name"}});
+            let request = serde_json::json!({"api":2,"op":"search","params":{"key":"test"}});
+            let result: Value =
+                serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+            assert_eq!(result["ok"], true, "{result}");
+            assert_eq!(server.join().unwrap(), expected);
+            if fallback {
+                assert_eq!(
+                    result["meta"]["diagnostics"],
+                    serde_json::json!(["unknown_method_fallback_get"])
+                );
+            } else {
+                assert!(result["meta"].get("diagnostics").is_none(), "{result}");
+            }
+        }
+    }
+
+    #[test]
+    fn method_fallback_diagnostic_survives_a_failed_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = accept_with_timeout(&listener);
+            let mut buf = [0u8; 1024];
+            let size = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..size]).to_string();
+            write!(
+                stream,
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            request
+        });
+        let source = serde_json::json!({"bookSourceName":"fallback failure","bookSourceUrl":base,
+            "searchUrl":"/search,{\"method\":\"DELETE\"}","ruleSearch":{"bookList":"$.data[*]"}});
+        let request = serde_json::json!({"api":2,"op":"search","params":{"key":"test"}});
+        let result: Value =
+            serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["error"]["status"], 404);
+        assert_eq!(
+            result["meta"]["diagnostics"],
+            serde_json::json!(["unknown_method_fallback_get"])
+        );
+        assert!(server.join().unwrap().starts_with("GET /search"));
     }
 
     #[test]

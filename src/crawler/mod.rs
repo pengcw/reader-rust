@@ -603,13 +603,18 @@ fn compile_url_request(
     }
     ensure_user_agent(&mut headers);
 
-    let method = match options
-        .get("method")
+    let raw_method = options.get("method");
+    let requested_method = raw_method
         .and_then(Value::as_str)
         .map(str::trim)
-        .map(str::to_ascii_uppercase)
-        .as_deref()
+        .map(str::to_ascii_uppercase);
+    if raw_method.is_some() && !matches!(requested_method.as_deref(), Some("GET" | "POST" | "HEAD"))
     {
+        if let Some(active) = current_active_session() {
+            active.note_unknown_method_fallback();
+        }
+    }
+    let method = match requested_method.as_deref() {
         Some("POST") => Method::POST,
         Some("HEAD") => Method::HEAD,
         _ => Method::GET,

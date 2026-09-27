@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
@@ -50,6 +51,7 @@ pub struct ActiveSession {
     variables: Mutex<HashMap<String, Value>>,
     // Fetched JS is reused only inside this operation; never shared across users.
     script_cache: Mutex<HashMap<String, String>>,
+    unknown_method_fallback: AtomicBool,
     initial_session: ExecuteSession,
 }
 
@@ -111,6 +113,7 @@ impl ActiveSession {
             header: Mutex::new(initial_header.clone()),
             variables: Mutex::new(initial_variables.clone().unwrap_or_default()),
             script_cache: Mutex::new(HashMap::new()),
+            unknown_method_fallback: AtomicBool::new(false),
             initial_session: ExecuteSession {
                 cookies: initial_cookies,
                 cookie_jar: initial_cookie_jar,
@@ -118,6 +121,14 @@ impl ActiveSession {
                 variables: initial_variables,
             },
         }
+    }
+
+    pub(crate) fn note_unknown_method_fallback(&self) {
+        self.unknown_method_fallback.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn had_unknown_method_fallback(&self) -> bool {
+        self.unknown_method_fallback.load(Ordering::Relaxed)
     }
 
     pub(crate) fn cookie_store(&self) -> &SharedCookieStore {
