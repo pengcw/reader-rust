@@ -71,6 +71,7 @@ pub struct TocRule {
 pub struct ContentRule {
     pub content: Option<String>,
     pub title: Option<String>,
+    pub sub_content: Option<String>,
     pub next_content_url: Option<String>,
     pub web_js: Option<String>,
     pub source_regex: Option<String>,

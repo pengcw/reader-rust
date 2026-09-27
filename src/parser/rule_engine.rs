@@ -777,6 +777,35 @@ impl RuleEngine {
         })
     }
 
+    /// Android evaluates subContent once against the original chapter response.
+    pub(crate) fn sub_content_with_context(
+        &self,
+        source: &BookSource,
+        body: &str,
+        base_url: &str,
+        book_variable: Option<&str>,
+        chapter_variable: Option<&str>,
+        book_name: Option<&str>,
+        chapter_title: Option<&str>,
+        book_fields: Option<&HashMap<String, String>>,
+    ) -> Option<String> {
+        let rule = source.rule_content.as_ref()?.sub_content.as_deref()?.trim();
+        if rule.is_empty() {
+            return None;
+        }
+        with_js_lib(source.js_lib.as_deref(), || {
+            let mut context = RuleVariableContext::for_content_with_fields(
+                book_variable,
+                chapter_variable,
+                book_name,
+                chapter_title,
+                book_fields,
+            );
+            self.eval_body_rule_with_context(rule, body, base_url, &mut context)
+                .map(|value| value.trim().to_string())
+        })
+    }
+
     fn content_with_context(
         &self,
         source: &BookSource,

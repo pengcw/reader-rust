@@ -939,7 +939,15 @@ fn execute_content(
     let mut visited_urls = HashSet::new();
     let mut fragments = Vec::new();
     let mut initial_response_url = None;
+    let mut first_page = None;
     let mut final_response = None;
+    let mut sub_requests = 0;
+    let text_book = params
+        .get("book")
+        .and_then(|book| book.get("type"))
+        .and_then(Value::as_i64)
+        .map(|kind| kind == 0 || kind & 8 != 0 && kind & 256 == 0)
+        .unwrap_or_else(|| source.book_source_type.unwrap_or(0) == 0);
     let mut truncated = false;
 
     while !visited_urls.contains(&current_url) {
@@ -966,6 +974,9 @@ fn execute_content(
             Some(&request_context),
         )?;
         visited_urls.insert(current_url.clone());
+        if first_page.is_none() {
+            first_page = Some((response.body.clone(), response.url.clone()));
+        }
         let response_url = response.url.clone();
         let chapter_url = initial_response_url.get_or_insert_with(|| response_url.clone());
         let page = engine.content_page_with_context(
@@ -999,13 +1010,59 @@ fn execute_content(
 
     let response =
         final_response.ok_or_else(|| ExecuteError::url_rule("content URL produced no request"))?;
+    if text_book {
+        if let Some((body, url)) = first_page.as_ref() {
+            if let Some(sub_content) = engine.sub_content_with_context(
+                source,
+                body,
+                url,
+                book_variable.as_deref(),
+                chapter_variable.as_deref(),
+                book_name.as_deref(),
+                chapter_title.as_deref(),
+                Some(&book_fields),
+            ) {
+                let sub_content = if sub_content.to_ascii_lowercase().starts_with("http") {
+                    if visited_urls.len() >= options.max_pages {
+                        truncated = true;
+                        String::new()
+                    } else {
+                        sub_requests += 1;
+                        let sub_context = url_rule_context_with_fields(
+                            book_variable.as_deref(),
+                            None,
+                            book_name.as_deref(),
+                            None,
+                            Some(&book_fields),
+                        );
+                        fetch_rule_with_context(
+                            session,
+                            source,
+                            &sub_content,
+                            "",
+                            1,
+                            url,
+                            options,
+                            Some(&sub_context),
+                        )?
+                        .body
+                    }
+                } else {
+                    sub_content
+                };
+                if !sub_content.trim().is_empty() {
+                    fragments.push(sub_content);
+                }
+            }
+        }
+    }
     let content = apply_replace_rules(&fragments.join("\n"), &replace_rules);
     if content.is_empty() && !is_volume {
         return Err(ExecuteError::parse("content is empty"));
     }
     Ok(success(
-        json!({"content": content, "pages": visited_urls.len(), "truncated": truncated}),
-        visited_urls.len(),
+        json!({"content": content, "pages": visited_urls.len() + sub_requests, "truncated": truncated}),
+        visited_urls.len() + sub_requests,
         truncated,
         &response,
         options,
@@ -1841,6 +1898,116 @@ mod tests {
         assert!(uses_js_ajax_content_rule(&source(
             "@js: java.ajax(baseUrl)"
         )));
+    }
+
+    #[test]
+    fn sub_content_uses_original_page_after_pagination_and_fetches_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let append_url = format!("{base}/append");
+        let server = thread::spawn(move || {
+            let mut paths = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut request = [0u8; 2048];
+                let size = stream.read(&mut request).unwrap();
+                let path = String::from_utf8_lossy(&request[..size])
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_string();
+                let body = match path.as_str() {
+                    "/chapter/1" => serde_json::json!({
+                        "content":"first","next":"/chapter/1-2",
+                        "append":format!(r#"{append_url},{{"js":"result + '?name=' + book.name"}}"#)
+                    })
+                    .to_string(),
+                    "/chapter/1-2" => r#"{"content":"second","append":"ignored"}"#.to_string(),
+                    "/append?name=Book" => "supplement".to_string(),
+                    _ => panic!("unexpected path {path}"),
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                paths.push(path);
+            }
+            paths
+        });
+        let source = serde_json::json!({
+            "bookSourceName":"sub content fixture","bookSourceUrl":base,
+            "ruleContent":{"content":"$.content","nextContentUrl":"$.next","subContent":"$.append"}
+        });
+        let request = serde_json::json!({"api":2,"op":"content","params":{
+            "url":format!("{base}/chapter/1"),"book":{"name":"Book"}}});
+        let result: Value =
+            serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["content"], "first\nsecond\nsupplement");
+        assert_eq!(result["data"]["pages"], 3);
+        assert_eq!(
+            server.join().unwrap(),
+            ["/chapter/1", "/chapter/1-2", "/append?name=Book"]
+        );
+    }
+
+    #[test]
+    fn sub_content_url_respects_page_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = accept_with_timeout(&listener);
+            let mut buf = [0u8; 1024];
+            stream.read(&mut buf).unwrap();
+            let body = r#"{"content":"main","append":"http://127.0.0.1:1/should-not-fetch"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let source = serde_json::json!({"bookSourceName":"budget", "bookSourceUrl":base,
+            "ruleContent":{"content":"$.content","subContent":"$.append"}});
+        let request = serde_json::json!({"api":2,"op":"content","params":{
+            "url":format!("{base}/chapter")},"options":{"maxPages":1}});
+        let result: Value =
+            serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["content"], "main");
+        assert_eq!(result["data"]["truncated"], true);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn sub_content_inline_applies_only_to_text_and_uses_original_response() {
+        for (kind, expected) in [(8, "main\nextra"), (32, "main")] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut buf = [0u8; 1024];
+                stream.read(&mut buf).unwrap();
+                let body = r#"{"content":"main","append":"extra"}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            });
+            let source = serde_json::json!({"bookSourceName":"inline", "bookSourceUrl":base,
+                "ruleContent":{"content":"$.content","subContent":"$.append"}});
+            let request = serde_json::json!({"api":2,"op":"content","params":{
+                "url":format!("{base}/chapter"),"book":{"type":kind}}});
+            let result: Value =
+                serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+            assert_eq!(result["ok"], true, "{result}");
+            assert_eq!(result["data"]["content"], expected);
+            server.join().unwrap();
+        }
     }
 
     #[test]
