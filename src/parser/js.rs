@@ -362,6 +362,44 @@ fn eval_js_inner(
     )
 }
 
+fn install_header_map<'js>(
+    ctx: &rquickjs::Ctx<'js>,
+    java: &Object<'js>,
+    initial: &serde_json::Map<String, JsonValue>,
+) -> anyhow::Result<()> {
+    java.set(
+        "headerMap",
+        ctx.json_parse(JsonValue::Object(initial.clone()).to_string())?,
+    )?;
+    eval_script(
+        ctx.clone(),
+        r#"(function(map) {
+        Object.defineProperties(map, {
+            put: { value: function(key, value) {
+                const previous = this[key]; this[key] = String(value); return previous;
+            } },
+            get: { value: function(key) { return this[key] ?? null; } },
+            remove: { value: function(key) {
+                const previous = this[key]; delete this[key]; return previous;
+            } }
+        });
+    })(java.headerMap)"#,
+    )?;
+    Ok(())
+}
+
+fn collect_header_map(ctx: &rquickjs::Ctx<'_>) -> anyhow::Result<Vec<(String, String)>> {
+    let map = eval_script(ctx.clone(), "java.headerMap")?;
+    let json = ctx
+        .json_stringify(map)?
+        .ok_or_else(|| anyhow::anyhow!("invalid java.headerMap"))?;
+    let values: serde_json::Map<String, JsonValue> = serde_json::from_str(&json.to_string()?)?;
+    Ok(values
+        .into_iter()
+        .filter_map(|(key, value)| value.as_str().map(|value| (key, value.to_owned())))
+        .collect())
+}
+
 fn eval_js_inner_with_source(
     script: &str,
     input: Option<&str>,
@@ -380,6 +418,39 @@ fn eval_js_inner_with_source(
         // SAFETY: the pointer is installed only for the duration of a native
         // callback invoked by this same QuickJS context and thread.
         let ctx = unsafe { rquickjs::Ctx::from_raw(raw_ctx) };
+        if let Some((initial, updated)) = header_map {
+            let java: Object<'_> = ctx.globals().get("java")?;
+            let original = if java.contains_key("headerMap")? {
+                Some(java.get::<_, Value<'_>>("headerMap")?)
+            } else {
+                None
+            };
+            let result = (|| {
+                install_header_map(&ctx, &java, initial)?;
+                let result = eval_js_reentrant(
+                    ctx.clone(),
+                    script,
+                    input,
+                    base_url,
+                    key,
+                    page,
+                    source_key,
+                    bindings,
+                    template_result,
+                )?;
+                *updated.borrow_mut() = Some(collect_header_map(&ctx)?);
+                Ok(result)
+            })();
+            match original {
+                Some(value) => {
+                    let _ = java.set("headerMap", value);
+                }
+                None => {
+                    let _ = java.remove("headerMap");
+                }
+            }
+            return result;
+        }
         return eval_js_reentrant(
             ctx,
             script,
@@ -1305,10 +1376,6 @@ fn eval_js_inner_with_source(
                 }),
             )?;
 
-            if let Some((initial, _)) = header_map {
-                let map = ctx.json_parse(JsonValue::Object(initial.clone()).to_string())?;
-                java_obj.set("headerMap", map)?;
-            }
             globals.set("java", java_obj)?;
             eval_script(
                 ctx.clone(),
@@ -2036,28 +2103,14 @@ fn eval_js_inner_with_source(
             // Rule scripts may run once per chapter while JS_ENV is reused. Keep
             // let/const declarations local to this evaluation to avoid a later
             // chapter failing with a global lexical redeclaration SyntaxError.
-            if header_map.is_some() {
-                eval_script(ctx.clone(), r#"(function(map) {
-                    Object.defineProperties(map, {
-                        put: { value: function(key, value) {
-                            const previous = this[key]; this[key] = String(value); return previous;
-                        } },
-                        get: { value: function(key) { return this[key] ?? null; } },
-                        remove: { value: function(key) {
-                            const previous = this[key]; delete this[key]; return previous;
-                        } }
-                    });
-                })(java.headerMap)"#)?;
+            if let Some((initial, _)) = header_map {
+                let java: Object<'_> = globals.get("java")?;
+                install_header_map(&ctx, &java, initial)?;
             }
             let scoped_script = format!("{{\n{script}\n}}");
             let v = eval_script(ctx.clone(), &scoped_script)?;
             if let Some((_, updated)) = header_map {
-                let map: rquickjs::Value<'_> = eval_script(ctx.clone(), "java.headerMap")?;
-                let json = ctx.json_stringify(map)?.ok_or_else(|| anyhow::anyhow!("invalid java.headerMap"))?;
-                let values: serde_json::Map<String, JsonValue> = serde_json::from_str(&json.to_string()?)?;
-                *updated.borrow_mut() = Some(values.into_iter().filter_map(|(key, value)| {
-                    value.as_str().map(|value| (key, value.to_owned()))
-                }).collect());
+                *updated.borrow_mut() = Some(collect_header_map(&ctx)?);
             }
 
             let result = if v.is_null() || v.is_undefined() {
@@ -4230,6 +4283,122 @@ mod tests {
     }
 
     #[test]
+    fn java_connect_and_normal_url_share_header_plan() {
+        use crate::crawler::session::{with_active_session, ExecuteSession};
+        use crate::crawler::{analyze_url, HttpSession};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    request.push_str(&line);
+                }
+                requests.push(request.to_ascii_lowercase());
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                )
+                .unwrap();
+            }
+            requests
+        });
+        let source = BookSource {
+            book_source_url: base.clone(),
+            header: Some(r#"{"X-Source":"source","X-Order":"source"}"#.to_owned()),
+            enabled_cookie_jar: Some(false),
+            ..Default::default()
+        };
+        let state = ExecuteSession {
+            header: Some(serde_json::json!({"X-Login":"login","X-Order":"login"})),
+            ..Default::default()
+        };
+        let rule = r#"/page,{"headers":{"X-Order":"option"},"js":"java.headerMap.put('X-Order','js'); java.headerMap.put('X-Js','signed'); result"}"#;
+        let client = HttpClient::standalone();
+        let (result, _) = with_active_session(Some(&state), &source.book_source_url, |_| {
+            let spec = analyze_url(rule, "", 1, &base, &source).unwrap();
+            let normal = HttpSession::new(&source, 3000)
+                .unwrap()
+                .fetch(&spec, 1024)
+                .unwrap()
+                .body;
+            let target = format!("{base}{rule}");
+            let connect = with_js_http_context(&client, &source, || {
+                eval_js(
+                    &format!(
+                        "(() => {{ const body = java.connect({}).body(); return body + '|' + (java.headerMap === undefined); }})()",
+                        serde_json::to_string(&target).unwrap()
+                    ),
+                    "",
+                    &base,
+                )
+                .unwrap()
+            });
+            let explicit = with_js_http_context(&client, &source, || {
+                eval_js(
+                    &format!(
+                        "(() => {{ const body = java.connect({}, {{'X-Explicit':'yes','X-Order':'passed'}}).body(); return body + '|' + (java.headerMap === undefined); }})()",
+                        serde_json::to_string(&target).unwrap()
+                    ),
+                    "",
+                    &base,
+                )
+                .unwrap()
+            });
+            (normal, connect, explicit)
+        });
+        assert_eq!(
+            result,
+            (
+                "ok".to_string(),
+                "ok|true".to_string(),
+                "ok|true".to_string()
+            )
+        );
+        let requests = server.join().unwrap();
+        for request in &requests[..2] {
+            assert!(request.contains("x-source: source\r\n"), "{request}");
+            assert!(request.contains("x-login: login\r\n"), "{request}");
+            assert!(request.contains("x-order: js\r\n"), "{request}");
+            assert!(request.contains("x-js: signed\r\n"), "{request}");
+        }
+        let explicit = &requests[2];
+        assert!(!explicit.contains("x-source:"), "{explicit}");
+        assert!(!explicit.contains("x-login:"), "{explicit}");
+        assert!(explicit.contains("x-explicit: yes\r\n"), "{explicit}");
+        assert!(explicit.contains("x-order: js\r\n"), "{explicit}");
+        assert!(explicit.contains("x-js: signed\r\n"), "{explicit}");
+    }
+
+    #[test]
+    fn nested_connect_restores_outer_header_map_after_failure() {
+        let source = BookSource {
+            book_source_url: "https://example.com".to_owned(),
+            ..Default::default()
+        };
+        let client = HttpClient::standalone();
+        let mut headers = vec![("X-Outer".to_owned(), "before".to_owned())];
+        let result = with_js_http_context(&client, &source, || {
+            eval_js_url_with_headers(
+                "java.headerMap.put('X-Outer','after'); java.connect('ftp://invalid'); java.headerMap.get('X-Outer')",
+                "https://example.com", "", 1, &source.book_source_url,
+                &source.book_source_url, None, &mut headers,
+            ).unwrap()
+        });
+        assert_eq!(result, "after");
+        assert_eq!(headers, vec![("X-Outer".to_owned(), "after".to_owned())]);
+    }
+
+    #[test]
     fn simple_http_methods_forward_optional_headers() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -4264,7 +4433,12 @@ mod tests {
 
         let url = format!("http://{address}/api");
         let client = HttpClient::standalone();
-        let result = with_js_http_client(&client, || {
+        let source = BookSource {
+            book_source_url: url.clone(),
+            header: Some(r#"{"X-Source":"not-for-simple-helpers"}"#.to_owned()),
+            ..Default::default()
+        };
+        let result = with_js_http_context(&client, &source, || {
             eval_js(
                 &format!(
                     "(() => {{ const get = java.get('{url}', {{'X-Test':'get'}}); const post = java.post('{url}', 'body', {{'X-Test':'post'}}); const head = java.head('{url}', {{'X-Test':'head'}}); return [get.body(), get.statusCode(), post.body(), head.statusCode(), String(get), head.body(), get.headers().get('content-length')].join('|'); }})()"
@@ -4279,6 +4453,9 @@ mod tests {
         let requests = server.join().unwrap();
         assert!(requests[0].starts_with("get /api "));
         assert!(requests[0].contains("x-test: get"));
+        assert!(requests
+            .iter()
+            .all(|request| !request.contains("x-source:")));
         assert!(requests[1].starts_with("post /api "));
         assert!(requests[1].contains("x-test: post"));
         assert!(requests[2].starts_with("head /api "));
