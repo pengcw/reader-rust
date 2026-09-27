@@ -230,6 +230,117 @@ fn parse_css_selector(css_selector: &str) -> Option<Selector> {
     })
 }
 
+// Keep the text predicate attached to the element before a descendant or +
+// combinator. Filtering the final selector results would inspect the wrong node.
+fn split_jsoup_contains(selector: &str) -> Option<(&str, &str, &str)> {
+    let mut quote = None;
+    let mut bracket_depth = 0usize;
+    let mut escaped = false;
+    for (index, ch) in selector.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active) = quote {
+            if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            ':' if bracket_depth == 0 && selector[index..].starts_with(":contains(") => {
+                let start = index + ":contains(".len();
+                let end = selector[start..].find(')')? + start;
+                let needle = selector[start..end].trim().trim_matches(['\'', '"']);
+                if needle.is_empty() || selector[..index].trim().is_empty() {
+                    return None;
+                }
+                return Some((&selector[..index], needle, &selector[end + 1..]));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn contains_suffix_valid(suffix: &str) -> bool {
+    if suffix.is_empty() {
+        return true;
+    }
+    let descendant = suffix.chars().next().is_some_and(char::is_whitespace);
+    let suffix = suffix.trim();
+    if let Some(rest) = suffix.strip_prefix('+') {
+        let (sibling, descendant) = split_contains_sibling(rest);
+        return parse_css_selector(sibling).is_some()
+            && (descendant.is_empty() || parse_css_selector(descendant).is_some());
+    }
+    descendant && !suffix.starts_with(['>', '~']) && parse_css_selector(suffix).is_some()
+}
+
+fn split_contains_sibling(suffix: &str) -> (&str, &str) {
+    let suffix = suffix.trim();
+    let end = suffix.find(char::is_whitespace).unwrap_or(suffix.len());
+    (&suffix[..end], suffix[end..].trim())
+}
+
+fn css_contains_text(element: &ElementRef<'_>, needle: &str) -> bool {
+    let text = element.text().collect::<Vec<_>>().join(" ");
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalized.to_lowercase().contains(
+        &needle
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase(),
+    )
+}
+
+fn select_css_with_contains<'a>(
+    selector: &str,
+    select: impl Fn(&str) -> Vec<ElementRef<'a>>,
+) -> Vec<ElementRef<'a>> {
+    let Some((prefix, needle, suffix)) = split_jsoup_contains(selector) else {
+        return select(selector);
+    };
+    if !contains_suffix_valid(suffix) {
+        return Vec::new();
+    }
+    select(prefix)
+        .into_iter()
+        .filter(|el| css_contains_text(el, needle))
+        .flat_map(|el| {
+            let suffix = suffix.trim();
+            if suffix.is_empty() {
+                return vec![el];
+            }
+            if let Some(rest) = suffix.strip_prefix('+') {
+                let (sibling, descendant) = split_contains_sibling(rest);
+                let Some(next) = el.next_siblings().find_map(ElementRef::wrap) else {
+                    return Vec::new();
+                };
+                let Some(sel) = parse_css_selector(sibling) else {
+                    return Vec::new();
+                };
+                if !sel.matches(&next) {
+                    return Vec::new();
+                }
+                if descendant.is_empty() {
+                    return vec![next];
+                }
+                return select_css_from_element(next, descendant);
+            }
+            select_css_from_element(el, suffix)
+        })
+        .collect()
+}
+
 fn parse_selector_with_index(selector: &str) -> ParsedSelector {
     let selector = selector.trim();
 
@@ -270,7 +381,12 @@ pub(crate) fn css_rule_is_valid(rule: &str) -> bool {
                 .next()
                 .unwrap_or_default();
             match parse_selector_with_index(&selector).base {
-                SelectorBase::Css(css) => parse_css_selector(&css).is_some(),
+                SelectorBase::Css(css) => split_jsoup_contains(&css).map_or_else(
+                    || parse_css_selector(&css).is_some(),
+                    |(prefix, _, suffix)| {
+                        parse_css_selector(prefix).is_some() && contains_suffix_valid(suffix)
+                    },
+                ),
                 SelectorBase::Children | SelectorBase::Text(_) => true,
             }
         })
@@ -393,10 +509,12 @@ fn collect_matches_from_element<'a>(
 }
 
 fn select_css<'a>(doc: &'a Html, css_selector: &str) -> Vec<ElementRef<'a>> {
-    let Some(sel) = parse_css_selector(css_selector) else {
-        return vec![];
-    };
-    doc.select(&sel).collect()
+    select_css_with_contains(css_selector, |part| {
+        let Some(sel) = parse_css_selector(part) else {
+            return Vec::new();
+        };
+        doc.select(&sel).collect()
+    })
 }
 
 pub(crate) fn select_css_list<'a>(doc: &'a Html, css_selector: &str) -> Vec<ElementRef<'a>> {
@@ -404,10 +522,12 @@ pub(crate) fn select_css_list<'a>(doc: &'a Html, css_selector: &str) -> Vec<Elem
 }
 
 fn select_css_from_element<'a>(el: ElementRef<'a>, css_selector: &str) -> Vec<ElementRef<'a>> {
-    let Some(sel) = parse_css_selector(css_selector) else {
-        return vec![];
-    };
-    el.select(&sel).collect()
+    select_css_with_contains(css_selector, |part| {
+        let Some(sel) = parse_css_selector(part) else {
+            return Vec::new();
+        };
+        el.select(&sel).collect()
+    })
 }
 
 fn child_elements<'a>(el: ElementRef<'a>) -> Vec<ElementRef<'a>> {
@@ -1956,6 +2076,29 @@ mod tests {
         assert_eq!(select_css_list(&doc, ".item:eq(1) a").len(), 0);
         assert!(parse_css_selector(r#"[data-name=":eq(0)"]"#).is_some());
         assert_eq!(select_css_list(&doc, ".item:eq(-1)").len(), 0);
+    }
+
+    #[test]
+    fn jsoup_contains_filters_before_adjacent_sibling_and_descendants() {
+        let doc = parse_document(
+            r#"<div class="info"><dl><dt>状态</dt><dd><a>连载</a></dd><dt>图书 <span>分类</span></dt><dd><a>奇幻</a></dd><dt>简介</dt><dd>分类说明</dd></dl></div>"#,
+        );
+        assert!(css_rule_is_valid(".info dl dt:contains(分类) + dd a@text"));
+        assert_eq!(
+            select_text_list(&doc, ".info dl dt:contains(分类) + dd a@text"),
+            vec!["奇幻"]
+        );
+        assert_eq!(
+            select_text_list(&doc, ".info dl dt:contains(状态) + dd a@text"),
+            vec!["连载"]
+        );
+        assert_eq!(
+            select_text_list(&doc, "dt:contains(图书 分类)@text"),
+            vec!["图书  分类"]
+        );
+        assert_eq!(select_css_list(&doc, "dt:contains(不存在) + dd").len(), 0);
+        assert!(parse_css_selector(r#"[data-x=":contains(分类)"]"#).is_some());
+        assert!(!css_rule_is_valid("dt:contains(分类).tag@text"));
     }
 
     #[test]
