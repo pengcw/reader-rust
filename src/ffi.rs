@@ -346,6 +346,106 @@ a ? a.attr("href") + ',{"headers":{"X-Page":"second"}}' : null;
     }
 
     #[test]
+    fn reader_execute_reuses_inline_js_lib_across_rules_without_cross_source_globals() {
+        use std::io::{BufRead, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut paths = Vec::new();
+            for _ in 0..6 {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("jsLib fixture did not receive request: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut first_line = String::new();
+                reader.read_line(&mut first_line).unwrap();
+                let path = first_line.split_whitespace().nth(1).unwrap().to_string();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                let body = if path.ends_with("/1-2") {
+                    "<p>two</p>"
+                } else {
+                    assert!(path.ends_with("/1"), "{path}");
+                    "<p>one</p><a id='next'>next</a>"
+                };
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                paths.push(path);
+            }
+            paths
+        });
+        for name in ["a", "b", "a"] {
+            // Same top-level const/function identifiers, different source-owned values.
+            let library = format!(
+                r#"const urlsData = ['{name}'];
+function route(path) {{ return path; }}
+function formatPage(html) {{ return urlsData[0] + ':' + org.jsoup.Jsoup.parse(html).select('p').first().text(); }}
+function nextPage(html) {{ return org.jsoup.Jsoup.parse(html).select('a#next').first() ? '/chapter/{name}/1-2' : null; }}"#
+            );
+            let source = json!({
+                "bookSourceUrl": format!("{base}/source/{name}"),
+                "bookSourceName": name,
+                "enabledCookieJar": false,
+                "jsLib": library,
+                "ruleContent": {
+                    "content": "<js>formatPage(result)</js>",
+                    "nextContentUrl": "<js>nextPage(result)</js>"
+                }
+            })
+            .to_string();
+            let url_rule = format!(r#"{base}/chapter/{name}/1,{{"js":"route(result)"}}"#);
+            let request = json!({"api":2,"op":"content","params":{"url":url_rule}}).to_string();
+            let c_source = CString::new(source).unwrap();
+            let c_request = CString::new(request).unwrap();
+            let output = reader_execute(
+                char_p::Ref::try_from(c_source.as_c_str()).unwrap(),
+                char_p::Ref::try_from(c_request.as_c_str()).unwrap(),
+            );
+            let response: serde_json::Value = serde_json::from_str(output.to_str()).unwrap();
+            assert_eq!(response["ok"], true, "{name}: {response}");
+            assert_eq!(
+                response["data"]["content"],
+                format!("{name}:one\n{name}:two")
+            );
+            assert_eq!(response["data"]["pages"], 2);
+        }
+        let paths = server.join().unwrap();
+        assert_eq!(
+            paths,
+            [
+                "/chapter/a/1",
+                "/chapter/a/1-2",
+                "/chapter/b/1",
+                "/chapter/b/1-2",
+                "/chapter/a/1",
+                "/chapter/a/1-2"
+            ]
+        );
+    }
+
+    #[test]
     fn test_reader_eval_text_and_clean() {
         let input = "<div><p>段落一</p><ul><li>项A</li><li>项B</li></ul><br>尾部</div>";
         let c_input = CString::new(input).unwrap();
