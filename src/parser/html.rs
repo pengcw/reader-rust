@@ -664,14 +664,29 @@ fn parse_attr_extractor(extractor: &str) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
-/// Get all text nodes from an element, preserving structure
+/// Extract direct text nodes, matching Legado's Jsoup `Element.textNodes()` behavior.
 fn get_text_nodes(el: &ElementRef) -> String {
+    let tag = el.value().name();
+    if tag.eq_ignore_ascii_case("script") || tag.eq_ignore_ascii_case("style") {
+        return String::new();
+    }
+
+    el.children()
+        .filter_map(|node| node.value().as_text())
+        .map(|text_node| text_node.text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Preserve recursive text collection for internal rule input, which is not the `textNodes` extractor.
+pub(crate) fn get_descendant_text_nodes(el: &ElementRef) -> String {
     let mut texts = Vec::new();
-    collect_text_nodes(*el, &mut texts);
+    collect_descendant_text_nodes(*el, &mut texts);
     texts.join("\n")
 }
 
-fn collect_text_nodes(el: ElementRef, texts: &mut Vec<String>) {
+fn collect_descendant_text_nodes(el: ElementRef, texts: &mut Vec<String>) {
     for node in el.children() {
         if let Some(text_node) = node.value().as_text() {
             let text = text_node.text.trim().to_string();
@@ -680,7 +695,7 @@ fn collect_text_nodes(el: ElementRef, texts: &mut Vec<String>) {
             }
         }
         if let Some(child_el) = ElementRef::wrap(node) {
-            collect_text_nodes(child_el, texts);
+            collect_descendant_text_nodes(child_el, texts);
         }
     }
 }
@@ -1759,6 +1774,33 @@ mod tests {
 
         let list_doc = parse_document("<ul><li>one</li><li>two</li></ul>");
         assert_eq!(select_list(&list_doc, "ul li").len(), 2);
+    }
+
+    #[test]
+    fn text_nodes_only_extract_direct_text_and_skip_script_style_data() {
+        let doc = parse_document(
+            r#"<div id="content"> first <span>nested</span><script>read2();</script><style>.x { color: red; }</style> second </div>"#,
+        );
+        let element = select_list(&doc, "#content").into_iter().next().unwrap();
+        assert_eq!(
+            extract_text(&element, "textNodes"),
+            Some("first\nsecond".to_string())
+        );
+
+        let script = select_list(&doc, "#content script")
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(extract_text(&script, "textNodes"), None);
+        let style = select_list(&doc, "#content style")
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(extract_text(&style, "textNodes"), None);
+
+        let recursive_input = get_descendant_text_nodes(&element);
+        assert!(recursive_input.contains("nested"));
+        assert!(recursive_input.contains("read2();"));
     }
 
     #[test]

@@ -2980,7 +2980,7 @@ fn eval_field_html_with_ctx(
     if let Some(key) = direct_get_key(rule) {
         return ctx.get(key);
     }
-    let input = html::extract_text(el, "textNodes").unwrap_or_default();
+    let input = html::get_descendant_text_nodes(el);
     let mut source_rule = SourceRule::compile(rule, ParseMode::Css, false);
     evaluate_put_entries(&source_rule.put_entries, ctx, |put_rule, ctx| {
         eval_field_html_with_ctx(put_rule, el, base_url, ctx)
