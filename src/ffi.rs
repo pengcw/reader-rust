@@ -251,6 +251,101 @@ mod tests {
     use std::ffi::CString;
 
     #[test]
+    fn reader_execute_content_uses_jsoup_cleanup_and_next_page_headers() {
+        use std::io::{BufRead, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("content fixture did not receive request: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    request.push_str(&line);
+                }
+                let request = request.to_ascii_lowercase();
+                let body = if request.starts_with("get /chapter/1-2 ") {
+                    r#"<div class="content"><p>second</p></div><div class="readPage">完</div>"#
+                } else {
+                    assert!(request.starts_with("get /chapter/1 "), "{request}");
+                    r#"<div class="content"><p>first</p><p style="display:none">hidden</p></div><div class="readPage"><a href="/chapter/1-2">下一页</a></div>"#
+                };
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+        let content_rule = r#"<js>
+var doc = org.jsoup.Jsoup.parse(result);
+doc.select("[style*='display:none']").remove();
+var paragraphs = doc.select("div.content p").toArray();
+var textList = [];
+for (var i = 0; i < paragraphs.length; i++) {
+    var txt = paragraphs[i].text().trim();
+    if (txt) textList.push(txt);
+}
+textList.join('\n\n');
+</js>"#;
+        let next_rule = r#"<js>
+var doc = org.jsoup.Jsoup.parse(result);
+var a = doc.select("div.readPage a:contains(下一页)").first();
+a ? a.attr("href") + ',{"headers":{"X-Page":"second"}}' : null;
+</js>"#;
+        let source = json!({"bookSourceUrl":base,"bookSourceName":"jsoup content fixture", "ruleContent":{"content":content_rule,"nextContentUrl":next_rule}}).to_string();
+        let request = json!({"api":2,"op":"content","params":{"url":format!("{base}/chapter/1")}})
+            .to_string();
+        let c_source = CString::new(source).unwrap();
+        let c_request = CString::new(request).unwrap();
+        let output = reader_execute(
+            char_p::Ref::try_from(c_source.as_c_str()).unwrap(),
+            char_p::Ref::try_from(c_request.as_c_str()).unwrap(),
+        );
+        let response: serde_json::Value = serde_json::from_str(output.to_str()).unwrap();
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["data"]["content"], "first\nsecond", "{response}");
+        assert_eq!(response["data"]["pages"], 2, "{response}");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[0].contains("x-page:"));
+        assert!(
+            requests[1].starts_with("get /chapter/1-2 "),
+            "{}",
+            requests[1]
+        );
+        assert!(
+            requests[1].contains("x-page: second\r\n"),
+            "{}",
+            requests[1]
+        );
+    }
+
+    #[test]
     fn test_reader_eval_text_and_clean() {
         let input = "<div><p>段落一</p><ul><li>项A</li><li>项B</li></ul><br>尾部</div>";
         let c_input = CString::new(input).unwrap();

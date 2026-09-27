@@ -4,8 +4,8 @@
 //! `RuleEngine` 调用，并将所有业务失败转换成稳定的 JSON envelope。
 
 use crate::crawler::{
-    analyze_url_with_context, with_active_session, ExecuteSession, FetchError, HttpResponse,
-    HttpSession, UrlRuleContext,
+    analyze_url_with_context, strip_url_options, with_active_session, ExecuteSession, FetchError,
+    HttpResponse, HttpSession, UrlRuleContext,
 };
 use crate::model::book_source::{book_source_from_value, BookSource};
 use crate::model::replace_rule::ReplaceRule;
@@ -1623,7 +1623,10 @@ fn success(
 
 // 复用主分支 BookService 的启发式，避免把章节翻页规则误判为下一章。
 fn same_origin_url(left: &str, right: &str) -> bool {
-    match (url::Url::parse(left), url::Url::parse(right)) {
+    match (
+        url::Url::parse(strip_url_options(left)),
+        url::Url::parse(strip_url_options(right)),
+    ) {
         (Ok(left), Ok(right)) => {
             left.scheme() == right.scheme()
                 && left.host_str() == right.host_str()
@@ -1634,9 +1637,9 @@ fn same_origin_url(left: &str, right: &str) -> bool {
 }
 
 fn should_follow_content_page(chapter_url: &str, current_url: &str, next_url: &str) -> bool {
-    let chapter_url = strip_fragment(chapter_url);
-    let current_url = strip_fragment(current_url);
-    let next_url = strip_fragment(next_url);
+    let chapter_url = strip_fragment(strip_url_options(chapter_url));
+    let current_url = strip_fragment(strip_url_options(current_url));
+    let next_url = strip_fragment(strip_url_options(next_url));
     if next_url == chapter_url || next_url == current_url {
         return false;
     }

@@ -901,7 +901,7 @@ fn split_url_options(rule: &str) -> (&str, Option<&str>) {
     (rule, None)
 }
 
-fn strip_url_options(rule: &str) -> &str {
+pub(crate) fn strip_url_options(rule: &str) -> &str {
     split_url_options(rule).0
 }
 
