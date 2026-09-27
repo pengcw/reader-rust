@@ -932,7 +932,21 @@ fn execute_content(
         if content.is_empty() && !is_volume {
             return Err(ExecuteError::parse("content is empty"));
         }
-        return Ok(success_without_http(json!({"content": content})));
+        let title = engine.content_title_with_context(
+            source,
+            "",
+            &initial_url,
+            book_variable.as_deref(),
+            chapter_variable.as_deref(),
+            book_name.as_deref(),
+            chapter_title.as_deref(),
+            Some(&book_fields),
+        );
+        let mut data = json!({"content": content});
+        if let Some(title) = title {
+            data["title"] = json!(title);
+        }
+        return Ok(success_without_http(data));
     }
 
     let mut pending = VecDeque::from([(initial_url.clone(), true)]);
@@ -1068,12 +1082,28 @@ fn execute_content(
             }
         }
     }
+    let title = first_page.as_ref().and_then(|(body, url)| {
+        engine.content_title_with_context(
+            source,
+            body,
+            url,
+            book_variable.as_deref(),
+            chapter_variable.as_deref(),
+            book_name.as_deref(),
+            chapter_title.as_deref(),
+            Some(&book_fields),
+        )
+    });
     let content = apply_replace_rules(&fragments.join("\n"), &replace_rules);
     if content.is_empty() && !is_volume {
         return Err(ExecuteError::parse("content is empty"));
     }
+    let mut data = json!({"content": content, "pages": visited_urls.len() + sub_requests, "truncated": truncated});
+    if let Some(title) = title {
+        data["title"] = json!(title);
+    }
     Ok(success(
-        json!({"content": content, "pages": visited_urls.len() + sub_requests, "truncated": truncated}),
+        data,
         visited_urls.len() + sub_requests,
         truncated,
         &response,
@@ -1921,6 +1951,68 @@ mod tests {
         assert!(uses_js_ajax_content_rule(&source(
             "@js: java.ajax(baseUrl)"
         )));
+    }
+
+    #[test]
+    fn content_title_uses_original_response_after_pagination() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for index in 0..2 {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut buf = [0u8; 2048];
+                stream.read(&mut buf).unwrap();
+                let body = if index == 0 {
+                    r#"{"content":"first","title":"Original","next":"/chapter/1-2"}"#
+                } else {
+                    r#"{"content":"second","title":"Other"}"#
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let source = serde_json::json!({"bookSourceName":"chapter title", "bookSourceUrl":base,
+            "ruleContent":{"content":"$.content","nextContentUrl":"$.next","title":"$.title"}});
+        let request = serde_json::json!({"api":2,"op":"content","params":{"url":format!("{base}/chapter/1")}});
+        let result: Value =
+            serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["title"], "Original");
+        assert_eq!(result["data"]["content"], "first\nsecond");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn empty_or_invalid_title_rule_does_not_add_a_title_field() {
+        for title_rule in ["$.title", "@js: throw new Error('title unavailable')"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut buf = [0u8; 1024];
+                stream.read(&mut buf).unwrap();
+                let body = r#"{"content":"main","title":"   "}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            });
+            let source = serde_json::json!({"bookSourceName":"optional title", "bookSourceUrl":base,
+                "ruleContent":{"content":"$.content","title":title_rule}});
+            let request = serde_json::json!({"api":2,"op":"content","params":{"url":format!("{base}/chapter")}});
+            let result: Value =
+                serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+            assert_eq!(result["ok"], true, "{result}");
+            assert!(result["data"].get("title").is_none(), "{result}");
+            assert_eq!(result["data"]["content"], "main");
+            server.join().unwrap();
+        }
     }
 
     #[test]
