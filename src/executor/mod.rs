@@ -2172,6 +2172,35 @@ mod tests {
     }
 
     #[test]
+    fn execute_round_trips_js_cache_without_cross_user_leakage() {
+        let source = serde_json::json!({
+            "bookSourceName": "cache session fixture",
+            "bookSourceUrl": "https://cache-session.example/",
+            "loginUi": "@js:JSON.stringify([{name:cache.get('private-token')||'missing'}])"
+        });
+        let login_request = serde_json::json!({
+            "api":2,"op":"login",
+            "params":{"values":{},"action":"cache.put('private-token','user-a',60); 'ok'"}
+        });
+        let first: Value =
+            serde_json::from_str(&execute(&source.to_string(), &login_request.to_string()))
+                .unwrap();
+        assert_eq!(first["ok"], true, "{first}");
+        assert!(first["session"]["variables"]["__reader_js_cache_v1"].is_object());
+
+        let ui_request = serde_json::json!({"api":2,"op":"login_ui","params":{}});
+        let other: Value =
+            serde_json::from_str(&execute(&source.to_string(), &ui_request.to_string())).unwrap();
+        assert_eq!(other["data"][0]["name"], "missing", "{other}");
+        let mut restored_request = ui_request;
+        restored_request["session"] = first["session"].clone();
+        let restored: Value =
+            serde_json::from_str(&execute(&source.to_string(), &restored_request.to_string()))
+                .unwrap();
+        assert_eq!(restored["data"][0]["name"], "user-a", "{restored}");
+    }
+
+    #[test]
     fn login_check_js_receives_and_can_replace_str_response() {
         let base_url = serve_once(r#"{"message":"before"}"#);
         let source = serde_json::json!({

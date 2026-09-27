@@ -5,7 +5,7 @@
 
 use crate::model::book_source::BookSource;
 use crate::parser::js::{
-    eval_js, eval_js_url_template_with_bindings, eval_js_url_with_bindings, with_js_lib,
+    eval_js_url_template_with_bindings, eval_js_url_with_bindings, with_js_lib,
 };
 use chardetng::EncodingDetector;
 use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8};
@@ -927,8 +927,18 @@ fn source_headers(source: &BookSource) -> Result<Vec<(String, String)>, String> 
         return Ok(Vec::new());
     };
     let raw = if let Some(script) = strip_js_prefix(raw.trim()) {
-        eval_js(script, "", &source.book_source_url)
-            .map_err(|error| format!("source header JavaScript failed: {error}"))?
+        // Android BaseSource.getHeaderMap evaluates the rule with the source
+        // binding, not the current book/chapter AnalyzeUrl bindings.
+        eval_js_url_with_bindings(
+            script,
+            "",
+            "",
+            0,
+            &source.book_source_url,
+            &source.book_source_url,
+            None,
+        )
+        .map_err(|error| format!("source header JavaScript failed: {error}"))?
     } else {
         raw.to_string()
     };
@@ -1572,6 +1582,40 @@ mod tests {
         assert!(spec.headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("referer") && value == "https://a.test"
         }));
+    }
+
+    #[test]
+    fn android_source_header_uses_source_and_session_before_url_options() {
+        use crate::crawler::session::{with_active_session, ExecuteSession};
+
+        let source = test_source(Some(
+            r#"@js:JSON.stringify({'X-Source':source.getKey(),'X-Token':source.getVariable(),'X-Order':'source'})"#,
+        ));
+        let request = r#"/chapter,{"headers":{"X-Order":"url"}}"#;
+        let state = |token: &str| ExecuteSession {
+            header: Some(serde_json::json!({"X-Order":"login","X-Login":"active"})),
+            variables: Some(HashMap::from([(
+                "variable".to_string(),
+                Value::String(token.to_string()),
+            )])),
+            ..Default::default()
+        };
+        for token in ["first-user", "second-user"] {
+            let (spec, _) =
+                with_active_session(Some(&state(token)), &source.book_source_url, |_| {
+                    analyze_url(request, "", 1, &source.book_source_url, &source).unwrap()
+                });
+            let header = |name: &str| {
+                spec.headers
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                    .map(|(_, value)| value.as_str())
+            };
+            assert_eq!(header("X-Source"), Some(source.book_source_url.as_str()));
+            assert_eq!(header("X-Token"), Some(token));
+            assert_eq!(header("X-Login"), Some("active"));
+            assert_eq!(header("X-Order"), Some("url"));
+        }
     }
 
     #[test]

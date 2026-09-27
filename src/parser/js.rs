@@ -623,8 +623,8 @@ fn eval_js_inner_with_source(
             cache_obj.set(
                 "put",
                 Func::new(
-                    |key: String, val: String, save_time: rquickjs::function::Opt<i64>| {
-                        let _ = js_cache_put(&key, val, save_time.0);
+                    |key: String, val: String, save_time: rquickjs::function::Opt<i64>| -> bool {
+                        js_cache_put(&key, val, save_time.0)
                     },
                 ),
             )?;
@@ -1481,8 +1481,10 @@ fn eval_js_inner_with_source(
                             catch (_) { stored = String(value); }
                         }
                         if (stored === undefined) stored = String(value);
-                        if (saveTime == null) nativeCachePut(String(key), stored);
-                        else nativeCachePut(String(key), stored, Number(saveTime));
+                        const ok = saveTime == null
+                            ? nativeCachePut(String(key), stored)
+                            : nativeCachePut(String(key), stored, Number(saveTime));
+                        if (!ok) throw new Error('cache.put: session cache limit exceeded');
                     };
                     globalThis.cache.delete = key => {
                         nativeCacheDelete(String(key));
@@ -1493,6 +1495,9 @@ fn eval_js_inner_with_source(
             globals.set(
                 "kv_get",
                 Func::new(|key: String| -> Option<String> {
+                    if let Some(active) = crate::crawler::session::current_active_session() {
+                        return active.js_cache_get(&format!("__kv:{key}"));
+                    }
                     let map = JS_KV.lock().unwrap_or_else(|e| e.into_inner());
                     map.get(&key).cloned()
                 }),
@@ -1500,6 +1505,9 @@ fn eval_js_inner_with_source(
             globals.set(
                 "kv_put",
                 Func::new(|key: String, val: String| -> bool {
+                    if let Some(active) = crate::crawler::session::current_active_session() {
+                        return active.js_cache_put(&format!("__kv:{key}"), val, None);
+                    }
                     let mut map = JS_KV.lock().unwrap_or_else(|e| e.into_inner());
                     map.insert(key, val);
                     true
@@ -2704,6 +2712,31 @@ fn active_js_lib_script() -> anyhow::Result<String> {
         return Ok(String::new());
     };
     let cache_key = md5_hex(&js_lib);
+    // A remote library can depend on a user's cookies. Keep it in the active
+    // operation only; a process-global cache would expose one user's script
+    // to another user of the same book source.
+    let remote = serde_json::from_str::<JsonValue>(&js_lib)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .is_some_and(|map| {
+            map.values()
+                .filter_map(JsonValue::as_str)
+                .any(is_absolute_http_url)
+        });
+    if remote {
+        let active = crate::crawler::session::current_active_session();
+        if let Some(cached) = active
+            .as_ref()
+            .and_then(|session| session.script_cache_get(&cache_key))
+        {
+            return Ok(cached);
+        }
+        let compiled = compile_js_lib(&js_lib)?;
+        if let Some(session) = active {
+            session.script_cache_put(cache_key, compiled.clone());
+        }
+        return Ok(compiled);
+    }
     if let Some(cached) = JS_LIB_CACHE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2761,24 +2794,20 @@ fn java_import_script(path: &str) -> Option<String> {
     }
 
     let cache_key = format!("import_script:{}", md5_hex(path));
-    if let Some(cached) = JS_LIB_CACHE
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .get(&cache_key)
-        .cloned()
+    let active = crate::crawler::session::current_active_session();
+    if let Some(cached) = active
+        .as_ref()
+        .and_then(|session| session.script_cache_get(&cache_key))
     {
         return Some(cached);
     }
-
     let body = java_analyzed_request_body(path);
     if body.is_empty() {
         return None;
     }
-
-    JS_LIB_CACHE
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(cache_key, body.clone());
+    if let Some(session) = active {
+        session.script_cache_put(cache_key, body.clone());
+    }
     Some(body)
 }
 
@@ -3257,6 +3286,9 @@ fn cookie_pairs_to_string(pairs: &HashMap<String, String>) -> String {
 }
 
 fn js_cache_get(key: &str) -> Option<String> {
+    if let Some(active) = crate::crawler::session::current_active_session() {
+        return active.js_cache_get(key);
+    }
     let mut cache = JS_CACHE.lock().unwrap_or_else(|error| error.into_inner());
     let expired = cache
         .get(key)
@@ -3271,6 +3303,9 @@ fn js_cache_get(key: &str) -> Option<String> {
 }
 
 fn js_cache_put(key: &str, value: String, save_time_secs: Option<i64>) -> bool {
+    if let Some(active) = crate::crawler::session::current_active_session() {
+        return active.js_cache_put(key, value, save_time_secs);
+    }
     let expires_at = save_time_secs
         .filter(|seconds| *seconds > 0)
         .and_then(|seconds| Instant::now().checked_add(Duration::from_secs(seconds as u64)));
@@ -3280,6 +3315,9 @@ fn js_cache_put(key: &str, value: String, save_time_secs: Option<i64>) -> bool {
 }
 
 fn js_cache_delete(key: &str) -> bool {
+    if let Some(active) = crate::crawler::session::current_active_session() {
+        return active.js_cache_delete(key);
+    }
     JS_CACHE
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -3629,16 +3667,50 @@ mod tests {
         })
         .to_string();
 
-        with_js_lib(Some(&js_lib), || {
-            let expression = format!("{marker} + 1");
-            assert_eq!(eval_js(&expression, "", &url).unwrap(), "42");
-            assert_eq!(eval_js(&expression, "", &url).unwrap(), "42");
+        with_active_session(None, &url, |_| {
+            with_js_lib(Some(&js_lib), || {
+                let expression = format!("{marker} + 1");
+                assert_eq!(eval_js(&expression, "", &url).unwrap(), "42");
+                assert_eq!(eval_js(&expression, "", &url).unwrap(), "42");
+            });
         });
         server.join().unwrap();
         assert_eq!(
             compile_js_lib(r#"{"inline":"var notLoaded=1"}"#).unwrap(),
             ""
         );
+    }
+
+    #[test]
+    fn remote_js_lib_is_not_shared_between_sessions() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("http://{address}/user-library.js");
+        let library = serde_json::json!({"remote": url}).to_string();
+        let server = thread::spawn(move || {
+            for user in ["userA", "userB"] {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request);
+                let body = format!("globalThis.scopedLibraryValue = '{user}';");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        with_js_lib(Some(&library), || {
+            with_active_session(None, &url, |_| {
+                assert_eq!(eval_js("scopedLibraryValue", "", &url).unwrap(), "userA");
+                assert_eq!(eval_js("scopedLibraryValue", "", &url).unwrap(), "userA");
+            });
+            with_active_session(None, &url, |_| {
+                assert_eq!(eval_js("scopedLibraryValue", "", &url).unwrap(), "userB");
+            });
+        });
+        server.join().unwrap();
     }
 
     #[test]
@@ -3700,6 +3772,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(expired, "true");
+    }
+
+    #[test]
+    fn js_cache_is_isolated_by_session_and_restored_from_session_delta() {
+        let url = "https://same-source.example/books";
+        let key = format!("session-cache-{}", Uuid::new_v4());
+        let (value, saved) = with_active_session(None, url, |_| {
+            eval_js(
+                &format!("cache.put('{key}', 'user-a', 60); cache.get('{key}')"),
+                "",
+                url,
+            )
+            .unwrap()
+        });
+        assert_eq!(value, "user-a");
+        let saved = saved.expect("cache write must be returned to the caller");
+        let (other_user, delta) = with_active_session(None, url, |_| {
+            eval_js(&format!("cache.get('{key}') === null"), "", url).unwrap()
+        });
+        assert_eq!(other_user, "true");
+        assert!(delta.is_none());
+        let (restored, _) = with_active_session(Some(&saved), url, |_| {
+            eval_js(&format!("cache.get('{key}')"), "", url).unwrap()
+        });
+        assert_eq!(restored, "user-a");
+
+        let (kv_saved, kv_state) = with_active_session(None, url, |_| {
+            eval_js("kv_put('private', 'user-a'); kv_get('private')", "", url).unwrap()
+        });
+        assert_eq!(kv_saved, "user-a");
+        let (kv_other, _) = with_active_session(None, url, |_| {
+            eval_js("kv_get('private') == null", "", url).unwrap()
+        });
+        assert_eq!(kv_other, "true");
+        let (kv_restored, _) = with_active_session(kv_state.as_ref(), url, |_| {
+            eval_js("kv_get('private')", "", url).unwrap()
+        });
+        assert_eq!(kv_restored, "user-a");
+
+        let (oversized, _) = with_active_session(None, url, |_| {
+            eval_js(&format!("cache.put('{key}', 'x'.repeat(16385))"), "", url)
+        });
+        assert!(oversized
+            .unwrap_err()
+            .to_string()
+            .contains("session cache limit exceeded"));
     }
 
     #[test]

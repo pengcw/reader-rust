@@ -12,7 +12,19 @@ use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
+
+const JS_CACHE_STATE_KEY: &str = "__reader_js_cache_v1";
+const JS_CACHE_MAX_ENTRIES: usize = 64;
+const JS_CACHE_MAX_VALUE_BYTES: usize = 16 * 1024;
+
+fn now_epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 /// 对称会话 DTO：输入与输出同构
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -33,6 +45,8 @@ pub struct ActiveSession {
     cookie_store: SharedCookieStore,
     header: Mutex<Option<Value>>,
     variables: Mutex<HashMap<String, Value>>,
+    // Fetched JS is reused only inside this operation; never shared across users.
+    script_cache: Mutex<HashMap<String, String>>,
     initial_session: ExecuteSession,
 }
 
@@ -79,6 +93,7 @@ impl ActiveSession {
             cookie_store,
             header: Mutex::new(initial_header.clone()),
             variables: Mutex::new(initial_variables.clone().unwrap_or_default()),
+            script_cache: Mutex::new(HashMap::new()),
             initial_session: ExecuteSession {
                 cookies: initial_cookies,
                 header: initial_header,
@@ -139,6 +154,82 @@ impl ActiveSession {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(key.to_string(), value);
+    }
+
+    /// Cache values live in the caller-owned session, never in a process-wide map.
+    pub(crate) fn script_cache_get(&self, key: &str) -> Option<String> {
+        self.script_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .cloned()
+    }
+
+    pub(crate) fn script_cache_put(&self, key: String, script: String) {
+        let mut cache = self.script_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() < 16 && script.len() <= 512 * 1024 {
+            cache.insert(key, script);
+        }
+    }
+
+    pub(crate) fn js_cache_get(&self, key: &str) -> Option<String> {
+        let mut variables = self.variables.lock().unwrap_or_else(|e| e.into_inner());
+        let entries = variables.get_mut(JS_CACHE_STATE_KEY)?.as_object_mut()?;
+        let entry = entries.get(key)?;
+        let expired = entry
+            .get("expiresAt")
+            .and_then(Value::as_u64)
+            .is_some_and(|expiry| expiry <= now_epoch_seconds());
+        if expired {
+            entries.remove(key);
+            return None;
+        }
+        entry.get("value")?.as_str().map(str::to_string)
+    }
+
+    pub(crate) fn js_cache_put(
+        &self,
+        key: &str,
+        value: String,
+        save_time_secs: Option<i64>,
+    ) -> bool {
+        if key.len() > 256 || value.len() > JS_CACHE_MAX_VALUE_BYTES {
+            return false;
+        }
+        let mut variables = self.variables.lock().unwrap_or_else(|e| e.into_inner());
+        let entries = variables
+            .entry(JS_CACHE_STATE_KEY.to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        let Some(entries) = entries.as_object_mut() else {
+            return false;
+        };
+        let now = now_epoch_seconds();
+        entries.retain(|_, entry| {
+            entry
+                .get("expiresAt")
+                .and_then(Value::as_u64)
+                .is_none_or(|expiry| expiry > now)
+        });
+        if !entries.contains_key(key) && entries.len() >= JS_CACHE_MAX_ENTRIES {
+            return false;
+        }
+        let expiry = save_time_secs
+            .filter(|seconds| *seconds > 0)
+            .map(|seconds| now.saturating_add(seconds as u64));
+        entries.insert(
+            key.to_string(),
+            serde_json::json!({"value":value,"expiresAt":expiry}),
+        );
+        true
+    }
+
+    pub(crate) fn js_cache_delete(&self, key: &str) -> bool {
+        let mut variables = self.variables.lock().unwrap_or_else(|e| e.into_inner());
+        variables
+            .get_mut(JS_CACHE_STATE_KEY)
+            .and_then(Value::as_object_mut)
+            .and_then(|entries| entries.remove(key))
+            .is_some()
     }
 
     pub fn remove_variable(&self, key: &str) {
@@ -372,5 +463,27 @@ mod tests {
         let delta = delta.expect("removing the login state must emit a session delta");
         assert_eq!(delta.cookies, None);
         assert_eq!(delta.header, None);
+    }
+
+    #[test]
+    fn js_cache_expires_and_has_a_bounded_session_footprint() {
+        let initial = ExecuteSession {
+            variables: Some(HashMap::from([(
+                JS_CACHE_STATE_KEY.to_string(),
+                json!({"expired":{"value":"old","expiresAt":1}}),
+            )])),
+            ..Default::default()
+        };
+        let (_, delta) = with_active_session(Some(&initial), "https://example.com", |session| {
+            assert_eq!(session.js_cache_get("expired"), None);
+            for index in 0..JS_CACHE_MAX_ENTRIES {
+                assert!(session.js_cache_put(&format!("key-{index}"), "v".into(), None));
+            }
+            assert!(!session.js_cache_put("one-more", "v".into(), None));
+            assert!(!session.js_cache_put("huge", "x".repeat(JS_CACHE_MAX_VALUE_BYTES + 1), None));
+            assert!(session.js_cache_delete("key-0"));
+            assert!(session.js_cache_put("replacement", "v".into(), None));
+        });
+        assert!(delta.is_some());
     }
 }
