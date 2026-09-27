@@ -2281,6 +2281,16 @@ fn eval_js_reentrant<'js>(
     result
 }
 
+fn finalize_java_get_string_url(value: String, base_url: &str, is_url: bool) -> String {
+    if !is_url {
+        value
+    } else if value.trim().is_empty() {
+        base_url.to_string()
+    } else {
+        rule_engine::resolve_url(base_url, &value)
+    }
+}
+
 pub(crate) fn java_get_string(
     rule: Option<&str>,
     content: Option<&str>,
@@ -2295,7 +2305,7 @@ pub(crate) fn java_get_string(
 
     let target_content = content.unwrap_or(default_content).trim();
     if target_content.is_empty() {
-        return String::new();
+        return finalize_java_get_string_url(String::new(), base_url, is_url);
     }
 
     // 支持 || 与 && 组合符 (规范 6.8 & 8.2)
@@ -2308,14 +2318,14 @@ pub(crate) fn java_get_string(
                     content,
                     default_content,
                     base_url,
-                    is_url,
+                    false,
                     unescape,
                 );
                 if !res.is_empty() {
-                    return res;
+                    return finalize_java_get_string_url(res, base_url, is_url);
                 }
             }
-            return String::new();
+            return finalize_java_get_string_url(String::new(), base_url, is_url);
         } else if delim == "&&" {
             let mut results = Vec::new();
             for part in split.parts {
@@ -2324,14 +2334,14 @@ pub(crate) fn java_get_string(
                     content,
                     default_content,
                     base_url,
-                    is_url,
+                    false,
                     unescape,
                 );
                 if !res.is_empty() {
                     results.push(res);
                 }
             }
-            return results.join("\n");
+            return finalize_java_get_string_url(results.join("\n"), base_url, is_url);
         }
     }
 
@@ -2419,11 +2429,7 @@ pub(crate) fn java_get_string(
         res = html::html_unescape(&res);
     }
 
-    if is_url && !res.is_empty() {
-        res = rule_engine::resolve_url(base_url, &res);
-    }
-
-    res
+    finalize_java_get_string_url(res, base_url, is_url)
 }
 
 pub(crate) fn java_get_string_list(
@@ -4918,6 +4924,33 @@ if (a) {
         "#;
         let result = eval_js(script, "", "https://example.com").unwrap();
         assert_eq!(result, "first|last|first|p1|<b>one</b>|one");
+    }
+
+    #[test]
+    fn real_source_get_string_json_fallback_values_and_blank_url() {
+        let body = r#"{"data":{"list":[{"publish_sn":"first"},{"publish_sn":"last"}]},"fallback":"备用","path":"/next","count":0,"enabled":false,"blank":""}"#;
+        let result = eval_js(
+            r#"[
+                java.getString('$.data.list[-1].publish_sn'),
+                java.getString('$.missing||$.fallback'),
+                java.getString('$.count'),
+                java.getString('$.enabled'),
+                java.getString('$.missing'),
+                java.getString('$.missing', null, true),
+                java.getString('$.blank', null, true),
+                java.getString('$.missing||$.path', null, true),
+                java.getString('$.missing||$.absent', null, true),
+                java.getString('$.fallback', '', true),
+                java.getString('', null, true)
+            ].join('|')"#,
+            body,
+            "https://example.com/chapter/",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            "last|备用|0|false||https://example.com/chapter/|https://example.com/chapter/|https://example.com/next|https://example.com/chapter/|https://example.com/chapter/|"
+        );
     }
 
     #[test]

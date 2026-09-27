@@ -446,6 +446,46 @@ function nextPage(html) {{ return org.jsoup.Jsoup.parse(html).select('a#next').f
     }
 
     #[test]
+    fn reader_execute_content_get_string_keeps_json_fallback_and_url_base() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 2048];
+            stream.read(&mut request).unwrap();
+            let body = r#"{"data":{"path":"/next","count":0,"fallback":"ok"}}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let source = json!({
+            "bookSourceUrl": base,
+            "bookSourceName": "getString fixture",
+            "ruleContent": {"content": "<js>[java.getString('$.data.missing||$.data.fallback'), java.getString('$.data.count'), java.getString('$.data.missing', null, true), java.getString('$.data.path', null, true)].join('|')</js>"}
+        }).to_string();
+        let chapter = format!("{base}/chapter");
+        let request = json!({"api":2,"op":"content","params":{"url":chapter}}).to_string();
+        let c_source = CString::new(source).unwrap();
+        let c_request = CString::new(request).unwrap();
+        let output = reader_execute(
+            char_p::Ref::try_from(c_source.as_c_str()).unwrap(),
+            char_p::Ref::try_from(c_request.as_c_str()).unwrap(),
+        );
+        let result: serde_json::Value = serde_json::from_str(output.to_str()).unwrap();
+        server.join().unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(
+            result["data"]["content"],
+            format!("ok|0|{chapter}|{base}/next")
+        );
+    }
+
+    #[test]
     fn test_reader_eval_text_and_clean() {
         let input = "<div><p>段落一</p><ul><li>项A</li><li>项B</li></ul><br>尾部</div>";
         let c_input = CString::new(input).unwrap();
