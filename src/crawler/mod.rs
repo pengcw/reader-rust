@@ -5,7 +5,7 @@
 
 use crate::model::book_source::BookSource;
 use crate::parser::js::{
-    eval_js_url_template_with_bindings, eval_js_url_with_bindings, eval_js_url_with_headers,
+    eval_js_url_template_with_headers, eval_js_url_with_bindings, eval_js_url_with_headers,
     with_js_lib,
 };
 use chardetng::EncodingDetector;
@@ -559,8 +559,25 @@ fn compile_url_request(
 
     // Stages 2-4: URL JS segments, embedded JS templates, legacy placeholders, page choices.
     let bindings = context.map(UrlRuleContext::bindings);
-    let mut rule = eval_url_rule_js_segments(raw_rule, key, page, source, base, bindings.as_ref())?;
-    rule = expand_url_templates(&rule, key, page, source, base, context, bindings.as_ref())?;
+    let mut rule = eval_url_rule_js_segments(
+        raw_rule,
+        key,
+        page,
+        source,
+        base,
+        bindings.as_ref(),
+        &mut headers,
+    )?;
+    rule = expand_url_templates(
+        &rule,
+        key,
+        page,
+        source,
+        base,
+        context,
+        bindings.as_ref(),
+        &mut headers,
+    )?;
     rule = replace_legacy_placeholders(&rule, key, page);
     rule = replace_page_choices_before_options(&rule, page);
 
@@ -688,6 +705,7 @@ fn eval_url_rule_js_segments(
     source: &BookSource,
     base_url: &str,
     bindings: Option<&HashMap<String, Value>>,
+    headers: &mut Vec<(String, String)>,
 ) -> Result<String, String> {
     static URL_JS_SEGMENTS: Lazy<Option<regex::Regex>> =
         Lazy::new(|| regex::Regex::new(r"(?is)<js>(.*?)</js>|@js:(.*)$|^js:(.*)$").ok());
@@ -713,7 +731,7 @@ fn eval_url_rule_js_segments(
             .or_else(|| captures.get(3))
             .map(|value| value.as_str())
             .unwrap_or_default();
-        result = eval_js_url_with_bindings(
+        result = eval_js_url_with_headers(
             script,
             &result,
             key,
@@ -721,6 +739,7 @@ fn eval_url_rule_js_segments(
             &source.book_source_url,
             base_url,
             bindings,
+            headers,
         )
         .map_err(|error| format!("URL JavaScript failed: {error}"))?;
         previous_end = matched.end();
@@ -742,6 +761,7 @@ fn expand_url_templates(
     base_url: &str,
     context: Option<&UrlRuleContext>,
     bindings: Option<&HashMap<String, Value>>,
+    headers: &mut Vec<(String, String)>,
 ) -> Result<String, String> {
     let mut output = String::with_capacity(rule.len());
     let mut cursor = 0;
@@ -765,7 +785,7 @@ fn expand_url_templates(
         } else if let Some(val) = context.and_then(|c| c.get(expression)) {
             val
         } else {
-            eval_js_url_template_with_bindings(
+            eval_js_url_template_with_headers(
                 expression,
                 rule,
                 key,
@@ -773,6 +793,7 @@ fn expand_url_templates(
                 &source.book_source_url,
                 base_url,
                 bindings,
+                headers,
             )
             .map_err(|error| format!("URL template JavaScript failed: {error}"))?
         };
@@ -1832,6 +1853,34 @@ mod tests {
         assert!(error.contains("URL option JavaScript failed"));
         let after_error = analyze_url("/next", "", 1, &base, &source).unwrap();
         assert!(!after_error.headers.iter().any(|(name, _)| name == "X-Js"));
+    }
+
+    #[test]
+    fn android_url_js_stages_share_request_headers_in_order() {
+        let source = test_source(Some(r#"{"X-Flow":"source"}"#));
+        let base = "https://example.com";
+        let rule = r#"<js>java.headerMap.put('X-Flow','segment'); '/chapter'</js>@result/{{java.headerMap.get('X-Flow') === 'segment' ? (java.headerMap.put('X-Flow','template'), 'read') : 'wrong'}},{"headers":{"X-Flow":"option"},"js":"java.headerMap.get('X-Flow') === 'option' ? (java.headerMap.put('X-Flow','final'), result) : '/wrong'"}"#;
+        let spec = analyze_url(rule, "", 1, base, &source).unwrap();
+        assert_eq!(spec.url, "https://example.com/chapter/read");
+        assert!(spec
+            .headers
+            .iter()
+            .any(|(name, value)| name == "X-Flow" && value == "final"));
+
+        let without_options = analyze_url(
+            r#"<js>java.headerMap.put('X-Flow','segment'); '/chapter'</js>@result/{{java.headerMap.get('X-Flow') === 'segment' ? (java.headerMap.put('X-Flow','template'), 'read') : 'wrong'}}"#,
+            "", 1, base, &source,
+        ).unwrap();
+        assert_eq!(without_options.url, "https://example.com/chapter/read");
+        assert!(without_options
+            .headers
+            .iter()
+            .any(|(name, value)| name == "X-Flow" && value == "template"));
+        let next = analyze_url("/next", "", 1, base, &source).unwrap();
+        assert!(next
+            .headers
+            .iter()
+            .any(|(name, value)| name == "X-Flow" && value == "source"));
     }
 
     #[test]
