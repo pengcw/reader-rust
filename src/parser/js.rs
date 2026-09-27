@@ -182,6 +182,7 @@ pub fn eval_js_search_with_source(
         Some(source_key),
         None,
         false,
+        None,
     )
 }
 
@@ -214,7 +215,41 @@ pub fn eval_js_url_with_bindings(
         Some(source_key),
         bindings,
         false,
+        None,
     )
+}
+
+/// Evaluate an AnalyzeUrl option script with its mutable, request-local headerMap.
+pub fn eval_js_url_with_headers(
+    script: &str,
+    result: &str,
+    key: &str,
+    page: i32,
+    source_key: &str,
+    base_url: &str,
+    bindings: Option<&HashMap<String, JsonValue>>,
+    headers: &mut Vec<(String, String)>,
+) -> anyhow::Result<String> {
+    let initial: serde_json::Map<String, JsonValue> = headers
+        .iter()
+        .map(|(name, value)| (name.clone(), JsonValue::String(value.clone())))
+        .collect();
+    let updated = std::cell::RefCell::new(None);
+    let result = eval_js_inner_with_source(
+        script,
+        Some(result),
+        Some(base_url),
+        Some(key),
+        Some(page),
+        Some(source_key),
+        bindings,
+        false,
+        Some((&initial, &updated)),
+    )?;
+    if let Some(values) = updated.into_inner() {
+        *headers = values;
+    }
+    Ok(result)
 }
 
 pub fn eval_js_url_template(
@@ -246,6 +281,7 @@ pub fn eval_js_url_template_with_bindings(
         Some(source_key),
         bindings,
         true,
+        None,
     )
 }
 
@@ -259,6 +295,7 @@ pub fn eval_js_template(script: &str, input: &str, base_url: &str) -> anyhow::Re
         None,
         None,
         true,
+        None,
     )
 }
 
@@ -277,6 +314,7 @@ pub fn eval_js_template_with_bindings(
         None,
         Some(bindings),
         true,
+        None,
     )
 }
 
@@ -288,7 +326,9 @@ fn eval_js_inner(
     page: Option<i32>,
     bindings: Option<&HashMap<String, JsonValue>>,
 ) -> anyhow::Result<String> {
-    eval_js_inner_with_source(script, input, base_url, key, page, None, bindings, false)
+    eval_js_inner_with_source(
+        script, input, base_url, key, page, None, bindings, false, None,
+    )
 }
 
 fn eval_js_inner_with_source(
@@ -300,6 +340,10 @@ fn eval_js_inner_with_source(
     source_key: Option<&str>,
     bindings: Option<&HashMap<String, JsonValue>>,
     template_result: bool,
+    header_map: Option<(
+        &serde_json::Map<String, JsonValue>,
+        &std::cell::RefCell<Option<Vec<(String, String)>>>,
+    )>,
 ) -> anyhow::Result<String> {
     if let Some(raw_ctx) = ACTIVE_JS_REENTRANT_CTX.with(|cell| *cell.borrow()) {
         // SAFETY: the pointer is installed only for the duration of a native
@@ -1230,6 +1274,10 @@ fn eval_js_inner_with_source(
                 }),
             )?;
 
+            if let Some((initial, _)) = header_map {
+                let map = ctx.json_parse(JsonValue::Object(initial.clone()).to_string())?;
+                java_obj.set("headerMap", map)?;
+            }
             globals.set("java", java_obj)?;
             eval_script(
                 ctx.clone(),
@@ -1957,8 +2005,29 @@ fn eval_js_inner_with_source(
             // Rule scripts may run once per chapter while JS_ENV is reused. Keep
             // let/const declarations local to this evaluation to avoid a later
             // chapter failing with a global lexical redeclaration SyntaxError.
+            if header_map.is_some() {
+                eval_script(ctx.clone(), r#"(function(map) {
+                    Object.defineProperties(map, {
+                        put: { value: function(key, value) {
+                            const previous = this[key]; this[key] = String(value); return previous;
+                        } },
+                        get: { value: function(key) { return this[key] ?? null; } },
+                        remove: { value: function(key) {
+                            const previous = this[key]; delete this[key]; return previous;
+                        } }
+                    });
+                })(java.headerMap)"#)?;
+            }
             let scoped_script = format!("{{\n{script}\n}}");
             let v = eval_script(ctx.clone(), &scoped_script)?;
+            if let Some((_, updated)) = header_map {
+                let map: rquickjs::Value<'_> = eval_script(ctx.clone(), "java.headerMap")?;
+                let json = ctx.json_stringify(map)?.ok_or_else(|| anyhow::anyhow!("invalid java.headerMap"))?;
+                let values: serde_json::Map<String, JsonValue> = serde_json::from_str(&json.to_string()?)?;
+                *updated.borrow_mut() = Some(values.into_iter().filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key, value.to_owned()))
+                }).collect());
+            }
 
             let result = if v.is_null() || v.is_undefined() {
                 if !template_result {

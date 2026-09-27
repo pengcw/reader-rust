@@ -5,7 +5,8 @@
 
 use crate::model::book_source::BookSource;
 use crate::parser::js::{
-    eval_js_url_template_with_bindings, eval_js_url_with_bindings, with_js_lib,
+    eval_js_url_template_with_bindings, eval_js_url_with_bindings, eval_js_url_with_headers,
+    with_js_lib,
 };
 use chardetng::EncodingDetector;
 use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8};
@@ -572,12 +573,16 @@ fn compile_url_request(
 
     // Stage 6: resolve URL and apply options that modify the request context.
     let mut url = absolute_url(base, url_part.trim());
+    // Android merges URL-option headers before running option JS against java.headerMap.
+    if let Some(extra) = options.get("headers") {
+        merge_headers(&mut headers, headers_from_value(extra));
+    }
     if let Some(script) = options
         .get("js")
         .and_then(Value::as_str)
         .filter(|script| !script.trim().is_empty())
     {
-        let rewritten = eval_js_url_with_bindings(
+        let rewritten = eval_js_url_with_headers(
             script,
             &url,
             key,
@@ -585,15 +590,13 @@ fn compile_url_request(
             &source.book_source_url,
             base,
             bindings.as_ref(),
+            &mut headers,
         )
         .map_err(|error| format!("URL option JavaScript failed: {error}"))?;
         url = absolute_url(base, &rewritten);
     }
     validate_http_url(&url)?;
 
-    if let Some(extra) = options.get("headers") {
-        merge_headers(&mut headers, headers_from_value(extra));
-    }
     if let Some(raw_proxy) = options
         .get("proxy")
         .and_then(Value::as_str)
@@ -1761,6 +1764,74 @@ mod tests {
 
         let spec = analyze_url("/search", "key", 1, "https://a.test", &source).unwrap();
         assert_eq!(spec.proxy.as_deref(), Some("http://source-proxy:8080"));
+    }
+
+    #[test]
+    fn android_url_option_js_mutates_request_local_headers() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let size = stream.read(&mut request).unwrap();
+            let text = String::from_utf8_lossy(&request[..size]).to_ascii_lowercase();
+            assert!(text.starts_with("get /rewritten http/1.1"));
+            assert!(text.contains("x-js: dynamic\r\n"));
+            assert!(text.contains("x-order: javascript\r\n"));
+            assert!(!text.contains("x-removed:"));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+            )
+            .unwrap();
+        });
+        let source = BookSource {
+            book_source_url: base.clone(),
+            header: Some(r#"{"X-Order":"source","X-Removed":"old"}"#.to_string()),
+            enabled_cookie_jar: Some(false),
+            ..Default::default()
+        };
+        let script = "java.headerMap.put('X-Js','dynamic'); java.headerMap['X-Order']='javascript'; java.headerMap.remove('X-Removed'); java.headerMap.get('X-Order') === 'javascript' ? '/rewritten' : '/wrong'";
+        let rule = format!(
+            "/start,{}",
+            serde_json::json!({"headers":{"X-Order":"option"},"js":script})
+        );
+        let spec = analyze_url(&rule, "", 1, &base, &source).unwrap();
+        assert_eq!(spec.url, format!("{base}/rewritten"));
+        assert_eq!(
+            HttpSession::new(&source, 3000)
+                .unwrap()
+                .fetch(&spec, 1024)
+                .unwrap()
+                .body,
+            "ok"
+        );
+        server.join().unwrap();
+
+        let next = analyze_url("/next", "", 1, &base, &source).unwrap();
+        assert!(!next
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("X-Js")));
+        assert!(next
+            .headers
+            .iter()
+            .any(|(name, value)| name == "X-Order" && value == "source"));
+
+        let error = analyze_url(
+            r#"/bad,{"js":"java.headerMap.put('X-Js','bad'); throw new Error('stop')"}"#,
+            "",
+            1,
+            &base,
+            &source,
+        )
+        .unwrap_err();
+        assert!(error.contains("URL option JavaScript failed"));
+        let after_error = analyze_url("/next", "", 1, &base, &source).unwrap();
+        assert!(!after_error.headers.iter().any(|(name, _)| name == "X-Js"));
     }
 
     #[test]
