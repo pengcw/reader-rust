@@ -2172,6 +2172,86 @@ mod tests {
     }
 
     #[test]
+    fn login_header_and_cookie_follow_the_ffi_session_lifecycle() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..4 {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut request = [0u8; 4096];
+                let size = stream.read(&mut request).unwrap();
+                requests.push(String::from_utf8_lossy(&request[..size]).to_ascii_lowercase());
+                let body = r#"{"data":[{"name":"Book","url":"/book"}]}"#;
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        let source = serde_json::json!({
+            "bookSourceName": "login session fixture",
+            "bookSourceUrl": base,
+            "searchUrl": "/search?key={{key}}",
+            "ruleSearch": {"bookList":"$.data[*]","name":"$.name","bookUrl":"$.url"}
+        });
+        let login = serde_json::json!({
+            "api":2,"op":"login","params":{"values":{},"action":format!(
+                "source.putLoginHeader(JSON.stringify({{Authorization:'Bearer secret',Cookie:'sid=secret'}})); java.ajax('{base}/during'); 'ok'"
+            )}
+        });
+        let first: Value =
+            serde_json::from_str(&execute(&source.to_string(), &login.to_string())).unwrap();
+        assert_eq!(first["ok"], true, "{first}");
+        assert_eq!(first["session"]["cookies"], "sid=secret");
+        assert_eq!(first["session"]["header"]["Authorization"], "Bearer secret");
+        let search = serde_json::json!({"api":2,"op":"search","params":{"key":"test"},"session":first["session"]});
+        let found: Value =
+            serde_json::from_str(&execute(&source.to_string(), &search.to_string())).unwrap();
+        assert_eq!(found["ok"], true, "{found}");
+        assert_eq!(found["session"], Value::Null);
+
+        let clear = serde_json::json!({
+            "api":2,"op":"login","params":{"values":{},"action":format!(
+                "source.removeLoginHeader(); java.ajax('{base}/cleared'); 'ok'"
+            )},"session":first["session"]
+        });
+        let cleared: Value =
+            serde_json::from_str(&execute(&source.to_string(), &clear.to_string())).unwrap();
+        assert_eq!(cleared["ok"], true, "{cleared}");
+        assert!(
+            cleared["session"].is_object(),
+            "clearing state must emit a delta: {cleared}"
+        );
+        assert!(cleared["session"]["cookies"].is_null());
+        assert!(cleared["session"]["header"].is_null());
+        let mut after = search;
+        after["session"] = cleared["session"].clone();
+        let final_result: Value =
+            serde_json::from_str(&execute(&source.to_string(), &after.to_string())).unwrap();
+        assert_eq!(final_result["ok"], true, "{final_result}");
+
+        let requests = server.join().unwrap();
+        for (index, path) in ["/during", "/search", "/cleared", "/search"]
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                requests[index].starts_with(&format!("get {path}")),
+                "{}",
+                requests[index]
+            );
+            let authenticated = index < 2;
+            assert_eq!(
+                requests[index].contains("authorization: bearer secret"),
+                authenticated
+            );
+            assert_eq!(
+                requests[index].contains("cookie: sid=secret"),
+                authenticated
+            );
+        }
+    }
+
+    #[test]
     fn execute_round_trips_js_cache_without_cross_user_leakage() {
         let source = serde_json::json!({
             "bookSourceName": "cache session fixture",
