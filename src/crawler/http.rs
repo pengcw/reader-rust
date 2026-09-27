@@ -1,4 +1,5 @@
 use cookie_store::CookieStore;
+use serde_json::Value;
 use std::fmt;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
@@ -30,6 +31,34 @@ impl SharedCookieStore {
             .collect::<Vec<_>>()
             .join("; ");
         (!value.is_empty()).then_some(value)
+    }
+
+    /// Preserve domain, path, expiry and session cookies across FFI calls.
+    pub(crate) fn snapshot(&self) -> Option<Value> {
+        let store = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cookies: Vec<Value> = store
+            .iter_unexpired()
+            .filter_map(|cookie| serde_json::to_value(cookie).ok())
+            .collect();
+        if cookies.is_empty() {
+            return None;
+        }
+        cookies.sort_by_key(Value::to_string);
+        Some(Value::Array(cookies))
+    }
+
+    pub(crate) fn restore(&self, snapshot: &Value) -> bool {
+        let Ok(store) = serde_json::from_value::<CookieStore>(snapshot.clone()) else {
+            return false;
+        };
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = store;
+        true
     }
 
     pub(crate) fn add_cookie_header(&self, cookie_header: &str, url: &Url) {

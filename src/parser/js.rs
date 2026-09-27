@@ -4656,6 +4656,7 @@ mod tests {
     fn test_js_session_bindings() {
         let initial = ExecuteSession {
             cookies: Some("sid=initial_token".to_string()),
+            cookie_jar: None,
             header: Some(json!({"Authorization": "Bearer init_auth"})),
             variables: Some(
                 [("myVar".to_string(), json!("initial_val"))]

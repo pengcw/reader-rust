@@ -32,6 +32,9 @@ fn now_epoch_seconds() -> u64 {
 pub struct ExecuteSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cookies: Option<String>,
+    /// Optional full cookie jar; `cookies` remains the legacy source-host view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cookie_jar: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub header: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -64,21 +67,34 @@ impl ActiveSession {
         let mut initial_variables = None;
 
         if let Some(session) = session_opt {
-            if let Some(ref cookies_str) = session.cookies {
-                if !cookies_str.trim().is_empty() {
-                    if let Some(ref url) = parsed_url {
-                        cookie_store.add_cookie_header(cookies_str, url);
+            // A valid jar is authoritative; replaying the flattened source cookie
+            // would erase its path/domain attributes and resurrect removed entries.
+            let restored_jar = session
+                .cookie_jar
+                .as_ref()
+                .is_some_and(|jar| cookie_store.restore(jar));
+            if !restored_jar {
+                if let Some(ref cookies_str) = session.cookies {
+                    if !cookies_str.trim().is_empty() {
+                        if let Some(ref url) = parsed_url {
+                            cookie_store.add_cookie_header(cookies_str, url);
+                        }
+                        initial_cookies = Some(cookies_str.clone());
                     }
-                    initial_cookies = Some(cookies_str.clone());
                 }
             }
-
             if let Some(ref header_val) = session.header {
-                // If header contains cookie, also sync to cookie_jar
-                if let Some(ref url) = parsed_url {
-                    extract_and_sync_cookies_from_header(&cookie_store, header_val, url);
+                if !restored_jar {
+                    if let Some(ref url) = parsed_url {
+                        extract_and_sync_cookies_from_header(&cookie_store, header_val, url);
+                    }
                 }
                 initial_header = Some(header_val.clone());
+            }
+            if restored_jar {
+                initial_cookies = parsed_url
+                    .as_ref()
+                    .and_then(|url| cookie_store.get_cookie_header(url));
             }
 
             if let Some(ref vars) = session.variables {
@@ -88,6 +104,7 @@ impl ActiveSession {
             }
         }
 
+        let initial_cookie_jar = cookie_store.snapshot();
         Self {
             source_url: source_url.to_string(),
             cookie_store,
@@ -96,6 +113,7 @@ impl ActiveSession {
             script_cache: Mutex::new(HashMap::new()),
             initial_session: ExecuteSession {
                 cookies: initial_cookies,
+                cookie_jar: initial_cookie_jar,
                 header: initial_header,
                 variables: initial_variables,
             },
@@ -334,6 +352,7 @@ impl ActiveSession {
 
         ExecuteSession {
             cookies,
+            cookie_jar: self.cookie_store.snapshot(),
             header,
             variables,
         }
@@ -406,6 +425,7 @@ mod tests {
         let source_url = "https://example.com/books";
         let initial = ExecuteSession {
             cookies: Some("uid=100".to_string()),
+            cookie_jar: None,
             header: Some(json!({"User-Agent": "Test"})),
             variables: None,
         };
@@ -449,6 +469,7 @@ mod tests {
 
         let initial = ExecuteSession {
             cookies: Some("sid=clear_me".to_string()),
+            cookie_jar: None,
             header: Some(json!({"Cookie": "sid=clear_me"})),
             variables: None,
         };
@@ -463,6 +484,45 @@ mod tests {
         let delta = delta.expect("removing the login state must emit a session delta");
         assert_eq!(delta.cookies, None);
         assert_eq!(delta.header, None);
+    }
+
+    #[test]
+    fn cookie_jar_round_trips_other_domains_paths_and_legacy_cookies() {
+        let source = "https://source.example/books";
+        let (_, state) = with_active_session(None, source, |active| {
+            let other = Url::parse("https://login.example/private/page").unwrap();
+            active
+                .cookie_store()
+                .add_set_cookie("token=private; Path=/private; Secure", &other);
+            active
+                .cookie_store()
+                .add_set_cookie("expired=no; Max-Age=0; Path=/", &other);
+            assert_eq!(active.get_cookie(source), None);
+            assert_eq!(
+                active.get_cookie("https://login.example/private/page"),
+                Some("token=private".into())
+            );
+        });
+        let state = state.expect("third-party cookie must produce a delta");
+        assert_eq!(state.cookies, None);
+        assert!(state.cookie_jar.is_some());
+        let json = serde_json::to_string(&state).unwrap();
+        let state: ExecuteSession = serde_json::from_str(&json).unwrap();
+        let (_, delta) = with_active_session(Some(&state), source, |active| {
+            assert_eq!(
+                active.get_cookie("https://login.example/private/next"),
+                Some("token=private".into())
+            );
+            assert_eq!(active.get_cookie("https://login.example/public"), None);
+            assert_eq!(active.get_cookie("https://source.example/private"), None);
+        });
+        assert_eq!(delta, None);
+
+        let legacy: ExecuteSession = serde_json::from_str(r#"{"cookies":"sid=old"}"#).unwrap();
+        let (_, delta) = with_active_session(Some(&legacy), source, |active| {
+            assert_eq!(active.get_cookie(source), Some("sid=old".into()));
+        });
+        assert_eq!(delta, None);
     }
 
     #[test]

@@ -2252,6 +2252,60 @@ mod tests {
     }
 
     #[test]
+    fn login_cookie_on_another_host_survives_next_ffi_call() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let login_host = format!("http://{address}");
+        let source = serde_json::json!({
+            "bookSourceName":"two hosts",
+            "bookSourceUrl":format!("http://127.0.0.2:{}", address.port())
+        });
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for index in 0..2 {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut buf = [0u8; 4096];
+                let size = stream.read(&mut buf).unwrap();
+                requests.push(String::from_utf8_lossy(&buf[..size]).to_ascii_lowercase());
+                let cookie = if index == 0 {
+                    "Set-Cookie: token=remote; Path=/private\r\n"
+                } else {
+                    ""
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\n{cookie}Content-Length: 2\r\nConnection: close\r\n\r\nok"
+                )
+                .unwrap();
+            }
+            requests
+        });
+        let call = |path: &str, session: Value| {
+            let request = serde_json::json!({
+                "api":2,"op":"login","params":{"values":{},"action":format!(
+                    "java.ajax('{login_host}{path}'); 'ok'"
+                )},"session":session
+            });
+            let result: Value =
+                serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+            assert_eq!(result["ok"], true, "{result}");
+            result
+        };
+        let first = call("/private/login", Value::Null);
+        assert!(first["session"]["cookies"].is_null());
+        assert!(first["session"]["cookieJar"].is_array());
+        let second = call("/private/next", first["session"].clone());
+        assert_eq!(second["session"], Value::Null);
+        let requests = server.join().unwrap();
+        assert!(!requests[0].contains("cookie: token=remote"));
+        assert!(
+            requests[1].contains("cookie: token=remote"),
+            "{}",
+            requests[1]
+        );
+    }
+
+    #[test]
     fn execute_round_trips_js_cache_without_cross_user_leakage() {
         let source = serde_json::json!({
             "bookSourceName": "cache session fixture",

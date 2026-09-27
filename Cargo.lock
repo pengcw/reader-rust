@@ -250,6 +250,8 @@ dependencies = [
  "idna",
  "log",
  "publicsuffix",
+ "serde",
+ "serde_derive",
  "time",
  "url",
 ]
