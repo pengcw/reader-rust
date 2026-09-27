@@ -2113,7 +2113,9 @@ fn eval_js_inner_with_source(
                 *updated.borrow_mut() = Some(collect_header_map(&ctx)?);
             }
 
-            let result = if v.is_null() || v.is_undefined() {
+            let result = if v.is_null() {
+                String::new()
+            } else if v.is_undefined() {
                 if !template_result {
                     if let Ok(res_val) = globals.get::<_, rquickjs::Value<'_>>("result") {
                         if !res_val.is_null() && !res_val.is_undefined() {
@@ -2219,7 +2221,10 @@ fn eval_js_reentrant<'js>(
 
         let scoped_script = format!("{{\n{script}\n}}");
         let value = eval_script(ctx.clone(), &scoped_script)?;
-        if value.is_null() || value.is_undefined() {
+        if value.is_null() {
+            return Ok(String::new());
+        }
+        if value.is_undefined() {
             if template_result {
                 return Ok(String::new());
             }
@@ -4280,6 +4285,110 @@ mod tests {
         assert!(requests[3].0.contains("x-url: configured"));
         assert!(requests[3].0.contains("x-order: url"));
         assert_eq!(requests[3].1, "payload");
+    }
+
+    #[test]
+    fn jsoup_contains_next_page_rule_returns_url_and_absence() {
+        use crate::model::rule::ContentRule;
+        use crate::parser::rule_engine::RuleEngine;
+
+        // nextContentUrl from the local 菠萝猫 source, including its URL options.
+        let rule = r#"<js>
+var doc = org.jsoup.Jsoup.parse(result);
+var a = doc.select("div.readPage a:contains(下一页)").first();
+if (a) {
+    var href = a.attr("href");
+    if (href && href.trim() != "") {
+        var url = href.startsWith("http") ? href : "https://www.boluomao.com" + href;
+        url + ',{"webView":true}';
+    } else { null; }
+} else { null; }
+</js>"#;
+        let source = BookSource {
+            book_source_url: "https://www.boluomao.com".to_owned(),
+            rule_content: Some(ContentRule {
+                next_content_url: Some(rule.to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let engine = RuleEngine::new().unwrap();
+        let base = "https://www.boluomao.com/book/1.html";
+        let html = r#"<div class="readPage"><a href="/book/2.html"><span>下一页</span></a><a href="/book/3.html">下一章</a></div>"#;
+        assert_eq!(
+            engine.next_content_url(&source, html, base).as_deref(),
+            Some("https://www.boluomao.com/book/2.html,{\"webView\":true}")
+        );
+        assert_eq!(
+            engine.next_content_url(&source, "<div class='readPage'>完</div>", base),
+            None
+        );
+        assert_eq!(eval_js("null", "old result", base).unwrap(), "");
+        assert_eq!(
+            eval_js("undefined", "old result", base).unwrap(),
+            "old result"
+        );
+    }
+
+    #[test]
+    fn next_content_url_options_reach_following_request() {
+        use crate::crawler::{analyze_url, HttpSession};
+        use crate::model::rule::ContentRule;
+        use crate::parser::rule_engine::RuleEngine;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/chapter", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = accept_with_timeout(&listener);
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+            )
+            .unwrap();
+            request.to_ascii_lowercase()
+        });
+        let source = BookSource {
+            book_source_url: base.clone(),
+            rule_content: Some(ContentRule {
+                next_content_url: Some(r#"@js:'/next,{"headers":{"X-Next":"rule"}}'"#.to_owned()),
+                ..Default::default()
+            }),
+            enabled_cookie_jar: Some(false),
+            ..Default::default()
+        };
+        let next = RuleEngine::new()
+            .unwrap()
+            .next_content_url(&source, "<p>first</p>", &base)
+            .unwrap();
+        assert_eq!(
+            next,
+            format!(
+                "http://{}/next,{{\"headers\":{{\"X-Next\":\"rule\"}}}}",
+                base.split('/').nth(2).unwrap()
+            )
+        );
+        let spec = analyze_url(&next, "", 1, &base, &source).unwrap();
+        assert_eq!(
+            HttpSession::new(&source, 3000)
+                .unwrap()
+                .fetch(&spec, 1024)
+                .unwrap()
+                .body,
+            "ok"
+        );
+        let request = server.join().unwrap();
+        assert!(request.starts_with("get /next http/1.1"), "{request}");
+        assert!(request.contains("x-next: rule\r\n"), "{request}");
     }
 
     #[test]

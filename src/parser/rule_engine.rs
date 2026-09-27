@@ -1090,7 +1090,7 @@ impl RuleEngine {
             .into_iter()
             .map(|url| url.trim().to_string())
             .filter(|url| !url.is_empty())
-            .map(|url| resolve_url(base_url, &url))
+            .map(|url| resolve_content_page_url(base_url, &url))
             .collect()
     }
 
@@ -2607,6 +2607,18 @@ fn pick_json_field(v: &Value, rule: Option<&str>) -> Option<String> {
         format!("$.{rule}")
     };
     jsonpath::jsonpath_first_string(v, &normalized)
+}
+
+// A next-content URL may carry AnalyzeUrl options for the following request.
+// Keep a valid option object after resolving only the URL portion.
+fn resolve_content_page_url(base: &str, value: &str) -> String {
+    for (index, _) in value.match_indices(',').rev() {
+        let options = value[index + 1..].trim();
+        if serde_json::from_str::<Value>(options).is_ok_and(|value| value.is_object()) {
+            return format!("{}{}", resolve_url(base, &value[..index]), &value[index..]);
+        }
+    }
+    resolve_url(base, value)
 }
 
 pub(crate) fn resolve_url(base: &str, url: &str) -> String {
