@@ -74,7 +74,7 @@ thread_local! {
     static ACTIVE_JS_REENTRANT_CTX: RefCell<Option<NonNull<rquickjs::qjs::JSContext>>> =
         const { RefCell::new(None) };
 
-    static JS_ENV: (Runtime, Context, Arc<AtomicU64>) = {
+    static JS_ENV: (Runtime, Arc<AtomicU64>) = {
         let rt = Runtime::new().expect("Failed to create JS Runtime");
         rt.set_max_stack_size(512 * 1024);
         rt.set_memory_limit(30 * 1024 * 1024);
@@ -95,8 +95,7 @@ thread_local! {
             false
         })));
 
-        let ctx = Context::full(&rt).expect("Failed to create JS Context");
-        (rt, ctx, start_time)
+        (rt, start_time)
     };
 }
 
@@ -464,7 +463,11 @@ fn eval_js_inner_with_source(
         );
     }
 
-    JS_ENV.with(|(_, ctx, start_time)| {
+    JS_ENV.with(|(runtime, start_time)| {
+        // A fresh context prevents top-level `const` in jsLib from being
+        // redeclared and keeps implicit JS globals out of other sources.
+        // Native callbacks still reuse this context through ACTIVE_JS_REENTRANT_CTX.
+        let ctx = Context::full(runtime)?;
         let now = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2114,9 +2117,7 @@ fn eval_js_inner_with_source(
                 }"#,
             )?;
 
-            // Rule scripts may run once per chapter while JS_ENV is reused. Keep
-            // let/const declarations local to this evaluation to avoid a later
-            // chapter failing with a global lexical redeclaration SyntaxError.
+            // Keep rule lexical declarations local within this evaluation too.
             if let Some((initial, _)) = header_map {
                 let java: Object<'_> = globals.get("java")?;
                 install_header_map(&ctx, &java, initial)?;
@@ -3869,6 +3870,34 @@ mod tests {
         assert_eq!(
             compile_js_lib(r#"{"inline":"var notLoaded=1"}"#).unwrap(),
             ""
+        );
+    }
+
+    #[test]
+    fn inline_js_lib_const_functions_survive_repeated_rules_without_cross_source_leaks() {
+        // 爱发电 / 引力圈 use a top-level `const urlsData` plus helper functions.
+        let first =
+            "const urlsData = ['ifdian.net']; function getSourceHost() { return urlsData[0]; }";
+        let second = "const urlsData = ['app2.unifans.io']; function getSourceHost() { return urlsData[0]; }";
+        with_js_lib(Some(first), || {
+            assert_eq!(
+                eval_js("getSourceHost()", "", "https://example.com").unwrap(),
+                "ifdian.net"
+            );
+            assert_eq!(
+                eval_js("getSourceHost()", "", "https://example.com").unwrap(),
+                "ifdian.net"
+            );
+        });
+        with_js_lib(Some(second), || {
+            assert_eq!(
+                eval_js("getSourceHost()", "", "https://example.com").unwrap(),
+                "app2.unifans.io"
+            );
+        });
+        assert_eq!(
+            eval_js("typeof getSourceHost", "", "https://example.com").unwrap(),
+            "undefined"
         );
     }
 
