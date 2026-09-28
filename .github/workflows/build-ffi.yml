@@ -21,6 +21,10 @@ on:
 permissions:
   contents: write
 
+env:
+  # Keep build-std reproducible instead of following the moving nightly channel.
+  RUST_NIGHTLY: nightly-2026-09-27
+
 jobs:
   build:
     name: Build for ${{ matrix.target }}
@@ -49,6 +53,7 @@ jobs:
 
     steps:
       - name: Checkout repository
+        if: github.event.inputs.target == '' || github.event.inputs.target == 'all' || github.event.inputs.target == matrix.target
         uses: actions/checkout@v4
 
       - name: Setup Rust
@@ -113,8 +118,9 @@ jobs:
       # Building std against the same old sysroot is essential: linking only
       # the application against an old libc does not fix a newer prebuilt std.
       - name: Setup Rust and standard library sources
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ env.RUST_NIGHTLY }}
           components: rust-src
           targets: armv7-unknown-linux-gnueabi
 
@@ -148,7 +154,7 @@ jobs:
 
       - name: Build Kindle library and target std
         run: |
-          cargo +nightly build --locked --release --lib \
+          cargo +"${RUST_NIGHTLY}" build --locked --release --lib \
             --target armv7-unknown-linux-gnueabi \
             -Z build-std=std,panic_abort
 
@@ -190,12 +196,14 @@ jobs:
             sha256: 4b00e0351a702d37be5ae660d9077d9ae3da22e5145e28d8089f193f325f446a
     steps:
       - name: Checkout repository
+        if: github.event.inputs.target == '' || github.event.inputs.target == 'all' || github.event.inputs.target == matrix.target
         uses: actions/checkout@v4
 
       - name: Setup Rust with standard library sources
         if: github.event.inputs.target == '' || github.event.inputs.target == 'all' || github.event.inputs.target == matrix.target
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ env.RUST_NIGHTLY }}
           components: rust-src
           targets: ${{ matrix.target }}
 
@@ -235,7 +243,7 @@ jobs:
       - name: Build library and target std
         if: github.event.inputs.target == '' || github.event.inputs.target == 'all' || github.event.inputs.target == matrix.target
         run: |
-          cargo +nightly build --locked --release --lib \
+          cargo +"${RUST_NIGHTLY}" build --locked --release --lib \
             --target '${{ matrix.target }}' \
             -Z build-std=std,panic_abort
 
