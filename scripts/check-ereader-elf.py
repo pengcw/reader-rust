@@ -52,12 +52,15 @@ def check(path, target, sysroot):
         if (flags & 0xFF000000) != 0x05000000 or (flags & 0x600) != float_abi:
             raise ValueError(f"expected EABI5 {target} float ABI, ELF flags=0x{flags:08x}")
 
+    if not (sysroot / "lib" / loader).exists():
+        raise ValueError(f"missing target ELF loader {loader} in {sysroot}/lib")
+
     dynamic = readelf("-d", str(path))
     needed = set(re.findall(r"\(NEEDED\).*?\[([^\]]+)\]", dynamic))
-    if not needed or "libc.so.6" not in needed or loader not in needed:
-        raise ValueError(f"missing target libc/loader {loader}: {sorted(needed)}")
-    if needed - ALLOWED_NEEDED - {loader}:
-        raise ValueError(f"unexpected dependencies: {sorted(needed - ALLOWED_NEEDED - {loader})}")
+    if not needed or "libc.so.6" not in needed:
+        raise ValueError(f"missing target libc: {sorted(needed)}")
+    if needed - ALLOWED_NEEDED:
+        raise ValueError(f"unexpected dependencies: {sorted(needed - ALLOWED_NEEDED)}")
     if "(TEXTREL)" in dynamic:
         raise ValueError("text relocations")
 
