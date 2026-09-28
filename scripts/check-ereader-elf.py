@@ -64,8 +64,11 @@ def check(path, target, sysroot):
     needed = set(re.findall(r"\(NEEDED\).*?\[([^\]]+)\]", dynamic))
     if not needed or "libc.so.6" not in needed:
         raise ValueError(f"missing target libc: {sorted(needed)}")
-    if needed - ALLOWED_NEEDED:
-        raise ValueError(f"unexpected dependencies: {sorted(needed - ALLOWED_NEEDED)}")
+    wrong_loaders = {name for name in needed if name.startswith("ld-linux") and name != loader}
+    if wrong_loaders:
+        raise ValueError(f"loader ABI mismatch: {sorted(wrong_loaders)}")
+    if needed - ALLOWED_NEEDED - {loader}:
+        raise ValueError(f"unexpected dependencies: {sorted(needed - ALLOWED_NEEDED - {loader})}")
     if "(TEXTREL)" in dynamic:
         raise ValueError("text relocations")
 
