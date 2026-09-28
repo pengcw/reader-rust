@@ -28,14 +28,19 @@ def readelf(*args):
 
 
 def glibc_from_sysroot(root):
-    versions = []
-    for path in (root / "lib").glob("libc-*.so"):
-        match = re.fullmatch(r"libc-(\d+)\.(\d+)(?:\.\d+)?\.so", path.name)
-        if match:
-            versions.append(tuple(map(int, match.groups())))
-    if len(versions) != 1:
-        raise ValueError(f"expected one versioned libc in {root}/lib, got {versions}")
-    return versions[0]
+    libc = root / "lib" / "libc.so.6"
+    if not libc.is_file():
+        raise ValueError(f"missing target libc {libc}")
+    version_info = readelf("--version-info", str(libc))
+    sections = version_info.split("Version definition section", 1)
+    if len(sections) != 2:
+        raise ValueError(f"missing GLIBC version definitions in {libc}")
+    definitions = sections[1].split("Version needs section", 1)[0]
+    versions = [tuple(map(int, version)) for version in
+                re.findall(r"\bName:\s*GLIBC_(\d+)\.(\d+)\b", definitions)]
+    if not versions:
+        raise ValueError(f"no GLIBC versions defined by {libc}")
+    return max(versions)
 
 
 def check(path, target, sysroot):
