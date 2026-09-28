@@ -4,11 +4,6 @@ dockerfile = "Dockerfile.cross"
 [target.armv7-linux-androideabi]
 dockerfile = "Dockerfile.cross"
 
-[target.armv7-unknown-linux-gnueabihf]
-dockerfile = "Dockerfile.cross"
-
-[target.armv7-unknown-linux-gnueabi]
-dockerfile = "Dockerfile.cross"
-
-[target.aarch64-unknown-linux-gnu]
-dockerfile = "Dockerfile.cross"
+# Embedded Linux ARM targets (Kindle soft-float, Kobo hard-float and reMarkable
+# aarch64) use pinned KOReader toolchains in .github/workflows/build-ffi.yml.
+# cross's stock sysroots can silently require a newer glibc than the devices.

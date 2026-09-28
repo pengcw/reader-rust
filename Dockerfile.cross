@@ -1,33 +1,29 @@
+# Cross is used only for the Android targets (see Cross.toml).
+# KOReader's Building_targets.md recommends Android NDK r23c. Use the same
+# pinned NDK on both Android ABIs instead of cross's older bundled NDK r21d
+# (whose armv7 clang driver crashes when linking some Rust cdylibs).
 ARG CROSS_BASE_IMAGE
 FROM $CROSS_BASE_IMAGE
 
-RUN dpkg --add-architecture armhf || true && \
-    dpkg --add-architecture arm64 || true && \
-    apt-get update && \
-    apt-get install -y libclang-dev clang llvm-dev || true
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libclang-dev clang llvm-dev curl unzip && \
+    rm -rf /var/lib/apt/lists/*
 
-# Fix Android NDK missing -lunwind linker error (cross v0.2.5 image ships NDK r21d)
-RUN find / -name "libgcc.a" 2>/dev/null | while read f; do cp "$f" "$(dirname "$f")/libunwind.a"; done || true
-
-# The cross v0.2.5 armv7-linux-androideabi image ships NDK r21d (clang 9.0.8).
-# Its 32-bit link driver ("clang90") segfaults when linking Rust cdylibs
-# (e.g. jsonpath_lib, which declares crate-type = ["cdylib", "rlib"]):
-#   clang90: error: unable to execute command: Segmentation fault (core dumped)
-# Switching -fuse-ld between gold/lld/bfd does not help; the driver itself crashes.
-# Install a modern NDK for the armv7 target only (aarch64 keeps the image default,
-# which works). NDK r22+ defaults to lld, so no -fuse-ld flags are needed.
-# Use the API 21 (Android 5.0) clang driver: lowest API level that pairs with the
-# rustc armv7-linux-androideabi target, so the .so keeps running on old devices.
 ARG CROSS_BASE_IMAGE
-RUN if echo "$CROSS_BASE_IMAGE" | grep -q "armv7-linux-androideabi"; then \
-      apt-get update && \
-      apt-get install -y --no-install-recommends curl unzip && \
-      curl -sSL https://dl.google.com/android/repository/android-ndk-r26d-linux.zip -o /tmp/android-ndk-r26d-linux.zip && \
-      unzip -q /tmp/android-ndk-r26d-linux.zip -d /opt && \
-      rm /tmp/android-ndk-r26d-linux.zip; \
+RUN if echo "$CROSS_BASE_IMAGE" | grep -Eq 'armv7-linux-androideabi|aarch64-linux-android'; then \
+      curl --fail --location --retry 3 \
+        'https://dl.google.com/android/repository/android-ndk-r23c-linux.zip' \
+        -o /tmp/android-ndk-r23c-linux.zip && \
+      unzip -q /tmp/android-ndk-r23c-linux.zip -d /opt && \
+      rm /tmp/android-ndk-r23c-linux.zip; \
     fi
 
-ENV CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=/opt/android-ndk-r26d/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang \
-    CC_armv7_linux_androideabi=/opt/android-ndk-r26d/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang \
-    CXX_armv7_linux_androideabi=/opt/android-ndk-r26d/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang++ \
-    AR_armv7_linux_androideabi=/opt/android-ndk-r26d/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+# API 21 is the oldest Android API compatible with the Rust ARMv7 target.
+ENV CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=/opt/android-ndk-r23c/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang \
+    CC_armv7_linux_androideabi=/opt/android-ndk-r23c/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang \
+    CXX_armv7_linux_androideabi=/opt/android-ndk-r23c/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang++ \
+    AR_armv7_linux_androideabi=/opt/android-ndk-r23c/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar \
+    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=/opt/android-ndk-r23c/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang \
+    CC_aarch64_linux_android=/opt/android-ndk-r23c/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang \
+    CXX_aarch64_linux_android=/opt/android-ndk-r23c/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang++ \
+    AR_aarch64_linux_android=/opt/android-ndk-r23c/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
