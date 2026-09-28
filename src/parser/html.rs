@@ -100,7 +100,8 @@ fn quote_unquoted_colon_attribute_value(attribute: &str) -> Option<String> {
     }
 
     let value_start = equals? + 1;
-    let leading_space = attribute[value_start..].len() - attribute[value_start..].trim_start().len();
+    let leading_space =
+        attribute[value_start..].len() - attribute[value_start..].trim_start().len();
     let value_start = value_start + leading_space;
     let value_end = attribute[value_start..]
         .char_indices()
@@ -174,7 +175,7 @@ fn quote_unquoted_colon_attribute_values(selector: &str) -> Option<String> {
     Some(output)
 }
 
-// Jsoup's :eq(n) tests the zero-based *element sibling* index, not the
+// Jsoup's :eq/:lt/:gt test the zero-based *element sibling* index, not the
 // position in the complete query result. CSS :nth-child is one-based.
 fn normalize_jsoup_eq(selector: &str) -> Option<String> {
     let mut output = String::with_capacity(selector.len());
@@ -201,18 +202,29 @@ fn normalize_jsoup_eq(selector: &str) -> Option<String> {
             '\'' | '"' => quote = Some(ch),
             '[' => bracket_depth += 1,
             ']' => bracket_depth = bracket_depth.saturating_sub(1),
-            ':' if bracket_depth == 0 && selector[index..].starts_with(":eq(") => {
-                let start = index + 4;
-                let end = start
-                    + selector[start..]
-                        .bytes()
-                        .take_while(u8::is_ascii_digit)
-                        .count();
-                if end > start && selector[end..].starts_with(')') {
-                    let nth = selector[start..end].parse::<usize>().ok()?.checked_add(1)?;
-                    output.push_str(&selector[cursor..index]);
-                    output.push_str(&format!(":nth-child({nth})"));
-                    cursor = end + 1;
+            ':' if bracket_depth == 0 => {
+                let kind = ["eq", "lt", "gt"]
+                    .into_iter()
+                    .find(|kind| selector[index..].starts_with(&format!(":{kind}(")));
+                if let Some(kind) = kind {
+                    let start = index + kind.len() + 2;
+                    let end = start
+                        + selector[start..]
+                            .bytes()
+                            .take_while(u8::is_ascii_digit)
+                            .count();
+                    if end > start && selector[end..].starts_with(')') {
+                        let index_value = selector[start..end].parse::<usize>().ok()?;
+                        let css = match kind {
+                            "eq" => format!(":nth-child({})", index_value.checked_add(1)?),
+                            "lt" => format!(":nth-child(-n+{index_value})"),
+                            "gt" => format!(":nth-child(n+{})", index_value.checked_add(2)?),
+                            _ => unreachable!(),
+                        };
+                        output.push_str(&selector[cursor..index]);
+                        output.push_str(&css);
+                        cursor = end + 1;
+                    }
                 }
             }
             _ => {}
@@ -228,6 +240,167 @@ fn parse_css_selector(css_selector: &str) -> Option<Selector> {
         let quoted = quote_unquoted_colon_attribute_values(&normalized)?;
         Selector::parse(&quoted).ok()
     })
+}
+
+// Jsoup's regex pseudos inspect the matched element's text, before evaluating
+// sibling/descendant combinators. Leave regex metacharacters untouched.
+fn split_jsoup_matches(selector: &str) -> Option<(&str, &str, &str, bool)> {
+    let mut quote = None;
+    let mut bracket_depth = 0usize;
+    let mut escaped = false;
+    for (index, ch) in selector.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active) = quote {
+            if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            ':' if bracket_depth == 0 => {
+                let (start, own) = if selector[index..].starts_with(":matchesOwn(") {
+                    (index + ":matchesOwn(".len(), true)
+                } else if selector[index..].starts_with(":matches(") {
+                    (index + ":matches(".len(), false)
+                } else {
+                    continue;
+                };
+                if selector[..index].trim().is_empty() {
+                    return None;
+                }
+                let mut depth = 1usize;
+                let mut in_class = false;
+                let mut quoted_literal = false;
+                let mut escaped = false;
+                for (offset, ch) in selector[start..].char_indices() {
+                    if escaped {
+                        escaped = false;
+                        continue;
+                    }
+                    if ch == '\\' {
+                        let remaining = &selector[start + offset..];
+                        if !in_class && remaining.starts_with("\\Q") {
+                            quoted_literal = true;
+                        } else if quoted_literal && remaining.starts_with("\\E") {
+                            quoted_literal = false;
+                        }
+                        escaped = true;
+                        continue;
+                    }
+                    if quoted_literal {
+                        continue;
+                    }
+                    match ch {
+                        '[' => in_class = true,
+                        ']' => in_class = false,
+                        '(' if !in_class => depth += 1,
+                        ')' if !in_class => {
+                            depth -= 1;
+                            if depth == 0 {
+                                let end = start + offset;
+                                return Some((
+                                    &selector[..index],
+                                    &selector[start..end],
+                                    &selector[end + 1..],
+                                    own,
+                                ));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                return None;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn matches_suffix_valid(suffix: &str) -> bool {
+    if suffix.is_empty() {
+        return true;
+    }
+    let trimmed = suffix.trim();
+    if let Some(rest) = trimmed.strip_prefix(['+', '~']) {
+        let (sibling, descendant) = split_contains_sibling(rest);
+        return parse_css_selector(sibling).is_some()
+            && (descendant.is_empty() || parse_css_selector(descendant).is_some());
+    }
+    suffix.chars().next().is_some_and(char::is_whitespace)
+        && !trimmed.starts_with('>')
+        && parse_css_selector(trimmed).is_some()
+}
+
+fn select_css_with_matches<'a>(
+    selector: &str,
+    select: impl Fn(&str) -> Vec<ElementRef<'a>>,
+) -> Option<Vec<ElementRef<'a>>> {
+    let (prefix, pattern, suffix, own) = split_jsoup_matches(selector)?;
+    if !matches_suffix_valid(suffix) || !crate::parser::source_regex::is_valid(pattern) {
+        return Some(Vec::new());
+    }
+    Some(
+        select(prefix)
+            .into_iter()
+            .filter(|el| {
+                let text = if own {
+                    el.children()
+                        .filter_map(|node| node.value().as_text())
+                        .map(|node| node.text.as_ref())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                } else {
+                    el.text().collect::<Vec<_>>().join(" ")
+                };
+                let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                crate::parser::source_regex::captures_first(pattern, &normalized).is_some()
+            })
+            .flat_map(|el| {
+                let suffix = suffix.trim();
+                if suffix.is_empty() {
+                    return vec![el];
+                }
+                if let Some(rest) = suffix.strip_prefix(['+', '~']) {
+                    let adjacent = suffix.starts_with('+');
+                    let (sibling, descendant) = split_contains_sibling(rest);
+                    let Some(sel) = parse_css_selector(sibling) else {
+                        return Vec::new();
+                    };
+                    let matches: Vec<_> = if adjacent {
+                        el.next_siblings()
+                            .find_map(ElementRef::wrap)
+                            .filter(|next| sel.matches(next))
+                            .into_iter()
+                            .collect()
+                    } else {
+                        el.next_siblings()
+                            .filter_map(ElementRef::wrap)
+                            .filter(|next| sel.matches(next))
+                            .collect()
+                    };
+                    if descendant.is_empty() {
+                        return matches;
+                    }
+                    return matches
+                        .into_iter()
+                        .flat_map(|next| select_css_from_element(next, descendant))
+                        .collect();
+                }
+                select_css_from_element(el, suffix)
+            })
+            .collect(),
+    )
 }
 
 // Keep the text predicate attached to the element before a descendant or +
@@ -381,12 +554,21 @@ pub(crate) fn css_rule_is_valid(rule: &str) -> bool {
                 .next()
                 .unwrap_or_default();
             match parse_selector_with_index(&selector).base {
-                SelectorBase::Css(css) => split_jsoup_contains(&css).map_or_else(
-                    || parse_css_selector(&css).is_some(),
-                    |(prefix, _, suffix)| {
-                        parse_css_selector(prefix).is_some() && contains_suffix_valid(suffix)
-                    },
-                ),
+                SelectorBase::Css(css) => {
+                    if let Some((prefix, pattern, suffix, _)) = split_jsoup_matches(&css) {
+                        parse_css_selector(prefix).is_some()
+                            && crate::parser::source_regex::is_valid(pattern)
+                            && matches_suffix_valid(suffix)
+                    } else {
+                        split_jsoup_contains(&css).map_or_else(
+                            || parse_css_selector(&css).is_some(),
+                            |(prefix, _, suffix)| {
+                                parse_css_selector(prefix).is_some()
+                                    && contains_suffix_valid(suffix)
+                            },
+                        )
+                    }
+                }
                 SelectorBase::Children | SelectorBase::Text(_) => true,
             }
         })
@@ -508,7 +690,28 @@ fn collect_matches_from_element<'a>(
     apply_indices(matches, selector)
 }
 
+fn unique_in_document_order<'a>(
+    matches: Vec<ElementRef<'a>>,
+    document_elements: impl Iterator<Item = ElementRef<'a>>,
+) -> Vec<ElementRef<'a>> {
+    if matches.is_empty() {
+        return matches;
+    }
+    let mut remaining: HashSet<_> = matches.into_iter().map(|el| el.id()).collect();
+    document_elements
+        .filter(|el| remaining.remove(&el.id()))
+        .collect()
+}
+
 fn select_css<'a>(doc: &'a Html, css_selector: &str) -> Vec<ElementRef<'a>> {
+    if let Some(matches) = select_css_with_matches(css_selector, |part| {
+        parse_css_selector(part)
+            .map(|sel| doc.select(&sel).collect())
+            .unwrap_or_default()
+    }) {
+        let all = Selector::parse("*").expect("valid universal selector");
+        return unique_in_document_order(matches, doc.select(&all));
+    }
     select_css_with_contains(css_selector, |part| {
         let Some(sel) = parse_css_selector(part) else {
             return Vec::new();
@@ -522,6 +725,14 @@ pub(crate) fn select_css_list<'a>(doc: &'a Html, css_selector: &str) -> Vec<Elem
 }
 
 fn select_css_from_element<'a>(el: ElementRef<'a>, css_selector: &str) -> Vec<ElementRef<'a>> {
+    if let Some(matches) = select_css_with_matches(css_selector, |part| {
+        parse_css_selector(part)
+            .map(|sel| el.select(&sel).collect())
+            .unwrap_or_default()
+    }) {
+        let all = Selector::parse("*").expect("valid universal selector");
+        return unique_in_document_order(matches, el.select(&all));
+    }
     select_css_with_contains(css_selector, |part| {
         let Some(sel) = parse_css_selector(part) else {
             return Vec::new();
@@ -856,9 +1067,7 @@ fn normalize_jsoup_text_node(text: &str) -> String {
         }
     }
 
-    normalized
-        .trim_matches(|ch| ch <= '\u{0020}')
-        .to_string()
+    normalized.trim_matches(|ch| ch <= '\u{0020}').to_string()
 }
 
 /// Extract direct text nodes, matching Legado's Jsoup `Element.textNodes()` behavior.
@@ -995,7 +1204,8 @@ pub fn select_text_list(doc: &Html, rule: &str) -> Vec<String> {
     if let Some(operator) = combo.delimiter.as_deref() {
         if operator == "%%" {
             return rule_analyzer::interleave_result_groups(
-                combo.parts
+                combo
+                    .parts
                     .iter()
                     .map(|part| select_text_list(doc, part))
                     .collect(),
@@ -1108,9 +1318,8 @@ pub(crate) fn parse_xpath_package_with_mode(
 }
 
 fn html_to_xpath_xml(html: &str) -> String {
-    static DOCTYPE: Lazy<regex::Regex> = Lazy::new(|| {
-        regex::Regex::new(r"(?is)<!doctype[^>]*>").expect("valid doctype regex")
-    });
+    static DOCTYPE: Lazy<regex::Regex> =
+        Lazy::new(|| regex::Regex::new(r"(?is)<!doctype[^>]*>").expect("valid doctype regex"));
     static VOID_ELEMENT: Lazy<regex::Regex> = Lazy::new(|| {
         regex::Regex::new(
             r"(?is)<(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)(\b[^>]*)>",
@@ -1120,8 +1329,14 @@ fn html_to_xpath_xml(html: &str) -> String {
 
     let without_doctype = DOCTYPE.replace_all(html, "");
     let xml = VOID_ELEMENT.replace_all(&without_doctype, |captures: &regex::Captures| {
-        let whole = captures.get(0).map(|value| value.as_str()).unwrap_or_default();
-        let attrs = captures.get(2).map(|value| value.as_str()).unwrap_or_default();
+        let whole = captures
+            .get(0)
+            .map(|value| value.as_str())
+            .unwrap_or_default();
+        let attrs = captures
+            .get(2)
+            .map(|value| value.as_str())
+            .unwrap_or_default();
         if attrs.trim_end().ends_with('/') {
             whole.to_string()
         } else {
@@ -1332,7 +1547,10 @@ fn evaluate_xpath_with_fallback<'d>(
 ) -> Option<sxd_xpath::Value<'d>> {
     let norm = normalize_xpath_query(xpath);
     let context = new_xpath_context();
-    for candidate in xpath_candidates(norm.as_ref(), matches!(node, sxd_xpath::nodeset::Node::Root(_))) {
+    for candidate in xpath_candidates(
+        norm.as_ref(),
+        matches!(node, sxd_xpath::nodeset::Node::Root(_)),
+    ) {
         let Some(expression) = sxd_xpath::Factory::new().build(&candidate).ok().flatten() else {
             continue;
         };
@@ -1389,10 +1607,7 @@ pub(crate) fn xpath_select_nodes_in_mode<'d>(
     xpath_select_nodes(node, xpath.as_ref())
 }
 
-pub(crate) fn xpath_eval_strings(
-    node: sxd_xpath::nodeset::Node<'_>,
-    xpath: &str,
-) -> Vec<String> {
+pub(crate) fn xpath_eval_strings(node: sxd_xpath::nodeset::Node<'_>, xpath: &str) -> Vec<String> {
     let wants_html = xpath.trim() == "html()" || xpath.trim().ends_with("/html()");
     match evaluate_xpath_with_fallback(node, xpath) {
         Some(sxd_xpath::Value::Nodeset(nodes)) => nodes
@@ -1423,10 +1638,7 @@ pub(crate) fn xpath_eval_strings_in_mode(
     xpath_eval_strings(node, xpath.as_ref())
 }
 
-fn normalize_html_xpath_attribute_names(
-    xpath: &str,
-    html_mode: bool,
-) -> std::borrow::Cow<'_, str> {
+fn normalize_html_xpath_attribute_names(xpath: &str, html_mode: bool) -> std::borrow::Cow<'_, str> {
     if !html_mode {
         return std::borrow::Cow::Borrowed(xpath);
     }
@@ -1559,7 +1771,20 @@ fn append_sxd_element(element: sxd_document::dom::Element<'_>, out: &mut String,
     let name = element.name().local_part();
     let is_void = matches!(
         name,
-        "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" | "meta" | "param" | "source" | "track" | "wbr"
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
     );
     if outer {
         out.push('<');
@@ -2079,6 +2304,29 @@ mod tests {
     }
 
     #[test]
+    fn jsoup_lt_gt_use_element_sibling_indices_before_descendant_selection() {
+        let doc = parse_document(
+            r#"<ul><li class="item"><a>first</a></li><li>other</li><li class="item"><a>third</a></li><li class="item"><a>fourth</a></li></ul><ul><li class="item"><a>second list</a></li></ul>"#,
+        );
+        assert_eq!(
+            select_text_list(&doc, "li.item:lt(2) a@text"),
+            vec!["first", "second list"]
+        );
+        assert_eq!(
+            select_text_list(&doc, "li.item:gt(1) a@text"),
+            vec!["third", "fourth"]
+        );
+        assert_eq!(
+            select_text_list(&doc, "li.item:lt(0) a@text"),
+            Vec::<String>::new()
+        );
+        assert!(css_rule_is_valid("li.item:gt(1) a@text"));
+        assert!(css_rule_is_valid("li.item:lt(2) a@text"));
+        assert!(parse_css_selector(r#"[data-x=":lt(2)"]"#).is_some());
+        assert!(parse_css_selector("li:gt(-1)").is_none());
+    }
+
+    #[test]
     fn jsoup_contains_filters_before_adjacent_sibling_and_descendants() {
         let doc = parse_document(
             r#"<div class="info"><dl><dt>状态</dt><dd><a>连载</a></dd><dt>图书 <span>分类</span></dt><dd><a>奇幻</a></dd><dt>简介</dt><dd>分类说明</dd></dl></div>"#,
@@ -2099,6 +2347,71 @@ mod tests {
         assert_eq!(select_css_list(&doc, "dt:contains(不存在) + dd").len(), 0);
         assert!(parse_css_selector(r#"[data-x=":contains(分类)"]"#).is_some());
         assert!(!css_rule_is_valid("dt:contains(分类).tag@text"));
+    }
+
+    #[test]
+    fn jsoup_matches_filters_before_sibling_and_descendant_selection() {
+        let doc = parse_document(
+            "<dl><dt>简介</dt><a>ignore</a><dt>章节目录</dt><a href='1'>一</a><span>other</span><a href='2'>二</a><dt>其他</dt><a href='3'>三</a></dl>",
+        );
+        assert!(css_rule_is_valid("dl dt:matches(章节目录|目录章节)~a@href"));
+        assert_eq!(
+            select_text_list(&doc, "dl dt:matches(章节目录|目录章节)~a@href"),
+            vec!["1", "2", "3"]
+        );
+        assert_eq!(
+            select_text_list(&doc, "dl dt:matches(章节目录)+a@href"),
+            vec!["1"]
+        );
+        assert_eq!(
+            select_text_list(&doc, "dl dt:matches((章节|目录)+)~a@href"),
+            vec!["1", "2", "3"]
+        );
+        assert!(!css_rule_is_valid("dl dt:matches(()~a@href"));
+        assert!(parse_css_selector(r#"[data-x=":matches(目录)"]"#).is_some());
+        let literal = parse_document("<p class='target'>右括号 )</p>");
+        assert_eq!(
+            select_css_list(&literal, r"p.target:matches(\Q)\E)").len(),
+            1
+        );
+        assert_eq!(select_css_list(&literal, r"p.target:matches([)])").len(), 1);
+    }
+
+    #[test]
+    fn jsoup_matches_multiple_headings_dedupes_in_document_order() {
+        let doc = parse_document(
+            "<dl><dt>目录一</dt><a href='1'>一</a><dt>目录二</dt><a href='2'>二</a><dt>其他</dt><a href='3'>三</a></dl>",
+        );
+        let rule = "dl dt:matches(目录)~a@href";
+        assert_eq!(select_text_list(&doc, rule), vec!["1", "2", "3"]);
+        assert_eq!(
+            select_list(&doc, "dl dt:matches(目录)~a")
+                .iter()
+                .filter_map(|el| el.value().attr("href"))
+                .collect::<Vec<_>>(),
+            vec!["1", "2", "3"]
+        );
+        let root = select_css_list(&doc, "dl")[0];
+        assert_eq!(
+            select_css_from_element(root, "dt:matches(目录)~a")
+                .iter()
+                .filter_map(|el| el.value().attr("href"))
+                .collect::<Vec<_>>(),
+            vec!["1", "2", "3"]
+        );
+    }
+
+    #[test]
+    fn jsoup_matches_own_ignores_descendant_text() {
+        let doc = parse_document(
+            "<div class='item'>前缀<span>章节目录</span></div><div class='item'>目录<span>章节</span></div>",
+        );
+        assert_eq!(select_css_list(&doc, "div.item:matches(章节目录)").len(), 1);
+        assert_eq!(
+            select_css_list(&doc, "div.item:matchesOwn(章节目录)").len(),
+            0
+        );
+        assert_eq!(select_css_list(&doc, "div.item:matchesOwn(目录)").len(), 1);
     }
 
     #[test]
@@ -2310,7 +2623,10 @@ mod tests {
         assert_eq!(select_xpath(frag, "/p"), vec!["Frag 1", "Frag 2"]);
 
         // 7. Non-existent path returns empty without panic
-        assert_eq!(select_xpath(html, "/unknown/nonexistent/path"), Vec::<String>::new());
+        assert_eq!(
+            select_xpath(html, "/unknown/nonexistent/path"),
+            Vec::<String>::new()
+        );
 
         // 8. A real attribute whose name starts with "text" must not be rewritten.
         let attr_html = r#"<div textContent="raw-value">body</div>"#;
@@ -2325,8 +2641,7 @@ mod tests {
 
         let (html_package, html_mode) = parse_xpath_package_with_mode(attr_html).unwrap();
         assert!(html_mode);
-        let html_root =
-            sxd_xpath::nodeset::Node::Root(html_package.as_document().root());
+        let html_root = sxd_xpath::nodeset::Node::Root(html_package.as_document().root());
         assert_eq!(
             xpath_eval_strings_in_mode(html_root, "//div/@textContent", html_mode),
             vec!["raw-value"]
@@ -2339,12 +2654,7 @@ mod tests {
             xpath_eval_strings_in_mode(xml_root, "//root/@textContent", xml_mode),
             vec!["raw-value"]
         );
-        assert!(xpath_eval_strings_in_mode(
-            xml_root,
-            "//root/@textcontent",
-            xml_mode
-        )
-        .is_empty());
+        assert!(xpath_eval_strings_in_mode(xml_root, "//root/@textcontent", xml_mode).is_empty());
 
         // 9. XPath html() must re-escape text when serializing inner HTML.
         let entity_html = r#"<div id="entity">1 &lt; 2 &amp; 3</div>"#;
@@ -2359,12 +2669,10 @@ mod tests {
         assert_eq!(fragment_elements.as_array().unwrap().len(), 2);
 
         // 11. XPath element combinations use Legado's one-pass %% interleave.
-        let combined_html =
-            "<root><a>A1</a><a>A2</a><b>B1</b><b>B2</b><b>B3</b><c>C1</c></root>";
-        let combined: serde_json::Value = serde_json::from_str(
-            &select_xpath_elements_json(combined_html, "//a%%//b%%//c"),
-        )
-        .unwrap();
+        let combined_html = "<root><a>A1</a><a>A2</a><b>B1</b><b>B2</b><b>B3</b><c>C1</c></root>";
+        let combined: serde_json::Value =
+            serde_json::from_str(&select_xpath_elements_json(combined_html, "//a%%//b%%//c"))
+                .unwrap();
         let texts = combined
             .as_array()
             .unwrap()

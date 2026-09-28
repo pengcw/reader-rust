@@ -51,6 +51,8 @@ pub struct ActiveSession {
     variables: Mutex<HashMap<String, Value>>,
     // Fetched JS is reused only inside this operation; never shared across users.
     script_cache: Mutex<HashMap<String, String>>,
+    // Legado's putMemory stores process-local values; never serialize them to session.
+    memory_cache: Mutex<HashMap<String, Value>>,
     unknown_method_fallback: AtomicBool,
     initial_session: ExecuteSession,
 }
@@ -113,6 +115,7 @@ impl ActiveSession {
             header: Mutex::new(initial_header.clone()),
             variables: Mutex::new(initial_variables.clone().unwrap_or_default()),
             script_cache: Mutex::new(HashMap::new()),
+            memory_cache: Mutex::new(HashMap::new()),
             unknown_method_fallback: AtomicBool::new(false),
             initial_session: ExecuteSession {
                 cookies: initial_cookies,
@@ -199,6 +202,28 @@ impl ActiveSession {
         if cache.len() < 16 && script.len() <= 512 * 1024 {
             cache.insert(key, script);
         }
+    }
+
+    pub(crate) fn memory_cache_get(&self, key: &str) -> Option<Value> {
+        self.memory_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .cloned()
+    }
+
+    pub(crate) fn memory_cache_put(&self, key: String, value: Value) {
+        self.memory_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, value);
+    }
+
+    pub(crate) fn memory_cache_delete(&self, key: &str) {
+        self.memory_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
     }
 
     pub(crate) fn js_cache_get(&self, key: &str) -> Option<String> {

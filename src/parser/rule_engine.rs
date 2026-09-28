@@ -123,35 +123,45 @@ impl RuleVariableContext {
         match key {
             "name" => {
                 self.book_name = Some(value.to_string());
-                self.book_fields.insert("bookName".to_string(), value.to_string());
+                self.book_fields
+                    .insert("bookName".to_string(), value.to_string());
             }
             "bookName" => {
                 self.book_name = Some(value.to_string());
-                self.book_fields.insert("name".to_string(), value.to_string());
+                self.book_fields
+                    .insert("name".to_string(), value.to_string());
             }
             "wordCount" => {
-                self.book_fields.insert("word_count".to_string(), value.to_string());
+                self.book_fields
+                    .insert("word_count".to_string(), value.to_string());
             }
             "word_count" => {
-                self.book_fields.insert("wordCount".to_string(), value.to_string());
+                self.book_fields
+                    .insert("wordCount".to_string(), value.to_string());
             }
             "coverUrl" => {
-                self.book_fields.insert("cover_url".to_string(), value.to_string());
+                self.book_fields
+                    .insert("cover_url".to_string(), value.to_string());
             }
             "cover_url" => {
-                self.book_fields.insert("coverUrl".to_string(), value.to_string());
+                self.book_fields
+                    .insert("coverUrl".to_string(), value.to_string());
             }
             "tocUrl" => {
-                self.book_fields.insert("toc_url".to_string(), value.to_string());
+                self.book_fields
+                    .insert("toc_url".to_string(), value.to_string());
             }
             "toc_url" => {
-                self.book_fields.insert("tocUrl".to_string(), value.to_string());
+                self.book_fields
+                    .insert("tocUrl".to_string(), value.to_string());
             }
             "lastChapter" => {
-                self.book_fields.insert("latestChapterTitle".to_string(), value.to_string());
+                self.book_fields
+                    .insert("latestChapterTitle".to_string(), value.to_string());
             }
             "latestChapterTitle" => {
-                self.book_fields.insert("lastChapter".to_string(), value.to_string());
+                self.book_fields
+                    .insert("lastChapter".to_string(), value.to_string());
             }
             _ => {}
         }
@@ -167,7 +177,10 @@ impl RuleVariableContext {
             }
         }
         match key {
-            "bookName" => self.book_name.clone().or_else(|| self.book_fields.get("name").cloned()),
+            "bookName" => self
+                .book_name
+                .clone()
+                .or_else(|| self.book_fields.get("name").cloned()),
             "title" => self.chapter_title.clone(),
             _ => self
                 .chapter
@@ -457,12 +470,8 @@ impl RuleEngine {
             let rule = source.rule_search.clone().unwrap_or_default();
             let (list_rule, reverse) = normalize_list_rule(rule.book_list.as_deref().unwrap_or(""));
             let context = RuleVariableContext::default();
-            let (body, list_rule) = prepare_list_rule_and_body(
-                Cow::Borrowed(body),
-                list_rule,
-                base_url,
-                &context,
-            );
+            let (body, list_rule) =
+                prepare_list_rule_and_body(Cow::Borrowed(body), list_rule, base_url, &context);
             let mode = self.detect_mode(list_rule, &body);
             let mut results = match mode {
                 ParseMode::JsonPath => {
@@ -509,12 +518,8 @@ impl RuleEngine {
                 .unwrap_or_else(|| source.rule_search.clone().unwrap_or_default());
             let (list_rule, reverse) = normalize_list_rule(rule.book_list.as_deref().unwrap_or(""));
             let context = RuleVariableContext::default();
-            let (body, list_rule) = prepare_list_rule_and_body(
-                Cow::Borrowed(body),
-                list_rule,
-                base_url,
-                &context,
-            );
+            let (body, list_rule) =
+                prepare_list_rule_and_body(Cow::Borrowed(body), list_rule, base_url, &context);
             let mode = self.detect_mode(list_rule, &body);
             let mut results = match mode {
                 ParseMode::JsonPath => {
@@ -576,7 +581,8 @@ impl RuleEngine {
     ) -> Book {
         with_js_lib(source.js_lib.as_deref(), || {
             let rule = source.rule_book_info.clone().unwrap_or_default();
-            let mut context = RuleVariableContext::for_book_with_fields(variable, book_name, book_fields);
+            let mut context =
+                RuleVariableContext::for_book_with_fields(variable, book_name, book_fields);
 
             let mode = self.detect_mode(rule.name.as_deref().unwrap_or(""), body);
             match mode {
@@ -962,13 +968,8 @@ impl RuleEngine {
             ParseMode::Css => {
                 let doc = html::parse_document(&content_body);
                 if extract_js(&content_rule).1.is_some() {
-                    eval_field_html_doc_with_ctx(
-                        &content_rule,
-                        &doc,
-                        base_url,
-                        context,
-                    )
-                    .unwrap_or_default()
+                    eval_field_html_doc_with_ctx(&content_rule, &doc, base_url, context)
+                        .unwrap_or_default()
                 } else {
                     html::select_all_text(&doc, self.strip_mode_prefix(&content_rule))
                         .unwrap_or_default()
@@ -3145,12 +3146,9 @@ fn eval_field_html_with_ctx(
             .into_iter()
             .next()
             .unwrap_or_default(),
-        ParseMode::Regex => regex_capture_first(
-            pure.trim_start_matches(':').trim(),
-            &input,
-        )
-        .and_then(|row| row.get(1).or_else(|| row.first()).and_then(Clone::clone))
-        .unwrap_or_default(),
+        ParseMode::Regex => regex_capture_first(pure.trim_start_matches(':').trim(), &input)
+            .and_then(|row| row.get(1).or_else(|| row.first()).and_then(Clone::clone))
+            .unwrap_or_default(),
         ParseMode::Js => {
             eval_js_with_bindings(strip_js_rule(pure), &input, base_url, &ctx.js_bindings())
                 .unwrap_or_default()
@@ -3194,12 +3192,9 @@ fn eval_field_html_doc_with_ctx(
             .first()
             .cloned()
             .unwrap_or_default(),
-        ParseMode::Regex => regex_capture_first(
-            pure.trim_start_matches(':').trim(),
-            &input,
-        )
-        .and_then(|row| row.get(1).or_else(|| row.first()).and_then(Clone::clone))
-        .unwrap_or_default(),
+        ParseMode::Regex => regex_capture_first(pure.trim_start_matches(':').trim(), &input)
+            .and_then(|row| row.get(1).or_else(|| row.first()).and_then(Clone::clone))
+            .unwrap_or_default(),
         ParseMode::Js => {
             eval_js_with_bindings(strip_js_rule(pure), &input, base_url, &ctx.js_bindings())
                 .unwrap_or_default()
@@ -3247,12 +3242,9 @@ fn eval_field_xpath_with_ctx(
             .into_iter()
             .next()
             .unwrap_or_default(),
-        ParseMode::Regex => regex_capture_first(
-            pure.trim_start_matches(':').trim(),
-            &input,
-        )
-        .and_then(|row| row.get(1).or_else(|| row.first()).and_then(Clone::clone))
-        .unwrap_or_default(),
+        ParseMode::Regex => regex_capture_first(pure.trim_start_matches(':').trim(), &input)
+            .and_then(|row| row.get(1).or_else(|| row.first()).and_then(Clone::clone))
+            .unwrap_or_default(),
         ParseMode::Js => {
             eval_js_with_bindings(strip_js_rule(pure), &input, base_url, &ctx.js_bindings())
                 .unwrap_or_default()
@@ -3318,12 +3310,9 @@ fn eval_field_json_with_ctx(
                 pick_json_field(v, Some(pure)).unwrap_or_else(|| pure.to_string())
             }
         }
-        ParseMode::Regex => regex_capture_first(
-            pure.trim_start_matches(':').trim(),
-            &input,
-        )
-        .and_then(|row| row.get(1).or_else(|| row.first()).and_then(Clone::clone))
-        .unwrap_or_default(),
+        ParseMode::Regex => regex_capture_first(pure.trim_start_matches(':').trim(), &input)
+            .and_then(|row| row.get(1).or_else(|| row.first()).and_then(Clone::clone))
+            .unwrap_or_default(),
         ParseMode::Js => {
             eval_js_with_bindings(strip_js_rule(pure), &input, base_url, &ctx.js_bindings())
                 .unwrap_or_default()
@@ -4256,9 +4245,10 @@ html;"#
         };
         let body = r#"<div id="acontent"><p>正文</p><img data-src="/img/a.png" style="display:none;"></div>"#;
 
-        let content = RuleEngine::new()
-            .unwrap()
-            .content(&source, body, "https://example.test/chapter");
+        let content =
+            RuleEngine::new()
+                .unwrap()
+                .content(&source, body, "https://example.test/chapter");
 
         assert!(content.contains("正文"));
         assert!(content.contains("src=\"https://example.test/img/a.png\""));
@@ -4303,9 +4293,10 @@ arr;"#
 <li class="chapter-li volume-cover"><a href="/cover">Cover</a></li>
 </ul>"#;
 
-        let (chapters, _) = RuleEngine::new()
-            .unwrap()
-            .chapter_list(&source, body, "https://source.example/book");
+        let (chapters, _) =
+            RuleEngine::new()
+                .unwrap()
+                .chapter_list(&source, body, "https://source.example/book");
 
         assert_eq!(chapters.len(), 2);
         assert_eq!(chapters[0].title, "Chapter 1");
@@ -4335,9 +4326,10 @@ arr;"#
             ..Default::default()
         };
 
-        let (chapters, _) = RuleEngine::new()
-            .unwrap()
-            .chapter_list(&source, "", "https://source.example/book");
+        let (chapters, _) =
+            RuleEngine::new()
+                .unwrap()
+                .chapter_list(&source, "", "https://source.example/book");
 
         assert_eq!(chapters.len(), 2);
         assert_eq!(chapters[0].title, "Middle chapter");
@@ -5213,7 +5205,8 @@ chapter_id='{{$.chapter_id}}'
         };
 
         let mock_body = r#"{"data":"arsadataUMNAHxEs93aodUJwIx4FcWXXx5RnV0XXbcPcN6JNbBGFl+nRnI3oLzKOkWqQvEU3aYfonNTUyImBoOjk884Xb+e4CHPXR8ZJrIL4uhRMRuArcX/wpzHvionV+aZb+VcfPXuOilMIPt2r6ObLkdedP3fFBpIrXGBdBgFy/DpZrGKyOwfwqDSG/rkA3XX2Rq0nRQbM4uLT+Ii0DzHjxumDH5ALs6MVXWcTvA/dZJkbisWwXK/vgfQsM+t11xykYDannTKAHx4B3nul20EykzZay/4OUS5wm46gpIFgWaIxjRg=","status":0}"#;
-        let base_url = "https://api-cdn.kaimanhua.com/comic-api/v2/comic/getcomicdata?comic_id=10034";
+        let base_url =
+            "https://api-cdn.kaimanhua.com/comic-api/v2/comic/getcomicdata?comic_id=10034";
         let book = engine.book_info(&source, mock_body, base_url, base_url);
         assert_eq!(book.name, "开局十个大帝都是我徒弟");
         assert_eq!(book.author, "九月十月");
@@ -5238,7 +5231,11 @@ chapter_id='{{$.chapter_id}}'
             let real_book = engine.book_info(&source, &comic_body, base_url, base_url);
             assert_eq!(real_book.name, "开局十个大帝都是我徒弟");
             assert_eq!(real_book.author, "iCiyuan动漫");
-            assert!(real_book.variable.as_deref().unwrap_or("").contains("112464"));
+            assert!(real_book
+                .variable
+                .as_deref()
+                .unwrap_or("")
+                .contains("112464"));
 
             let (real_chapters, _) = engine.chapter_list_with_variable(
                 &source,
@@ -5252,6 +5249,34 @@ chapter_id='{{$.chapter_id}}'
             assert!(real_chapters[0].url.contains("comic_id=112464"));
             assert!(real_chapters[0].url.contains("chapter_id=2066785"));
         }
+    }
+
+    #[test]
+    fn html_toc_matches_fallback_keeps_unique_chapters_in_document_order() {
+        let engine = RuleEngine::new().unwrap();
+        let source: BookSource = serde_json::from_value(serde_json::json!({
+            "bookSourceName": "Matches directory fixture",
+            "bookSourceUrl": "https://example.com",
+            "ruleToc": {
+                "chapterList": "#content_1 a||#list dt:matches(章节目录|目录章节)~a",
+                "chapterName": "text",
+                "chapterUrl": "href"
+            }
+        }))
+        .unwrap();
+        let body = "<dl id='list'><dt>章节目录</dt><a href='/1'>第一章</a><dt>目录章节</dt><a href='/2'>第二章</a><dt>其他</dt><a href='/3'>第三章</a></dl>";
+        let (chapters, _) = engine.chapter_list(&source, body, "https://example.com/toc");
+        assert_eq!(chapters.len(), 3);
+        assert_eq!(
+            chapters
+                .iter()
+                .map(|chapter| chapter.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["第一章", "第二章", "第三章"]
+        );
+        assert_eq!(chapters[0].url, "https://example.com/1");
+        assert_eq!(chapters[1].url, "https://example.com/2");
+        assert_eq!(chapters[2].url, "https://example.com/3");
     }
 
     #[test]
@@ -5388,7 +5413,12 @@ chapter_id='{{$.chapter_id}}'
                 }
             }
         }"#;
-        let book = engine.book_info(&source, info_body, "https://novel.html5.qq.com/", "https://novel.html5.qq.com/qbread/api/novel/bookInfo?resourceId=1132746073");
+        let book = engine.book_info(
+            &source,
+            info_body,
+            "https://novel.html5.qq.com/",
+            "https://novel.html5.qq.com/qbread/api/novel/bookInfo?resourceId=1132746073",
+        );
         assert_eq!(book.name, "帝皇的告死天使");
         assert_eq!(book.author, "莫格卓根");
         assert_eq!(book.kind.as_deref(), Some("1132746073"));
@@ -5456,7 +5486,11 @@ chapter_id='{{$.chapter_id}}'
                 }]
             }
         }"#;
-        let content = engine.content(&source, content_body, "https://novel.html5.qq.com/be-api/content/ads-read");
+        let content = engine.content(
+            &source,
+            content_body,
+            "https://novel.html5.qq.com/be-api/content/ads-read",
+        );
         assert!(content.contains("标准泰拉历.912.M41"));
     }
 
@@ -5486,11 +5520,19 @@ chapter_id='{{$.chapter_id}}'
                 <span class="tag">玄幻</span>
             </div>
         "#;
-        let book = engine.book_info(&source, body, "https://books.example/book/1", "https://books.example/book/1");
+        let book = engine.book_info(
+            &source,
+            body,
+            "https://books.example/book/1",
+            "https://books.example/book/1",
+        );
         assert_eq!(book.name, "斗破 苍穹");
         assert_eq!(book.author, "天蚕土豆");
         assert!(book.intro.as_ref().unwrap().contains("<b>属于斗气</b>"));
-        assert_eq!(book.toc_url.as_deref(), Some("https://books.example/book/1/toc"));
+        assert_eq!(
+            book.toc_url.as_deref(),
+            Some("https://books.example/book/1/toc")
+        );
         assert_eq!(book.kind.as_deref(), Some("玄幻"));
     }
 

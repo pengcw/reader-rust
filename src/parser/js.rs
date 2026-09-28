@@ -516,6 +516,10 @@ fn eval_js_inner_with_source(
             let sk_clone = source_key_val.clone();
             source_obj.set("key", source_key_val.clone())?;
             source_obj.set("getKey", Func::new(move || sk_clone.clone()))?;
+            if let Some(active_source) = ACTIVE_JS_BOOK_SOURCE.with(|cell| cell.borrow().clone()) {
+                source_obj.set("bookSourceUrl", active_source.book_source_url)?;
+                source_obj.set("header", active_source.header.unwrap_or_default())?;
+            }
 
             let source_key_for_get = source_key_val.clone();
             source_obj.set(
@@ -781,6 +785,33 @@ fn eval_js_inner_with_source(
                 "delete",
                 Func::new(|key: String| {
                     let _ = js_cache_delete(&key);
+                }),
+            )?;
+            cache_obj.set(
+                "__memoryGet",
+                Func::new(|key: String| -> Option<String> {
+                    crate::crawler::session::current_active_session()
+                        .and_then(|session| session.memory_cache_get(&key))
+                        .and_then(|value| serde_json::to_string(&value).ok())
+                }),
+            )?;
+            cache_obj.set(
+                "__memoryPut",
+                Func::new(|key: String, value: String| {
+                    if let (Some(session), Ok(value)) = (
+                        crate::crawler::session::current_active_session(),
+                        serde_json::from_str(&value),
+                    ) {
+                        session.memory_cache_put(key, value);
+                    }
+                }),
+            )?;
+            cache_obj.set(
+                "__memoryDelete",
+                Func::new(|key: String| {
+                    if let Some(session) = crate::crawler::session::current_active_session() {
+                        session.memory_cache_delete(&key);
+                    }
                 }),
             )?;
             globals.set("cache", cache_obj)?;
@@ -1396,6 +1427,15 @@ fn eval_js_inner_with_source(
                         const value = nativeSourceGetLoginHeader();
                         return value == null ? null : value;
                     };
+                    globalThis.source.getLoginHeaderMap = function() {
+                        const raw = source.getLoginHeader();
+                        if (raw == null) return null;
+                        let value;
+                        try { value = JSON.parse(raw); } catch (_) { return null; }
+                        return value && typeof value === 'object' && !Array.isArray(value)
+                            ? new Map(Object.entries(value).map(([key, item]) => [key, String(item)]))
+                            : null;
+                    };
                     globalThis.source.setVariable = function(value, extendedValue) {
                         if (arguments.length > 1) {
                             nativeSourceSetVariable(
@@ -1637,6 +1677,25 @@ fn eval_js_inner_with_source(
                     };
                     globalThis.cache.delete = key => {
                         nativeCacheDelete(String(key));
+                    };
+                    // Memory entries are per active FFI operation, never persisted
+                    // into the caller's session delta or shared across users.
+                    const localMemory = new Map();
+                    globalThis.cache.getFromMemory = key => {
+                        key = String(key);
+                        const stored = cache.__memoryGet(key);
+                        return stored == null ? (localMemory.get(key) ?? null) : JSON.parse(stored);
+                    };
+                    globalThis.cache.putMemory = (key, value) => {
+                        key = String(key);
+                        localMemory.set(key, value);
+                        const encoded = JSON.stringify(value);
+                        if (encoded !== undefined) cache.__memoryPut(key, encoded);
+                    };
+                    globalThis.cache.deleteMemory = key => {
+                        key = String(key);
+                        localMemory.delete(key);
+                        cache.__memoryDelete(key);
                     };
                 })();"#,
             )?;
@@ -4001,6 +4060,38 @@ mod tests {
     }
 
     #[test]
+    fn memory_cache_spellings_keep_values_in_operation_only() {
+        let url = "https://memory-cache.example/books";
+        let (value, delta) = with_active_session(None, url, |_| {
+            eval_js(
+                "cache.putMemory('item', {count: 2}); cache.getFromMemory('item').count",
+                "",
+                url,
+            )
+            .unwrap();
+            eval_js("cache.getFromMemory('item').count", "", url).unwrap()
+        });
+        assert_eq!(value, "2");
+        assert!(
+            delta.is_none(),
+            "memory cache must not change the session DTO"
+        );
+        let (isolated, _) = with_active_session(None, url, |_| {
+            eval_js("cache.getFromMemory('item') === null", "", url).unwrap()
+        });
+        assert_eq!(isolated, "true");
+        let (deleted, _) = with_active_session(None, url, |_| {
+            eval_js(
+                "cache.putMemory('item', 'text'); cache.deleteMemory('item'); cache.getFromMemory('item') === null",
+                "",
+                url,
+            )
+            .unwrap()
+        });
+        assert_eq!(deleted, "true");
+    }
+
+    #[test]
     fn js_cache_is_isolated_by_session_and_restored_from_session_delta() {
         let url = "https://same-source.example/books";
         let key = format!("session-cache-{}", Uuid::new_v4());
@@ -4971,6 +5062,28 @@ if (a) {
     }
 
     #[test]
+    fn source_exposes_url_and_raw_header_in_execute_context() {
+        let source = BookSource {
+            book_source_url: "https://source.example".to_string(),
+            header: Some(r#"{"User-Agent":"reader"}"#.to_string()),
+            ..Default::default()
+        };
+        let client = HttpClient::standalone();
+        let result = with_js_http_context(&client, &source, || {
+            eval_js(
+                "[source.bookSourceUrl, JSON.parse(source.header)['User-Agent'], source.getKey()].join('|')",
+                "",
+                &source.book_source_url,
+            )
+            .unwrap()
+        });
+        assert_eq!(
+            result,
+            "https://source.example|reader|https://source.example"
+        );
+    }
+
+    #[test]
     fn source_contract_uses_book_source_key_and_single_source_variable() {
         let source = BookSource {
             book_source_url: "https://source.example".to_string(),
@@ -5258,6 +5371,50 @@ if (a) {
     }
 
     #[test]
+    fn login_header_map_handles_missing_invalid_and_valid_headers() {
+        let url = "https://headers.example/books";
+        let (missing, unchanged) = with_active_session(None, url, |_| {
+            eval_js("source.getLoginHeaderMap() === null", "", url).unwrap()
+        });
+        assert_eq!(missing, "true");
+        assert!(unchanged.is_none());
+
+        let invalid = ExecuteSession {
+            header: Some(json!("not JSON")),
+            ..Default::default()
+        };
+        let (bad, unchanged) = with_active_session(Some(&invalid), url, |_| {
+            eval_js("source.getLoginHeaderMap() === null", "", url).unwrap()
+        });
+        assert_eq!(bad, "true");
+        assert!(unchanged.is_none());
+
+        let non_object = ExecuteSession {
+            header: Some(json!("[1,2]")),
+            ..Default::default()
+        };
+        let (bad_type, _) = with_active_session(Some(&non_object), url, |_| {
+            eval_js("source.getLoginHeaderMap() === null", "", url).unwrap()
+        });
+        assert_eq!(bad_type, "true");
+
+        let valid = ExecuteSession {
+            header: Some(json!({"X-Reader": "ok", "X-Count": "2"})),
+            ..Default::default()
+        };
+        let (result, unchanged) = with_active_session(Some(&valid), url, |_| {
+            eval_js(
+                "const headers = source.getLoginHeaderMap(); [headers instanceof Map, headers.size, headers.get('X-Reader'), headers.get('X-Count')].join('|')",
+                "",
+                url,
+            )
+            .unwrap()
+        });
+        assert_eq!(result, "true|2|ok|2");
+        assert!(unchanged.is_none());
+    }
+
+    #[test]
     fn test_js_session_bindings() {
         let initial = ExecuteSession {
             cookies: Some("sid=initial_token".to_string()),
@@ -5293,6 +5450,15 @@ if (a) {
                 // Read login header
                 let h = eval_js("source.getLoginHeader()", "", "https://example.com").unwrap();
                 assert!(h.contains("init_auth"));
+                assert_eq!(
+                    eval_js(
+                        "source.getLoginHeaderMap().get('Authorization')",
+                        "",
+                        "https://example.com"
+                    )
+                    .unwrap(),
+                    "Bearer init_auth"
+                );
 
                 // Put new login header with Cookie
                 eval_js(
