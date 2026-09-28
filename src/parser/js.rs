@@ -2234,6 +2234,33 @@ fn eval_js_inner_with_source(
     }) // closes JS_ENV.with
 }
 
+fn snapshot_object_properties<'js>(
+    object: &Object<'js>,
+) -> anyhow::Result<HashMap<String, Value<'js>>> {
+    let mut snapshot = HashMap::new();
+    for key in object.keys::<String>() {
+        let key = key?;
+        snapshot.insert(key.clone(), object.get::<_, Value<'js>>(key.as_str())?);
+    }
+    Ok(snapshot)
+}
+
+fn restore_object_properties<'js>(
+    object: &Object<'js>,
+    snapshot: HashMap<String, Value<'js>>,
+) -> anyhow::Result<()> {
+    let current_keys = object.keys::<String>().collect::<rquickjs::Result<Vec<_>>>()?;
+    for key in current_keys {
+        if !snapshot.contains_key(&key) {
+            object.remove(key.as_str())?;
+        }
+    }
+    for (key, value) in snapshot {
+        object.set(key.as_str(), value)?;
+    }
+    Ok(())
+}
+
 fn eval_js_reentrant<'js>(
     ctx: rquickjs::Ctx<'js>,
     script: &str,
@@ -2246,6 +2273,9 @@ fn eval_js_reentrant<'js>(
     template_result: bool,
 ) -> anyhow::Result<String> {
     let globals = ctx.globals();
+    let globals_snapshot = snapshot_object_properties(&globals)?;
+    let java: Object<'js> = globals.get("java")?;
+    let java_snapshot = snapshot_object_properties(&java)?;
     let mut saved = Vec::<(String, Option<Value<'js>>)>::new();
 
     let mut save_global = |name: &str| -> anyhow::Result<()> {
@@ -2293,7 +2323,11 @@ fn eval_js_reentrant<'js>(
             }
         }
 
-        let scoped_script = format!("{{\n{script}\n}}");
+        // Direct eval inside a temporary function keeps nested AnalyzeUrl
+        // var/function declarations local while preserving eval's completion value.
+        // Explicit globalThis/java mutations are restored by the snapshots below.
+        let source = serde_json::to_string(script)?;
+        let scoped_script = format!("(function() {{ return eval({source}); }})()");
         let value = eval_script(ctx.clone(), &scoped_script)?;
         if value.is_null() {
             return Ok(String::new());
@@ -2337,7 +2371,17 @@ fn eval_js_reentrant<'js>(
             }
         }
     }
-    result
+
+    let java_restore = restore_object_properties(&java, java_snapshot);
+    let globals_restore = restore_object_properties(&globals, globals_snapshot);
+    match result {
+        Err(error) => Err(error),
+        Ok(value) => {
+            java_restore?;
+            globals_restore?;
+            Ok(value)
+        }
+    }
 }
 
 fn finalize_java_get_string_url(value: String, base_url: &str, is_url: bool) -> String {
@@ -4700,7 +4744,7 @@ if (a) {
     }
 
     #[test]
-    fn nested_connect_restores_outer_header_map_after_failure() {
+    fn nested_connect_restores_outer_scope_and_header_map_after_failure() {
         let source = BookSource {
             book_source_url: "https://example.com".to_owned(),
             ..Default::default()
@@ -4709,12 +4753,16 @@ if (a) {
         let mut headers = vec![("X-Outer".to_owned(), "before".to_owned())];
         let result = with_js_http_context(&client, &source, || {
             eval_js_url_with_headers(
-                "java.headerMap.put('X-Outer','after'); java.connect('ftp://invalid'); java.headerMap.get('X-Outer')",
+                r#"globalThis.outerMarker=1;
+java.outerMarker=1;
+java.headerMap.put('X-Outer','after');
+java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; java.leakedJava=1; globalThis.outerMarker=2; java.outerMarker=2; throw 123"}');
+[globalThis.outerMarker, typeof leakedVar, typeof globalThis.leakedGlobal, java.outerMarker, typeof java.leakedJava, java.headerMap.get('X-Outer')].join('|')"#,
                 "https://example.com", "", 1, &source.book_source_url,
                 &source.book_source_url, None, &mut headers,
             ).unwrap()
         });
-        assert_eq!(result, "after");
+        assert_eq!(result, "1|undefined|undefined|1|undefined|after");
         assert_eq!(headers, vec![("X-Outer".to_owned(), "after".to_owned())]);
     }
 

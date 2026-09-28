@@ -934,12 +934,12 @@ fn execute_content(
             .entry("name".to_string())
             .or_insert_with(|| name_str.clone());
     }
-    let (mut chapter_variable, chapter_title) = input_chapter_state(params);
+    let (mut chapter_variable, mut chapter_title) = input_chapter_state(params);
     let is_volume = input_chapter_is_volume(params);
     let replace_rules = parse_replace_rules(params.get("replaceRules"))?;
 
     if uses_js_ajax_content_rule(source) {
-        let page = engine.content_page_with_context(
+        let page = engine.content_first_page_with_context(
             source,
             "",
             &initial_url,
@@ -948,23 +948,14 @@ fn execute_content(
             book_name.as_deref(),
             chapter_title.as_deref(),
             Some(&book_fields),
+            true,
         );
         let content = apply_replace_rules(&page.content, &replace_rules);
         if content.is_empty() && !is_volume {
             return Err(ExecuteError::parse("content is empty"));
         }
-        let title = engine.content_title_with_context(
-            source,
-            "",
-            &initial_url,
-            book_variable.as_deref(),
-            chapter_variable.as_deref(),
-            book_name.as_deref(),
-            chapter_title.as_deref(),
-            Some(&book_fields),
-        );
         let mut data = json!({"content": content});
-        if let Some(title) = title {
+        if let Some(title) = page.title {
             data["title"] = json!(title);
         }
         return Ok(success_without_http(data));
@@ -976,6 +967,7 @@ fn execute_content(
     let mut initial_response_url = None;
     let mut first_page = None;
     let mut final_response = None;
+    let mut title = None;
     let mut sub_requests = 0;
     let text_book = params
         .get("book")
@@ -1012,24 +1004,43 @@ fn execute_content(
             Some(&request_context),
         )?;
         visited_urls.insert(current_url.clone());
-        if first_page.is_none() {
+        let is_first_page = first_page.is_none();
+        if is_first_page {
             first_page = Some((response.body.clone(), response.url.clone()));
         }
         let response_url = response.url.clone();
         let chapter_url = initial_response_url.get_or_insert_with(|| response_url.clone());
-        let page = engine.content_page_with_context_follow(
-            source,
-            &response.body,
-            &response.url,
-            book_variable.as_deref(),
-            chapter_variable.as_deref(),
-            book_name.as_deref(),
-            chapter_title.as_deref(),
-            Some(&book_fields),
-            follow_next,
-        );
+        let page = if is_first_page {
+            engine.content_first_page_with_context(
+                source,
+                &response.body,
+                &response.url,
+                book_variable.as_deref(),
+                chapter_variable.as_deref(),
+                book_name.as_deref(),
+                chapter_title.as_deref(),
+                Some(&book_fields),
+                follow_next,
+            )
+        } else {
+            engine.content_page_with_context_follow(
+                source,
+                &response.body,
+                &response.url,
+                book_variable.as_deref(),
+                chapter_variable.as_deref(),
+                book_name.as_deref(),
+                chapter_title.as_deref(),
+                Some(&book_fields),
+                follow_next,
+            )
+        };
         if !page.content.is_empty() {
             fragments.push(page.content);
+        }
+        if let Some(parsed_title) = page.title.as_ref() {
+            chapter_title = Some(parsed_title.clone());
+            title = Some(parsed_title.clone());
         }
         book_variable = page.book_variable;
         chapter_variable = page.chapter_variable;
@@ -1037,11 +1048,8 @@ fn execute_content(
 
         let recursive = page.next_urls.len() == 1;
         for next_url in page.next_urls {
-            let allowed = if recursive {
-                should_follow_content_page(chapter_url, &response_url, &next_url)
-            } else {
-                same_origin_url(chapter_url, &next_url)
-            };
+            let allowed = !recursive
+                || should_follow_content_page(chapter_url, &response_url, &next_url);
             if allowed
                 && !visited_urls.contains(&next_url)
                 && !pending.iter().any(|(url, _)| url == &next_url)
@@ -1103,18 +1111,6 @@ fn execute_content(
             }
         }
     }
-    let title = first_page.as_ref().and_then(|(body, url)| {
-        engine.content_title_with_context(
-            source,
-            body,
-            url,
-            book_variable.as_deref(),
-            chapter_variable.as_deref(),
-            book_name.as_deref(),
-            chapter_title.as_deref(),
-            Some(&book_fields),
-        )
-    });
     let content = apply_replace_rules(&fragments.join("\n"), &replace_rules);
     if content.is_empty() && !is_volume {
         return Err(ExecuteError::parse("content is empty"));
@@ -1622,20 +1618,6 @@ fn success(
 }
 
 // 复用主分支 BookService 的启发式，避免把章节翻页规则误判为下一章。
-fn same_origin_url(left: &str, right: &str) -> bool {
-    match (
-        url::Url::parse(strip_url_options(left)),
-        url::Url::parse(strip_url_options(right)),
-    ) {
-        (Ok(left), Ok(right)) => {
-            left.scheme() == right.scheme()
-                && left.host_str() == right.host_str()
-                && left.port_or_known_default() == right.port_or_known_default()
-        }
-        _ => false,
-    }
-}
-
 fn should_follow_content_page(chapter_url: &str, current_url: &str, next_url: &str) -> bool {
     let chapter_url = strip_fragment(strip_url_options(chapter_url));
     let current_url = strip_fragment(strip_url_options(current_url));
@@ -2122,7 +2104,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_next_content_urls_are_fetched_serially_in_order_without_recursing() {
+    fn multiple_next_content_urls_preserve_order_without_recursing() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
@@ -2166,6 +2148,81 @@ mod tests {
             server.join().unwrap(),
             ["/chapter/1", "/part-two", "/part-three"]
         );
+    }
+
+    #[test]
+    fn multiple_next_content_urls_allow_cross_origin_pages() {
+        let primary = TcpListener::bind("127.0.0.1:0").unwrap();
+        let primary_base = format!("http://{}", primary.local_addr().unwrap());
+        let secondary = TcpListener::bind("127.0.0.1:0").unwrap();
+        let secondary_url = format!("http://{}/part-three", secondary.local_addr().unwrap());
+
+        let primary_server = thread::spawn({
+            let secondary_url = secondary_url.clone();
+            move || {
+                let mut paths = Vec::new();
+                for index in 0..2 {
+                    let (mut stream, _) = accept_with_timeout(&primary);
+                    let mut buf = [0u8; 2048];
+                    let size = stream.read(&mut buf).unwrap();
+                    let path = String::from_utf8_lossy(&buf[..size])
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap()
+                        .to_string();
+                    let body = if index == 0 {
+                        serde_json::json!({
+                            "content":"first",
+                            "next":["/part-two", secondary_url]
+                        })
+                        .to_string()
+                    } else {
+                        r#"{"content":"second"}"#.to_string()
+                    };
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                    paths.push(path);
+                }
+                paths
+            }
+        });
+        let secondary_server = thread::spawn(move || {
+            let (mut stream, _) = accept_with_timeout(&secondary);
+            let mut buf = [0u8; 2048];
+            let size = stream.read(&mut buf).unwrap();
+            let path = String::from_utf8_lossy(&buf[..size])
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .to_string();
+            let body = r#"{"content":"third"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            path
+        });
+
+        let source = serde_json::json!({"bookSourceName":"cross-origin pages","bookSourceUrl":primary_base,
+            "ruleContent":{"content":"$.content","nextContentUrl":"$.next[*]"}});
+        let request = serde_json::json!({"api":2,"op":"content","params":{"url":format!("{primary_base}/chapter/1")}});
+        let result: Value =
+            serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["content"], "first\nsecond\nthird");
+        assert_eq!(result["data"]["pages"], 3);
+        assert_eq!(
+            primary_server.join().unwrap(),
+            ["/chapter/1", "/part-two"]
+        );
+        assert_eq!(secondary_server.join().unwrap(), "/part-three");
     }
 
     #[test]

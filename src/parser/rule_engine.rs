@@ -20,6 +20,7 @@ pub struct RuleEngine;
 pub(crate) struct ContentPageResult {
     pub content: String,
     pub next_urls: Vec<String>,
+    pub title: Option<String>,
     pub book_variable: Option<String>,
     pub chapter_variable: Option<String>,
 }
@@ -806,14 +807,14 @@ impl RuleEngine {
             ContentPageResult {
                 content,
                 next_urls,
+                title: None,
                 book_variable: context.book_variable(),
                 chapter_variable: context.chapter_variable(),
             }
         })
     }
 
-    /// The title rule is evaluated after content against the first chapter response.
-    pub(crate) fn content_title_with_context(
+    pub(crate) fn content_first_page_with_context(
         &self,
         source: &BookSource,
         body: &str,
@@ -823,11 +824,8 @@ impl RuleEngine {
         book_name: Option<&str>,
         chapter_title: Option<&str>,
         book_fields: Option<&HashMap<String, String>>,
-    ) -> Option<String> {
-        let rule = source.rule_content.as_ref()?.title.as_deref()?.trim();
-        if rule.is_empty() {
-            return None;
-        }
+        follow_next: bool,
+    ) -> ContentPageResult {
         with_js_lib(source.js_lib.as_deref(), || {
             let mut context = RuleVariableContext::for_content_with_fields(
                 book_variable,
@@ -836,10 +834,40 @@ impl RuleEngine {
                 chapter_title,
                 book_fields,
             );
-            self.eval_body_rule_with_context(rule, body, base_url, &mut context)
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
+            let title = self.content_title_in_context(source, body, base_url, &mut context);
+            if let Some(title) = title.as_ref() {
+                context.chapter_title = Some(title.clone());
+            }
+            let content = self.content_with_context(source, body, base_url, &mut context);
+            let next_urls = if follow_next {
+                self.next_content_urls_with_context(source, body, base_url, &mut context)
+            } else {
+                Vec::new()
+            };
+            ContentPageResult {
+                content,
+                next_urls,
+                title,
+                book_variable: context.book_variable(),
+                chapter_variable: context.chapter_variable(),
+            }
         })
+    }
+
+    fn content_title_in_context(
+        &self,
+        source: &BookSource,
+        body: &str,
+        base_url: &str,
+        context: &mut RuleVariableContext,
+    ) -> Option<String> {
+        let rule = source.rule_content.as_ref()?.title.as_deref()?.trim();
+        if rule.is_empty() {
+            return None;
+        }
+        self.eval_body_rule_with_context(rule, body, base_url, context)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
     }
 
     /// Android evaluates subContent once against the original chapter response.
@@ -4192,6 +4220,47 @@ mod tests {
         assert_eq!(
             page.next_urls.first().map(String::as_str),
             Some("https://books.example/chapter/next/NEXT")
+        );
+        let chapter_vars = serde_json::from_str::<HashMap<String, String>>(
+            page.chapter_variable.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(chapter_vars["pageToken"], "NEXT");
+    }
+
+    #[test]
+    fn content_first_page_evaluates_title_before_content_and_next_url() {
+        let source = BookSource {
+            rule_content: Some(ContentRule {
+                title: Some("@put:{pageToken:.token@text}.title@text".to_string()),
+                content: Some(
+                    "@js:[title, chapter.title, chapter.variableMap.pageToken].join('|')"
+                        .to_string(),
+                ),
+                next_content_url: Some(
+                    "@js:'/next/' + title + '/' + chapter.variableMap.pageToken".to_string(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let page = RuleEngine::new().unwrap().content_first_page_with_context(
+            &source,
+            r#"<span class="token">NEXT</span><h1 class="title">Fresh</h1>"#,
+            "https://books.example/chapter/1",
+            None,
+            None,
+            Some("Book"),
+            Some("Old"),
+            None,
+            true,
+        );
+
+        assert_eq!(page.title.as_deref(), Some("Fresh"));
+        assert_eq!(page.content, "Fresh|Fresh|NEXT");
+        assert_eq!(
+            page.next_urls.first().map(String::as_str),
+            Some("https://books.example/next/Fresh/NEXT")
         );
         let chapter_vars = serde_json::from_str::<HashMap<String, String>>(
             page.chapter_variable.as_deref().unwrap(),
