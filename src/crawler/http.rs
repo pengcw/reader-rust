@@ -237,6 +237,11 @@ impl HttpClient {
         max_response_bytes: Option<usize>,
         follow_redirects: bool,
     ) -> Result<RawHttpResponse, HttpClientError> {
+        if crate::host_services::is_offline() {
+            return Err(HttpClientError::Network(
+                "network is disabled in offline diagnostics".to_string(),
+            ));
+        }
         let mut current_url =
             Url::parse(url).map_err(|error| HttpClientError::InvalidUrl(error.to_string()))?;
         ensure_http_url(&current_url)?;

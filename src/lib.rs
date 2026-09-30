@@ -1,6 +1,7 @@
 pub mod crawler;
 pub mod executor;
 pub mod ffi;
+pub mod host_services;
 pub mod model;
 pub mod parser;
 pub mod util;

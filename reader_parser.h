@@ -14,16 +14,6 @@ extern "C" {
 #endif
 
 /** \brief
- *  对已经取得的响应进行离线规则诊断；该函数绝不主动发起 HTTP 请求。
- */
-char *
-debug_parse (
-    char const * source_json,
-    char const * html_body,
-    char const * base_url,
-    char const * mode);
-
-/** \brief
  *  通用规则/求值/清洗/微指令入口。该函数保持 ABI v1 已有语义，但不承担书源抓取。
  */
 char *
@@ -45,6 +35,38 @@ reader_execute (
 void
 reader_free_string (
     char * value);
+
+
+#include <stddef.h>
+#include <stdint.h>
+
+/** <No documentation available> */
+typedef struct ReaderHostServices {
+    /** <No documentation available> */
+    uint32_t abi_version;
+
+    /** <No documentation available> */
+    int32_t (*call)(void *, char const *, char const *, uint8_t *, size_t);
+
+    /** <No documentation available> */
+    void * user_data;
+
+    /** \brief
+     *  Zero selects 64 KiB. Maximum is 8 MiB. Calls are never replayed to resize.
+     */
+    size_t max_response_bytes;
+} ReaderHostServices_t;
+
+/** \brief
+ *  Register services in this thread/process. NULL unregisters; host owns pointers.
+ *  Returns 0 on success, -1 for invalid configuration, -2 during a host callback.
+ *  # Safety
+ *  The host must keep callback/user_data alive until unregistering and obey the
+ *  callback's buffer, same-thread and non-unwinding contract.
+ */
+int32_t
+reader_set_host_services (
+    ReaderHostServices_t const * services);
 
 
 #ifdef __cplusplus
