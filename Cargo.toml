@@ -21,7 +21,7 @@ chardetng = "0.1"
 md-5 = "0.10"
 ring = "0.17"
 hex = "0.4"
-scraper = "0.20"
+scraper = "0.27"
 jsonpath_lib = "0.3"
 regex = "1"
 java_regex = "0.1"
@@ -37,10 +37,10 @@ safer-ffi = { version = "0.1", features = ["headers"] }
 flate2 = "1.0"
 
 [target.'cfg(any(all(target_arch = "aarch64", target_os = "linux"), all(target_arch = "arm", target_os = "linux"), target_os = "android"))'.dependencies]
-rquickjs = { version = "0.7", features = ["bindgen"] }
+rquickjs = { version = "0.8", features = ["bindgen"] }
 
 [target.'cfg(not(any(all(target_arch = "aarch64", target_os = "linux"), all(target_arch = "arm", target_os = "linux"), target_os = "android")))'.dependencies]
-rquickjs = { version = "0.7" }
+rquickjs = { version = "0.8" }
 
 [profile.release]
 opt-level = "z"
