@@ -7,6 +7,35 @@ use crate::parser::rule_engine::{apply_legado_regex, RuleEngine};
 use safer_ffi::prelude::*;
 use serde_json::{json, Value};
 
+const MAX_RAKERS_EVAL_JSON_BYTES: usize = 16 * 1024 * 1024;
+const MAX_RAKERS_EVAL_HTML_BYTES: usize = 8 * 1024 * 1024;
+const RAKERS_EVAL_MAX_REMOTE_SCRIPTS: usize = 8;
+const DEFAULT_RAKERS_EVAL_TIMEOUT_MS: u64 = 15_000;
+const MAX_RAKERS_EVAL_TIMEOUT_MS: u64 = 120_000;
+const MAX_RAKERS_EVAL_REDIRECTS: usize = 5;
+
+#[derive(Default, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct RakersEvalRequest {
+    url: Option<String>,
+    html: Option<String>,
+    base_url: Option<String>,
+    method: Option<String>,
+    headers: Option<Value>,
+    #[serde(alias = "cookie")]
+    cookies: Option<Value>,
+    #[serde(alias = "source", alias = "data")]
+    body: Option<String>,
+    proxy: Option<String>,
+    /// Seconds, matching the common LuaSocket/KOReader timeout unit.
+    timeout: Option<u64>,
+    timeout_ms: Option<u64>,
+    redirect: Option<bool>,
+    #[serde(alias = "maxredirects")]
+    max_redirects: Option<usize>,
+    charset: Option<String>,
+}
+
 /// 释放所有 `reader_*` 返回给 C/Lua 的字符串。每个非空指针必须且只能释放一次。
 #[ffi_export]
 pub fn reader_free_string(value: Option<char_p::Box>) {
@@ -25,6 +54,12 @@ pub fn reader_eval(input: char_p::Ref<'_>, rule: char_p::Ref<'_>) -> char_p::Box
     }
     if rule == "@debug_parse" {
         return debug_parse_request(input);
+    }
+    if rule == "@http_request" {
+        return eval_http_request(input);
+    }
+    if rule == "@rakers_render" {
+        return rakers_render_request(input);
     }
     if rule == "@host_call" {
         let result = match serde_json::from_str::<Value>(input) {
@@ -147,6 +182,338 @@ pub unsafe fn reader_set_host_services(
     services: Option<&crate::host_services::ReaderHostServices>,
 ) -> i32 {
     unsafe { crate::host_services::set(services) }
+}
+
+fn rakers_render_request(input: &str) -> char_p::Box {
+    if input.len() > MAX_RAKERS_EVAL_JSON_BYTES {
+        return rakers_eval_error("Rakers render input exceeds 16 MiB");
+    }
+    let request = match parse_rakers_eval_request(input) {
+        Ok(request) => request,
+        Err(error) => return rakers_eval_error(&error),
+    };
+
+    let rendered = match (request.url.as_deref(), request.html.as_deref()) {
+        (Some(_), Some(_)) => return rakers_eval_error("provide either url or html, not both"),
+        (Some(url), None) => match fetch_and_render_rakers_url(url, &request) {
+            Ok(rendered) => rendered,
+            Err(error) => return rakers_eval_error(&error),
+        },
+        (None, Some(html)) => {
+            if request.method.is_some()
+                || request.headers.is_some()
+                || request.cookies.is_some()
+                || request.body.is_some()
+                || request.proxy.is_some()
+                || request.timeout.is_some()
+                || request.timeout_ms.is_some()
+                || request.redirect.is_some()
+                || request.max_redirects.is_some()
+                || request.charset.is_some()
+            {
+                return rakers_eval_error("HTTP request options require url input");
+            }
+            let base_url = match request.base_url.as_deref() {
+                Some(raw_url) => match validate_rakers_http_url(raw_url) {
+                    Ok(url) => Some(url),
+                    Err(error) => return rakers_eval_error(&error),
+                },
+                None => None,
+            };
+            match render_rakers_html(html, base_url.as_ref().map(url::Url::as_str), None, None) {
+                Ok(rendered) => rendered,
+                Err(error) => return rakers_eval_error(&error),
+            }
+        }
+        (None, None) => return rakers_eval_error("request must contain url or html"),
+    };
+
+    ffi_string(rendered)
+}
+
+fn eval_http_request(input: &str) -> char_p::Box {
+    if input.len() > MAX_RAKERS_EVAL_JSON_BYTES {
+        return rakers_eval_error("HTTP request input exceeds 16 MiB");
+    }
+    let request = match parse_rakers_eval_request(input) {
+        Ok(request) => request,
+        Err(error) => return rakers_eval_error(&error),
+    };
+    if request.html.is_some() || request.base_url.is_some() {
+        return rakers_eval_error("@http_request requires a URL, not HTML input");
+    }
+    let Some(url) = request.url.as_deref() else {
+        return rakers_eval_error("@http_request requires url");
+    };
+    let response = match execute_eval_http_request(url, &request) {
+        Ok(response) => response,
+        Err(error) => return rakers_eval_error(&error),
+    };
+    let content_type = response
+        .headers
+        .get(ureq::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    let body =
+        crate::crawler::decode_body(&response.body, request.charset.as_deref(), content_type);
+    if body.len() > MAX_RAKERS_EVAL_HTML_BYTES {
+        return rakers_eval_error("HTTP response text exceeds 8 MiB");
+    }
+    let headers = eval_response_headers(&response.headers);
+    ffi_string(
+        json!({
+            "url": response.url,
+            "status": response.status,
+            "headers": headers,
+            "body": body,
+        })
+        .to_string(),
+    )
+}
+
+fn eval_response_headers(headers: &ureq::http::HeaderMap) -> Value {
+    let mut grouped = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for (name, value) in headers {
+        if let Ok(value) = value.to_str() {
+            grouped
+                .entry(name.as_str().to_ascii_lowercase())
+                .or_default()
+                .push(value.to_string());
+        }
+    }
+    let mut output = serde_json::Map::new();
+    for (name, values) in grouped {
+        let value = if values.len() == 1 {
+            Value::String(values.into_iter().next().unwrap_or_default())
+        } else {
+            Value::Array(values.into_iter().map(Value::String).collect())
+        };
+        output.insert(name, value);
+    }
+    Value::Object(output)
+}
+
+fn parse_rakers_eval_request(input: &str) -> Result<RakersEvalRequest, String> {
+    let trimmed = input.trim();
+    if trimmed.starts_with('{') {
+        return serde_json::from_str(trimmed)
+            .map_err(|error| format!("Invalid Rakers render request: {error}"));
+    }
+    if !trimmed.starts_with('<') {
+        if let Ok(url) = url::Url::parse(trimmed) {
+            return Ok(RakersEvalRequest {
+                url: Some(url.to_string()),
+                ..Default::default()
+            });
+        }
+        if trimmed.starts_with("http:") || trimmed.starts_with("https:") {
+            return Err("invalid URL".to_string());
+        }
+    }
+    Ok(RakersEvalRequest {
+        html: Some(input.to_string()),
+        ..Default::default()
+    })
+}
+
+fn fetch_and_render_rakers_url(
+    raw_url: &str,
+    request: &RakersEvalRequest,
+) -> Result<String, String> {
+    let response = execute_eval_http_request(raw_url, request)?;
+    let content_type = response
+        .headers
+        .get(ureq::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    let html =
+        crate::crawler::decode_body(&response.body, request.charset.as_deref(), content_type);
+    let headers = rakers_eval_headers(request.headers.as_ref())?;
+    let user_agent = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        .map(|(_, value)| value.clone())
+        .or_else(|| Some(crate::crawler::DEFAULT_USER_AGENT.to_string()));
+    let proxy = request
+        .proxy
+        .as_deref()
+        .map(str::trim)
+        .filter(|proxy| !proxy.is_empty())
+        .map(str::to_string);
+
+    render_rakers_html(&html, Some(&response.url), user_agent, proxy)
+}
+
+fn execute_eval_http_request(
+    raw_url: &str,
+    request: &RakersEvalRequest,
+) -> Result<crate::crawler::RawHttpResponse, String> {
+    if request.base_url.is_some() {
+        return Err("baseUrl is only valid with html input".to_string());
+    }
+    let page_url = validate_rakers_http_url(raw_url)?;
+    let headers = rakers_eval_headers(request.headers.as_ref())?;
+    let cookie_header = rakers_eval_cookie_header(request.cookies.as_ref())?;
+    let timeout_ms = rakers_eval_timeout_ms(request)?;
+    let max_redirects = request.max_redirects.unwrap_or(MAX_RAKERS_EVAL_REDIRECTS);
+    if max_redirects > MAX_RAKERS_EVAL_REDIRECTS {
+        return Err(format!(
+            "maxRedirects must be at most {MAX_RAKERS_EVAL_REDIRECTS}"
+        ));
+    }
+    let proxy = request
+        .proxy
+        .as_deref()
+        .map(str::trim)
+        .filter(|proxy| !proxy.is_empty());
+
+    let cookies = crate::crawler::SharedCookieStore::default();
+    if let Some(cookie_header) = cookie_header.as_deref() {
+        cookies.add_cookie_header(cookie_header, &page_url);
+    }
+    let client = crate::crawler::HttpClient::new(timeout_ms, Some(cookies), proxy)
+        .map_err(|error| format!("HTTP client setup failed: {error}"))?;
+    let method = request.method.as_deref().unwrap_or("GET");
+    let method = ureq::http::Method::from_bytes(method.as_bytes())
+        .map_err(|error| format!("invalid HTTP method: {error}"))?;
+    if request.redirect == Some(false) || max_redirects == 0 {
+        client.execute_once(
+            method,
+            page_url.as_str(),
+            &headers,
+            request.body.as_deref(),
+            Some(MAX_RAKERS_EVAL_HTML_BYTES),
+        )
+    } else {
+        client.execute_with_redirect_limit(
+            method,
+            page_url.as_str(),
+            &headers,
+            request.body.as_deref(),
+            Some(MAX_RAKERS_EVAL_HTML_BYTES),
+            max_redirects,
+        )
+    }
+    .map_err(|error| format!("HTTP request failed: {error}"))
+}
+
+fn validate_rakers_http_url(raw_url: &str) -> Result<url::Url, String> {
+    match url::Url::parse(raw_url) {
+        Ok(url)
+            if matches!(url.scheme(), "http" | "https")
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none() =>
+        {
+            Ok(url)
+        }
+        _ => Err("URL must be an absolute http(s) URL without credentials".to_string()),
+    }
+}
+
+fn rakers_eval_headers(raw: Option<&Value>) -> Result<Vec<(String, String)>, String> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let Value::Object(headers) = raw else {
+        return Err("headers must be a JSON object".to_string());
+    };
+
+    let mut parsed = Vec::new();
+    for (name, value) in headers {
+        let values = match value {
+            Value::Array(values) => values
+                .iter()
+                .map(eval_header_value)
+                .collect::<Option<Vec<_>>>(),
+            value => eval_header_value(value).map(|value| vec![value]),
+        }
+        .ok_or_else(|| format!("header {name:?} values must be strings, numbers, or booleans"))?;
+        parsed.extend(values.into_iter().map(|value| (name.clone(), value)));
+    }
+    Ok(parsed)
+}
+
+fn eval_header_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn rakers_eval_cookie_header(raw: Option<&Value>) -> Result<Option<String>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match raw {
+        Value::Null => Ok(None),
+        Value::String(value) => Ok((!value.trim().is_empty()).then(|| value.clone())),
+        Value::Object(cookies) => {
+            let mut pairs = Vec::new();
+            for (name, value) in cookies {
+                let value = eval_header_value(value).ok_or_else(|| {
+                    format!("cookie {name:?} value must be a string, number, or boolean")
+                })?;
+                pairs.push(format!("{name}={value}"));
+            }
+            Ok((!pairs.is_empty()).then(|| pairs.join("; ")))
+        }
+        _ => Err("cookie/cookies must be a string or JSON object".to_string()),
+    }
+}
+
+fn rakers_eval_timeout_ms(request: &RakersEvalRequest) -> Result<u64, String> {
+    let timeout_ms = if let Some(timeout_ms) = request.timeout_ms {
+        timeout_ms
+    } else if let Some(timeout_seconds) = request.timeout {
+        timeout_seconds
+            .checked_mul(1000)
+            .ok_or_else(|| "timeout is too large".to_string())?
+    } else {
+        DEFAULT_RAKERS_EVAL_TIMEOUT_MS
+    };
+    if !(1..=MAX_RAKERS_EVAL_TIMEOUT_MS).contains(&timeout_ms) {
+        return Err(format!(
+            "timeout must be between 1 and {} ms",
+            MAX_RAKERS_EVAL_TIMEOUT_MS
+        ));
+    }
+    Ok(timeout_ms)
+}
+
+fn render_rakers_html(
+    html: &str,
+    page_url: Option<&str>,
+    user_agent: Option<String>,
+    proxy: Option<String>,
+) -> Result<String, String> {
+    if html.len() > MAX_RAKERS_EVAL_HTML_BYTES {
+        return Err("Rakers render HTML exceeds 8 MiB".to_string());
+    }
+    let config = rakers::HttpConfig {
+        user_agent,
+        headers: Vec::new(),
+        proxy,
+        forward_headers: false,
+    };
+    let rendered = rakers::render(
+        html,
+        false,
+        page_url,
+        &config,
+        true,
+        Some(RAKERS_EVAL_MAX_REMOTE_SCRIPTS),
+        Some(std::time::Duration::from_secs(3)),
+    )
+    .map_err(|error| format!("Rakers render failed: {error}"))?;
+    if rendered.len() > MAX_RAKERS_EVAL_HTML_BYTES {
+        return Err("Rakers rendered HTML exceeds 8 MiB".to_string());
+    }
+    Ok(rendered)
+}
+
+fn rakers_eval_error(message: &str) -> char_p::Box {
+    ffi_string(json!({"error":message}).to_string())
 }
 
 fn debug_parse_request(input: &str) -> char_p::Box {

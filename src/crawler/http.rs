@@ -214,7 +214,34 @@ impl HttpClient {
         body: Option<&str>,
         max_response_bytes: Option<usize>,
     ) -> Result<RawHttpResponse, HttpClientError> {
-        self.execute_with_redirects(method, url, headers, body, max_response_bytes, true)
+        self.execute_with_redirect_limit(
+            method,
+            url,
+            headers,
+            body,
+            max_response_bytes,
+            MAX_REDIRECTS,
+        )
+    }
+
+    pub(crate) fn execute_with_redirect_limit(
+        &self,
+        method: Method,
+        url: &str,
+        headers: &[(String, String)],
+        body: Option<&str>,
+        max_response_bytes: Option<usize>,
+        max_redirects: usize,
+    ) -> Result<RawHttpResponse, HttpClientError> {
+        self.execute_with_redirects(
+            method,
+            url,
+            headers,
+            body,
+            max_response_bytes,
+            true,
+            max_redirects,
+        )
     }
 
     pub(crate) fn execute_once(
@@ -225,7 +252,7 @@ impl HttpClient {
         body: Option<&str>,
         max_response_bytes: Option<usize>,
     ) -> Result<RawHttpResponse, HttpClientError> {
-        self.execute_with_redirects(method, url, headers, body, max_response_bytes, false)
+        self.execute_with_redirects(method, url, headers, body, max_response_bytes, false, 0)
     }
 
     fn execute_with_redirects(
@@ -236,6 +263,7 @@ impl HttpClient {
         body: Option<&str>,
         max_response_bytes: Option<usize>,
         follow_redirects: bool,
+        max_redirects: usize,
     ) -> Result<RawHttpResponse, HttpClientError> {
         if crate::host_services::is_offline() {
             return Err(HttpClientError::Network(
@@ -249,7 +277,7 @@ impl HttpClient {
         let mut base_headers = header_map(headers)?;
         let mut body = body.map(str::to_owned);
 
-        for redirect_count in 0..=MAX_REDIRECTS {
+        for redirect_count in 0..=max_redirects {
             let mut request_headers = base_headers.clone();
             if !request_headers.contains_key(COOKIE) {
                 if let Some(value) = self
@@ -277,10 +305,10 @@ impl HttpClient {
             let status = response.status().as_u16();
             if follow_redirects {
                 if let Some(location) = redirect_location(status, response.headers()) {
-                    if redirect_count == MAX_REDIRECTS {
-                        return Err(HttpClientError::Network(
-                            "too many redirects (maximum 5)".to_string(),
-                        ));
+                    if redirect_count == max_redirects {
+                        return Err(HttpClientError::Network(format!(
+                            "too many redirects (maximum {max_redirects})"
+                        )));
                     }
 
                     let next_url = current_url

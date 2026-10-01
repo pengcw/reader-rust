@@ -22,6 +22,7 @@ md-5 = "0.10"
 ring = "0.17"
 hex = "0.4"
 scraper = "0.27"
+rakers = { path = "vendor/rakers" }
 jsonpath_lib = "0.3"
 regex = "1"
 java_regex = "0.1"

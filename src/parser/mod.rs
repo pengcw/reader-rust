@@ -1,3 +1,4 @@
+pub(crate) mod compression;
 pub mod html;
 pub mod js;
 pub mod jsonpath;

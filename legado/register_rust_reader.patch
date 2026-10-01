@@ -1,0 +1,100 @@
+--- a/Legado/Backend.lua	2026-08-13 18:52:26.353368531 +0800
++++ b/Legado/Backend.lua	2026-08-13 18:53:21.781316684 +0800
+@@ -62,10 +62,13 @@
+ function M:_isQingread() return self.settings_data.data.server_type == 3 end
+ function M:_isReader3() return self.settings_data.data.server_type == 2 end
+ function M:_isLegadoApp() return self.settings_data.data.server_type == 1 end
++function M:_isRustReader() return self.settings_data.data.server_type == 5 end
+ 
+ function M:loadApiProvider()
+     local client
+-    if self:_isReader3() then
++    if self:_isRustReader() then
++        client = require("Legado.spore.rust_reader")
++    elseif self:_isReader3() then
+         client = require("Legado.spore.reader3")
+     elseif self:_isQingread() then
+         client = require("Legado.spore.qread")
+--- a/Legado/ConfigValidator.lua	2026-08-13 18:52:26.354368566 +0800
++++ b/Legado/ConfigValidator.lua	2026-08-13 18:53:21.786498486 +0800
+@@ -5,8 +5,8 @@
+ 
+ --- server_type: 1=legado, 2=reader3, 3=qread
+ function M.check(url, server_type, user, pwd)
+-    if not (H.is_num(server_type) and (server_type == 1  or server_type == 2 or server_type == 3)) then
+-        return nil, '服务器类型必须是1、2或3'
++    if not (H.is_num(server_type) and (server_type == 1  or server_type == 2 or server_type == 3 or server_type == 5)) then
++        return nil, '服务器类型必须是1、2、3或5'
+     end
+     if server_type == 3 then
+         if not (H.is_str(user) and user ~= '') then
+@@ -15,7 +15,7 @@
+         if not (H.is_str(pwd) and pwd ~= '') then
+             return nil, '轻阅读必须认证凭证'
+         end
+-    elseif server_type == 2 then
++    elseif server_type == 2 or server_type == 5 then
+         if H.is_str(user) and user ~= "" and (pwd == "" or not H.is_str(pwd)) then
+             return nil, "请清空用户名或补全用户凭证"
+         end
+@@ -43,7 +43,7 @@
+     end
+ 
+     local clean_url = socket_url.build(parsed)
+-    if  server_type == 2 and not string.find(string.lower(parsed.path or ""), "/reader3$") then
++    if  (server_type == 2 or server_type == 5) and not string.find(string.lower(parsed.path or ""), "/reader3$") then
+         clean_url = socket_url.absolute(clean_url, "/reader3")
+     elseif server_type == 3 and not string.find(string.lower(parsed.path or ""), "/api/5$") then
+         clean_url = socket_url.absolute(clean_url, "/api/5")
+--- a/Legado/WebConfigDialog.lua	2026-08-13 18:52:26.354368566 +0800
++++ b/Legado/WebConfigDialog.lua	2026-08-13 18:55:55.023263104 +0800
+@@ -33,6 +33,9 @@
+         end,}}, {{
+             text = "Reader3 服务器版", callback = function()
+                 on_select(2)
++        end,}}, {{
++            text = "Rust Reader3", callback = function()
++                on_select(5)
+         end,}},},
+     }
+     UIManager:show(dialog)
+@@ -42,7 +45,8 @@
+     local hints = {
+         [1] = "手机APP WEB服务地址 (如: http://127.0.0.1:1122)",
+         [2] = "(如: http://127.0.0.1:1122 - 会自动添加/reader3)",
+-        [3] = "(如: http://127.0.0.1:1122 - 会自动添加/api/5)"
++        [3] = "(如: http://127.0.0.1:1122 - 会自动添加/api/5)",
++        [5] = "(如: http://127.0.0.1:1122 - 会自动添加/reader3)"
+     }
+     return hints[server_type] or "WEB地址 (必填)"
+ end
+@@ -119,7 +123,8 @@
+     local type_names = {
+         [1] = "手机APP",
+         [2] = "Reader3 服务器版", 
+-        [3] = "轻阅读后端"
++        [3] = "轻阅读后端",
++        [5] = "Rust Reader3"
+     }
+ 
+     local name_input = config_name or ""
+@@ -147,8 +152,8 @@
+             hint = "描述 (可选)",
+         },}
+         
+-    if current_type == 2 or current_type == 3 then
+-        local hint_info = current_type == 2 and "可选" or "必填"
++    if current_type == 2 or current_type == 3 or current_type == 5 then
++        local hint_info = (current_type == 2 or current_type == 5) and "可选" or "必填"
+         table.insert(fields, {
+             text = username_input,
+             hint = string.format("用户名 (%s)", hint_info),
+@@ -216,7 +221,7 @@
+     local user, pwd
+     
+     -- 根据类型获取
+-    if server_type == 2 or server_type == 3 then
++    if server_type == 2 or server_type == 3 or server_type == 5 then
+         user = util.trim(fields[4] or "")
+         pwd = util.trim(fields[5] or "")
+     end

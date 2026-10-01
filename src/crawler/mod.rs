@@ -133,6 +133,7 @@ pub struct RequestSpec {
     pub retry: usize,
     pub proxy: Option<String>,
     pub response_type: Option<String>,
+    pub(crate) render_with_rakers: bool,
     pub(crate) body_js: Option<BodyJs>,
 }
 
@@ -307,6 +308,11 @@ impl HttpSession {
                         &url,
                     )
                     .map_err(FetchError::Rule)?;
+                    let body = if spec.render_with_rakers {
+                        render_with_rakers(spec, &url, &body, max_response_bytes)?
+                    } else {
+                        body
+                    };
                     return Ok(HttpResponse {
                         url,
                         status,
@@ -336,12 +342,62 @@ impl HttpSession {
     }
 }
 
+const RAKERS_MAX_REMOTE_SCRIPTS: usize = 8;
+const RAKERS_SCRIPT_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn render_with_rakers(
+    spec: &RequestSpec,
+    page_url: &str,
+    html: &str,
+    max_response_bytes: usize,
+) -> Result<String, FetchError> {
+    let user_agent = spec
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        .map(|(_, value)| value.clone());
+    // Do not forward book-source cookies or authorization headers to external
+    // scripts or JavaScript-initiated requests.
+    let config = rakers::HttpConfig {
+        user_agent,
+        headers: Vec::new(),
+        proxy: spec.proxy.clone(),
+        forward_headers: false,
+    };
+    let rendered = rakers::render(
+        html,
+        false,
+        Some(page_url),
+        &config,
+        true,
+        Some(RAKERS_MAX_REMOTE_SCRIPTS),
+        Some(RAKERS_SCRIPT_TIMEOUT),
+    )
+    .map_err(|error| FetchError::Rule(format!("Rakers render failed: {error}")))?;
+    let limit = max_response_bytes.max(1);
+    if rendered.len() > limit {
+        return Err(FetchError::ResponseTooLarge {
+            url: page_url.to_string(),
+            limit,
+        });
+    }
+    Ok(rendered)
+}
+
 /// Execute an AnalyzeUrl request for JavaScript APIs while preserving its request
 /// options and the source-bound cookie session. Unlike `fetch`, this returns
 /// non-2xx HTTP responses instead of converting their status into an error.
 pub(crate) fn execute_request_spec(
     client: &HttpClient,
     spec: &RequestSpec,
+) -> Result<RawHttpResponse, HttpClientError> {
+    execute_request_spec_limited(client, spec, None)
+}
+
+pub(crate) fn execute_request_spec_limited(
+    client: &HttpClient,
+    spec: &RequestSpec,
+    max_response_bytes: Option<usize>,
 ) -> Result<RawHttpResponse, HttpClientError> {
     let client = match spec
         .proxy
@@ -360,7 +416,7 @@ pub(crate) fn execute_request_spec(
             &spec.url,
             &spec.headers,
             spec.body.as_deref(),
-            None,
+            max_response_bytes,
         ) {
             Ok(response) if response.status >= 500 && attempt < retries => continue,
             Ok(response) => return Ok(response),
@@ -683,6 +739,10 @@ fn compile_url_request(
         retry,
         proxy,
         response_type,
+        render_with_rakers: options
+            .get("webView")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         body_js,
     })
 }

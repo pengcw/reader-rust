@@ -1048,8 +1048,8 @@ fn execute_content(
 
         let recursive = page.next_urls.len() == 1;
         for next_url in page.next_urls {
-            let allowed = !recursive
-                || should_follow_content_page(chapter_url, &response_url, &next_url);
+            let allowed =
+                !recursive || should_follow_content_page(chapter_url, &response_url, &next_url);
             if allowed
                 && !visited_urls.contains(&next_url)
                 && !pending.iter().any(|(url, _)| url == &next_url)

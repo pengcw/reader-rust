@@ -1,5 +1,6 @@
 use crate::crawler::{
-    analyze_url_with_headers, decode_body, execute_request_spec, format_analyzed_body, HttpClient,
+    analyze_url_with_headers, decode_body, execute_request_spec, execute_request_spec_limited,
+    format_analyzed_body, HttpClient,
 };
 use crate::model::book_source::BookSource;
 use crate::parser::html;
@@ -13,9 +14,6 @@ use aes::Aes128;
 use base64::Engine;
 use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use chrono::{FixedOffset, Local, TimeZone};
-use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use once_cell::sync::Lazy;
 use ring::{digest, hmac};
 use rquickjs::function::Func;
@@ -23,7 +21,6 @@ use rquickjs::{Context, Object, Runtime, Value};
 use serde_json::Value as JsonValue;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -891,6 +888,10 @@ fn eval_js_inner_with_source(
                 ),
             )?;
             java_obj.set(
+                "__archiveInput",
+                Func::new(|url: String| -> String { java_archive_input(&url) }),
+            )?;
+            java_obj.set(
                 "__hostCall",
                 Func::new(|operation: String, arguments: String| -> String {
                     match serde_json::from_str::<JsonValue>(&arguments) {
@@ -1028,6 +1029,26 @@ fn eval_js_inner_with_source(
                         .map(|byte| byte.rem_euclid(256) as u8)
                         .collect::<Vec<_>>();
                     java_bytes_to_str(&bytes, Some(&charset))
+                }),
+            )?;
+            java_obj.set(
+                "__decodeArchiveText",
+                Func::new(|bytes_json: String, charset: String| -> Option<String> {
+                    let bytes = serde_json::from_str::<Vec<u8>>(&bytes_json).ok()?;
+                    if bytes.len() > 262144 {
+                        return None;
+                    }
+                    let label = charset.trim();
+                    if !label.is_empty()
+                        && encoding_rs::Encoding::for_label(label.as_bytes()).is_none()
+                    {
+                        return None;
+                    }
+                    Some(decode_body(
+                        &bytes,
+                        (!label.is_empty()).then_some(label),
+                        None,
+                    ))
                 }),
             )?;
             java_obj.set(
@@ -1182,9 +1203,7 @@ fn eval_js_inner_with_source(
             java_obj.set(
                 "gzip",
                 Func::new(|input: String| -> String {
-                    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-                    let _ = encoder.write_all(input.as_bytes());
-                    if let Ok(compressed) = encoder.finish() {
+                    if let Ok(compressed) = crate::parser::compression::gzip(input.as_bytes()) {
                         base64::engine::general_purpose::STANDARD.encode(compressed)
                     } else {
                         String::new()
@@ -1194,16 +1213,34 @@ fn eval_js_inner_with_source(
             java_obj.set(
                 "ungzip",
                 Func::new(|input: String| -> String {
-                    if let Ok(compressed) =
-                        base64::engine::general_purpose::STANDARD.decode(input.trim())
-                    {
-                        let mut decoder = GzDecoder::new(&compressed[..]);
-                        let mut s = String::new();
-                        if decoder.read_to_string(&mut s).is_ok() {
-                            return s;
-                        }
+                    let input = input.trim();
+                    if input.len() > crate::parser::compression::MAX_INPUT.div_ceil(3) * 4 {
+                        return String::new();
                     }
-                    String::new()
+                    base64::engine::general_purpose::STANDARD
+                        .decode(input)
+                        .ok()
+                        .and_then(|bytes| crate::parser::compression::gunzip(&bytes).ok())
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                        .unwrap_or_default()
+                }),
+            )?;
+            java_obj.set(
+                "__gunzipBytes",
+                Func::new(|input: String| -> String {
+                    use crate::parser::compression::{self, Error};
+                    let result = if input.len() > compression::MAX_INPUT * 4 + 2 {
+                        Err(Error::LimitExceeded)
+                    } else {
+                        serde_json::from_str::<Vec<u8>>(&input)
+                            .map_err(|_| Error::InvalidInput)
+                            .and_then(|bytes| compression::gunzip(&bytes))
+                    };
+                    match result {
+                        Ok(bytes) => serde_json::json!({"ok":true,"data":bytes}),
+                        Err(error) => serde_json::json!({"ok":false,"error":{
+                            "kind":error.kind(),"message":"gzip operation failed"}}),
+                    }.to_string()
                 }),
             )?;
             java_obj.set(
@@ -1951,19 +1988,33 @@ fn eval_js_inner_with_source(
                     };
                     java.createSymmetricCrypto = function(transformation, key, iv) {
                         const algorithm = String(transformation == null ? '' : transformation);
-                        const normalized = algorithm.toUpperCase();
-                        if (!/^AES\/(CBC|ECB)\/(PKCS5PADDING|PKCS7PADDING|NOPADDING)$/.test(normalized)) {
+                        const normalized = algorithm.toUpperCase() === 'DES'
+                            ? 'DES/ECB/PKCS5PADDING' : algorithm.toUpperCase();
+                        if (!/^(AES|DES)\/(CBC|ECB)\/(PKCS5PADDING|PKCS7PADDING|NOPADDING)$/.test(normalized)) {
                             throw new Error(
                                 'createSymmetricCrypto: unsupported transformation ' + algorithm);
                         }
-                        const keyBytes = toBytes(key);
-                        const ivBytes = iv == null ? [] : toBytes(iv);
+                        const des = normalized.startsWith('DES/');
+                        const symmetricBytes = value => {
+                            if (des && (Array.isArray(value) || value instanceof Uint8Array)) {
+                                return Array.from(value, byte => {
+                                    if (!Number.isInteger(byte) || byte < -128 || byte > 255) {
+                                        throw new Error('createSymmetricCrypto: invalid byte');
+                                    }
+                                    return (byte + 256) % 256;
+                                });
+                            }
+                            return toBytes(value);
+                        };
+                        const keyBytes = symmetricBytes(key);
+                        const ivBytes = iv == null ? [] : symmetricBytes(iv);
                         const cbc = normalized.split('/')[1] === 'CBC';
-                        if (![16, 24, 32].includes(keyBytes.length)
-                            || (cbc ? ivBytes.length !== 16 : ivBytes.length !== 0)) {
+                        const blockSize = des ? 8 : 16;
+                        if (!(des ? keyBytes.length === 8 : [16, 24, 32].includes(keyBytes.length))
+                            || (cbc ? ivBytes.length !== blockSize : ivBytes.length !== 0)) {
                             throw new Error('createSymmetricCrypto: invalid key or iv');
                         }
-                        const native = keyBytes.length === 16 && cbc
+                        const native = !des && keyBytes.length === 16 && cbc
                             && !normalized.endsWith('/NOPADDING');
                         let capabilities;
                         if (!native) {
@@ -1980,10 +2031,10 @@ fn eval_js_inner_with_source(
                         }
                         const invoke = (mode, data) => {
                             const dataBytes = Array.isArray(data) || data instanceof Uint8Array
-                                ? toBytes(data)
+                                ? symmetricBytes(data)
                                 : mode.startsWith('decrypt')
                                     ? JSON.parse(java.__decodeSymmetricInput(String(data == null ? '' : data)))
-                                    : toBytes(data);
+                                    : symmetricBytes(data);
                             if (!native) {
                                 if (dataBytes.length > capabilities.maxInputBytes) {
                                     throw new Error('createSymmetricCrypto: input too large');
@@ -2029,6 +2080,187 @@ fn eval_js_inner_with_source(
                                 return java.bytesToStr(invoke('decrypt', data), 'UTF-8');
                             }
                         };
+                    };
+                    const cryptoKeyValue = value => {
+                        if (Array.isArray(value) || value instanceof Uint8Array) {
+                            if (value.length > 16384) throw new Error('crypto key too large');
+                            return toBytes(value);
+                        }
+                        const text = String(value == null ? '' : value);
+                        if (text.length > 16384) throw new Error('crypto key too large');
+                        if (text.includes('-----BEGIN ')) return text;
+                        return JSON.parse(java.__base64DecodeBytes(text, 0));
+                    };
+                    java.createAsymmetricCrypto = function(transformation) {
+                        const name = String(transformation == null ? '' : transformation).toUpperCase();
+                        const algorithm = name === 'RSA' ? 'RSA/ECB/PKCS1PADDING' : name;
+                        if (algorithm !== 'RSA/ECB/PKCS1PADDING') {
+                            throw new Error('createAsymmetricCrypto: unsupported transformation');
+                        }
+                        let publicKey, privateKey, capabilities;
+                        const keyValue = cryptoKeyValue;
+                        const invoke = (action, data, usePublicKey) => {
+                            // Android defaults to PUBLIC for BOTH encrypt and decrypt.
+                            const usePublic = usePublicKey === undefined ? true : Boolean(usePublicKey);
+                            if ((action === 'decrypt') === usePublic) {
+                                const error = new Error('createAsymmetricCrypto: unsupported key direction');
+                                error.kind = 'unsupported';
+                                throw error;
+                            }
+                            const key = usePublic ? publicKey : privateKey;
+                            if (key == null) throw new Error('createAsymmetricCrypto: selected key is missing');
+                            if (!capabilities) capabilities = java.hostCall('crypto.rsa.capabilities', {});
+                            if (!capabilities || capabilities.protocol !== 1 || capabilities.available !== true
+                                || capabilities.transformation !== algorithm
+                                || !Number.isSafeInteger(capabilities.maxInputBytes)
+                                || capabilities.maxInputBytes < 0
+                                || !Number.isSafeInteger(capabilities.maxEncryptBytes)
+                                || capabilities.maxEncryptBytes < 0
+                                || !Number.isSafeInteger(capabilities.maxOutputBytes)
+                                || capabilities.maxOutputBytes < 0) {
+                                throw new Error('createAsymmetricCrypto: host capability unavailable');
+                            }
+                            const input = action === 'decrypt' && typeof data === 'string'
+                                ? JSON.parse(java.__decodeSymmetricInput(data)) : toBytes(data);
+                            const limit = action === 'encrypt'
+                                ? capabilities.maxEncryptBytes : capabilities.maxInputBytes;
+                            if (input.length > limit) {
+                                throw new Error('createAsymmetricCrypto: input too large');
+                            }
+                            const output = java.hostCall('crypto.asymmetric', {
+                                action, transformation: algorithm, usePublicKey: usePublic, key, data: input
+                            });
+                            if (!Array.isArray(output) || output.length > capabilities.maxOutputBytes
+                                || !output.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255)) {
+                                throw new Error('createAsymmetricCrypto: invalid host byte response');
+                            }
+                            return output;
+                        };
+                        const object = {
+                            setPublicKey(value) { publicKey = keyValue(value); return object; },
+                            setPrivateKey(value) { privateKey = keyValue(value); return object; },
+                            encrypt(data, usePublicKey) { return invoke('encrypt', data, usePublicKey); },
+                            encryptBase64(data, usePublicKey) {
+                                return java.__base64EncodeBytes(JSON.stringify(invoke('encrypt', data, usePublicKey)), 2);
+                            },
+                            encryptHex(data, usePublicKey) {
+                                return invoke('encrypt', data, usePublicKey)
+                                    .map(byte => byte.toString(16).padStart(2, '0')).join('');
+                            },
+                            decrypt(data, usePublicKey) { return invoke('decrypt', data, usePublicKey); },
+                            decryptStr(data, usePublicKey) {
+                                return java.bytesToStr(invoke('decrypt', data, usePublicKey), 'UTF-8');
+                            }
+                        };
+                        return object;
+                    };
+                    java.createSign = function(algorithm) {
+                        const name = String(algorithm == null ? '' : algorithm).toUpperCase();
+                        if (name !== 'SHA256WITHRSA') throw new Error('createSign: unsupported algorithm');
+                        let privateKey, publicKey, capabilities;
+                        const invoke = (action, data, signature, charset) => {
+                            const key = action === 'sign' ? privateKey : publicKey;
+                            if (key == null) throw new Error('createSign: selected key is missing');
+                            if (!capabilities) capabilities = java.hostCall('crypto.sign.capabilities', {});
+                            if (!capabilities || capabilities.protocol !== 1 || capabilities.available !== true
+                                || capabilities.algorithm !== name
+                                || !Number.isSafeInteger(capabilities.maxInputBytes) || capabilities.maxInputBytes < 0
+                                || !Number.isSafeInteger(capabilities.maxSignatureBytes) || capabilities.maxSignatureBytes < 0) {
+                                throw new Error('createSign: host capability unavailable');
+                            }
+                            if (typeof data !== 'string' && !Array.isArray(data) && !(data instanceof Uint8Array)) {
+                                throw new Error('createSign: text or byte input required');
+                            }
+                            if (data.length > capabilities.maxInputBytes) throw new Error('createSign: input too large');
+                            const input = typeof data === 'string'
+                                ? java.strToBytes(data, charset == null ? 'UTF-8' : String(charset)) : toBytes(data);
+                            if (input.length > capabilities.maxInputBytes) throw new Error('createSign: input too large');
+                            let sig;
+                            if (action === 'verify') {
+                                if (!Array.isArray(signature) && !(signature instanceof Uint8Array)) {
+                                    throw new Error('createSign: signature bytes required');
+                                }
+                                if (signature.length > capabilities.maxSignatureBytes) throw new Error('createSign: signature too large');
+                                sig = toBytes(signature);
+                            }
+                            const result = java.hostCall('crypto.signature', {
+                                action, algorithm: name, key, data: input, signature: sig
+                            });
+                            if (action === 'verify') {
+                                if (typeof result !== 'boolean') throw new Error('createSign: invalid verification response');
+                            } else if (!Array.isArray(result) || result.length < 128
+                                || result.length > capabilities.maxSignatureBytes
+                                || !result.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255)) {
+                                throw new Error('createSign: invalid signature response');
+                            }
+                            return result;
+                        };
+                        const object = {
+                            setPrivateKey(value) { privateKey = cryptoKeyValue(value); return object; },
+                            setPublicKey(value) { publicKey = cryptoKeyValue(value); return object; },
+                            sign(data, charset) { return invoke('sign', data, undefined, charset); },
+                            signHex(data, charset) {
+                                return invoke('sign', data, undefined, charset)
+                                    .map(byte => byte.toString(16).padStart(2, '0')).join('');
+                            },
+                            verify(data, signature) { return invoke('verify', data, signature); }
+                        };
+                        return object;
+                    };
+                    const archiveInput = value => {
+                        if (Array.isArray(value) || value instanceof Uint8Array) {
+                            if (value.length > 524288) throw new Error('archive input too large');
+                            return toBytes(value);
+                        }
+                        const text = String(value == null ? '' : value);
+                        if (/^https?:\/\//i.test(text)) {
+                            const response = JSON.parse(java.__archiveInput(text));
+                            if (!response.ok) {
+                                const error = new Error(response.error.message);
+                                error.kind = response.error.kind; throw error;
+                            }
+                            return response.data;
+                        }
+                        if (text.length > 1048576 || text.length % 2 !== 0 || !/^[0-9a-f]*$/i.test(text)) {
+                            throw new Error('archive input must be hexadecimal or bytes');
+                        }
+                        return JSON.parse(java.__hexDecodeBytes(text));
+                    };
+                    const archiveBytes = (operation, arguments) => {
+                        const output = java.hostCall(operation, arguments);
+                        if (output === null) return null;
+                        if (!Array.isArray(output) || output.length > 262144
+                            || !output.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255)) {
+                            throw new Error('invalid archive byte response');
+                        }
+                        return output;
+                    };
+                    java.getZipByteArrayContent = function(input, path) {
+                        return archiveBytes('compression.zip.read', {
+                            data: archiveInput(input), path: String(path)
+                        });
+                    };
+                    java.getZipStringContent = function(input, path, charset) {
+                        const bytes = java.getZipByteArrayContent(input, path);
+                        if (bytes === null) return '';
+                        const text = java.__decodeArchiveText(
+                            JSON.stringify(bytes), charset == null ? '' : String(charset));
+                        if (text === null || text === undefined) {
+                            const error = new Error('getZipStringContent: invalid bytes or unsupported charset');
+                            error.kind = 'invalid_argument';
+                            throw error;
+                        }
+                        return text;
+                    };
+                    // Project extension: unlike existing ungzip, this returns raw bytes.
+                    java.gunzipBytes = function(input) {
+                        const response = JSON.parse(java.__gunzipBytes(JSON.stringify(archiveInput(input))));
+                        if (!response.ok) {
+                            const error = new Error(response.error.message);
+                            error.kind = response.error.kind;
+                            throw error;
+                        }
+                        return response.data;
                     };
                     const base64 = {
                         DEFAULT: 0, NO_PADDING: 1, NO_WRAP: 2, CRLF: 4, URL_SAFE: 8,
@@ -2083,6 +2315,116 @@ fn eval_js_inner_with_source(
                             : JsString(value == null ? '' : value);
                         return new.target ? new JsString(text) : text;
                     }
+                    const streamRange = (bytes, offset, length) => {
+                        if (!Array.isArray(bytes) && !(bytes instanceof Uint8Array)) {
+                            throw new Error('byte array required');
+                        }
+                        const start = offset === undefined ? 0 : Number(offset);
+                        const count = length === undefined ? bytes.length - start : Number(length);
+                        if (!Number.isInteger(start) || !Number.isInteger(count)
+                            || start < 0 || count < 0 || start + count > bytes.length) {
+                            throw new Error('invalid stream byte range');
+                        }
+                        return [start, count];
+                    };
+                    function ByteArrayInputStream(bytes, offset, length) {
+                        if (!new.target) return new ByteArrayInputStream(bytes, offset, length);
+                        const [start, count] = streamRange(bytes, offset, length);
+                        if (count > 524288) throw new Error('stream input too large');
+                        this.bytes = toBytes(bytes.slice(start, start + count));
+                        this.position = 0;
+                        this.markPosition = 0;
+                        this.closed = false;
+                    }
+                    ByteArrayInputStream.prototype = {
+                        checkOpen() { if (this.closed) throw new Error('stream is closed'); },
+                        read(buffer, offset, length) {
+                            this.checkOpen();
+                            if (buffer === undefined) {
+                                return this.position < this.bytes.length ? this.bytes[this.position++] : -1;
+                            }
+                            const [start, count] = streamRange(buffer, offset, length);
+                            if (count === 0) return 0;
+                            if (this.position === this.bytes.length) return -1;
+                            const n = Math.min(count, this.bytes.length - this.position);
+                            for (let i = 0; i < n; ++i) buffer[start + i] = this.bytes[this.position++];
+                            return n;
+                        },
+                        readAllBytes() {
+                            this.checkOpen();
+                            const result = this.bytes.slice(this.position);
+                            this.position = this.bytes.length;
+                            return result;
+                        },
+                        readNBytes(length) {
+                            this.checkOpen();
+                            if (!Number.isInteger(length) || length < 0) throw new Error('invalid read length');
+                            const result = this.bytes.slice(this.position, this.position + length);
+                            this.position += result.length;
+                            return result;
+                        },
+                        available() { this.checkOpen(); return this.bytes.length - this.position; },
+                        skip(count) {
+                            this.checkOpen();
+                            if (!Number.isSafeInteger(count)) throw new Error('invalid skip count');
+                            const n = Math.min(Math.max(0, count), this.bytes.length - this.position);
+                            this.position += n;
+                            return n;
+                        },
+                        mark() { this.markPosition = this.position; },
+                        reset() { this.checkOpen(); this.position = this.markPosition; },
+                        markSupported() { return true; },
+                        close() {} // JDK ByteArrayInputStream close is a no-op.
+                    };
+                    function GZIPInputStream(input, size) {
+                        if (!new.target) return new GZIPInputStream(input, size);
+                        if (!(input instanceof ByteArrayInputStream)) throw new Error('ByteArrayInputStream required');
+                        if (size !== undefined && (!Number.isInteger(size) || size <= 0 || size > 262144)) {
+                            throw new Error('invalid gzip buffer size');
+                        }
+                        input.checkOpen();
+                        const decoded = java.gunzipBytes(input.bytes.slice(input.position));
+                        input.position = input.bytes.length;
+                        this.bytes = decoded;
+                        this.position = 0;
+                        this.closed = false;
+                        this.input = input;
+                    }
+                    GZIPInputStream.prototype = Object.create(ByteArrayInputStream.prototype);
+                    Object.assign(GZIPInputStream.prototype, {
+                        available() { this.checkOpen(); return this.position < this.bytes.length ? 1 : 0; },
+                        markSupported() { return false; },
+                        mark() {},
+                        reset() { throw new Error('gzip mark/reset is unsupported'); },
+                        close() { if (!this.closed) { this.closed = true; this.input.close(); } }
+                    });
+                    function ByteArrayOutputStream(size) {
+                        if (!new.target) return new ByteArrayOutputStream(size);
+                        if (size !== undefined && (!Number.isInteger(size) || size < 0 || size > 262144)) {
+                            throw new Error('invalid output stream size');
+                        }
+                        this.bytes = [];
+                    }
+                    ByteArrayOutputStream.prototype = {
+                        write(value, offset, length) {
+                            if (typeof value === 'number') {
+                                if (!Number.isInteger(value)) throw new Error('integer byte required');
+                                if (this.bytes.length >= 262144) throw new Error('output stream too large');
+                                this.bytes.push(value & 255);
+                                return;
+                            }
+                            const [start, count] = streamRange(value, offset, length);
+                            if (this.bytes.length + count > 262144) throw new Error('output stream too large');
+                            for (let i = 0; i < count; ++i) this.bytes.push(Number(value[start + i]) & 255);
+                        },
+                        toByteArray() { return this.bytes.slice(); },
+                        toString(charset) { return java.bytesToStr(this.bytes, charset == null ? 'UTF-8' : String(charset)); },
+                        size() { return this.bytes.length; },
+                        reset() { this.bytes = []; },
+                        writeTo(stream) { stream.write(this.bytes); },
+                        flush() {},
+                        close() {} // JDK ByteArrayOutputStream close is a no-op.
+                    };
                     function SecretKeySpec(key, algorithm) {
                         return { key: toBytes(key), algorithm: JsString(algorithm) };
                     }
@@ -2157,7 +2499,9 @@ fn eval_js_inner_with_source(
                     Packages.java = Packages.java || {};
                     Packages.java.lang = Packages.java.lang || {};
                     Packages.java.net = Packages.java.net || {};
+                    Packages.java.io = Packages.java.io || {};
                     Packages.java.util = Packages.java.util || {};
+                    Packages.java.util.zip = Packages.java.util.zip || {};
                     Packages.javax = Packages.javax || {};
                     Packages.javax.crypto = Packages.javax.crypto || {};
                     Packages.javax.crypto.spec = Packages.javax.crypto.spec || {};
@@ -2167,6 +2511,9 @@ fn eval_js_inner_with_source(
                     Packages.android.util = Packages.android.util || {};
 
                     Packages.java.lang.String = markClass('String', JavaString);
+                    Packages.java.io.ByteArrayInputStream = markClass('ByteArrayInputStream', ByteArrayInputStream);
+                    Packages.java.io.ByteArrayOutputStream = markClass('ByteArrayOutputStream', ByteArrayOutputStream);
+                    Packages.java.util.zip.GZIPInputStream = markClass('GZIPInputStream', GZIPInputStream);
                     Packages.java.net.URLEncoder = markClass('URLEncoder', URLEncoder);
                     Packages.java.net.URLDecoder = markClass('URLDecoder', URLDecoder);
                     Packages.java.util.Arrays = markClass('Arrays', Arrays);
@@ -2216,6 +2563,9 @@ fn eval_js_inner_with_source(
                     globalThis.app = hostContext;
                 })();"#,
             )?;
+
+            eval_script(ctx.clone(), include_str!("js_security.js"))?;
+            eval_script(ctx.clone(), include_str!("js_des.js"))?;
 
             if !shared_js.trim().is_empty() {
                 eval_script(ctx.clone(), &shared_js)?;
@@ -3759,6 +4109,41 @@ fn java_request_simple_response_with_client(
         }),
     };
     payload.to_string()
+}
+
+fn java_archive_input(url: &str) -> String {
+    const LIMIT: usize = 512 * 1024;
+    let result = (|| {
+        if url.len() > 8192 {
+            return Err(("invalid_argument", "archive URL too long"));
+        }
+        let client = active_js_http_client();
+        let source = ACTIVE_JS_BOOK_SOURCE.with(|cell| cell.borrow().clone());
+        let response = if let Some(source) = source {
+            let spec = analyze_url_with_headers(url, "", 0, &source.book_source_url, &source, None)
+                .map_err(|_| ("invalid_argument", "invalid archive request"))?;
+            execute_request_spec_limited(&client, &spec, Some(LIMIT))
+        } else {
+            client.execute(Method::GET, url, &[], None, Some(LIMIT))
+        }
+        .map_err(|error| match error {
+            crate::crawler::HttpClientError::ResponseTooLarge { .. } => {
+                ("limit_exceeded", "archive response too large")
+            }
+            _ => ("network_error", "archive request failed"),
+        })?;
+        if !(200..300).contains(&response.status) {
+            return Err(("network_error", "archive HTTP status is unsuccessful"));
+        }
+        Ok(response.body)
+    })();
+    match result {
+        Ok(bytes) => serde_json::json!({"ok":true,"data":bytes}),
+        Err((kind, message)) => {
+            serde_json::json!({"ok":false,"error":{"kind":kind,"message":message}})
+        }
+    }
+    .to_string()
 }
 
 fn java_analyzed_request_body(url: &str) -> String {

@@ -62,19 +62,12 @@ pub(crate) fn captures_first(pattern: &str, input: &str) -> Option<Vec<Option<St
     regex.find_iter(input).next().map(match_captures)
 }
 
-pub(crate) fn captures_all(
-    pattern: &str,
-    input: &str,
-) -> Option<Vec<Vec<Option<String>>>> {
+pub(crate) fn captures_all(pattern: &str, input: &str) -> Option<Vec<Vec<Option<String>>>> {
     let regex = get_cached_regex(pattern)?;
     Some(regex.find_iter(input).map(match_captures).collect())
 }
 
-pub(crate) fn replace_all(
-    input: &str,
-    pattern: &str,
-    replacement: &str,
-) -> Result<String, ()> {
+pub(crate) fn replace_all(input: &str, pattern: &str, replacement: &str) -> Result<String, ()> {
     let regex = get_cached_regex(pattern).ok_or(())?;
     Ok(regex.replace_all(input, replacement))
 }
