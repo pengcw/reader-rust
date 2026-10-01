@@ -121,11 +121,7 @@ mod tests {
     #[test]
     fn interleave_uses_first_group_length_and_all_groups_per_index() {
         assert_eq!(
-            interleave_result_groups(vec![
-                vec!["A1", "A2"],
-                vec!["B1", "B2", "B3"],
-                vec!["C1"],
-            ]),
+            interleave_result_groups(vec![vec!["A1", "A2"], vec!["B1", "B2", "B3"], vec!["C1"],]),
             vec!["A1", "B1", "C1", "A2", "B2"]
         );
     }

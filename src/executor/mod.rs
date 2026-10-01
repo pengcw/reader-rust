@@ -2218,10 +2218,7 @@ mod tests {
         assert_eq!(result["ok"], true, "{result}");
         assert_eq!(result["data"]["content"], "first\nsecond\nthird");
         assert_eq!(result["data"]["pages"], 3);
-        assert_eq!(
-            primary_server.join().unwrap(),
-            ["/chapter/1", "/part-two"]
-        );
+        assert_eq!(primary_server.join().unwrap(), ["/chapter/1", "/part-two"]);
         assert_eq!(secondary_server.join().unwrap(), "/part-three");
     }
 

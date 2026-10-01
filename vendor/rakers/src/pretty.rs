@@ -307,3 +307,56 @@ fn is_void_tag(name: &str) -> bool {
 fn is_raw_content_tag(name: &str) -> bool {
     matches!(name, "script" | "style" | "pre" | "textarea")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::pretty_print;
+
+    #[test]
+    fn block_elements_are_indented() {
+        let input = "<html><body><div><p>hello</p></div></body></html>";
+        let out = pretty_print(input);
+        assert!(out.contains("\n  <body>"), "body not indented");
+        assert!(out.contains("\n    <div>"), "div not indented");
+        assert!(out.contains("\n      <p>"), "p not indented");
+    }
+
+    #[test]
+    fn inline_whitespace_preserved() {
+        let input = "<html><body><p>Some <strong>bold</strong> text.</p></body></html>";
+        let out = pretty_print(input);
+        assert!(
+            out.contains("Some <strong>bold</strong> text."),
+            "spaces around inline element were lost: {out}"
+        );
+    }
+
+    #[test]
+    fn script_content_verbatim() {
+        // '<' inside a script body must not be parsed as a tag.
+        let input = "<html><body><script>var x = 1 < 2;</script></body></html>";
+        let out = pretty_print(input);
+        assert!(
+            out.contains("var x = 1 < 2;"),
+            "script content was corrupted: {out}"
+        );
+    }
+
+    #[test]
+    fn doctype_preserved() {
+        let input = "<!DOCTYPE html><html><body></body></html>";
+        let out = pretty_print(input);
+        assert!(
+            out.starts_with("<!DOCTYPE html>\n"),
+            "doctype not at top: {out}"
+        );
+    }
+
+    #[test]
+    fn void_elements_on_own_line() {
+        let input = "<html><head><meta charset=\"utf-8\"><link rel=\"stylesheet\" href=\"a.css\"></head><body></body></html>";
+        let out = pretty_print(input);
+        assert!(out.contains("\n    <meta"), "meta not indented");
+        assert!(out.contains("\n    <link"), "link not indented");
+    }
+}

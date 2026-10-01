@@ -102,10 +102,7 @@ mod tests {
             captures_first(r"(a)?b", "b"),
             Some(vec![Some("b".into()), None])
         );
-        assert_eq!(
-            find_all(r"[ab]", "a b"),
-            Some(vec!["a".into(), "b".into()])
-        );
+        assert_eq!(find_all(r"[ab]", "a b"), Some(vec!["a".into(), "b".into()]));
     }
 
     #[test]
@@ -139,10 +136,7 @@ mod tests {
             replace_all("a1 b22", r"(\d+)", "[$1]"),
             Ok("a[1] b[22]".into())
         );
-        assert_eq!(
-            replace_all("a1", r"(\d)", r"\$1"),
-            Ok("a$1".into())
-        );
+        assert_eq!(replace_all("a1", r"(\d)", r"\$1"), Ok("a$1".into()));
         assert_eq!(
             replace_first_match("x12y34", r"(\d+)", "<$1>"),
             Ok(Some("<12>".into()))

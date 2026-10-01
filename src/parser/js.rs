@@ -814,6 +814,39 @@ fn eval_js_inner_with_source(
             globals.set("cache", cache_obj)?;
 
             let java_obj = Object::new(ctx.clone())?;
+            let file_cache_namespace = ACTIVE_JS_BOOK_SOURCE.with(|cell| {
+                cell.borrow().as_ref().map(|source| source.book_source_url.clone())
+            }).unwrap_or_else(|| source_key_val.clone());
+            java_obj.set(
+                "__fileCache",
+                Func::new(move |action: String, arguments: String| -> String {
+                    let operation = match action.as_str() {
+                        "get" => "cache.file.get",
+                        "put" => "cache.file.put",
+                        "delete" => "cache.file.delete",
+                        _ => return serde_json::json!({"ok":false,"error":{
+                            "kind":"invalid_argument","message":"invalid cache operation"}}).to_string(),
+                    };
+                    if file_cache_namespace.is_empty() {
+                        return serde_json::json!({"ok":false,"error":{
+                            "kind":"unavailable","message":"file cache requires a source context"}}).to_string();
+                    }
+                    if arguments.len() > 2 * 1024 * 1024 {
+                        return serde_json::json!({"ok":false,"error":{
+                            "kind":"limit_exceeded","message":"cache request too large"}}).to_string();
+                    }
+                    let Ok(mut args) = serde_json::from_str::<JsonValue>(&arguments) else {
+                        return serde_json::json!({"ok":false,"error":{
+                            "kind":"invalid_argument","message":"invalid cache request"}}).to_string();
+                    };
+                    let Some(object) = args.as_object_mut() else {
+                        return serde_json::json!({"ok":false,"error":{
+                            "kind":"invalid_argument","message":"invalid cache request"}}).to_string();
+                    };
+                    object.insert("namespace".into(), JsonValue::String(file_cache_namespace.clone()));
+                    crate::host_services::call(operation, &args).to_string()
+                }),
+            )?;
             let content_for_set = content_state.clone();
             let base_url_for_set = base_url_state.clone();
             java_obj.set(
@@ -1103,6 +1136,12 @@ fn eval_js_inner_with_source(
                         java_aes_encode(&input, &key, &algorithm, &iv)
                     },
                 ),
+            )?;
+            java_obj.set(
+                "__signature",
+                Func::new(|request: String| -> String {
+                    crate::parser::crypto::signature_json(&request)
+                }),
             )?;
             java_obj.set(
                 "__symmetricCrypto",
@@ -1471,6 +1510,22 @@ fn eval_js_inner_with_source(
                         }
                         return response.data;
                     };
+                    const chineseConvert = (direction, value) => {
+                        const text = String(value == null ? '' : value);
+                        if (text.length > 65536) {
+                            const error = new Error('Chinese text input too large');
+                            error.kind = 'limit_exceeded'; throw error;
+                        }
+                        if (text === '') return '';
+                        const output = java.hostCall('text.chinese.convert', {direction, text});
+                        if (typeof output !== 'string' || output.length > 262144) {
+                            const error = new Error('invalid Chinese conversion response');
+                            error.kind = 'invalid_response'; throw error;
+                        }
+                        return output;
+                    };
+                    java.t2s = value => chineseConvert('t2s', value);
+                    java.s2t = value => chineseConvert('s2t', value);
                     const nativeSourceSetVariable = globalThis.source.setVariable;
                     const nativeSourceRemoveVariable = globalThis.source.__removeVariable;
                     const nativeSourceRemoveLoginInfo = globalThis.source.__removeLoginInfo;
@@ -1711,6 +1766,35 @@ fn eval_js_inner_with_source(
                         return JSON.parse(java.__base64DecodeBytes(
                             String(value), Number(flags || 0)));
                     };
+                    const fileCacheCall = (action, arguments) => {
+                        const response = JSON.parse(java.__fileCache(action, JSON.stringify(arguments)));
+                        if (!response.ok) {
+                            const error = new Error(response.error.message);
+                            error.kind = response.error.kind; throw error;
+                        }
+                        return response.data;
+                    };
+                    globalThis.cache.getFile = key => {
+                        const value = fileCacheCall('get', {key: String(key)});
+                        if (value !== null && (typeof value !== 'string' || value.length > 262144)) {
+                            const error = new Error('invalid file cache response');
+                            error.kind = 'invalid_response'; throw error;
+                        }
+                        return value;
+                    };
+                    globalThis.cache.putFile = (key, value, saveTime) => {
+                        const ttl = saveTime == null ? 0 : Number(saveTime);
+                        const text = String(value == null ? '' : value);
+                        if (!Number.isInteger(ttl) || ttl < -2147483648 || ttl > 2147483647
+                            || text.length > 262144) {
+                            const error = new Error('invalid file cache value or TTL');
+                            error.kind = 'invalid_argument'; throw error;
+                        }
+                        if (fileCacheCall('put', {key: String(key), value: text, saveTime: ttl}) !== true) {
+                            const error = new Error('invalid file cache write response');
+                            error.kind = 'invalid_response'; throw error;
+                        }
+                    };
                     const nativeCacheGet = globalThis.cache.get;
                     const nativeCachePut = globalThis.cache.put;
                     const nativeCacheDelete = globalThis.cache.delete;
@@ -1732,7 +1816,21 @@ fn eval_js_inner_with_source(
                         if (!ok) throw new Error('cache.put: session cache limit exceeded');
                     };
                     globalThis.cache.delete = key => {
-                        nativeCacheDelete(String(key));
+                        key = String(key);
+                        try {
+                            if (fileCacheCall('delete', {key}) !== true) {
+                                const error = new Error('invalid file cache delete response');
+                                error.kind = 'invalid_response'; throw error;
+                            }
+                        } catch (error) {
+                            // Keep legacy memory-only deletion when the optional
+                            // service/source context is not configured. Real errors
+                            // are terminal and must not clear memory or be retried.
+                            if (error.kind !== 'unavailable' && error.kind !== 'unsupported') throw error;
+                        }
+                        nativeCacheDelete(key);
+                        localMemory.delete(key);
+                        cache.__memoryDelete(key);
                     };
                     // Memory entries are per active FFI operation, never persisted
                     // into the caller's session delta or shared across users.
@@ -1996,7 +2094,7 @@ fn eval_js_inner_with_source(
                         }
                         const des = normalized.startsWith('DES/');
                         const symmetricBytes = value => {
-                            if (des && (Array.isArray(value) || value instanceof Uint8Array)) {
+                            if (Array.isArray(value) || value instanceof Uint8Array) {
                                 return Array.from(value, byte => {
                                     if (!Number.isInteger(byte) || byte < -128 || byte > 255) {
                                         throw new Error('createSymmetricCrypto: invalid byte');
@@ -2014,8 +2112,7 @@ fn eval_js_inner_with_source(
                             || (cbc ? ivBytes.length !== blockSize : ivBytes.length !== 0)) {
                             throw new Error('createSymmetricCrypto: invalid key or iv');
                         }
-                        const native = !des && keyBytes.length === 16 && cbc
-                            && !normalized.endsWith('/NOPADDING');
+                        const native = !des;
                         let capabilities;
                         if (!native) {
                             capabilities = java.hostCall('crypto.capabilities', {});
@@ -2049,6 +2146,11 @@ fn eval_js_inner_with_source(
                                 }
                                 return bytes;
                             }
+                            const nativeLimit = 262144 + (mode === 'decrypt' && !normalized.endsWith('/NOPADDING') ? 16 : 0);
+                            if (dataBytes.length > nativeLimit) {
+                                const error = new Error('createSymmetricCrypto: input too large');
+                                error.kind = 'limit_exceeded'; throw error;
+                            }
                             const result = java.__symmetricCrypto(
                                 mode,
                                 algorithm,
@@ -2056,7 +2158,8 @@ fn eval_js_inner_with_source(
                                 JSON.stringify(ivBytes),
                                 JSON.stringify(dataBytes));
                             if (result == null) {
-                                throw new Error('createSymmetricCrypto: invalid key, iv, or data');
+                                const error = new Error('createSymmetricCrypto: invalid block length or padding');
+                                error.kind = 'operation_failed'; throw error;
                             }
                             return JSON.parse(result);
                         };
@@ -2084,7 +2187,13 @@ fn eval_js_inner_with_source(
                     const cryptoKeyValue = value => {
                         if (Array.isArray(value) || value instanceof Uint8Array) {
                             if (value.length > 16384) throw new Error('crypto key too large');
-                            return toBytes(value);
+                            return Array.from(value, byte => {
+                                if (!Number.isInteger(byte) || byte < -128 || byte > 255) {
+                                    const error = new Error('invalid crypto key byte');
+                                    error.kind = 'invalid_argument'; throw error;
+                                }
+                                return (byte + 256) % 256;
+                            });
                         }
                         const text = String(value == null ? '' : value);
                         if (text.length > 16384) throw new Error('crypto key too large');
@@ -2157,35 +2266,45 @@ fn eval_js_inner_with_source(
                     java.createSign = function(algorithm) {
                         const name = String(algorithm == null ? '' : algorithm).toUpperCase();
                         if (name !== 'SHA256WITHRSA') throw new Error('createSign: unsupported algorithm');
-                        let privateKey, publicKey, capabilities;
+                        let privateKey, publicKey;
+                        const capabilities = {maxInputBytes:16384,maxSignatureBytes:512};
+                        const signatureError = (kind, message) => {
+                            const error = new Error('createSign: ' + message);
+                            error.kind = kind; return error;
+                        };
+                        const signatureBytes = value => Array.from(value, byte => {
+                            if (!Number.isInteger(byte) || byte < -128 || byte > 255) {
+                                const error = new Error('createSign: invalid byte');
+                                error.kind = 'invalid_argument'; throw error;
+                            }
+                            return (byte + 256) % 256;
+                        });
                         const invoke = (action, data, signature, charset) => {
                             const key = action === 'sign' ? privateKey : publicKey;
-                            if (key == null) throw new Error('createSign: selected key is missing');
-                            if (!capabilities) capabilities = java.hostCall('crypto.sign.capabilities', {});
-                            if (!capabilities || capabilities.protocol !== 1 || capabilities.available !== true
-                                || capabilities.algorithm !== name
-                                || !Number.isSafeInteger(capabilities.maxInputBytes) || capabilities.maxInputBytes < 0
-                                || !Number.isSafeInteger(capabilities.maxSignatureBytes) || capabilities.maxSignatureBytes < 0) {
-                                throw new Error('createSign: host capability unavailable');
-                            }
+                            if (key == null) throw signatureError('invalid_argument', 'selected key is missing');
                             if (typeof data !== 'string' && !Array.isArray(data) && !(data instanceof Uint8Array)) {
-                                throw new Error('createSign: text or byte input required');
+                                throw signatureError('invalid_argument', 'text or byte input required');
                             }
-                            if (data.length > capabilities.maxInputBytes) throw new Error('createSign: input too large');
+                            if (data.length > capabilities.maxInputBytes) throw signatureError('limit_exceeded', 'input too large');
                             const input = typeof data === 'string'
-                                ? java.strToBytes(data, charset == null ? 'UTF-8' : String(charset)) : toBytes(data);
-                            if (input.length > capabilities.maxInputBytes) throw new Error('createSign: input too large');
+                                ? java.strToBytes(data, charset == null ? 'UTF-8' : String(charset)) : signatureBytes(data);
+                            if (input.length > capabilities.maxInputBytes) throw signatureError('limit_exceeded', 'input too large');
                             let sig;
                             if (action === 'verify') {
                                 if (!Array.isArray(signature) && !(signature instanceof Uint8Array)) {
-                                    throw new Error('createSign: signature bytes required');
+                                    throw signatureError('invalid_argument', 'signature bytes required');
                                 }
-                                if (signature.length > capabilities.maxSignatureBytes) throw new Error('createSign: signature too large');
-                                sig = toBytes(signature);
+                                if (signature.length > capabilities.maxSignatureBytes) throw signatureError('limit_exceeded', 'signature too large');
+                                sig = signatureBytes(signature);
                             }
-                            const result = java.hostCall('crypto.signature', {
+                            const response = JSON.parse(java.__signature(JSON.stringify({
                                 action, algorithm: name, key, data: input, signature: sig
-                            });
+                            })));
+                            if (!response.ok) {
+                                const error = new Error(response.error.message);
+                                error.kind = response.error.kind; throw error;
+                            }
+                            const result = response.data;
                             if (action === 'verify') {
                                 if (typeof result !== 'boolean') throw new Error('createSign: invalid verification response');
                             } else if (!Array.isArray(result) || result.length < 128
@@ -3339,39 +3458,10 @@ fn java_symmetric_crypto(
     iv_json: &str,
     data_json: &str,
 ) -> Option<String> {
-    let normalized = transformation.to_ascii_uppercase();
-    if normalized != "AES/CBC/PKCS5PADDING" && normalized != "AES/CBC/PKCS7PADDING" {
-        return None;
-    }
-
-    let key = json_byte_array(key_json);
-    let iv = json_byte_array(iv_json);
-    let data = json_byte_array(data_json);
-    if key.len() != 16 || iv.len() != 16 {
-        return None;
-    }
-
-    let output = match mode {
-        "encrypt" => {
-            let cipher = Aes128CbcEncryptor::new_from_slices(&key, &iv).ok()?;
-            let mut buffer = vec![0u8; data.len() + 16];
-            buffer[..data.len()].copy_from_slice(&data);
-            cipher
-                .encrypt_padded_mut::<Pkcs7>(&mut buffer, data.len())
-                .ok()?
-                .to_vec()
-        }
-        "decrypt" => {
-            let cipher = Aes128CbcDecryptor::new_from_slices(&key, &iv).ok()?;
-            let mut buffer = data;
-            cipher
-                .decrypt_padded_mut::<Pkcs7>(&mut buffer)
-                .ok()?
-                .to_vec()
-        }
-        _ => return None,
-    };
-
+    let key: Vec<u8> = serde_json::from_str(key_json).ok()?;
+    let iv: Vec<u8> = serde_json::from_str(iv_json).ok()?;
+    let data: Vec<u8> = serde_json::from_str(data_json).ok()?;
+    let output = crate::parser::crypto::symmetric(mode, transformation, &key, &iv, &data)?;
     serde_json::to_string(&output).ok()
 }
 
@@ -4356,7 +4446,7 @@ mod tests {
     use super::*;
     use crate::crawler::session::{with_active_session, ExecuteSession};
     use serde_json::json;
-    use std::io::BufRead;
+    use std::io::{BufRead, Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::thread;
 
@@ -4479,6 +4569,139 @@ mod tests {
             });
         });
         server.join().unwrap();
+    }
+
+    #[test]
+    fn java_archive_input_preserves_binary_and_source_header_plan() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = accept_with_timeout(&listener);
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n\x00\xff\x80\x01").unwrap();
+            request.to_ascii_lowercase()
+        });
+        let source = BookSource {
+            book_source_url: base.clone(),
+            header: Some(r#"{"X-Source":"source"}"#.to_owned()),
+            enabled_cookie_jar: Some(false),
+            ..Default::default()
+        };
+        let state = ExecuteSession {
+            header: Some(json!({"X-Login":"login"})),
+            ..Default::default()
+        };
+        let client = HttpClient::standalone();
+        let target = format!(r#"{base}/binary,{{"headers":{{"X-Option":"yes"}}}}"#);
+        let (payload, _) = with_active_session(Some(&state), &base, |_| {
+            with_js_http_context(&client, &source, || java_archive_input(&target))
+        });
+        let result: JsonValue = serde_json::from_str(&payload).unwrap();
+        assert_eq!(result["data"], json!([0, 255, 128, 1]));
+        let request = server.join().unwrap();
+        for header in ["x-source: source", "x-login: login", "x-option: yes"] {
+            assert!(request.contains(header), "{request}");
+        }
+        let offline: JsonValue = serde_json::from_str(&crate::host_services::with_offline(|| {
+            java_archive_input(&base)
+        }))
+        .unwrap();
+        assert_eq!(offline["error"]["kind"], "network_error");
+    }
+
+    #[test]
+    fn java_zip_text_detects_encoding_and_respects_explicit_charset() {
+        let text = "这是一段中文小说内容，测试压缩文件字符编码自动识别。";
+        let gbk = encoding_rs::GBK.encode(text).0.into_owned();
+        let script = format!(
+            r#"(() => {{
+                const inputs = {{gbk: {gbk}, utf8: {utf8}, bom: [255,254,45,78,135,101], empty: []}};
+                java.getZipByteArrayContent = (_, path) => path === 'missing' ? null : inputs[path];
+                const read = (path, charset) => java.getZipStringContent([], path, charset);
+                let invalid;
+                try {{ read('gbk', 'not-a-charset'); }} catch (e) {{ invalid = e.kind; }}
+                return JSON.stringify([
+                    read('gbk'), read('gbk', 'GBK'), read('utf8'), read('bom'),
+                    read('empty'), read('missing'), read('gbk', 'UTF-8') !== read('gbk'), invalid,
+                    java.bytesToStr(inputs.gbk, 'UTF-8') === read('gbk', 'UTF-8')
+                ]);
+            }})()"#,
+            gbk = serde_json::to_string(&gbk).unwrap(),
+            utf8 = serde_json::to_string(text.as_bytes()).unwrap(),
+        );
+        let result = eval_js(&script, "", "https://example.com").unwrap();
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&result).unwrap(),
+            json!([
+                text,
+                text,
+                text,
+                "中文",
+                "",
+                "",
+                true,
+                "invalid_argument",
+                true
+            ])
+        );
+    }
+
+    #[test]
+    fn java_security_facade_validates_specs_states_and_overloads() {
+        let result = eval_js(
+            r#"(() => {
+                const j = new JavaImporter();
+                j.importPackage(Packages.java.security, Packages.java.security.spec);
+                const source = [-1, 0, 127];
+                const spec = new j.PKCS8EncodedKeySpec(source);
+                source[0] = 0; spec.getEncoded()[0] = 0;
+                const s = j.Signature.getInstance('SHA256withRSA');
+                const f = j.KeyFactory.getInstance('RSA');
+                let count = 0;
+                for (const action of [
+                    () => s.sign(), () => s.verify([]), () => s.update([1]),
+                    () => s.initSign({}), () => f.generatePrivate(spec),
+                    () => f.generatePublic(new j.X509EncodedKeySpec([48,0])),
+                    () => new j.PKCS8EncodedKeySpec([NaN]),
+                    () => new j.PKCS8EncodedKeySpec([256]),
+                    () => j.Signature.getInstance('SHA256withRSA','provider'),
+                    () => s.sign([]), () => s.update([1],0)
+                ]) { try { action(); } catch(e) { if (e.kind === 'invalid_argument') count++; } }
+                return [spec.getEncoded().join(','),spec.getFormat(),s.getAlgorithm(),count].join('|');
+            })()"#,
+            "",
+            "https://example.com",
+        ).unwrap();
+        assert_eq!(result, "255,0,127|PKCS#8|SHA256withRSA|11");
+    }
+
+    #[test]
+    fn java_memory_streams_preserve_ranges_eof_and_close_semantics() {
+        let result = eval_js(
+            r#"
+            const j = new JavaImporter(Packages.java.io);
+            const input = new j.ByteArrayInputStream([9,255,1,2],1,3);
+            const buffer = [0,0,0,0];
+            const count = input.read(buffer,1,2);
+            input.close();
+            const output = new j.ByteArrayOutputStream();
+            output.write(buffer,1,count); output.write(input.read()); output.close();
+            [count,output.toByteArray().join(','),input.read(),input.read([],0,0)].join('|')
+        "#,
+            "",
+            "https://example.com",
+        )
+        .unwrap();
+        assert_eq!(result, "2|255,1,2|-1|0");
     }
 
     #[test]
@@ -5660,12 +5883,11 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
             "true|true|reader|reader|reader"
         );
 
-        assert!(eval_js(
-            "java.createSymmetricCrypto('AES/ECB/PKCS5Padding', '1234567890abcdef')",
+        assert_eq!(eval_js(
+            "(()=>{const c=java.createSymmetricCrypto('AES/ECB/PKCS5Padding', '1234567890abcdef');return c.decryptStr(c.encrypt('reader'));})()",
             "",
             "https://example.com"
-        )
-        .is_err());
+        ).unwrap(), "reader");
         assert!(eval_js(
             "java.createSymmetricCrypto('AES/CBC/PKCS5Padding', 'short', 'abcdef1234567890').encryptBase64('reader')",
             "",

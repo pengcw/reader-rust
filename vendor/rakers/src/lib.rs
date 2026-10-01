@@ -472,3 +472,490 @@ pub fn render_url(url: &str, cfg: &HttpConfig, clean: bool) -> anyhow::Result<St
         Some(Duration::from_secs(30)),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render_simple(input: &str, is_js: bool, page_url: Option<&str>) -> anyhow::Result<String> {
+        render(
+            input,
+            is_js,
+            page_url,
+            &HttpConfig::default(),
+            false,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn html_inline_script_document_write() {
+        let input = concat!(
+            "<!DOCTYPE html><html><head><title>Test</title></head>",
+            "<body><h1>Before</h1>",
+            r#"<script>document.write("<p>Hello from JS!</p>"); console.log("done");</script>"#,
+            "</body></html>"
+        );
+        let out = render_simple(input, false, None).unwrap();
+        assert!(out.contains("<h1>Before</h1>"), "static content preserved");
+        assert!(
+            out.contains("<p>Hello from JS!</p>"),
+            "document.write injected"
+        );
+    }
+
+    #[test]
+    fn js_file_mode_loop() {
+        let js = concat!(
+            r#"document.write("<ul>");"#,
+            "\n",
+            r#"for (let i = 1; i <= 3; i++) { document.write("<li>Item " + i + "</li>"); }"#,
+            "\n",
+            r#"document.write("</ul>");"#,
+            "\n",
+            r#"console.log("rendered", 3, "items");"#,
+        );
+        let out = render_simple(js, true, None).unwrap();
+        assert!(out.contains("<li>Item 1</li>"), "first item");
+        assert!(out.contains("<li>Item 2</li>"), "second item");
+        assert!(out.contains("<li>Item 3</li>"), "third item");
+    }
+
+    #[test]
+    fn dynamically_appended_script_with_src_is_fetched_via_stub() {
+        let input = concat!(
+            "<!DOCTYPE html><html><head></head><body>",
+            "<script>window._r_fetch_sync = function(u) { return \"document.write('<p>fetched</p>');\"; };</script>",
+            "<script>var s = document.createElement('script'); s.src = 'https://example.com/fetch.js'; document.body.appendChild(s);</script>",
+            "</body></html>",
+        );
+        let out = render_simple(input, false, None).unwrap();
+        assert!(
+            out.contains("<p>fetched</p>"),
+            "dynamically fetched script executed"
+        );
+    }
+
+    #[test]
+    fn console_messages_captured() {
+        let js = r#"console.log("hello", "world"); console.warn("oops");"#;
+        let rt = runtime::JsRuntime::with_timeout(std::time::Duration::from_secs(30));
+        rt.execute(&[js.to_owned()], None, &HttpConfig::default())
+            .unwrap();
+        let msgs = runtime::JsRuntime::logged_messages();
+        assert_eq!(msgs[0], "hello world");
+        assert_eq!(msgs[1], "oops");
+    }
+
+    #[test]
+    fn document_writeln_adds_newline() {
+        let js = r#"document.writeln("line1"); document.writeln("line2");"#;
+        let out = render_simple(js, true, None).unwrap();
+        assert!(out.contains("line1\nline2\n"), "writeln appends newline");
+    }
+
+    #[test]
+    fn window_aliases_global() {
+        let js = r#"window.document.write("<p>via window</p>");"#;
+        let out = render_simple(js, true, None).unwrap();
+        assert!(
+            out.contains("<p>via window</p>"),
+            "window.document.write works"
+        );
+    }
+
+    #[test]
+    fn script_errors_are_non_fatal() {
+        let html = concat!(
+            "<!DOCTYPE html><html><body>",
+            "<script>throw new Error('deliberate');</script>",
+            "<script>document.write('<p>survived</p>');</script>",
+            "</body></html>"
+        );
+        let out = render_simple(html, false, None).unwrap();
+        assert!(
+            out.contains("<p>survived</p>"),
+            "rendering continues after script error"
+        );
+    }
+
+    #[test]
+    fn location_href_reflects_page_url() {
+        let js = r#"document.write(window.location.href);"#;
+        let out = render_simple(js, true, Some("https://example.com/page")).unwrap();
+        assert!(
+            out.contains("https://example.com/page"),
+            "location.href set from page_url"
+        );
+    }
+
+    #[test]
+    fn common_globals_accessible() {
+        let js = r#"
+            var ua = window.navigator.userAgent;
+            var tid = window.setTimeout(function(){}, 100);
+            var mq  = window.matchMedia('(max-width: 768px)');
+            var mo  = new window.MutationObserver(function(){});
+            document.write('<p>' + ua + '</p>');
+        "#;
+        let out = render_simple(js, true, None).unwrap();
+        assert!(out.contains("<p>rakers/"), "navigator.userAgent accessible");
+    }
+
+    #[test]
+    fn document_create_element_is_accessible() {
+        let js = r#"
+            var el = document.createElement('div');
+            el.className = 'test';
+            document.write('<p>' + el.className + '</p>');
+        "#;
+        let out = render_simple(js, true, None).unwrap();
+        assert!(out.contains("<p>test</p>"), "createElement stub works");
+    }
+
+    #[test]
+    fn settimeout_callback_flushed() {
+        let html = concat!(
+            "<!DOCTYPE html><html><body>",
+            r#"<div id="app"></div>"#,
+            "<script>setTimeout(function() {",
+            r#"document.getElementById('app').innerHTML = '<h1>Rendered via setTimeout</h1>';"#,
+            "}, 0);</script>",
+            "</body></html>"
+        );
+        let out = render_simple(html, false, None).unwrap();
+        assert!(
+            out.contains("<h1>Rendered via setTimeout</h1>"),
+            "setTimeout callback flushed before readback"
+        );
+    }
+
+    #[test]
+    fn body_inner_html_set_directly() {
+        let js = r#"document.body.innerHTML = '<h1>Set directly</h1>';"#;
+        let out = render_simple(js, true, None).unwrap();
+        assert!(
+            out.contains("<h1>Set directly</h1>"),
+            "body.innerHTML = '...' captured"
+        );
+    }
+
+    #[test]
+    fn append_child_to_body() {
+        let js = r#"
+            var h1 = document.createElement('h1');
+            h1.innerHTML = 'Appended';
+            document.body.appendChild(h1);
+        "#;
+        let out = render_simple(js, true, None).unwrap();
+        assert!(
+            out.contains("<h1>Appended</h1>"),
+            "appendChild serialized into output"
+        );
+    }
+
+    #[test]
+    fn nested_elements_serialized() {
+        let js = r#"
+            var ul = document.createElement('ul');
+            for (var i = 1; i <= 3; i++) {
+                var li = document.createElement('li');
+                li.innerHTML = 'Item ' + i;
+                ul.appendChild(li);
+            }
+            document.body.appendChild(ul);
+        "#;
+        let out = render_simple(js, true, None).unwrap();
+        assert!(out.contains("<li>Item 1</li>"), "nested li 1");
+        assert!(out.contains("<li>Item 3</li>"), "nested li 3");
+    }
+
+    #[test]
+    fn get_element_by_id_content_with_append() {
+        let js = r#"
+            var app = document.getElementById('app');
+            app.innerHTML = '<p>App content</p>';
+            document.body.appendChild(app);
+        "#;
+        let out = render_simple(js, true, None).unwrap();
+        assert!(
+            out.contains("<p>App content</p>"),
+            "getElementById + appendChild captured"
+        );
+    }
+
+    #[test]
+    fn clean_removes_scripts_and_unwraps_noscript() {
+        let html = concat!(
+            "<!DOCTYPE html><html><head>",
+            r#"<link rel="modulepreload" href="/bundle.js">"#,
+            r#"<link rel="preload" as="script" href="/chunk.js">"#,
+            r#"<link rel="stylesheet" href="/style.css">"#, // must be kept
+            "</head><body>",
+            "<h1>Hello</h1>",
+            r#"<script src="/app.js"></script>"#,
+            "<script>var x = 1;</script>",
+            "<noscript><p>JS required</p></noscript>",
+            "</body></html>",
+        );
+        let out = render(html, false, None, &HttpConfig::default(), true, None, None).unwrap();
+        assert!(!out.contains("<script"), "script tags removed");
+        assert!(!out.contains("modulepreload"), "modulepreload link removed");
+        assert!(
+            !out.contains(r#"as="script""#),
+            "preload-script link removed"
+        );
+        assert!(
+            out.contains(r#"rel="stylesheet""#),
+            "stylesheet link preserved"
+        );
+        assert!(!out.contains("<noscript"), "noscript tags removed");
+        assert!(
+            out.contains("<p>JS required</p>"),
+            "noscript content preserved"
+        );
+        assert!(out.contains("<h1>Hello</h1>"), "regular content preserved");
+    }
+
+    #[test]
+    #[cfg_attr(not(feature = "rquickjs"), ignore = "boa has no interrupt handler")]
+    fn script_timeout_is_non_fatal() {
+        // An infinite loop must be interrupted; the next script must still run.
+        let rt = runtime::JsRuntime::with_timeout(std::time::Duration::from_millis(100));
+        rt.execute(
+            &[
+                "while(true){}".to_owned(),
+                "document.write('<p>survived</p>');".to_owned(),
+            ],
+            None,
+            &HttpConfig::default(),
+        )
+        .unwrap();
+        assert!(
+            runtime::JsRuntime::written_html().contains("<p>survived</p>"),
+            "second script must run after timeout interrupts the first"
+        );
+    }
+
+    #[test]
+    fn to_json_fields() {
+        let out = to_json(100, "<h1>hi</h1>");
+        assert!(out.contains("\"raw_bytes\": 100"), "raw_bytes field");
+        assert!(
+            out.contains("\"rendered_bytes\": 11"),
+            "rendered_bytes field"
+        );
+        assert!(out.contains("\"html\""), "html field present");
+        assert!(out.contains("<h1>hi</h1>"), "html content");
+    }
+
+    #[test]
+    fn to_json_escapes_special_chars() {
+        let out = to_json(0, "say \"hello\"\nline2\\end");
+        assert!(
+            out.contains(r#"say \"hello\"\nline2\\end"#),
+            "quotes, newline, backslash escaped: {out}"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(not(feature = "rquickjs"), ignore = "boa microtask draining differs")]
+    fn fetch_stub_resolves_then_chain() {
+        // fetch() must return a resolved Promise so .then() chains fire, not crash.
+        // Assert the rendered string appears *after* </script> — not just in the source.
+        let js = concat!(
+            "window.fetch('/api/data')",
+            ".then(function(r){ return r.text(); })",
+            ".then(function(t){ document.write('<p>fetch-ok</p>'); });",
+        );
+        let out = render(js, true, None, &HttpConfig::default(), false, None, None).unwrap();
+        let after_script = out.find("</script>").map(|i| &out[i..]).unwrap_or("");
+        assert!(
+            after_script.contains("<p>fetch-ok</p>"),
+            "fetch .then() chain must fire, got: {out}"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(not(feature = "rquickjs"), ignore = "boa microtask draining differs")]
+    fn fetch_stub_json_resolves() {
+        let js = concat!(
+            "window.fetch('/api').then(function(r){ return r.json(); })",
+            ".then(function(d){ document.write('<p>json-ok</p>'); });",
+        );
+        let out = render(js, true, None, &HttpConfig::default(), false, None, None).unwrap();
+        let after_script = out.find("</script>").map(|i| &out[i..]).unwrap_or("");
+        assert!(
+            after_script.contains("<p>json-ok</p>"),
+            "fetch.json() chain must fire, got: {out}"
+        );
+    }
+
+    #[test]
+    fn xhr_stub_fires_onload() {
+        let js = concat!(
+            "var xhr = new XMLHttpRequest();",
+            "xhr.open('GET', '/api/data');",
+            "xhr.onload = function() { document.write('<p>xhr-ok</p>'); };",
+            "xhr.send();",
+        );
+        let out = render(js, true, None, &HttpConfig::default(), false, None, None).unwrap();
+        let after_script = out.find("</script>").map(|i| &out[i..]).unwrap_or("");
+        assert!(
+            after_script.contains("<p>xhr-ok</p>"),
+            "XHR onload must fire, got: {out}"
+        );
+    }
+
+    #[test]
+    fn xhr_stub_fires_addeventlistener_load() {
+        let js = concat!(
+            "var xhr = new XMLHttpRequest();",
+            "xhr.open('GET', '/api');",
+            "xhr.addEventListener('load', function() { document.write('<p>xhr-addev-ok</p>'); });",
+            "xhr.send();",
+        );
+        let out = render(js, true, None, &HttpConfig::default(), false, None, None).unwrap();
+        assert!(
+            out.contains("<p>xhr-addev-ok</p>"),
+            "XHR addEventListener('load') must fire, got: {out}"
+        );
+    }
+
+    #[test]
+    fn location_pathname_reflects_page_url() {
+        let js = r#"document.write(window.location.pathname)"#;
+        let out = render(
+            js,
+            true,
+            Some("https://example.com/foo/bar"),
+            &HttpConfig::default(),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            out.contains("/foo/bar"),
+            "pathname should be /foo/bar, got: {out}"
+        );
+    }
+
+    #[test]
+    fn location_fields_parsed_from_url() {
+        let js = concat!(
+            "document.write(window.location.protocol + '|');",
+            "document.write(window.location.hostname + '|');",
+            "document.write(window.location.pathname + '|');",
+            "document.write(window.location.search + '|');",
+            "document.write(window.location.hash);",
+        );
+        let out = render(
+            js,
+            true,
+            Some("https://example.com/path?q=1#sec"),
+            &HttpConfig::default(),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(out.contains("https:|"), "protocol wrong: {out}");
+        assert!(out.contains("example.com|"), "hostname wrong: {out}");
+        assert!(out.contains("/path|"), "pathname wrong: {out}");
+        assert!(out.contains("?q=1|"), "search wrong: {out}");
+        assert!(out.contains("#sec"), "hash wrong: {out}");
+    }
+
+    #[test]
+    fn location_defaults_when_no_url() {
+        let js = r#"document.write(window.location.href)"#;
+        let out = render(js, true, None, &HttpConfig::default(), false, None, None).unwrap();
+        assert!(
+            out.contains("about:blank"),
+            "href should be about:blank when no URL given, got: {out}"
+        );
+    }
+
+    #[test]
+    fn history_state_updated_by_push() {
+        let js = concat!(
+            "window.history.pushState({page:1}, '');",
+            "document.write(JSON.stringify(window.history.state));",
+        );
+        let out = render(js, true, None, &HttpConfig::default(), false, None, None).unwrap();
+        assert!(
+            out.contains(r#""page""#) && out.contains('1'.to_string().as_str()),
+            "history.state should reflect pushed state, got: {out}"
+        );
+    }
+
+    #[test]
+    fn single_reexport_target_detects_shim() {
+        assert_eq!(
+            single_reexport_target("import './bundle.js'"),
+            Some("./bundle.js")
+        );
+        assert_eq!(
+            single_reexport_target("import \"../dist/app.js\";"),
+            Some("../dist/app.js")
+        );
+        assert_eq!(
+            single_reexport_target("import '/assets/main.js'\n"),
+            Some("/assets/main.js")
+        );
+        // Multiple statements — not a shim
+        assert_eq!(
+            single_reexport_target("import './a.js'\nimport './b.js'"),
+            None
+        );
+        // Named import — not a bare side-effect import
+        assert_eq!(
+            single_reexport_target("import { foo } from './lib.js'"),
+            None
+        );
+        // Bare specifier (npm package) — don't follow
+        assert_eq!(single_reexport_target("import 'react'"), None);
+        // Regular IIFE bundle — not a module
+        assert_eq!(single_reexport_target("(function(){ var x = 1; })()"), None);
+    }
+
+    #[test]
+    fn proxy_config_does_not_break_inline_rendering() {
+        let cfg = HttpConfig {
+            proxy: Some("socks5://127.0.0.1:9050".to_owned()),
+            ..Default::default()
+        };
+        let html = r#"<html><body><script>document.write('<p>ok</p>');</script></body></html>"#;
+        let out = render(html, false, None, &cfg, false, None, None).unwrap();
+        assert!(
+            out.contains("<p>ok</p>"),
+            "inline script renders with proxy configured"
+        );
+    }
+
+    #[test]
+    fn proxy_fetch_failure_is_non_fatal() {
+        // Port 1 is reserved and will always refuse the connection immediately.
+        let cfg = HttpConfig {
+            proxy: Some("socks5://127.0.0.1:1".to_owned()),
+            ..Default::default()
+        };
+        // A script that tries to XHR-load an external URL; the fetch will fail
+        // through the dead proxy but the render should complete without panicking.
+        let html = concat!(
+            "<html><body><script>",
+            "var x = new XMLHttpRequest();",
+            "x.open('GET','http://example.com/data.json',false);",
+            "try { x.send(); } catch(e) {}",
+            "document.write('<p>done</p>');",
+            "</script></body></html>"
+        );
+        let out = render(html, false, None, &cfg, false, None, None).unwrap();
+        assert!(
+            out.contains("<p>done</p>"),
+            "render completes despite proxy failure"
+        );
+    }
+}

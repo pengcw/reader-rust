@@ -986,4 +986,233 @@ function nextPage(html) {{ return org.jsoup.Jsoup.parse(html).select('a#next').f
             "<p>段落一</p><ul><li>项A</li><li>项B</li></ul><br>尾部"
         );
     }
+
+    #[test]
+    fn reader_eval_rakers_render_executes_external_script_without_source_credentials() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("Rakers did not fetch its script: {error}"),
+                }
+            };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                let finished = line == "\r\n";
+                request.push_str(&line);
+                if finished {
+                    break;
+                }
+            }
+            let script = "document.getElementById('app').innerHTML = '<p>rendered from external script</p>';";
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{script}", script.len()).unwrap();
+            request
+        });
+
+        let input = serde_json::json!({
+            "html": "<html><body><div id='app'>Loading</div><script src='/hydrate.js'></script></body></html>",
+            "baseUrl": format!("{base_url}/chapter")
+        })
+        .to_string();
+        let c_input = CString::new(input).unwrap();
+        let c_rule = CString::new("@rakers_render").unwrap();
+        let rendered = reader_eval(
+            char_p::Ref::try_from(c_input.as_c_str()).unwrap(),
+            char_p::Ref::try_from(c_rule.as_c_str()).unwrap(),
+        );
+        let request = server.join().unwrap();
+
+        assert!(rendered.to_str().contains("rendered from external script"));
+        assert!(request.starts_with("GET /hydrate.js "), "{request}");
+        assert!(
+            !request.to_ascii_lowercase().contains("cookie:"),
+            "{request}"
+        );
+        assert!(
+            !request.to_ascii_lowercase().contains("authorization:"),
+            "{request}"
+        );
+    }
+
+    #[test]
+    fn reader_eval_rakers_render_accepts_koreader_http_request_fields() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("reader_eval did not fetch its URL: {error}"),
+                }
+            };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut headers = String::new();
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                if let Some(value) = line
+                    .strip_prefix("Content-Length:")
+                    .or_else(|| line.strip_prefix("content-length:"))
+                {
+                    content_length = value.trim().parse().unwrap();
+                }
+                let finished = line == "\r\n";
+                headers.push_str(&line);
+                if finished {
+                    break;
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let page = "<html><body><div id='app'>Loading</div><script>document.getElementById('app').innerHTML='<p>URL request rendered</p>';</script></body></html>";
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}", page.len()).unwrap();
+            (headers, String::from_utf8(body).unwrap())
+        });
+
+        let input = serde_json::json!({
+            "url": format!("{base_url}/submit"),
+            "method": "POST",
+            "headers": {
+                "Content-Type": "text/plain",
+                "User-Agent": "KOReader fixture",
+                "X-Book-Source": "eval-test"
+            },
+            "cookies": {"sid": "eval-cookie"},
+            "source": "payload=chapter",
+            "timeout": 5,
+            "redirect": true,
+            "maxRedirects": 3
+        })
+        .to_string();
+        let c_input = CString::new(input).unwrap();
+        let c_rule = CString::new("@rakers_render").unwrap();
+        let rendered = reader_eval(
+            char_p::Ref::try_from(c_input.as_c_str()).unwrap(),
+            char_p::Ref::try_from(c_rule.as_c_str()).unwrap(),
+        );
+        let (request_headers, request_body) = server.join().unwrap();
+
+        assert!(rendered.to_str().contains("URL request rendered"));
+        assert!(
+            request_headers.starts_with("POST /submit "),
+            "{request_headers}"
+        );
+        assert!(request_headers
+            .to_ascii_lowercase()
+            .contains("x-book-source: eval-test"));
+        assert!(request_headers
+            .to_ascii_lowercase()
+            .contains("user-agent: koreader fixture"));
+        assert!(request_headers
+            .to_ascii_lowercase()
+            .contains("cookie: sid=eval-cookie"));
+        assert_eq!(request_body, "payload=chapter");
+    }
+
+    #[test]
+    fn reader_eval_rakers_render_accepts_raw_html_and_url() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let html = "<div id='app'>Loading</div><script>document.getElementById('app').innerHTML='<p>raw HTML rendered</p>';</script>";
+        let c_html = CString::new(html).unwrap();
+        let c_rule = CString::new("@rakers_render").unwrap();
+        let rendered_html = reader_eval(
+            char_p::Ref::try_from(c_html.as_c_str()).unwrap(),
+            char_p::Ref::try_from(c_rule.as_c_str()).unwrap(),
+        );
+        assert!(rendered_html.to_str().contains("raw HTML rendered"));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/page", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            let page = "<html><body><div id='app'>Loading</div><script>document.getElementById('app').innerHTML='<p>raw URL rendered</p>';</script></body></html>";
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}", page.len()).unwrap();
+        });
+        let c_url = CString::new(url).unwrap();
+        let rendered_url = reader_eval(
+            char_p::Ref::try_from(c_url.as_c_str()).unwrap(),
+            char_p::Ref::try_from(c_rule.as_c_str()).unwrap(),
+        );
+        server.join().unwrap();
+        assert!(rendered_url.to_str().contains("raw URL rendered"));
+    }
+
+    #[test]
+    fn reader_eval_http_request_returns_status_headers_and_unrendered_body() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/error-page", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            let body = "<div id='app'>server response</div><script>document.getElementById('app').innerHTML='must not render';</script>";
+            write!(stream, "HTTP/1.1 418 I'm a teapot\r\nContent-Type: text/html; charset=utf-8\r\nX-Fixture: eval-http\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+
+        let input = serde_json::json!({"url": url, "method": "GET"}).to_string();
+        let c_input = CString::new(input).unwrap();
+        let c_rule = CString::new("@http_request").unwrap();
+        let output = reader_eval(
+            char_p::Ref::try_from(c_input.as_c_str()).unwrap(),
+            char_p::Ref::try_from(c_rule.as_c_str()).unwrap(),
+        );
+        server.join().unwrap();
+        let response: Value = serde_json::from_str(output.to_str()).unwrap();
+
+        assert_eq!(response["status"], 418);
+        assert_eq!(response["headers"]["x-fixture"], "eval-http");
+        assert!(response["body"]
+            .as_str()
+            .unwrap()
+            .contains("server response"));
+        assert!(response["body"]
+            .as_str()
+            .unwrap()
+            .contains("must not render"));
+    }
 }

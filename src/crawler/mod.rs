@@ -1655,6 +1655,43 @@ mod tests {
     }
 
     #[test]
+    fn webview_opt_in_renders_inline_javascript_before_rule_parsing() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let source = BookSource {
+            book_source_url: base.clone(),
+            enabled_cookie_jar: Some(false),
+            ..Default::default()
+        };
+        let html = r#"<!doctype html><html><body><div id="app">Loading</div><script>document.getElementById('app').innerHTML = '<p>' + 'hydrated' + ' chapter' + '</p>';</script></body></html>"#;
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 2048];
+                let _ = stream.read(&mut request);
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}", html.len()).unwrap();
+            }
+        });
+        let session = HttpSession::new(&source, 3000).unwrap();
+        let plain_spec = analyze_url("/page", "", 1, &base, &source).unwrap();
+        let rendered_spec =
+            analyze_url(r#"/page,{"webView":true}"#, "", 1, &base, &source).unwrap();
+        assert!(!plain_spec.render_with_rakers);
+        assert!(rendered_spec.render_with_rakers);
+
+        let plain = session.fetch(&plain_spec, 4096).unwrap();
+        let rendered = session.fetch(&rendered_spec, 4096).unwrap();
+        assert!(plain.body.contains("Loading"));
+        assert!(!plain.body.contains("<p>hydrated chapter</p>"));
+        assert!(rendered.body.contains("<p>hydrated chapter</p>"));
+        server.join().unwrap();
+    }
+
+    #[test]
     fn compat_url_compile_expands_key_page_and_headers() {
         let source = test_source(None);
         let spec = analyze_url(
