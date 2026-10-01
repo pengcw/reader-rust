@@ -88,6 +88,12 @@ def check(path, target, sysroot):
         raise ValueError("depends on private glibc symbols")
 
     symbols = readelf("--dyn-syms", str(path))
+    undefined_globals = re.findall(r"\bGLOBAL\s+DEFAULT\s+UND\s+(\S+)", symbols)
+    if target == "armv7-unknown-linux-gnueabi" and any(
+        symbol.split("@", 1)[0] == "getauxval" for symbol in undefined_globals
+    ):
+        raise ValueError("Kindle EGLIBC 2.12 binary must not import getauxval")
+
     exports = set(re.findall(r"\bFUNC\s+GLOBAL\s+DEFAULT\s+\d+\s+(\S+)", symbols))
     if missing := REQUIRED_SYMBOLS - exports:
         raise ValueError(f"missing Lua FFI symbols: {sorted(missing)}")

@@ -3,6 +3,9 @@ name = "reader-rust-ffi"
 version = "1.0.9"
 edition = "2021"
 
+[features]
+kindle-eglibc-2-12 = []
+
 [lib]
 name = "reader_parser"
 crate-type = ["cdylib", "rlib"]

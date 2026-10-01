@@ -153,9 +153,12 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Build Kindle library and target std
+        env:
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABI_RUSTFLAGS: "-C link-arg=-Wl,-z,defs"
         run: |
           cargo +"${RUST_NIGHTLY}" build --locked --release --lib \
             --target armv7-unknown-linux-gnueabi \
+            --features kindle-eglibc-2-12 \
             -Z build-std=std,panic_abort
 
       - name: Reject incompatible ELF before packaging
