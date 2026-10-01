@@ -18,6 +18,31 @@ pub fn reader_free_string(value: Option<char_p::Box>) {
 pub fn reader_eval(input: char_p::Ref<'_>, rule: char_p::Ref<'_>) -> char_p::Box {
     let input = input.to_str();
     let rule = rule.to_str().trim();
+    if crate::host_services::in_callback() {
+        return ffi_string(
+            json!({"error":"host callbacks cannot re-enter reader_eval"}).to_string(),
+        );
+    }
+    if rule == "@debug_parse" {
+        return debug_parse_request(input);
+    }
+    if rule == "@host_call" {
+        let result = match serde_json::from_str::<Value>(input) {
+            Ok(request) => match request.get("operation").and_then(Value::as_str) {
+                Some(operation) => crate::host_services::call(
+                    operation,
+                    request.get("arguments").unwrap_or(&Value::Null),
+                ),
+                None => {
+                    json!({"ok":false,"error":{"kind":"invalid_argument","message":"operation is required"}})
+                }
+            },
+            Err(_) => {
+                json!({"ok":false,"error":{"kind":"invalid_argument","message":"invalid host request JSON"}})
+            }
+        };
+        return ffi_string(result.to_string());
+    }
 
     if rule == "@version" {
         return ffi_string(env!("CARGO_PKG_VERSION").to_string());
@@ -103,15 +128,65 @@ pub fn reader_eval(input: char_p::Ref<'_>, rule: char_p::Ref<'_>) -> char_p::Box
 /// ABI v2 书源业务入口：SO 自行完成 URL 规则、HTTP、Cookie、分页和解析。
 #[ffi_export]
 pub fn reader_execute(source_json: char_p::Ref<'_>, request_json: char_p::Ref<'_>) -> char_p::Box {
+    if crate::host_services::in_callback() {
+        return ffi_string(json!({"ok":false,"error":{"kind":"host_reentrant","message":"host callbacks cannot re-enter reader_execute"}}).to_string());
+    }
     ffi_string(executor::execute(
         source_json.to_str(),
         request_json.to_str(),
     ))
 }
 
-/// 对已经取得的响应进行离线规则诊断；该函数绝不主动发起 HTTP 请求。
+/// Register services in this thread/process. NULL unregisters; host owns pointers.
+/// Returns 0 on success, -1 for invalid configuration, -2 during a host callback.
 #[ffi_export]
-pub fn debug_parse(
+/// # Safety
+/// The host must keep callback/user_data alive until unregistering and obey the
+/// callback's buffer, same-thread and non-unwinding contract.
+pub unsafe fn reader_set_host_services(
+    services: Option<&crate::host_services::ReaderHostServices>,
+) -> i32 {
+    unsafe { crate::host_services::set(services) }
+}
+
+fn debug_parse_request(input: &str) -> char_p::Box {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Request {
+        source: Value,
+        body: String,
+        base_url: String,
+        mode: String,
+    }
+    let request: Request = match serde_json::from_str(input) {
+        Ok(request) => request,
+        Err(error) => {
+            return ffi_string(
+                json!({"error":format!("Invalid debug request: {error}")}).to_string(),
+            )
+        }
+    };
+    let source = match request.source {
+        Value::String(source) => source,
+        value => value.to_string(),
+    };
+    // JSON may contain escaped NUL; replace it rather than constructing invalid C strings.
+    let source = ffi_string(source);
+    let body = ffi_string(request.body);
+    let base_url = ffi_string(request.base_url);
+    let mode = ffi_string(request.mode);
+    crate::host_services::with_offline(|| {
+        debug_parse(
+            source.as_ref(),
+            body.as_ref(),
+            base_url.as_ref(),
+            mode.as_ref(),
+        )
+    })
+}
+
+/// Internal offline diagnostic, exposed only via reader_eval(..., "@debug_parse").
+fn debug_parse(
     source_json: char_p::Ref<'_>,
     html_body: char_p::Ref<'_>,
     base_url: char_p::Ref<'_>,
@@ -151,7 +226,7 @@ pub fn debug_parse(
     ffi_string(
         json!({
             "result": result,
-            "logs": ["Debug mode is active. Detailed RuleEngine traces are not implemented yet."],
+            "logs": ["Offline debug mode: network and host services are disabled. Detailed RuleEngine traces are not implemented yet."],
         })
         .to_string(),
     )
@@ -483,6 +558,45 @@ function nextPage(html) {{ return org.jsoup.Jsoup.parse(html).select('a#next').f
             result["data"]["content"],
             format!("ok|0|{chapter}|{base}/next")
         );
+    }
+
+    #[test]
+    fn debug_microcommand_parses_offline_and_rejects_network() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let source = json!({"bookSourceUrl":url,"bookSourceName":"debug fixture",
+            "ruleBookInfo":{"name":"h1@text"},
+            "ruleContent":{"content":format!("@js: java.ajax('{url}')")}});
+        let request = json!({"source":source,"body":"<h1>书名</h1>","baseUrl":url,"mode":"info"});
+        let output = debug_parse_request(&request.to_string());
+        let result: Value = serde_json::from_str(output.to_str()).unwrap();
+        assert_eq!(result["result"]["name"], "书名");
+        let mut request = request;
+        request["mode"] = json!("content");
+        debug_parse_request(&request.to_string());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(!crate::host_services::is_offline());
+        assert!(
+            serde_json::from_str::<Value>(debug_parse_request("{}").to_str())
+                .unwrap()
+                .get("error")
+                .is_some()
+        );
+        let input = CString::new(request.to_string()).unwrap();
+        let rule = CString::new("@debug_parse").unwrap();
+        let result = reader_eval(
+            char_p::Ref::try_from(input.as_c_str()).unwrap(),
+            char_p::Ref::try_from(rule.as_c_str()).unwrap(),
+        );
+        assert!(serde_json::from_str::<Value>(result.to_str())
+            .unwrap()
+            .get("result")
+            .is_some());
     }
 
     #[test]

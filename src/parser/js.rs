@@ -891,6 +891,15 @@ fn eval_js_inner_with_source(
                 ),
             )?;
             java_obj.set(
+                "__hostCall",
+                Func::new(|operation: String, arguments: String| -> String {
+                    match serde_json::from_str::<JsonValue>(&arguments) {
+                        Ok(arguments) => crate::host_services::call(&operation, &arguments).to_string(),
+                        Err(_) => serde_json::json!({"ok":false,"error":{"kind":"invalid_argument","message":"invalid host arguments JSON"}}).to_string(),
+                    }
+                }),
+            )?;
+            java_obj.set(
                 "__toURL",
                 Func::new(
                     |url: String, base_url: rquickjs::function::Opt<String>| -> String {
@@ -1415,6 +1424,16 @@ fn eval_js_inner_with_source(
                 ctx.clone(),
                 r#"(function() {
                     const java = globalThis.java;
+                    java.hostCall = function(operation, arguments) {
+                        const response = JSON.parse(java.__hostCall(
+                            String(operation), JSON.stringify(arguments == null ? null : arguments)));
+                        if (!response.ok) {
+                            const error = new Error(response.error.message);
+                            error.kind = response.error.kind;
+                            throw error;
+                        }
+                        return response.data;
+                    };
                     const nativeSourceSetVariable = globalThis.source.setVariable;
                     const nativeSourceRemoveVariable = globalThis.source.__removeVariable;
                     const nativeSourceRemoveLoginInfo = globalThis.source.__removeLoginInfo;
@@ -1933,19 +1952,52 @@ fn eval_js_inner_with_source(
                     java.createSymmetricCrypto = function(transformation, key, iv) {
                         const algorithm = String(transformation == null ? '' : transformation);
                         const normalized = algorithm.toUpperCase();
-                        if (normalized !== 'AES/CBC/PKCS5PADDING'
-                            && normalized !== 'AES/CBC/PKCS7PADDING') {
+                        if (!/^AES\/(CBC|ECB)\/(PKCS5PADDING|PKCS7PADDING|NOPADDING)$/.test(normalized)) {
                             throw new Error(
                                 'createSymmetricCrypto: unsupported transformation ' + algorithm);
                         }
                         const keyBytes = toBytes(key);
                         const ivBytes = iv == null ? [] : toBytes(iv);
+                        const cbc = normalized.split('/')[1] === 'CBC';
+                        if (![16, 24, 32].includes(keyBytes.length)
+                            || (cbc ? ivBytes.length !== 16 : ivBytes.length !== 0)) {
+                            throw new Error('createSymmetricCrypto: invalid key or iv');
+                        }
+                        const native = keyBytes.length === 16 && cbc
+                            && !normalized.endsWith('/NOPADDING');
+                        let capabilities;
+                        if (!native) {
+                            capabilities = java.hostCall('crypto.capabilities', {});
+                            const combination = capabilities && capabilities.symmetric
+                                && capabilities.symmetric[normalized];
+                            if (!capabilities || capabilities.protocol !== 1 || !combination
+                                || !Array.isArray(combination.keyBytes)
+                                || !combination.keyBytes.includes(keyBytes.length)
+                                || !Number.isSafeInteger(capabilities.maxInputBytes)
+                                || capabilities.maxInputBytes < 0) {
+                                throw new Error('createSymmetricCrypto: host combination unavailable');
+                            }
+                        }
                         const invoke = (mode, data) => {
                             const dataBytes = Array.isArray(data) || data instanceof Uint8Array
                                 ? toBytes(data)
                                 : mode.startsWith('decrypt')
                                     ? JSON.parse(java.__decodeSymmetricInput(String(data == null ? '' : data)))
                                     : toBytes(data);
+                            if (!native) {
+                                if (dataBytes.length > capabilities.maxInputBytes) {
+                                    throw new Error('createSymmetricCrypto: input too large');
+                                }
+                                const bytes = java.hostCall('crypto.symmetric', {
+                                    action: mode, transformation: normalized,
+                                    key: keyBytes, iv: ivBytes, data: dataBytes
+                                });
+                                if (!Array.isArray(bytes) || bytes.length > dataBytes.length + 16
+                                    || !bytes.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255)) {
+                                    throw new Error('createSymmetricCrypto: invalid host byte response');
+                                }
+                                return bytes;
+                            }
                             const result = java.__symmetricCrypto(
                                 mode,
                                 algorithm,
@@ -2249,7 +2301,9 @@ fn restore_object_properties<'js>(
     object: &Object<'js>,
     snapshot: HashMap<String, Value<'js>>,
 ) -> anyhow::Result<()> {
-    let current_keys = object.keys::<String>().collect::<rquickjs::Result<Vec<_>>>()?;
+    let current_keys = object
+        .keys::<String>()
+        .collect::<rquickjs::Result<Vec<_>>>()?;
     for key in current_keys {
         if !snapshot.contains_key(&key) {
             object.remove(key.as_str())?;
