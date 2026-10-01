@@ -20,7 +20,13 @@ ALLOWED_NEEDED = {
     "libc.so.6", "libm.so.6", "libgcc_s.so.1", "libpthread.so.0",
     "libdl.so.2", "librt.so.1", "libresolv.so.2", "libatomic.so.1",
 }
-REQUIRED_SYMBOLS = {"reader_eval", "reader_execute", "debug_parse", "reader_free_string"}
+# debug_parse is an internal operation exposed through reader_eval, not a C ABI symbol.
+REQUIRED_SYMBOLS = {
+    "reader_eval",
+    "reader_execute",
+    "reader_free_string",
+    "reader_set_host_services",
+}
 
 
 def readelf(*args):
