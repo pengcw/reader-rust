@@ -1899,12 +1899,41 @@ fn eval_js_inner_with_source(
             eval_script(
                 ctx.clone(),
                 r#"if (globalThis.java && globalThis.java.getString) {
+                    const _xpathDocuments = new Map();
+                    const _xpathDocumentIds = new Map();
+                    let _xpathDocumentBytes = 0;
+                    const _internXPathDocument = document => {
+                        if (_xpathDocumentIds.has(document)) return _xpathDocumentIds.get(document);
+                        const bytes = document.length * 2;
+                        if (_xpathDocuments.size >= 64 || _xpathDocumentBytes + bytes > 8 * 1024 * 1024) {
+                            throw new RangeError('XPath document pool budget exceeded');
+                        }
+                        const id = _xpathDocuments.size;
+                        _xpathDocuments.set(id, document);
+                        _xpathDocumentIds.set(document, id);
+                        _xpathDocumentBytes += bytes;
+                        return id;
+                    };
+                    const _readerNodeContent = (rule, content, rawCss = false) => {
+                        if (!content || typeof content !== 'object' || !('__readerXPathNode' in content)) return content;
+                        const xpath = !rawCss && /^\s*(?:@xpath:|\/|\.\/|id\()/i.test(String(rule));
+                        if (xpath) {
+                            const node = content.__readerXPathNode;
+                            const document = node && _xpathDocuments.get(node.documentId);
+                            return JSON.stringify({__readerXPathNode: node && {
+                                document: document === undefined ? node.document : document,
+                                path: node.path, htmlMode: node.htmlMode
+                            }});
+                        }
+                        return typeof content.outerHtml === 'function' ? content.outerHtml() : '';
+                    };
                     const _orig_getString = globalThis.java.getString;
                     globalThis.java.getString = function(rule, content, isUrl, unescape) {
                         const r = (rule !== undefined && rule !== null) ? String(rule) : undefined;
                         if (typeof content === 'boolean' && arguments.length === 2) {
                             return _orig_getString(r, undefined, false, content);
                         }
+                        content = _readerNodeContent(r, content);
                         if (typeof content === 'object' && content !== null) {
                             try { content = JSON.stringify(content); } catch (e) {}
                         }
@@ -1914,6 +1943,7 @@ fn eval_js_inner_with_source(
                     const _orig_getStringList = globalThis.java.getStringList;
                     globalThis.java.getStringList = function(rule, content, isUrl) {
                         if (rule == null || String(rule) === '') return null;
+                        content = _readerNodeContent(rule, content);
                         if (typeof content === 'object' && content !== null) {
                             try { content = JSON.stringify(content); } catch (e) {}
                         }
@@ -1940,11 +1970,20 @@ fn eval_js_inner_with_source(
                     const _nativeGetElements = globalThis.java.getElements;
                     const _decorateItems = (values, rawCss = false) => {
                         if (!Array.isArray(values)) values = [];
+                        const carrier = values.find(item => item && item.__readerXPathNode
+                            && typeof item.__readerXPathNode.document === 'string');
+                        const documentId = carrier ? _internXPathDocument(carrier.__readerXPathNode.document) : undefined;
                         const items = values.map(item => {
                             if (!item || item.__readerHtmlElement !== true) return item;
                             const attrs = item.attrs || {};
+                            const node = item.__readerXPathNode;
+                            const context = node ? {
+                                documentId: documentId === undefined ? node.documentId : documentId,
+                                path: node.path, htmlMode: node.htmlMode
+                            } : undefined;
                             return {
                                 __readerIndex: item.__readerIndex,
+                                __readerXPathNode: context,
                                 attr(name) { return attrs[String(name)] || ''; },
                                 hasClass(name) {
                                     return String(attrs.class || '').split(/\s+/).includes(String(name));
@@ -1955,7 +1994,9 @@ fn eval_js_inner_with_source(
                                 select(selector) {
                                     const rule = String(selector);
                                     const xpath = /^\s*(?:@xpath:|\/|\.\/|id\()/i.test(rule);
-                                    return _wrapElements(rule, item.outerHtml || '', xpath ? false : true);
+                                    const content = xpath && context
+                                        ? {__readerXPathNode: context} : item.outerHtml || '';
+                                    return _wrapElements(rule, content, xpath ? false : true);
                                 },
                                 toString() { return item.outerHtml || ''; }
                             };
@@ -1971,6 +2012,7 @@ fn eval_js_inner_with_source(
                         return items;
                     };
                     const _wrapElements = (rule, content, rawCss = false) => {
+                        content = _readerNodeContent(rule, content, rawCss);
                         const raw = _nativeGetElements(rule, content, rawCss);
                         let values;
                         try { values = JSON.parse(raw); } catch (e) { values = []; }
@@ -2973,7 +3015,9 @@ pub(crate) fn java_get_string(
         let script = rule_engine::strip_js_rule(main_rule);
         eval_js(script, target_content, base_url).unwrap_or_default()
     } else if let Some(pure) = html::xpath_rule(main_rule) {
-        html::select_xpath(target_content, pure).join("\n")
+        html::select_xpath_from_context(target_content, pure)
+            .unwrap_or_else(|| html::select_xpath(target_content, pure))
+            .join("\n")
     } else if main_rule.starts_with("@json:")
         || main_rule.starts_with("@Json:")
         || main_rule.starts_with("@JSON:")
@@ -3120,7 +3164,8 @@ pub(crate) fn java_get_string_list(
             Vec::new()
         }
     } else if let Some(pure) = html::xpath_rule(main_rule) {
-        html::select_xpath(target_content, pure)
+        html::select_xpath_from_context(target_content, pure)
+            .unwrap_or_else(|| html::select_xpath(target_content, pure))
     } else if main_rule.starts_with("@json:")
         || main_rule.starts_with("@Json:")
         || main_rule.starts_with("@JSON:")
@@ -3274,7 +3319,8 @@ fn java_get_elements_json_with_mode(
 
     if !raw_css {
         if let Some(pure) = html::xpath_rule(rule) {
-            return html::select_xpath_elements_json(content, pure);
+            return html::select_xpath_elements_from_context(content, pure)
+                .unwrap_or_else(|| html::select_xpath_elements_json(content, pure));
         }
     }
 
@@ -6316,6 +6362,141 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
             ),
             vec!["A1", "B1", "C1", "A2", "B2"]
         );
+    }
+
+    #[test]
+    fn xml_node_context_preserves_case_relative_ancestor_and_sibling_queries() {
+        let body = r#"<?xml version="1.0"?><Root><Item><Child>Value</Child></Item><Sibling>Other</Sibling></Root>"#;
+        let output = eval_js(
+            r#"
+            const item = java.getElement('//Item', result);
+            [item.select('./Child').size(), item.select('.//Child').size(),
+             item.select('.//child').size(), item.select('@xpath:parent::Root').size(),
+             item.select('@xpath:following-sibling::Sibling').size(),
+             item.select('@xpath:/Root/Sibling').size()].join('|')
+        "#,
+            body,
+            "https://fixture.test",
+        )
+        .unwrap();
+        assert_eq!(output, "1|1|0|1|1|1");
+    }
+
+    #[test]
+    fn xml_node_context_preserves_qualified_attributes_and_non_html_void_content() {
+        let body = r#"<?xml version="1.0"?><root xmlns:x="urn:x" xmlns:y="urn:y"><x:Item id="plain" x:id="X" y:id="Y"><x:Child>V</x:Child><link>https://fixture.test/a</link></x:Item></root>"#;
+        let output = eval_js(
+            r#"
+            const item = java.getElement('//x:Item', result);
+            const link = java.getElement('//link', result);
+            [item.attr('id'), item.attr('x:id'), item.attr('y:id'),
+             item.select('.//x:Child').size(),
+             item.outerHtml().includes('urn:x'), item.outerHtml().includes('urn:y'),
+             link.outerHtml().includes('https://fixture.test/a'),
+             link.html()].join('|')
+        "#,
+            body,
+            "https://fixture.test",
+        )
+        .unwrap();
+        assert_eq!(output, "plain|X|Y|1|true|true|true|https://fixture.test/a");
+    }
+
+    #[test]
+    fn xml_node_context_helpers_keep_css_and_json_conversion_paths() {
+        for body in [
+            r#"<?xml version="1.0"?><Root><Item><Child class="kid">Value</Child></Item></Root>"#,
+            r#"<div><section id="item"><span class="kid">Value</span></section></div>"#,
+        ] {
+            let output = eval_js(r#"
+                const item = java.getElement('//Item', result) || java.getElement('//section', result);
+                [java.getElements('.kid', item).size(),
+                 java.getElements('@css:.kid', item).size(),
+                 java.getElements('.kid', item, true).size(),
+                 java.getString('.kid@text', item),
+                 java.getStringList('.kid@text', item).join(','),
+                 java.getStringList('$.a[*]', {a:[1,2]}).join(',')].join('|')
+            "#, body, "https://fixture.test").unwrap();
+            assert_eq!(output, "1|1|1|Value|Value|1,2");
+        }
+    }
+
+    #[test]
+    fn xml_node_context_uses_local_namespace_and_preserves_xml_inner_html() {
+        let body = r#"<?xml version="1.0"?><root xmlns:x="urn:outer"><x:Child>Outer</x:Child><branch xmlns:x="urn:inner"><x:Child>Inner</x:Child><link>URL</link></branch></root>"#;
+        let output = eval_js(
+            r#"
+            const branch = java.getElement('//branch', result);
+            [branch.select('./x:Child').first().text(),
+             java.getString('@xpath:./html()', branch).includes('URL'),
+             java.getString('@xpath:./html()', branch).includes('x:Child')].join('|')
+        "#,
+            body,
+            "https://fixture.test",
+        )
+        .unwrap();
+        assert_eq!(output, "Inner|true|true");
+    }
+
+    #[test]
+    fn xml_node_context_document_pool_is_shared_and_evaluation_local() {
+        let items: String = (0..200)
+            .map(|index| format!("<Item><Child>{index}</Child></Item>"))
+            .collect();
+        let body = format!(
+            "<?xml version=\"1.0\"?><Root><noise>{}</noise>{items}</Root>",
+            "x".repeat(64 * 1024)
+        );
+        let output = eval_js(r#"
+            const items = java.getElements('//Item', result);
+            const again = java.getElements('//Item', result);
+            [items.size(), new Set(items.map(item => item.__readerXPathNode.documentId)).size,
+             items[0].__readerXPathNode.documentId === again[0].__readerXPathNode.documentId,
+             JSON.stringify(items).length < 60000,
+             items.get(100).select('./Child').first().text(),
+             items.get(100).select('@xpath:preceding-sibling::Item[1]/Child').first().text()].join('|')
+        "#, &body, "https://fixture.test").unwrap();
+        assert_eq!(output, "200|1|true|true|100|99");
+        let output = eval_js(
+            r#"java.getElement('//Item', result).__readerXPathNode.documentId"#,
+            &body,
+            "https://fixture.test",
+        )
+        .unwrap();
+        assert_eq!(output, "0");
+    }
+
+    #[test]
+    fn xml_node_context_document_pool_rejects_excess_distinct_documents() {
+        let output = eval_js(r#"
+            let rejected = false;
+            try {
+                for (let i = 0; i < 65; i++) {
+                    java.getElements('//Item', '<?xml version="1.0"?><Root><Item>' + i + '</Item></Root>');
+                }
+            } catch (error) { rejected = error instanceof RangeError; }
+            String(rejected)
+        "#, "", "https://fixture.test").unwrap();
+        assert_eq!(output, "true");
+    }
+
+    #[test]
+    fn xml_node_context_is_accepted_by_java_query_helpers() {
+        let body = r#"<?xml version="1.0"?><Root><Item><Child>One</Child><Child>Two</Child></Item></Root>"#;
+        let output = eval_js(
+            r#"
+            const item = java.getElement('//Item', result);
+            const child = java.getElement('@xpath:./Child', item);
+            [java.getString('@xpath:./Child', item),
+             java.getStringList('@xpath:./Child', item).join(','),
+             java.getElements('@xpath:./Child', item).size(),
+             child === null ? 'missing' : child.text()].join('|')
+        "#,
+            body,
+            "https://fixture.test",
+        )
+        .unwrap();
+        assert_eq!(output, "One\nTwo|One,Two|2|One");
     }
 
     #[test]

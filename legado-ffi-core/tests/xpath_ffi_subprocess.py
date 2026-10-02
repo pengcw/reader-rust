@@ -24,6 +24,11 @@ CASES = [
     ("valid-no-match", XML, "//x:Missing", []),
     ("js-declared-prefix", XML, '@js:java.getString("//x:Item")', "Book"),
     ("js-unknown-prefix", XML, '@js:java.getString("//unknown:Item")', ""),
+    ("js-node-context-roundtrip", XML,
+     '@js:const item=java.getElement("//x:Item",result); [item.attr("x:id"),item.select("@xpath:parent::branch").size(),java.getString("@xpath:.",item)].join("|")',
+     "a|1|Book"),
+    ("js-node-context-unknown-prefix", XML,
+     '@js:java.getElement("//x:Item",result).select(".//unknown:Missing").size()', "0"),
 ]
 
 

@@ -1593,6 +1593,23 @@ fn new_xpath_context<'d>(
     }
 
     let mut registered = HashSet::new();
+    let scope = match node {
+        sxd_xpath::nodeset::Node::Element(element) => Some(element),
+        _ => node.parent().and_then(|parent| match parent {
+            sxd_xpath::nodeset::Node::Element(element) => Some(element),
+            _ => None,
+        }),
+    };
+    if let Some(element) = scope {
+        for namespace in element.namespaces_in_scope() {
+            if required.contains(namespace.prefix()) {
+                context.set_namespace(namespace.prefix(), namespace.uri());
+                registered.insert(namespace.prefix().to_string());
+            }
+        }
+        return required.is_subset(&registered).then_some(context);
+    }
+    // Root queries retain the existing document-wide prefix discovery policy.
     for child in node.document().root().children() {
         if let sxd_document::dom::ChildOfRoot::Element(element) = child {
             if register_xpath_element_namespaces(&mut context, element, &required, &mut registered)
@@ -1863,39 +1880,389 @@ pub(crate) fn select_xpath_elements_json(html: &str, xpath: &str) -> String {
         xpath.as_ref(),
     );
 
-    let items: Vec<serde_json::Value> = nodes
-        .into_iter()
-        .map(|node| {
-            let text = node.string_value();
-            match node {
-                sxd_xpath::nodeset::Node::Element(el) => {
-                    let attrs = el
+    let Some(snapshot) =
+        xpath_document_snapshot(sxd_xpath::nodeset::Node::Root(package.as_document().root()))
+    else {
+        return "[]".into();
+    };
+    let Some(items) = xpath_nodes_json(&nodes, html_mode, &snapshot) else {
+        return "[]".into();
+    };
+    serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct XPathNodeContext {
+    document: String,
+    path: Vec<usize>,
+    html_mode: bool,
+}
+
+const MAX_XPATH_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_XPATH_PATH_DEPTH: usize = 256;
+const MAX_XPATH_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+
+fn with_xpath_node_context<T>(
+    content: &str,
+    invalid: T,
+    query: impl FnOnce(sxd_xpath::nodeset::Node<'_>, bool, &str) -> T,
+) -> Option<T> {
+    if content.len() > MAX_XPATH_DOCUMENT_BYTES * 2 {
+        return content.contains("\"__readerXPathNode\"").then_some(invalid);
+    }
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    let marker = value.get("__readerXPathNode")?;
+    let Ok(context) = serde_json::from_value::<XPathNodeContext>(marker.clone()) else {
+        return Some(invalid);
+    };
+    if context.document.len() > MAX_XPATH_DOCUMENT_BYTES
+        || context.path.is_empty()
+        || context.path.len() > MAX_XPATH_PATH_DEPTH
+    {
+        return Some(invalid);
+    }
+    let Ok(package) = sxd_document::parser::parse(&context.document) else {
+        return Some(invalid);
+    };
+    let mut node = sxd_xpath::nodeset::Node::Root(package.as_document().root());
+    for index in &context.path {
+        let Some(child) = node
+            .children()
+            .into_iter()
+            .filter(|child| matches!(child, sxd_xpath::nodeset::Node::Element(_)))
+            .nth(*index)
+        else {
+            return Some(invalid);
+        };
+        node = child;
+    }
+    Some(query(node, context.html_mode, &context.document))
+}
+
+pub(crate) fn select_xpath_from_context(content: &str, xpath: &str) -> Option<Vec<String>> {
+    with_xpath_node_context(content, Vec::new(), |node, mode, _| {
+        if !mode && (xpath.trim() == "html()" || xpath.trim().ends_with("/html()")) {
+            return xpath_select_nodes(node, xpath)
+                .into_iter()
+                .map(|node| {
+                    if let sxd_xpath::nodeset::Node::Element(element) = node {
+                        let mut output = String::new();
+                        append_sxd_xml_element(element, &mut output, false);
+                        output
+                    } else {
+                        node.string_value()
+                    }
+                })
+                .collect();
+        }
+        xpath_eval_strings_in_mode(node, xpath, mode)
+    })
+}
+
+pub(crate) fn select_xpath_elements_from_context(content: &str, xpath: &str) -> Option<String> {
+    with_xpath_node_context(content, "[]".to_string(), |node, mode, snapshot| {
+        let nodes = xpath_select_nodes_in_mode(node, xpath, mode);
+        let Some(items) = xpath_nodes_json(&nodes, mode, snapshot) else {
+            return "[]".into();
+        };
+        serde_json::to_string(&items).unwrap_or_else(|_| "[]".into())
+    })
+}
+
+fn xpath_element_path(mut element: sxd_document::dom::Element<'_>) -> Vec<usize> {
+    use sxd_document::dom::{ChildOfElement, ChildOfRoot, ParentOfChild};
+    let mut path = Vec::new();
+    while let Some(parent) = element.parent() {
+        match parent {
+            ParentOfChild::Root(root) => {
+                let index = root
+                    .children()
+                    .into_iter()
+                    .filter_map(|child| match child {
+                        ChildOfRoot::Element(child) => Some(child),
+                        _ => None,
+                    })
+                    .position(|child| child == element)
+                    .expect("attached element");
+                path.push(index);
+                break;
+            }
+            ParentOfChild::Element(parent) => {
+                let index = parent
+                    .children()
+                    .into_iter()
+                    .filter_map(|child| match child {
+                        ChildOfElement::Element(child) => Some(child),
+                        _ => None,
+                    })
+                    .position(|child| child == element)
+                    .expect("attached element");
+                path.push(index);
+                element = parent;
+            }
+        }
+    }
+    path.reverse();
+    path
+}
+
+fn xml_qname(
+    element: sxd_document::dom::Element<'_>,
+    name: sxd_document::QName<'_>,
+    preferred: Option<&str>,
+    attribute: bool,
+) -> String {
+    let Some(uri) = name.namespace_uri() else {
+        return name.local_part().to_string();
+    };
+    if !attribute && preferred.is_none() {
+        return name.local_part().to_string();
+    }
+    let namespaces = element.namespaces_in_scope();
+    let preferred = preferred.filter(|prefix| {
+        namespaces
+            .iter()
+            .any(|namespace| namespace.prefix() == *prefix && namespace.uri() == uri)
+    });
+    let prefix = preferred.or_else(|| {
+        namespaces
+            .iter()
+            .find(|namespace| !namespace.prefix().is_empty() && namespace.uri() == uri)
+            .map(|namespace| namespace.prefix())
+    });
+    match prefix {
+        Some(prefix) => format!("{prefix}:{}", name.local_part()),
+        None => name.local_part().to_string(),
+    }
+}
+
+fn xpath_node_json(
+    node: sxd_xpath::nodeset::Node<'_>,
+    html_mode: bool,
+    snapshot: Option<&str>,
+) -> serde_json::Value {
+    match node {
+        sxd_xpath::nodeset::Node::Element(element) => {
+            let attrs = element
+                .attributes()
+                .into_iter()
+                .map(|attr| {
+                    let name = if html_mode {
+                        attr.name().local_part().to_string()
+                    } else {
+                        xml_qname(element, attr.name(), attr.preferred_prefix(), true)
+                    };
+                    (name, serde_json::Value::String(attr.value().to_string()))
+                })
+                .collect::<serde_json::Map<_, _>>();
+            let serialize = |outer| {
+                if html_mode {
+                    sxd_element_to_html(element, outer)
+                } else {
+                    let mut output = String::new();
+                    append_sxd_xml_element(element, &mut output, outer);
+                    output
+                }
+            };
+            let mut item = serde_json::json!({
+                "__readerHtmlElement": true,
+                "__readerXPathNode": {"path":xpath_element_path(element), "htmlMode":html_mode},
+                "attrs":attrs, "html":serialize(false), "outerHtml":serialize(true), "text":node.string_value(),
+            });
+            if let Some(snapshot) = snapshot {
+                item["__readerXPathNode"]["document"] =
+                    serde_json::Value::String(snapshot.to_string());
+            }
+            item
+        }
+        _ => serde_json::Value::String(node.string_value()),
+    }
+}
+
+/// One snapshot per result group, not per element. JS keeps it in a private
+/// evaluation-local pool; serialized result elements contain only compact IDs.
+pub(crate) fn xpath_nodes_json(
+    nodes: &[sxd_xpath::nodeset::Node<'_>],
+    mode: bool,
+    snapshot: &str,
+) -> Option<Vec<serde_json::Value>> {
+    if snapshot.len() > MAX_XPATH_DOCUMENT_BYTES {
+        return None;
+    }
+    let mut emitted = false;
+    let mut bytes = 2usize;
+    let mut items = Vec::new();
+    for node in nodes {
+        let element = matches!(node, sxd_xpath::nodeset::Node::Element(_));
+        let item = xpath_node_json(*node, mode, (element && !emitted).then_some(snapshot));
+        emitted |= element;
+        if item
+            .get("__readerXPathNode")
+            .and_then(|context| context.get("path"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|path| path.len() > MAX_XPATH_PATH_DEPTH)
+        {
+            return None;
+        }
+        bytes = bytes.checked_add(serde_json::to_vec(&item).ok()?.len() + 1)?;
+        if bytes > MAX_XPATH_OUTPUT_BYTES {
+            return None;
+        }
+        items.push(item);
+    }
+    Some(items)
+}
+
+fn xml_escape_attribute(value: &str) -> String {
+    html_escape_attribute(value)
+        .replace('\t', "&#9;")
+        .replace('\n', "&#10;")
+        .replace('\r', "&#13;")
+}
+
+fn append_sxd_xml_element(
+    element: sxd_document::dom::Element<'_>,
+    output: &mut String,
+    outer: bool,
+) {
+    if output.len() > MAX_XPATH_DOCUMENT_BYTES {
+        return;
+    }
+    let name = xml_qname(element, element.name(), element.preferred_prefix(), false);
+    if outer {
+        output.push('<');
+        output.push_str(&name);
+        output.push_str(" xmlns=\"");
+        output.push_str(&xml_escape_attribute(if name.contains(':') {
+            element.recursive_default_namespace_uri().unwrap_or("")
+        } else {
+            element.name().namespace_uri().unwrap_or("")
+        }));
+        output.push('"');
+        let mut namespaces = element.namespaces_in_scope();
+        namespaces.sort_by(|a, b| a.prefix().cmp(b.prefix()));
+        for namespace in namespaces {
+            if namespace.prefix().is_empty() || namespace.prefix() == "xml" {
+                continue;
+            }
+            output.push_str(" xmlns:");
+            output.push_str(namespace.prefix());
+            output.push_str("=\"");
+            output.push_str(&xml_escape_attribute(namespace.uri()));
+            output.push('"');
+            if output.len() > MAX_XPATH_DOCUMENT_BYTES {
+                return;
+            }
+        }
+        for attr in element.attributes() {
+            output.push(' ');
+            output.push_str(&xml_qname(
+                element,
+                attr.name(),
+                attr.preferred_prefix(),
+                true,
+            ));
+            output.push_str("=\"");
+            output.push_str(&xml_escape_attribute(attr.value()));
+            output.push('"');
+            if output.len() > MAX_XPATH_DOCUMENT_BYTES {
+                return;
+            }
+        }
+        output.push('>');
+    }
+    for child in element.children() {
+        if output.len() > MAX_XPATH_DOCUMENT_BYTES {
+            return;
+        }
+        match child {
+            sxd_document::dom::ChildOfElement::Element(element) => {
+                append_sxd_xml_element(element, output, true)
+            }
+            sxd_document::dom::ChildOfElement::Text(text) => {
+                output.push_str(&html_escape_text(text.text()).replace('\r', "&#13;"))
+            }
+            sxd_document::dom::ChildOfElement::Comment(comment) => {
+                output.push_str("<!--");
+                output.push_str(comment.text());
+                output.push_str("-->");
+            }
+            sxd_document::dom::ChildOfElement::ProcessingInstruction(pi) => {
+                append_xml_pi(pi, output)
+            }
+        }
+    }
+    if outer {
+        output.push_str("</");
+        output.push_str(&name);
+        output.push('>');
+    }
+}
+
+fn append_xml_pi(pi: sxd_document::dom::ProcessingInstruction<'_>, output: &mut String) {
+    output.push_str("<?");
+    output.push_str(pi.target());
+    if let Some(value) = pi.value() {
+        output.push(' ');
+        output.push_str(value);
+    }
+    output.push_str("?>");
+}
+
+pub(crate) fn xpath_document_snapshot(node: sxd_xpath::nodeset::Node<'_>) -> Option<String> {
+    // Check depth before entering the recursive serializer.
+    let mut pending = vec![(
+        sxd_xpath::nodeset::Node::Root(node.document().root()),
+        0usize,
+    )];
+    let mut input_bytes = 0usize;
+    while let Some((node, depth)) = pending.pop() {
+        if depth > MAX_XPATH_PATH_DEPTH {
+            return None;
+        }
+        input_bytes = input_bytes.checked_add(match node {
+            sxd_xpath::nodeset::Node::Element(element) => {
+                element.name().local_part().len()
+                    + element
                         .attributes()
                         .iter()
-                        .map(|a| {
-                            (
-                                a.name().local_part().to_string(),
-                                serde_json::Value::String(a.value().to_string()),
-                            )
-                        })
-                        .collect::<serde_json::Map<_, _>>();
-                    serde_json::json!({
-                        "__readerHtmlElement": true,
-                        "attrs": attrs,
-                        "html": sxd_element_to_html(el, false),
-                        "outerHtml": sxd_element_to_html(el, true),
-                        "text": text,
-                    })
-                }
-                sxd_xpath::nodeset::Node::Attribute(attr) => {
-                    serde_json::Value::String(attr.value().to_string())
-                }
-                _ => serde_json::Value::String(text),
+                        .map(|attr| attr.name().local_part().len() + attr.value().len())
+                        .sum::<usize>()
             }
-        })
-        .collect();
-
-    serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+            sxd_xpath::nodeset::Node::Text(text) => text.text().len(),
+            sxd_xpath::nodeset::Node::Comment(comment) => comment.text().len(),
+            sxd_xpath::nodeset::Node::ProcessingInstruction(pi) => {
+                pi.target().len() + pi.value().map(str::len).unwrap_or(0)
+            }
+            _ => 0,
+        })?;
+        if input_bytes > MAX_XPATH_DOCUMENT_BYTES {
+            return None;
+        }
+        pending.extend(node.children().into_iter().map(|child| {
+            let next_depth =
+                depth + usize::from(matches!(child, sxd_xpath::nodeset::Node::Element(_)));
+            (child, next_depth)
+        }));
+    }
+    let mut output = String::from("<?xml version=\"1.0\"?>");
+    for child in node.document().root().children() {
+        match child {
+            sxd_document::dom::ChildOfRoot::Element(element) => {
+                append_sxd_xml_element(element, &mut output, true)
+            }
+            sxd_document::dom::ChildOfRoot::Comment(comment) => {
+                output.push_str("<!--");
+                output.push_str(comment.text());
+                output.push_str("-->");
+            }
+            sxd_document::dom::ChildOfRoot::ProcessingInstruction(pi) => {
+                append_xml_pi(pi, &mut output)
+            }
+        }
+    }
+    (output.len() <= MAX_XPATH_DOCUMENT_BYTES).then_some(output)
 }
 
 pub(crate) fn sxd_element_to_html(element: sxd_document::dom::Element<'_>, outer: bool) -> String {
@@ -2242,6 +2609,100 @@ pub fn clean_html(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xml_node_context_snapshot_preserves_namespace_resets_and_attribute_aliases() {
+        let xml = r#"<?xml version="1.0"?><root xmlns="urn:a" xmlns:p="urn:a"><child xmlns:p="urn:b"/><plain xmlns=""/></root>"#;
+        let (package, _) = parse_xpath_package_with_mode(xml).unwrap();
+        let snapshot =
+            xpath_document_snapshot(sxd_xpath::nodeset::Node::Root(package.as_document().root()))
+                .unwrap();
+        let restored = sxd_document::parser::parse(&snapshot).unwrap();
+        let children = xpath_select_nodes(
+            sxd_xpath::nodeset::Node::Root(restored.as_document().root()),
+            "/*/*",
+        );
+        let namespaces: Vec<_> = children
+            .iter()
+            .map(|node| match node {
+                sxd_xpath::nodeset::Node::Element(element) => element.name().namespace_uri(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(namespaces, vec![Some("urn:a"), None]);
+        let xml =
+            r#"<?xml version="1.0"?><root xmlns:x="urn:a"><item xmlns:y="urn:a" x:id="X"/></root>"#;
+        let wrapped: serde_json::Value =
+            serde_json::from_str(&select_xpath_elements_json(xml, "//item")).unwrap();
+        assert_eq!(wrapped[0]["attrs"]["x:id"], "X");
+        assert!(wrapped[0]["attrs"].get("y:id").is_none());
+    }
+
+    #[test]
+    fn xml_node_context_result_shares_snapshot_and_enforces_budgets() {
+        let xml = format!(
+            "<?xml version=\"1.0\"?><root><noise>{}</noise>{}</root>",
+            "x".repeat(64 * 1024),
+            "<Item><Child>V</Child></Item>".repeat(200)
+        );
+        let output = select_xpath_elements_json(&xml, "//Item");
+        let items: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let items = items.as_array().unwrap();
+        assert_eq!(items.len(), 200);
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item["__readerXPathNode"].get("document").is_some())
+                .count(),
+            1
+        );
+        assert!(
+            output.len() < xml.len() * 6,
+            "output expanded to {} bytes",
+            output.len()
+        );
+        let package = sxd_document::parser::parse("<root>value</root>").unwrap();
+        let root = sxd_xpath::nodeset::Node::Root(package.as_document().root());
+        assert!(xpath_nodes_json(&[], false, &"x".repeat(MAX_XPATH_DOCUMENT_BYTES + 1)).is_none());
+        let huge = format!("<root>{}</root>", "x".repeat(128 * 1024));
+        let package = sxd_document::parser::parse(&huge).unwrap();
+        let node = xpath_select_nodes(
+            sxd_xpath::nodeset::Node::Root(package.as_document().root()),
+            "/root",
+        )[0];
+        assert!(xpath_nodes_json(&vec![node; 100], false, &huge).is_none());
+        let deep = format!(
+            "{}{}",
+            "<a>".repeat(MAX_XPATH_PATH_DEPTH + 1),
+            "</a>".repeat(MAX_XPATH_PATH_DEPTH + 1)
+        );
+        let package = sxd_document::parser::parse(&deep).unwrap();
+        assert!(xpath_document_snapshot(sxd_xpath::nodeset::Node::Root(
+            package.as_document().root()
+        ))
+        .is_none());
+        assert!(xpath_document_snapshot(root).is_some());
+    }
+
+    #[test]
+    fn xml_node_context_invalid_descriptors_never_fall_back_to_html() {
+        for marker in [
+            serde_json::json!({}),
+            serde_json::json!({"document":"<root/>","htmlMode":false,"path":[]}),
+            serde_json::json!({"document":"<root/>","htmlMode":false,"path":[99]}),
+            serde_json::json!({"document":"broken","htmlMode":false,"path":[0]}),
+            serde_json::json!({"document":"<root/>","htmlMode":false,"path":[0],"extra":true}),
+            serde_json::json!({"document":"<root/>","htmlMode":false,"path":vec![0; MAX_XPATH_PATH_DEPTH + 1]}),
+        ] {
+            let content = serde_json::json!({"__readerXPathNode":marker}).to_string();
+            assert_eq!(select_xpath_from_context(&content, "//*"), Some(Vec::new()));
+            assert_eq!(
+                select_xpath_elements_from_context(&content, "//*").as_deref(),
+                Some("[]")
+            );
+        }
+        assert!(select_xpath_from_context("<root/>", "//*").is_none());
+    }
 
     #[test]
     fn xpath_parser_normalizes_common_html_entities() {

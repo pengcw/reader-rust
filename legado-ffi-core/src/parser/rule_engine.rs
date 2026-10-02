@@ -1626,6 +1626,7 @@ impl RuleEngine {
             list_js,
             base_url,
             &list_context,
+            html_mode,
         );
         let mut out = Vec::with_capacity(items.len());
 
@@ -2328,6 +2329,7 @@ fn parse_chapter_list_xpath(
         list_js,
         base_url,
         ctx,
+        html_mode,
     );
 
     let mut out = Vec::with_capacity(items.len());
@@ -3127,41 +3129,28 @@ fn apply_xpath_list_js<'a>(
     script: Option<&str>,
     base_url: &str,
     ctx: &RuleVariableContext,
+    html_mode: bool,
 ) -> Vec<sxd_xpath::nodeset::Node<'a>> {
     if script.is_none() {
         return items;
     }
 
-    let values = items
-        .iter()
-        .enumerate()
-        .map(|(index, node)| match node {
-            sxd_xpath::nodeset::Node::Element(element) => {
-                let attrs = element
-                    .attributes()
-                    .iter()
-                    .map(|attr| {
-                        (
-                            attr.name().local_part().to_string(),
-                            Value::String(attr.value().to_string()),
-                        )
-                    })
-                    .collect::<serde_json::Map<_, _>>();
-                json!({
-                    "__readerHtmlElement": true,
-                    "__readerIndex": index,
-                    "attrs": attrs,
-                    "html": html::sxd_element_to_html(*element, false),
-                    "outerHtml": html::sxd_element_to_html(*element, true),
-                    "text": node.string_value(),
-                })
-            }
-            _ => json!({
-                "__readerIndex": index,
-                "value": node.string_value(),
-            }),
-        })
-        .collect();
+    if items.is_empty() {
+        return items;
+    }
+    let Some(snapshot) = html::xpath_document_snapshot(items[0]) else {
+        return Vec::new();
+    };
+    let Some(mut values) = html::xpath_nodes_json(&items, html_mode, &snapshot) else {
+        return Vec::new();
+    };
+    for (index, (value, node)) in values.iter_mut().zip(&items).enumerate() {
+        if matches!(node, sxd_xpath::nodeset::Node::Element(_)) {
+            value["__readerIndex"] = json!(index);
+        } else {
+            *value = json!({"__readerIndex":index, "value":node.string_value()});
+        }
+    }
 
     let Some(Value::Array(result)) = eval_list_js(values, script, base_url, ctx) else {
         return items;
@@ -4264,6 +4253,29 @@ mod tests {
                 "{rule}"
             );
         }
+    }
+
+    #[test]
+    fn xml_node_context_xpath_list_js_returns_original_nodes_after_filtering() {
+        let source = BookSource {
+            book_source_url: "https://fixture.test".into(),
+            rule_search: Some(SearchRule {
+                book_list: Some(
+                    "@xpath://Item@js:result.filter(item => item.select('./Enabled').size() > 0)"
+                        .into(),
+                ),
+                name: Some("./Name".into()),
+                book_url: Some("./Url".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let books = RuleEngine::new().unwrap().search_books(&source,
+            r#"<?xml version="1.0"?><Root><Item><Name>First</Name><Url>/1</Url></Item><Item><Enabled/><Name>Second</Name><Url>/2</Url></Item></Root>"#,
+            "https://fixture.test");
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].name, "Second");
+        assert_eq!(books[0].book_url, "https://fixture.test/2");
     }
 
     #[test]
