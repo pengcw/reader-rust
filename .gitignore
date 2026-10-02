@@ -1,30 +1,21 @@
-# Environment variables (contains secrets)
+# Environment variables (may contain secrets)
 .env
 
-# Rust build artifacts
-target/
+# Rust build output, including generated shared libraries
+**/target/
 
 # Python cache
 __pycache__/
 *.py[cod]
 *.pyo
 
-# IDE
+.pi/
+.codex/
+
+# IDE and OS files
 .idea/
 .vscode/
 *.swp
 *.swo
-
-# OS
 .DS_Store
 Thumbs.db
-
-# Storage data (if contains user data)
-/storage/
-
-release-assets/
-node_modules/
-playwright-report/
-test-results/
-.superpowers/
-.codegraph/
