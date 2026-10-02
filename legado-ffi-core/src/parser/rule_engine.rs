@@ -2841,15 +2841,63 @@ fn interpolate_templates(
 }
 
 fn find_template_close(expression: &str) -> Option<usize> {
-    let mut brace_depth = 0;
-    for (index, ch) in expression.char_indices() {
-        match ch {
-            '{' => brace_depth += 1,
-            '}' if brace_depth > 0 => brace_depth -= 1,
-            '}' if expression[index..].starts_with("}}") => return Some(index),
-            _ => {}
-        }
+    enum State {
+        Code,
+        Quoted(u8),
+        LineComment,
+        BlockComment,
     }
+
+    let bytes = expression.as_bytes();
+    let mut state = State::Code;
+    let mut brace_depth = 0usize;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+        match state {
+            State::Quoted(quote) => {
+                if byte == b'\\' {
+                    index += 2;
+                    continue;
+                }
+                if byte == quote {
+                    state = State::Code;
+                }
+            }
+            State::LineComment => {
+                if matches!(byte, b'\n' | b'\r') {
+                    state = State::Code;
+                }
+            }
+            State::BlockComment => {
+                if byte == b'*' && next == Some(b'/') {
+                    state = State::Code;
+                    index += 2;
+                    continue;
+                }
+            }
+            State::Code => match (byte, next) {
+                (b'\'' | b'"' | b'`', _) => state = State::Quoted(byte),
+                (b'/', Some(b'/')) => {
+                    state = State::LineComment;
+                    index += 2;
+                    continue;
+                }
+                (b'/', Some(b'*')) => {
+                    state = State::BlockComment;
+                    index += 2;
+                    continue;
+                }
+                (b'{', _) => brace_depth += 1,
+                (b'}', _) if brace_depth > 0 => brace_depth -= 1,
+                (b'}', Some(b'}')) => return Some(index),
+                _ => {}
+            },
+        }
+        index += 1;
+    }
+    // Returned offsets always point to ASCII braces, hence UTF-8 boundaries.
     None
 }
 
@@ -4626,6 +4674,59 @@ mod tests {
         )
         .unwrap();
         assert_eq!(chapter_vars["pageToken"], "NEXT");
+    }
+
+    #[test]
+    fn template_close_ignores_quoted_braces_escapes_and_comments() {
+        for expression in [
+            r#""}}""#,
+            r#"'it\'s }}'"#,
+            r#""escaped \\ and \" }}""#,
+            "`text }}`",
+            r#"({a:{b:'}}'}}).a.b"#,
+            "1 /* }} { */ + 2",
+            "1 // }} {\n + 2",
+            r#""中文}}""#,
+            "8 / 2",
+        ] {
+            assert_eq!(
+                find_template_close(&[expression, "}}TAIL"].concat()),
+                Some(expression.len()),
+                "{expression}"
+            );
+        }
+        for malformed in [
+            "'unterminated }}",
+            "/* unterminated }}",
+            "{unclosed }}",
+            "1 // }}",
+        ] {
+            assert_eq!(find_template_close(malformed), None, "{malformed}");
+        }
+    }
+
+    #[test]
+    fn template_interpolation_handles_literal_delimiters_and_comments() {
+        let ctx = RuleVariableContext::default();
+        for (rule, expected) in [
+            (r#"{{"}}"}}"#, "}}"),
+            (r#"{{'it\'s }}'}}"#, "it's }}"),
+            (r#"{{({a:{b:'}}'}}).a.b}}"#, "}}"),
+            ("{{1 /* }} { */ + 2}}", "3"),
+            ("{{1 // }} {\n + 2}}", "3"),
+            ("{{`text }}`}}", "text }}"),
+            (r#"前{{"中文}}"}}后{{8 / 2}}"#, "前中文}}后4"),
+            (
+                "before {{'unterminated }} after",
+                "before {{'unterminated }} after",
+            ),
+        ] {
+            assert_eq!(
+                interpolate_templates(rule, "", "https://fixture.test", &ctx, None),
+                expected,
+                "{rule}"
+            );
+        }
     }
 
     #[test]
