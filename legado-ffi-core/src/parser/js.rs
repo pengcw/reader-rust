@@ -5112,7 +5112,7 @@ mod tests {
             r#"/ajax,{"method":"POST","headers":{"X-Url":"configured","X-Order":"url"},"body":"payload","js":"result"}"#
                 .to_string();
         let script = format!(
-            "(() => {{ globalThis.__sourceHeaderCounter = 0; const ajax = java.ajax([{}]); const all = java.ajaxAll([{}, {}]); const one = java.connect({}, {{'X-Order':'connect','X-Connect':'configured'}}); return [ajax, all[0].code(), all[1].code(), one.code(), all[0].body(), all[1].body(), one.body()].join('|'); }})()",
+            "(() => {{ const ajax = java.ajax([{}]); const all = java.ajaxAll([{}, {}]); const one = java.connect({}, {{'X-Order':'connect','X-Connect':'configured'}}); return [ajax, all[0].code(), all[1].code(), one.code(), all[0].body(), all[1].body(), one.body(), source.get('header-evaluation-count')].join('|'); }})()",
             serde_json::to_string(&url).unwrap(),
             serde_json::to_string(&url).unwrap(),
             serde_json::to_string(&url).unwrap(),
@@ -5121,7 +5121,7 @@ mod tests {
         let source = BookSource {
             book_source_url: format!("http://{address}/source"),
             header: Some(
-                r#"js:globalThis.__sourceHeaderCounter=(globalThis.__sourceHeaderCounter||0)+1;JSON.stringify({"X-Source":String(globalThis.__sourceHeaderCounter),"X-Order":"source"})"#
+                r#"js:const count=Number(source.get('header-evaluation-count')||'0')+1;source.put('header-evaluation-count',String(count));JSON.stringify({"X-Source":String(count),"X-Order":"source"})"#
                     .to_string(),
             ),
             ..Default::default()
@@ -5130,13 +5130,17 @@ mod tests {
         let result = with_js_http_context(&client, &source, || {
             eval_js(&script, "", &source.book_source_url).unwrap()
         });
-        assert_eq!(result, "ok|201|201|201|ok|ok|ok");
+        assert_eq!(result, "ok|201|201|201|ok|ok|ok|3");
 
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 4);
         for (index, (request, body)) in requests[..3].iter().enumerate() {
             assert!(request.starts_with("post /ajax "));
-            assert!(request.contains(&format!("x-source: {}", index + 1)));
+            assert!(
+                request.contains(&format!("x-source: {}", index + 1)),
+                "source header evaluation {} was not reflected in request: {request}",
+                index + 1
+            );
             assert!(request.contains("x-url: configured"));
             assert!(request.contains("x-order: url"));
             assert_eq!(body, "payload");

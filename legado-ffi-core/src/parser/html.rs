@@ -1467,10 +1467,116 @@ impl sxd_xpath::function::Function for HtmlIdFunction {
     }
 }
 
-fn new_xpath_context<'d>() -> sxd_xpath::Context<'d> {
+fn xpath_name_start(character: char) -> bool {
+    character == '_'
+        || character.is_alphabetic()
+        || (!character.is_ascii() && !character.is_whitespace())
+}
+
+fn xpath_name_char(character: char) -> bool {
+    xpath_name_start(character) || character.is_ascii_digit() || matches!(character, '.' | '-')
+}
+
+fn xpath_prefixes(xpath: &str) -> HashSet<String> {
+    let characters: Vec<_> = xpath.char_indices().collect();
+    let mut prefixes = HashSet::new();
+    let mut quote = None;
+
+    for index in 0..characters.len() {
+        let (_, character) = characters[index];
+        if let Some(active_quote) = quote {
+            if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            continue;
+        }
+        if character != ':'
+            || index == 0
+            || index + 1 == characters.len()
+            || characters[index - 1].1 == ':'
+            || characters[index + 1].1 == ':'
+        {
+            continue;
+        }
+
+        let mut start = index;
+        while start > 0 && xpath_name_char(characters[start - 1].1) {
+            start -= 1;
+        }
+        if start == index || !xpath_name_start(characters[start].1) {
+            continue;
+        }
+        let next = characters[index + 1].1;
+        if next != '*' && !xpath_name_start(next) {
+            continue;
+        }
+
+        let prefix_start = characters[start].0;
+        let (last_offset, last_character) = characters[index - 1];
+        let prefix_end = last_offset + last_character.len_utf8();
+        prefixes.insert(xpath[prefix_start..prefix_end].to_string());
+    }
+
+    prefixes
+}
+
+fn register_xpath_element_namespaces<'d>(
+    context: &mut sxd_xpath::Context<'d>,
+    element: sxd_document::dom::Element<'d>,
+    required: &HashSet<String>,
+    registered: &mut HashSet<String>,
+) -> bool {
+    for namespace in element.namespaces_in_scope() {
+        let prefix = namespace.prefix();
+        if required.contains(prefix) && registered.insert(prefix.to_string()) {
+            context.set_namespace(prefix, namespace.uri());
+        }
+    }
+    if required.is_subset(registered) {
+        return true;
+    }
+    for child in element.children() {
+        if let sxd_document::dom::ChildOfElement::Element(child) = child {
+            if register_xpath_element_namespaces(context, child, required, registered) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn new_xpath_context<'d>(
+    node: sxd_xpath::nodeset::Node<'d>,
+    xpath: &str,
+) -> Option<sxd_xpath::Context<'d>> {
     let mut context = sxd_xpath::Context::new();
     context.set_function("id", HtmlIdFunction);
-    context
+
+    let required = xpath_prefixes(xpath);
+    if required.is_empty() {
+        return Some(context);
+    }
+
+    let mut registered = HashSet::new();
+    for child in node.document().root().children() {
+        if let sxd_document::dom::ChildOfRoot::Element(element) = child {
+            if register_xpath_element_namespaces(&mut context, element, &required, &mut registered)
+            {
+                break;
+            }
+        }
+    }
+
+    // sxd-xpath 0.4.2 panics while evaluating an unbound prefix. Treat an
+    // unresolved prefix as a non-match instead of allowing it to abort the FFI host.
+    if !required.is_subset(&registered) {
+        return None;
+    }
+    Some(context)
 }
 
 pub(crate) fn xpath_rule(rule: &str) -> Option<&str> {
@@ -1546,7 +1652,7 @@ fn evaluate_xpath_with_fallback<'d>(
     xpath: &str,
 ) -> Option<sxd_xpath::Value<'d>> {
     let norm = normalize_xpath_query(xpath);
-    let context = new_xpath_context();
+    let context = new_xpath_context(node, norm.as_ref())?;
     for candidate in xpath_candidates(
         norm.as_ref(),
         matches!(node, sxd_xpath::nodeset::Node::Root(_)),
@@ -2146,6 +2252,18 @@ mod tests {
             "/html/body/p",
         );
         assert_eq!(values, vec!["Normal"]);
+    }
+
+    #[test]
+    fn xpath_parser_resolves_declared_prefixes_and_rejects_unknown_ones_safely() {
+        let xml = r#"<?xml version="1.0"?><root note="urn:x:books"><branch xmlns:x="urn:books"><x:Item x:id="a">Book</x:Item></branch></root>"#;
+        assert_eq!(select_xpath(xml, "//x:Item"), vec!["Book"]);
+        assert_eq!(select_xpath(xml, "//x:Item[@x:id='a']"), vec!["Book"]);
+        assert!(select_xpath(xml, "//unknown:Item").is_empty());
+        assert_eq!(
+            select_xpath(xml, "count(//root[@note='urn:x:books'])"),
+            vec!["1"]
+        );
     }
 
     #[test]
