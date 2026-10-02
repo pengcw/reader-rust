@@ -3130,6 +3130,203 @@ fn direct_get_key(rule: &str) -> Option<&str> {
         .strip_prefix("@get:{")
         .and_then(|value| value.strip_suffix('}'))
         .map(str::trim)
+        .filter(|key| !key.contains(['{', '}']))
+}
+
+#[derive(Clone, Copy)]
+enum FieldInput<'a> {
+    Html(scraper::ElementRef<'a>),
+    Json(&'a Value),
+    XPath(sxd_xpath::nodeset::Node<'a>, bool),
+}
+
+impl FieldInput<'_> {
+    fn fallback(self) -> ParseMode {
+        match self {
+            Self::Html(_) => ParseMode::Css,
+            Self::Json(_) => ParseMode::JsonPath,
+            Self::XPath(_, _) => ParseMode::XPath,
+        }
+    }
+
+    fn scalar(self, rule: &str, base_url: &str, ctx: &mut RuleVariableContext) -> Option<String> {
+        match self {
+            Self::Html(el) => eval_field_html_with_ctx(rule, &el, base_url, ctx),
+            Self::Json(value) => eval_field_json_with_ctx(rule, value, base_url, ctx),
+            Self::XPath(node, mode) => eval_field_xpath_with_ctx(rule, node, base_url, ctx, mode),
+        }
+    }
+
+    fn values(self, rule: &str, base_url: &str, ctx: &mut RuleVariableContext) -> Vec<String> {
+        if rule.trim().is_empty() {
+            return Vec::new();
+        }
+        if let Some(key) = direct_get_key(rule) {
+            return ctx
+                .get(key)
+                .filter(|text| !text.is_empty())
+                .into_iter()
+                .collect();
+        }
+        let input = match self {
+            Self::Html(el) => html::get_descendant_text_nodes(&el),
+            Self::Json(value) => serde_json::to_string(value).unwrap_or_default(),
+            Self::XPath(node, _) => node.string_value(),
+        };
+        let mut source = SourceRule::compile(rule, self.fallback(), matches!(self, Self::Json(_)));
+        if matches!(self, Self::Json(_))
+            && source.mode == ParseMode::XPath
+            && (rule.trim_start().starts_with('/') || rule.trim_start().starts_with("./"))
+        {
+            source.mode = ParseMode::JsonPath;
+        }
+        evaluate_put_entries(&source.put_entries, ctx, |rule, ctx| {
+            self.scalar(rule, base_url, ctx)
+        });
+        if let Some(key) = direct_get_key(&source.rule) {
+            return ctx
+                .get(key)
+                .filter(|text| !text.is_empty())
+                .into_iter()
+                .collect();
+        }
+        let expanded = match self {
+            Self::Json(value) => interpolate_json_templates(&source.rule, value, base_url, ctx),
+            _ => interpolate_common_templates(&source.rule, &input, base_url, ctx),
+        };
+        let had_templates = expanded != source.rule;
+        source.make_up_rule(&expanded);
+        let (pure, js) = extract_js(&source.rule);
+        let mut values = if let Some(key) = direct_get_key(pure) {
+            ctx.get(key).into_iter().collect()
+        } else {
+            match source.mode {
+                ParseMode::Css => match self {
+                    Self::Html(el) => html::select_text_list_from_element(&el, pure),
+                    _ => html::select_text_list(&html::parse_document(&input), pure),
+                },
+                ParseMode::XPath => match self {
+                    Self::XPath(_, _) if pure.trim().is_empty() => vec![input.clone()],
+                    Self::XPath(node, mode) => html::xpath_eval_strings_in_mode(node, pure, mode),
+                    _ => html::select_xpath(&input, pure),
+                },
+                ParseMode::JsonPath => match self {
+                    Self::Json(value) if !pure.is_empty() => {
+                        let values: Vec<_> = jsonpath::jsonpath_query(value, pure)
+                            .iter()
+                            .filter_map(jsonpath::value_to_string)
+                            .collect();
+                        if values.is_empty() && !pure.starts_with('$') {
+                            vec![pure.to_string()]
+                        } else {
+                            values
+                        }
+                    }
+                    _ => Vec::new(),
+                },
+                ParseMode::Regex => {
+                    regex_capture_first(pure.trim_start_matches(':').trim(), &input)
+                        .and_then(|row| row.get(1).or_else(|| row.first()).and_then(Clone::clone))
+                        .into_iter()
+                        .collect()
+                }
+                ParseMode::Js => {
+                    eval_js_with_bindings(strip_js_rule(pure), &input, base_url, &ctx.js_bindings())
+                        .ok()
+                        .into_iter()
+                        .collect()
+                }
+            }
+        };
+        if values.is_empty() && had_templates && !pure.is_empty() && !matches!(self, Self::Json(_))
+        {
+            values.push(pure.to_string());
+        }
+        values
+            .into_iter()
+            .filter_map(|mut text| {
+                if let Some(script) = js {
+                    if let Ok(result) =
+                        eval_js_with_bindings(script, &text, base_url, &ctx.js_bindings())
+                    {
+                        text = result;
+                    }
+                }
+                text = source.apply_replacement(&text);
+                if matches!(self, Self::XPath(_, _)) {
+                    text = text.trim().to_string();
+                }
+                (!text.is_empty()).then_some(text)
+            })
+            .collect()
+    }
+
+    fn groups(self, rule: &str, base_url: &str, ctx: &mut RuleVariableContext) -> Vec<String> {
+        let mode = classify_rule_mode(rule, self.fallback(), matches!(self, Self::Json(_))).0;
+        if matches!(mode, ParseMode::Js | ParseMode::Regex) {
+            return self.values(rule, base_url, ctx);
+        }
+        let split = rule_analyzer::split_top_level(rule, &["&&", "||", "%%"]);
+        match split.delimiter.as_deref() {
+            Some("||") => {
+                for branch in split.parts {
+                    let values = self.groups(&branch, base_url, ctx);
+                    if !values.is_empty() {
+                        return values;
+                    }
+                }
+                Vec::new()
+            }
+            Some("%%") => rule_analyzer::interleave_result_groups(
+                split
+                    .parts
+                    .iter()
+                    .map(|branch| self.groups(branch, base_url, ctx))
+                    .collect(),
+            ),
+            Some("&&") => split
+                .parts
+                .iter()
+                .flat_map(|branch| self.groups(branch, base_url, ctx))
+                .collect(),
+            _ => self.values(rule, base_url, ctx),
+        }
+    }
+
+    // None means this is not a combination: the old scalar path stays intact.
+    fn combined(
+        self,
+        rule: &str,
+        base_url: &str,
+        ctx: &mut RuleVariableContext,
+    ) -> Option<Option<String>> {
+        let mode = classify_rule_mode(rule, self.fallback(), matches!(self, Self::Json(_))).0;
+        if matches!(mode, ParseMode::Js | ParseMode::Regex) {
+            return None;
+        }
+        // Stop before postprocessing; operators inside scripts/replacements are
+        // never field delimiters. Reuse the existing quote/bracket-aware scanner.
+        let stages =
+            rule_analyzer::split_top_level(rule, &["@js:", "@jS:", "@Js:", "@JS:", "<js>", "##"]);
+        let selection = stages.parts.first().map(String::as_str).unwrap_or("");
+        rule_analyzer::split_top_level(selection, &["&&", "||", "%%"])
+            .delimiter
+            .as_ref()?;
+        let mut text = self.groups(selection, base_url, ctx).join("\n");
+        let suffix = rule.trim_start()[selection.len()..].trim_start();
+        let mut post = SourceRule::compile("", self.fallback(), matches!(self, Self::Json(_)));
+        post.make_up_rule(suffix);
+        if let Some(script) = extract_js(&post.rule).1 {
+            if let Ok(result) = eval_js_with_bindings(script, &text, base_url, &ctx.js_bindings()) {
+                text = result;
+            }
+        }
+        text = post.apply_replacement(&text);
+        if matches!(self, Self::XPath(_, _)) {
+            text = text.trim().to_string();
+        }
+        Some((!text.is_empty()).then_some(text))
+    }
 }
 
 fn evaluate_put_entries(
@@ -3149,6 +3346,9 @@ fn eval_field_html_with_ctx(
     base_url: &str,
     ctx: &mut RuleVariableContext,
 ) -> Option<String> {
+    if let Some(result) = FieldInput::Html(*el).combined(rule, base_url, ctx) {
+        return result;
+    }
     if let Some(key) = direct_get_key(rule) {
         return ctx.get(key);
     }
@@ -3251,6 +3451,9 @@ fn eval_field_xpath_with_ctx(
     if rule.trim().is_empty() {
         return None;
     }
+    if let Some(result) = FieldInput::XPath(node, html_mode).combined(rule, base_url, ctx) {
+        return result;
+    }
     if let Some(key) = direct_get_key(rule) {
         return ctx.get(key);
     }
@@ -3316,11 +3519,22 @@ fn eval_field_json_with_ctx(
     base_url: &str,
     ctx: &mut RuleVariableContext,
 ) -> Option<String> {
+    if let Some(result) = FieldInput::Json(v).combined(rule, base_url, ctx) {
+        return result;
+    }
     if let Some(key) = direct_get_key(rule) {
         return ctx.get(key);
     }
     let input = serde_json::to_string(v).unwrap_or_default();
     let mut source_rule = SourceRule::compile(rule, ParseMode::JsonPath, true);
+    let raw_rule = rule.trim_start();
+    if source_rule.mode == ParseMode::XPath
+        && (raw_rule.starts_with('/') || raw_rule.starts_with("./"))
+    {
+        // In JSON fields a slash-leading rule is normally a relative URL, not
+        // XPath. Use `@xpath:` when an XPath expression is intended.
+        source_rule.mode = ParseMode::JsonPath;
+    }
     evaluate_put_entries(&source_rule.put_entries, ctx, |put_rule, ctx| {
         eval_field_json_with_ctx(put_rule, v, base_url, ctx)
     });
@@ -3858,6 +4072,151 @@ mod tests {
     use crate::model::book_source::BookSource;
     use crate::model::rule::{BookInfoRule, ContentRule, SearchRule, TocRule};
     use crate::parser::js::eval_js;
+
+    // The same field contract is exercised against all three item contexts.
+    fn with_combination_fixture(
+        mut check: impl FnMut(
+            &str,
+            &str,
+            &str,
+            &mut dyn FnMut(&str, &mut RuleVariableContext) -> Option<String>,
+        ),
+    ) {
+        let doc = html::parse_document("<div class='item'><i class='a'>A1</i><i class='a'>A2</i><b class='b'>B1</b><b class='b'>B2</b><b class='b'>B3</b><u class='c'>C1</u></div>");
+        let selector = scraper::Selector::parse(".item").unwrap();
+        let item = doc.select(&selector).next().unwrap();
+        check(".a@text", ".b@text", ".c@text", &mut |rule, ctx| {
+            eval_field_html_with_ctx(rule, &item, "https://fixture.test", ctx)
+        });
+        let value = serde_json::json!({"a":["A1","A2"],"b":["B1","B2","B3"],"c":["C1"]});
+        check("$.a[*]", "$.b[*]", "$.c[*]", &mut |rule, ctx| {
+            eval_field_json_with_ctx(rule, &value, "https://fixture.test", ctx)
+        });
+        let package = sxd_document::parser::parse(
+            "<item><a>A1</a><a>A2</a><b>B1</b><b>B2</b><b>B3</b><c>C1</c></item>",
+        )
+        .unwrap();
+        let root = sxd_xpath::nodeset::Node::Root(package.as_document().root());
+        let item = html::xpath_select_nodes_in_mode(root, "/item", false)[0];
+        check("./a", "./b", "./c", &mut |rule, ctx| {
+            eval_field_xpath_with_ctx(rule, item, "https://fixture.test", ctx, false)
+        });
+    }
+
+    #[test]
+    fn field_combination_lists_preserve_single_value_and_interleave_contract() {
+        with_combination_fixture(|a, b, c, eval| {
+            let mut ctx = RuleVariableContext::for_search_item();
+            assert_eq!(eval(a, &mut ctx).as_deref(), Some("A1"));
+            assert_eq!(
+                eval(&format!("{a}&&{b}"), &mut ctx).as_deref(),
+                Some("A1\nA2\nB1\nB2\nB3")
+            );
+            assert_eq!(
+                eval(&format!("{a}%%{b}%%{c}"), &mut ctx).as_deref(),
+                Some("A1\nB1\nC1\nA2\nB2")
+            );
+            assert_eq!(eval(&format!("@get:{{missing}}%%{b}"), &mut ctx), None);
+        });
+    }
+
+    #[test]
+    fn field_combination_fallback_short_circuits_put_and_preserves_executed_writes() {
+        with_combination_fixture(|a, b, _, eval| {
+            let mut ctx = RuleVariableContext::for_search_item();
+            assert_eq!(
+                eval(
+                    &format!("@get:{{missing}}||{a}||{b}@put:{{skipped:{b}}}"),
+                    &mut ctx
+                )
+                .as_deref(),
+                Some("A1\nA2")
+            );
+            assert_eq!(ctx.get("skipped"), None);
+            assert_eq!(
+                eval(
+                    &format!("@get:{{missing}}@put:{{saved:{b}}}||@get:{{saved}}"),
+                    &mut ctx
+                )
+                .as_deref(),
+                Some("B1")
+            );
+            assert_eq!(ctx.get("saved").as_deref(), Some("B1"));
+            ctx.insert("empty".into(), String::new());
+            assert_eq!(
+                eval(&format!("@get:{{empty}}||{a}"), &mut ctx).as_deref(),
+                Some("A1\nA2")
+            );
+        });
+    }
+
+    #[test]
+    fn field_combination_postprocessing_runs_once_on_joined_result() {
+        with_combination_fixture(|a, b, _, eval| {
+            let mut ctx = RuleVariableContext::for_search_item();
+            assert_eq!(
+                eval(
+                    &format!("{a}&&{b}@js:result + (true && true ? '!' : '?')"),
+                    &mut ctx
+                )
+                .as_deref(),
+                Some("A1\nA2\nB1\nB2\nB3!")
+            );
+            assert_eq!(
+                eval(&format!("{a}&&{b}##A##X"), &mut ctx).as_deref(),
+                Some("X1\nX2\nB1\nB2\nB3")
+            );
+        });
+    }
+
+    #[test]
+    fn field_combination_mixed_operators_and_quoted_keys_keep_scanner_contract() {
+        with_combination_fixture(|a, b, c, eval| {
+            let mut ctx = RuleVariableContext::for_search_item();
+            assert_eq!(
+                eval(&format!("{a}||{b}&&{c}"), &mut ctx).as_deref(),
+                Some("A1\nA2")
+            );
+            assert_eq!(
+                eval(&format!("{a}&&{b}||{c}"), &mut ctx).as_deref(),
+                Some("A1\nA2\nB1\nB2\nB3")
+            );
+            ctx.insert("quoted&&key".into(), "stored".into());
+            assert_eq!(
+                eval(&format!("@get:{{quoted&&key}}||{a}"), &mut ctx).as_deref(),
+                Some("stored")
+            );
+            assert_eq!(eval("@js:true || false", &mut ctx).as_deref(), Some("true"));
+            assert_eq!(eval("@regex:A\\d&&A1", &mut ctx).as_deref(), Some("A1"));
+            assert_eq!(
+                eval(&format!("{a}&&{b}@JS:result + '!'"), &mut ctx).as_deref(),
+                Some("A1\nA2\nB1\nB2\nB3!")
+            );
+            assert_eq!(
+                eval(&format!("{a}&&{b}##A##&&"), &mut ctx).as_deref(),
+                Some("&&1\n&&2\nB1\nB2\nB3")
+            );
+        });
+    }
+
+    #[test]
+    fn field_combination_json_preserves_relative_urls_and_explicit_xpath() {
+        let value = serde_json::json!({"id":"7", "a&&b":["one","two"]});
+        let mut ctx = RuleVariableContext::for_search_item();
+        for (rule, expected) in [
+            ("/book/{{$.id}}", "/book/7"),
+            ("./book/{{$.id}}", "./book/7"),
+            ("/book/{{$.id}}&&./other/{{$.id}}", "/book/7\n./other/7"),
+            ("@xpath://missing||$.id", "7"),
+            ("$['a&&b']&&$.id", "one\ntwo\n7"),
+        ] {
+            assert_eq!(
+                eval_field_json_with_ctx(rule, &value, "https://fixture.test", &mut ctx).as_deref(),
+                Some(expected),
+                "{rule}"
+            );
+        }
+    }
 
     #[test]
     fn test_detect_mode() {

@@ -97,24 +97,16 @@ thread_local! {
 }
 
 pub fn with_js_lib<T>(js_lib: Option<&str>, f: impl FnOnce() -> T) -> T {
-    ACTIVE_JS_LIB.with(|cell| {
-        let previous = cell.replace(js_lib.map(|value| value.to_string()));
-        let result = f();
-        cell.replace(previous);
-        result
-    })
+    ACTIVE_JS_LIB
+        .with(|cell| crate::util::scoped::with_scoped_value(cell, js_lib.map(str::to_string), f))
 }
 
 /// Bind a source-specific synchronous HTTP client for the duration of a rule
 /// execution. Nested calls restore the prior client, so reader_eval keeps its
 /// legacy fallback client.
 pub(crate) fn with_js_http_client<T>(client: &HttpClient, f: impl FnOnce() -> T) -> T {
-    ACTIVE_JS_HTTP_CLIENT.with(|cell| {
-        let previous = cell.replace(Some(client.clone()));
-        let result = f();
-        cell.replace(previous);
-        result
-    })
+    ACTIVE_JS_HTTP_CLIENT
+        .with(|cell| crate::util::scoped::with_scoped_value(cell, Some(client.clone()), f))
 }
 
 pub(crate) fn with_js_http_context<T>(
@@ -122,10 +114,11 @@ pub(crate) fn with_js_http_context<T>(
     source: &BookSource,
     f: impl FnOnce() -> T,
 ) -> T {
-    let previous_source = ACTIVE_JS_BOOK_SOURCE.with(|cell| cell.replace(Some(source.clone())));
-    let result = with_js_http_client(client, f);
-    ACTIVE_JS_BOOK_SOURCE.with(|cell| cell.replace(previous_source));
-    result
+    ACTIVE_JS_BOOK_SOURCE.with(|cell| {
+        crate::util::scoped::with_scoped_value(cell, Some(source.clone()), || {
+            with_js_http_client(client, f)
+        })
+    })
 }
 
 fn active_js_http_client() -> HttpClient {
@@ -135,12 +128,8 @@ fn active_js_http_client() -> HttpClient {
 }
 
 fn with_js_reentrant_ctx<T>(ctx: &rquickjs::Ctx<'_>, f: impl FnOnce() -> T) -> T {
-    ACTIVE_JS_REENTRANT_CTX.with(|cell| {
-        let previous = cell.replace(Some(ctx.as_raw()));
-        let result = f();
-        cell.replace(previous);
-        result
-    })
+    ACTIVE_JS_REENTRANT_CTX
+        .with(|cell| crate::util::scoped::with_scoped_value(cell, Some(ctx.as_raw()), f))
 }
 
 pub fn eval_js(script: &str, input: &str, base_url: &str) -> anyhow::Result<String> {
@@ -666,12 +655,12 @@ fn eval_js_inner_with_source(
 
             source_obj.set(
                 "putLoginHeader",
-                Func::new(|val: String| {
+                Func::new(|ctx: rquickjs::Ctx<'_>, val: String| -> rquickjs::Result<()> {
                     if let Some(active) = crate::crawler::session::current_active_session() {
-                        let json_val = serde_json::from_str::<serde_json::Value>(&val)
-                            .unwrap_or_else(|_| serde_json::Value::String(val));
-                        active.put_login_header(json_val);
+                        active.put_login_header(serde_json::Value::String(val))
+                            .map_err(|message| rquickjs::Exception::throw_type(&ctx, &message))?;
                     }
+                    Ok(())
                 }),
             )?;
 
@@ -4449,6 +4438,103 @@ mod tests {
     use std::io::{BufRead, Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::thread;
+
+    #[test]
+    fn invalid_login_header_throws_without_changing_session() {
+        let (result, delta) = with_active_session(None, "https://example.test/", |_| {
+            eval_js(
+                r#"source.putLoginHeader('{"Cookie":"sid=old","Authorization":"old"}');
+                let rejected = false;
+                try { source.putLoginHeader('{"Cookie":"sid=new; broken"}'); }
+                catch (error) { rejected = error instanceof TypeError; }
+                [rejected, source.getLoginHeaderMap().get('Authorization'), cookie.getKey('', 'sid')].join('|')"#,
+                "", "https://example.test/",
+            ).unwrap()
+        });
+        assert_eq!(result, "true|old|old");
+        assert!(delta.is_some());
+    }
+
+    #[test]
+    fn scoped_js_contexts_restore_after_nested_unwind() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        assert!(ACTIVE_JS_LIB.with(|cell| cell.borrow().is_none()));
+        with_js_lib(Some("outer"), || {
+            let result: Result<(), ()> = with_js_lib(None, || Err(()));
+            assert_eq!(result, Err(()));
+            assert!(catch_unwind(AssertUnwindSafe(|| {
+                with_js_lib(Some("inner"), || panic!("expected"));
+            }))
+            .is_err());
+            assert_eq!(
+                ACTIVE_JS_LIB.with(|cell| cell.borrow().clone()),
+                Some("outer".into())
+            );
+        });
+        assert!(ACTIVE_JS_LIB.with(|cell| cell.borrow().is_none()));
+
+        let client = HttpClient::standalone();
+        let outer = BookSource {
+            book_source_url: "https://outer.test".into(),
+            ..Default::default()
+        };
+        let inner = BookSource {
+            book_source_url: "https://inner.test".into(),
+            ..Default::default()
+        };
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            with_js_http_context(&client, &outer, || {
+                assert!(catch_unwind(AssertUnwindSafe(|| {
+                    with_js_http_context(&client, &inner, || {
+                        assert!(ACTIVE_JS_HTTP_CLIENT.with(|cell| cell.borrow().is_some()));
+                        panic!("expected");
+                    });
+                }))
+                .is_err());
+                assert_eq!(
+                    ACTIVE_JS_BOOK_SOURCE.with(|cell| cell
+                        .borrow()
+                        .as_ref()
+                        .unwrap()
+                        .book_source_url
+                        .clone()),
+                    outer.book_source_url
+                );
+                assert!(ACTIVE_JS_HTTP_CLIENT.with(|cell| cell.borrow().is_some()));
+                panic!("expected");
+            });
+        }))
+        .is_err());
+        assert!(ACTIVE_JS_HTTP_CLIENT.with(|cell| cell.borrow().is_none()));
+        assert!(ACTIVE_JS_BOOK_SOURCE.with(|cell| cell.borrow().is_none()));
+
+        let runtime = Runtime::new().unwrap();
+        let outer_ctx = Context::full(&runtime).unwrap();
+        let inner_runtime = Runtime::new().unwrap();
+        let inner_ctx = Context::full(&inner_runtime).unwrap();
+        outer_ctx.with(|outer| {
+            with_js_reentrant_ctx(&outer, || {
+                inner_ctx.with(|inner| {
+                    assert!(catch_unwind(AssertUnwindSafe(|| {
+                        with_js_reentrant_ctx(&inner, || {
+                            assert_eq!(
+                                ACTIVE_JS_REENTRANT_CTX.with(|cell| *cell.borrow()),
+                                Some(inner.as_raw())
+                            );
+                            panic!("expected");
+                        });
+                    }))
+                    .is_err());
+                });
+                assert_eq!(
+                    ACTIVE_JS_REENTRANT_CTX.with(|cell| *cell.borrow()),
+                    Some(outer.as_raw())
+                );
+            });
+        });
+        assert!(ACTIVE_JS_REENTRANT_CTX.with(|cell| cell.borrow().is_none()));
+    }
 
     fn accept_with_timeout(listener: &TcpListener) -> (TcpStream, SocketAddr) {
         listener.set_nonblocking(true).unwrap();

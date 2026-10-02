@@ -93,7 +93,25 @@ impl ActiveSession {
                         extract_and_sync_cookies_from_header(&cookie_store, header_val, url);
                     }
                 }
-                initial_header = Some(header_val.clone());
+                // Keep only a marker for Cookie; the jar is authoritative even
+                // after its final cookie is deleted and its snapshot becomes None.
+                let parsed = match header_val {
+                    Value::String(raw) => serde_json::from_str::<Value>(raw).ok(),
+                    value => Some(value.clone()),
+                };
+                initial_header = Some(match parsed {
+                    Some(Value::Object(mut map))
+                        if map.keys().any(|key| key.eq_ignore_ascii_case("cookie")) =>
+                    {
+                        for (name, value) in &mut map {
+                            if name.eq_ignore_ascii_case("cookie") {
+                                *value = Value::String(String::new());
+                            }
+                        }
+                        Value::Object(map)
+                    }
+                    _ => header_val.clone(),
+                });
             }
             if restored_jar {
                 initial_cookies = parsed_url
@@ -297,18 +315,76 @@ impl ActiveSession {
     }
 
     pub fn get_login_header(&self) -> Option<Value> {
-        self.header
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        let header = self.header.lock().unwrap_or_else(|e| e.into_inner());
+        let mut value = header.clone()?;
+        // Preserve legacy malformed values for compatibility on State In. Valid
+        // objects use the live jar, never the persisted Cookie header's old value.
+        let parsed = match &value {
+            Value::String(raw) => serde_json::from_str::<Value>(raw).ok(),
+            _ => None,
+        };
+        if let Some(Value::Object(map)) = parsed {
+            value = Value::Object(map);
+        }
+        if let Value::Object(map) = &mut value {
+            let keys: Vec<_> = map
+                .keys()
+                .filter(|key| key.eq_ignore_ascii_case("cookie"))
+                .cloned()
+                .collect();
+            if !keys.is_empty() {
+                let cookie = self.get_cookie("");
+                for key in keys {
+                    if let Some(cookie) = &cookie {
+                        map.insert(key, Value::String(cookie.clone()));
+                    } else {
+                        map.remove(&key);
+                    }
+                }
+            }
+        }
+        Some(value)
     }
 
-    pub fn put_login_header(&self, value: Value) {
-        if let Some(url) = self.resolve_url("") {
-            extract_and_sync_cookies_from_header(&self.cookie_store, &value, &url);
+    pub fn put_login_header(&self, value: Value) -> Result<(), String> {
+        use ureq::http::{HeaderName, HeaderValue};
+
+        let value = match value {
+            Value::String(raw) => serde_json::from_str(&raw)
+                .map_err(|_| "login Header must be a JSON object".to_string())?,
+            value => value,
+        };
+        let Value::Object(mut map) = value else {
+            return Err("login Header must be a JSON object".into());
+        };
+        let mut cookie = None;
+        for (name, value) in &map {
+            HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| "invalid login Header name".to_string())?;
+            let value = value
+                .as_str()
+                .ok_or_else(|| "login Header values must be strings".to_string())?;
+            HeaderValue::from_str(value).map_err(|_| "invalid login Header value".to_string())?;
+            if name.eq_ignore_ascii_case("cookie") && cookie.replace(value.to_string()).is_some() {
+                return Err("duplicate login Cookie header".into());
+            }
         }
-        let mut h = self.header.lock().unwrap_or_else(|e| e.into_inner());
-        *h = Some(value);
+        // Lock order is Header -> jar, also used by the getter. No publication
+        // occurs before full validation; the jar update itself is transactional.
+        let mut header = self.header.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cookie) = cookie {
+            let url = self
+                .resolve_url("")
+                .ok_or_else(|| "invalid login source URL".to_string())?;
+            self.cookie_store.import_login_cookies(&cookie, &url)?;
+            for (name, value) in &mut map {
+                if name.eq_ignore_ascii_case("cookie") {
+                    *value = Value::String(String::new());
+                }
+            }
+        }
+        *header = Some(Value::Object(map));
+        Ok(())
     }
 
     pub fn remove_login_header(&self) {
@@ -410,9 +486,9 @@ pub fn with_active_session<T>(
     f: impl FnOnce(&ActiveSession) -> T,
 ) -> (T, Option<ExecuteSession>) {
     let active = Arc::new(ActiveSession::new(session_opt, source_url));
-    let previous = ACTIVE_SESSION.with(|cell| cell.replace(Some(Arc::clone(&active))));
-    let result = f(&active);
-    ACTIVE_SESSION.with(|cell| cell.replace(previous));
+    let result = ACTIVE_SESSION.with(|cell| {
+        crate::util::scoped::with_scoped_value(cell, Some(Arc::clone(&active)), || f(&active))
+    });
     let delta = active.extract_delta();
     (result, delta)
 }
@@ -457,6 +533,85 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn scoped_session_restores_parent_after_error_and_unwind() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        assert!(current_active_session().is_none());
+        let (_, delta) = with_active_session(None, "https://outer.test", |outer| {
+            let parent = current_active_session().unwrap();
+            let (result, child_delta) = with_active_session(None, "https://inner.test", |inner| {
+                inner.set_variable("child", json!(true));
+                Err::<(), _>("expected")
+            });
+            assert_eq!(result, Err("expected"));
+            assert!(child_delta.is_some());
+            assert!(Arc::ptr_eq(&parent, &current_active_session().unwrap()));
+            assert!(catch_unwind(AssertUnwindSafe(|| {
+                with_active_session(None, "https://inner.test", |_| panic!("expected"));
+            }))
+            .is_err());
+            assert!(Arc::ptr_eq(&parent, &current_active_session().unwrap()));
+            assert!(outer.extract_delta().is_none());
+        });
+        assert!(delta.is_none());
+        assert!(current_active_session().is_none());
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            with_active_session(None, "https://outer.test", |_| panic!("expected"));
+        }))
+        .is_err());
+        assert!(current_active_session().is_none());
+    }
+
+    #[test]
+    fn login_header_validation_does_not_partially_commit() {
+        let session = ActiveSession::new(None, "https://example.test/");
+        session
+            .put_login_header(json!({"Authorization":"old", "Cookie":"sid=old"}))
+            .unwrap();
+        let before = session.current_session();
+        for invalid in [
+            json!([1]),
+            json!("not json"),
+            json!({"X-Count": 2}),
+            json!({"bad name":"x", "Cookie":"sid=new"}),
+            json!({"Cookie":"sid=new", "X-Z":"bad\r\nvalue"}),
+            json!({"Cookie":"sid=new; broken"}),
+            json!({"Cookie":"sid=new", "cookie":"other=new"}),
+        ] {
+            assert!(session.put_login_header(invalid).is_err());
+            assert_eq!(session.current_session(), before);
+        }
+        session
+            .put_login_header(json!("{\"Authorization\":\"new\",\"Cookie\":\"sid=new\"}"))
+            .unwrap();
+        assert_eq!(session.get_cookie_key("", "sid").as_deref(), Some("new"));
+        assert_eq!(session.get_login_header().unwrap()["Authorization"], "new");
+    }
+
+    #[test]
+    fn login_header_cookie_uses_live_jar_and_does_not_resurrect_on_roundtrip() {
+        let initial = ExecuteSession {
+            header: Some(json!(
+                "{\"Cookie\":\"sid=old\",\"Authorization\":\"token\"}"
+            )),
+            ..Default::default()
+        };
+        let session = ActiveSession::new(Some(&initial), "https://example.test/");
+        session.set_cookie("", "sid=fresh");
+        assert_eq!(session.get_login_header().unwrap()["Cookie"], "sid=fresh");
+        session.remove_cookie("");
+        assert!(session.get_login_header().unwrap().get("Cookie").is_none());
+        let state = session.current_session();
+        let restored = ActiveSession::new(Some(&state), "https://example.test/");
+        assert!(restored.get_cookie("").is_none());
+        assert!(restored.get_login_header().unwrap().get("Cookie").is_none());
+        assert_eq!(
+            restored.get_login_header().unwrap()["Authorization"],
+            "token"
+        );
+    }
+
+    #[test]
     fn test_session_lifecycle_and_delta() {
         let source_url = "https://example.com/books";
         let initial = ExecuteSession {
@@ -493,7 +648,9 @@ mod tests {
 
         // Case 3: Modify loginHeader with Cookie -> Cookie synced to jar and delta emitted
         let (_, delta) = with_active_session(None, source_url, |session| {
-            session.put_login_header(json!({"Cookie": "sess=new_sess_token"}));
+            session
+                .put_login_header(json!({"Cookie": "sess=new_sess_token"}))
+                .unwrap();
             assert_eq!(
                 session.get_cookie("https://example.com"),
                 Some("sess=new_sess_token".to_string())

@@ -1139,6 +1139,37 @@ pub fn select_text_from_element(el: &ElementRef, rule: &str) -> Option<String> {
         .find_map(|current| extract_text(&current, "text"))
 }
 
+/// Element-relative list extraction used by composite field rules. The scalar
+/// entry point above retains its historical first-match behavior.
+pub(crate) fn select_text_list_from_element(el: &ElementRef, rule: &str) -> Vec<String> {
+    let parts = split_top_level(rule, &["@"]).parts;
+    let mut matches = vec![*el];
+    for (index, part) in parts.iter().enumerate() {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if index == parts.len() - 1 {
+            return matches
+                .into_iter()
+                .filter_map(|el| extract_text(&el, part))
+                .collect();
+        }
+        let selector = parse_selector_with_index(part);
+        matches = matches
+            .into_iter()
+            .flat_map(|el| collect_matches_from_element(el, &selector))
+            .collect();
+        if matches.is_empty() {
+            return Vec::new();
+        }
+    }
+    matches
+        .into_iter()
+        .filter_map(|el| extract_text(&el, "text"))
+        .collect()
+}
+
 /// Select all matching elements and collect their text, joined by newlines
 pub fn select_all_text(doc: &Html, rule: &str) -> Option<String> {
     let parts = split_top_level(rule, &["@"]).parts;
