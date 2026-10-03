@@ -968,7 +968,64 @@ pub(crate) fn strip_url_options(rule: &str) -> &str {
 fn parse_url_options(raw: &str) -> Result<Value, String> {
     serde_json::from_str(raw)
         .or_else(|_| serde_json::from_str(&escape_control_chars_in_json_strings(raw)))
+        .or_else(|_| {
+            serde_json::from_str(&escape_control_chars_in_json_strings(
+                &normalize_legacy_url_options(raw),
+            ))
+        })
         .map_err(|error| format!("invalid URL options: {error}"))
+}
+
+// Normalize only legacy quoting, then let serde_json validate the structure.
+// This is not JavaScript evaluation or a general JSON5 parser.
+fn normalize_legacy_url_options(raw: &str) -> String {
+    let mut output = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' | '"' => {
+                let quote = ch;
+                output.push('"');
+                while let Some(ch) = chars.next() {
+                    match ch {
+                        '\\' => {
+                            if let Some(escaped) = chars.next() {
+                                if escaped != '\'' || quote != '\'' {
+                                    output.push('\\');
+                                }
+                                output.push(escaped);
+                            } else {
+                                output.push('\\');
+                            }
+                        }
+                        ch if ch == quote => {
+                            output.push('"');
+                            break;
+                        }
+                        '"' => output.push_str("\\\""),
+                        other => output.push(other),
+                    }
+                }
+            }
+            ch if ch.is_whitespace() || "{}[],:".contains(ch) => output.push(ch),
+            other => {
+                let mut token = String::from(other);
+                while let Some(&next) = chars.peek() {
+                    if next.is_whitespace() || "{}[],:\"'".contains(next) {
+                        break;
+                    }
+                    token.push(chars.next().unwrap());
+                }
+                let mut lookahead = chars.clone();
+                if lookahead.find(|ch| !ch.is_whitespace()) == Some(':') {
+                    output.push_str(&serde_json::to_string(&token).unwrap());
+                } else {
+                    output.push_str(&token);
+                }
+            }
+        }
+    }
+    output
 }
 
 fn escape_control_chars_in_json_strings(raw: &str) -> String {
@@ -1266,10 +1323,16 @@ fn encode_form_body(body: &str, charset: Option<&str>) -> String {
         .unwrap_or(UTF_8);
     body.split('&')
         .map(|part| {
-            let (name, value) = part.split_once('=').unwrap_or((part, ""));
-            let name = encode_form_component(name, encoding, escape_mode);
-            let value = encode_form_component(value, encoding, escape_mode);
-            format!("{name}={value}")
+            let mut pieces = part.splitn(2, '=');
+            let name =
+                encode_form_component(pieces.next().unwrap_or_default(), encoding, escape_mode);
+            match pieces.next() {
+                Some(value) => format!(
+                    "{name}={}",
+                    encode_form_component(value, encoding, escape_mode)
+                ),
+                None => name,
+            }
         })
         .collect::<Vec<_>>()
         .join("&")

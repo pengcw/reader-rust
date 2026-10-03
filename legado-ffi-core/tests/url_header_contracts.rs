@@ -138,7 +138,7 @@ fn url_options_with_raw_unescaped_control_characters_in_json() {
     let spec = spec.unwrap();
     assert_eq!(spec.method, Method::POST);
     // Without Content-Type, non-JSON/XML bodies follow form encoding.
-    assert_eq!(spec.body.as_deref(), Some("first%0Asecond%09third="));
+    assert_eq!(spec.body.as_deref(), Some("first%0Asecond%09third"));
     assert!(spec
         .headers
         .iter()
@@ -201,6 +201,80 @@ fn form_body_encodes_raw_control_characters_in_values() {
     let options = json!({"method": "POST", "body": "text=first\nsecond\tthird"});
     let spec = analyze_url(&format!("/api,{options}"), "", 1, BASE, &source).unwrap();
     assert_eq!(spec.body.as_deref(), Some("text=first%0Asecond%09third"));
+}
+
+#[test]
+fn form_encoding_distinguishes_bare_keys_empty_values_and_equals_in_values() {
+    let source = source_with_header("");
+    for (body, expected) in [
+        ("裸字段", "%E8%A3%B8%E5%AD%97%E6%AE%B5"),
+        ("裸字段=", "%E8%A3%B8%E5%AD%97%E6%AE%B5="),
+        (
+            "裸字段=一=二",
+            "%E8%A3%B8%E5%AD%97%E6%AE%B5=%E4%B8%80%3D%E4%BA%8C",
+        ),
+        (
+            "裸字段&empty=&value=a=b",
+            "%E8%A3%B8%E5%AD%97%E6%AE%B5&empty=&value=a%3Db",
+        ),
+    ] {
+        let options = json!({"method": "POST", "body": body});
+        let spec = analyze_url(&format!("/api,{options}"), "", 1, BASE, &source).unwrap();
+        assert_eq!(spec.body.as_deref(), Some(expected), "{body}");
+    }
+}
+
+#[test]
+fn legacy_url_options_support_nested_keys_quotes_and_control_characters() {
+    let source = source_with_header("");
+    let rule = r#"/api,{method:'POST', headers:{'Content-Type':'text/plain', 'X-Note':'book, "quoted": it\'s'}, body:'中文\nline\tend\\path', retry:1}"#;
+    let spec = analyze_url(rule, "", 1, BASE, &source).unwrap();
+    assert_eq!(spec.method, Method::POST);
+    assert_eq!(spec.body.as_deref(), Some("中文\nline\tend\\path"));
+    assert!(spec
+        .headers
+        .iter()
+        .any(|(name, value)| name == "X-Note" && value == "book, \"quoted\": it's"));
+    let spec = analyze_url(
+        "/api,{method:'POST',body:'first\nsecond\tthird'}",
+        "",
+        1,
+        BASE,
+        &source,
+    )
+    .unwrap();
+    assert_eq!(spec.body.as_deref(), Some("first%0Asecond%09third"));
+}
+
+#[test]
+fn shuba69_single_quote_search_options_encode_gbk_post_body() {
+    let source = source_with_header("");
+    let rule = "/modules/article/search.php,{'charset':'gbk','body':'searchkey={{key}}&searchtype=all','method':'POST'}";
+    let spec = analyze_url(rule, "诡秘之主", 1, "https://69shuba.cx", &source).unwrap();
+    assert_eq!(spec.url, "https://69shuba.cx/modules/article/search.php");
+    assert_eq!(spec.method, Method::POST);
+    assert_eq!(
+        spec.body.as_deref(),
+        Some("searchkey=%B9%EE%C3%D8%D6%AE%D6%F7&searchtype=all")
+    );
+}
+
+#[test]
+fn legacy_url_options_reject_trailing_commas_and_executable_values() {
+    let source = source_with_header("");
+    for options in [
+        "{method:'POST',}",
+        "{headers:{'X-Note':'ok',}}",
+        "{body:'unterminated}",
+        "{method:'POST' body:'missing comma'}",
+        "{method:(function(){return 'POST'})()}",
+        "{method:'POST'} trailing",
+    ] {
+        assert!(
+            analyze_url(&format!("/api,{options}"), "", 1, BASE, &source).is_err(),
+            "{options}"
+        );
+    }
 }
 
 #[test]
