@@ -22,6 +22,16 @@ fn run(prefix: &str, pages: Vec<Value>) -> Value {
 }
 
 fn run_with_format(prefix: &str, pages: Vec<Value>, format_js: Option<&str>) -> Value {
+    run_with_context(prefix, pages, format_js, None, Value::Null)
+}
+
+fn run_with_context(
+    prefix: &str,
+    pages: Vec<Value>,
+    format_js: Option<&str>,
+    js_lib: Option<&str>,
+    book: Value,
+) -> Value {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -64,9 +74,13 @@ fn run_with_format(prefix: &str, pages: Vec<Value>, format_js: Option<&str>) -> 
     if let Some(script) = format_js {
         source["ruleToc"]["formatJs"] = json!(script);
     }
+    if let Some(script) = js_lib {
+        source["jsLib"] = json!(script);
+    }
     let result: Value = serde_json::from_str(&execute(
         &source.to_string(),
-        &json!({"api": 2, "op": "toc", "params": {"url": format!("{base}/toc/1")}}).to_string(),
+        &json!({"api": 2, "op": "toc", "params": {"url": format!("{base}/toc/1"), "book": book}})
+            .to_string(),
     ))
     .unwrap();
     assert_eq!(result["ok"], true, "{result}");
@@ -91,6 +105,68 @@ fn titles(chapters: &Value) -> Vec<&str> {
         .iter()
         .map(|chapter| chapter["title"].as_str().unwrap())
         .collect()
+}
+
+#[test]
+fn final_formatter_keeps_library_book_and_retained_chapter_variables() {
+    let mut first = page(&[(3, "Three"), (2, "Two old")], "/toc/2");
+    first["chapters"][0]["variable"] = json!("{\"cid\":\"c3\"}");
+    first["chapters"][1]["variable"] = json!("{\"cid\":\"old-c2\"}");
+    let mut second = page(&[(2, "Two updated"), (1, "One")], "");
+    second["chapters"][0]["variable"] = json!("{\"cid\":\"new-c2\"}");
+    second["chapters"][1]["variable"] = json!("{\"cid\":\"c1\"}");
+    let chapters = run_with_context("-", vec![first, second],
+        Some("gInt++; stamp([index, gInt, book.name, book.author, book.variableMap.bid, chapter.variableMap.cid, title])"),
+        Some("function stamp(parts) { return 'lib:' + parts.join('/'); }"),
+        json!({"name": "Book", "author": "Author", "variableMap": {"bid": "book-7"}}));
+    assert_eq!(
+        titles(&chapters),
+        [
+            "lib:1/1/Book/Author/book-7/c1/One",
+            "lib:2/2/Book/Author/book-7/new-c2/Two updated",
+            "lib:3/3/Book/Author/book-7/c3/Three",
+        ]
+    );
+    let variables: Vec<Value> = chapters
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|chapter| serde_json::from_str(chapter["variable"].as_str().unwrap()).unwrap())
+        .collect();
+    assert_eq!(
+        variables,
+        [
+            json!({"cid": "c1"}),
+            json!({"cid": "new-c2"}),
+            json!({"cid": "c3"})
+        ]
+    );
+}
+
+#[test]
+fn final_formatter_library_and_book_context_do_not_leak_between_calls() {
+    for marker in ["first", "second"] {
+        let library = format!("function stamp(title) {{ return '{marker}/' + title; }}");
+        let chapters = run_with_context(
+            "",
+            vec![page(&[(1, "One")], "/toc/2"), page(&[(2, "Two")], "")],
+            Some("stamp(book.variableMap.bid + '/' + title)"),
+            Some(&library),
+            json!({"variableMap": {"bid": marker}}),
+        );
+        assert_eq!(
+            titles(&chapters),
+            [
+                format!("{marker}/{marker}/One"),
+                format!("{marker}/{marker}/Two")
+            ]
+        );
+        assert_eq!(
+            reader_parser::parser::js::eval_js("typeof stamp", "", "https://outside-context.test/")
+                .unwrap(),
+            "undefined"
+        );
+    }
 }
 
 #[test]
