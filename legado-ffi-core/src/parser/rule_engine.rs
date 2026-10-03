@@ -1,4 +1,4 @@
-use crate::crawler::current_active_session;
+use crate::crawler::{current_active_session, UrlRuleContext};
 use crate::model::rule::{BookInfoRule, SearchRule, TocRule};
 use crate::model::{
     book::Book, book_chapter::BookChapter, book_source::BookSource, search::SearchBook,
@@ -919,6 +919,34 @@ impl RuleEngine {
             );
             self.eval_body_rule_with_context(rule, body, base_url, &mut context)
                 .map(|value| value.trim().to_string())
+        })
+    }
+
+    pub(crate) fn replace_content_with_context(
+        &self,
+        source: &BookSource,
+        content: &str,
+        base_url: &str,
+        context: &UrlRuleContext,
+    ) -> String {
+        let context = RuleVariableContext::for_content_with_fields(
+            context.book_variable.as_deref(),
+            context.chapter_variable.as_deref(),
+            context.book_name.as_deref(),
+            context.chapter_title.as_deref(),
+            Some(&context.book_fields),
+        );
+        with_js_lib(source.js_lib.as_deref(), || {
+            apply_content_replacement(
+                content.to_string(),
+                source
+                    .rule_content
+                    .as_ref()
+                    .and_then(|rule| rule.replace_regex.as_deref()),
+                content,
+                base_url,
+                &context,
+            )
         })
     }
 

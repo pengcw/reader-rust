@@ -993,6 +993,11 @@ fn execute_content(
         return Ok(success_without_http(data));
     }
 
+    // Source replaceRegex is applied once after all content fragments are joined.
+    let mut page_source = source.clone();
+    if let Some(rule) = &mut page_source.rule_content {
+        rule.replace_regex = None;
+    }
     let mut pending = VecDeque::from([(initial_url.clone(), true)]);
     let mut visited_urls = HashSet::new();
     let mut fragments = Vec::new();
@@ -1044,7 +1049,7 @@ fn execute_content(
         let chapter_url = initial_response_url.get_or_insert_with(|| response_url.clone());
         let page = if is_first_page {
             engine.content_first_page_with_context(
-                source,
+                &page_source,
                 &response.body,
                 &response.url,
                 book_variable.as_deref(),
@@ -1056,7 +1061,7 @@ fn execute_content(
             )
         } else {
             engine.content_page_with_context_follow(
-                source,
+                &page_source,
                 &response.body,
                 &response.url,
                 book_variable.as_deref(),
@@ -1143,7 +1148,20 @@ fn execute_content(
             }
         }
     }
-    let content = apply_replace_rules(&fragments.join("\n"), &replace_rules);
+    let replacement_context = url_rule_context_with_fields(
+        book_variable.as_deref(),
+        chapter_variable.as_deref(),
+        book_name.as_deref(),
+        chapter_title.as_deref(),
+        Some(&book_fields),
+    );
+    let content = engine.replace_content_with_context(
+        source,
+        &fragments.join("\n"),
+        &response.url,
+        &replacement_context,
+    );
+    let content = apply_replace_rules(&content, &replace_rules);
     if content.is_empty() && !is_volume {
         return Err(ExecuteError::parse("content is empty"));
     }
