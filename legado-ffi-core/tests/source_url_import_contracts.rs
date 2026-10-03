@@ -209,3 +209,64 @@ fn template_protection_preserves_literal_dollar_indices_and_unclosed_templates()
         assert_eq!(source.search_url.as_deref(), Some(expected));
     }
 }
+
+#[test]
+fn legacy_page_offsets_are_evaluated_after_import_in_all_original_forms() {
+    for (expression, expected, page_value) in [
+        ("searchPage+1", "{{page+1}}", 3),
+        ("searchPage-1", "{{page-1}}", 1),
+        ("<searchPage+1>", "{{page+1}}", 3),
+        ("<searchPage-1>", "{{page-1}}", 1),
+        ("{searchPage+1}", "{{page+1}}", 3),
+        ("{searchPage-1}", "{{page-1}}", 1),
+    ] {
+        let raw = format!("/search?q=searchKey&p={expression}&choice={{1,2}}");
+        let source = book_source_from_value(json!({
+            "bookSourceUrl":"https://example.com", "ruleSearchUrl":raw,
+            "ruleFindUrl":raw
+        }))
+        .unwrap();
+        let converted = format!("/search?q={{{{key}}}}&p={expected}&choice=<1,2>");
+        assert_eq!(source.search_url.as_deref(), Some(converted.as_str()));
+        assert_eq!(source.explore_url, source.search_url);
+        let spec = analyze_url(&converted, "reader", 2, &source.book_source_url, &source).unwrap();
+        assert_eq!(
+            spec.url,
+            format!("https://example.com/search?q=reader&p={page_value}&choice=2")
+        );
+    }
+}
+
+#[test]
+fn legacy_page_offsets_do_not_wrap_existing_template_expressions() {
+    let source = book_source_from_value(json!({
+        "bookSourceUrl":"https://example.com",
+        "ruleSearchUrl":"/search?p=searchPage+1&js={{searchPage-1}}&current={{page+1}}"
+    }))
+    .unwrap();
+    let raw = source.search_url.as_deref().unwrap();
+    assert_eq!(raw, "/search?p={{page+1}}&js={{page-1}}&current={{page+1}}");
+    let spec = analyze_url(raw, "", 2, &source.book_source_url, &source).unwrap();
+    assert_eq!(spec.url, "https://example.com/search?p=3&js=1&current=3");
+}
+
+#[test]
+fn page_offset_migration_does_not_rewrite_extracted_headers_or_post_body() {
+    let source = migrate_legacy_book_source_value(json!({
+        "bookSourceUrl":"https://example.com",
+        "ruleSearchUrl":"/search?p=searchPage+1@Header:{\"X-Literal\":\"searchPage+1\"}@body:value=searchPage-1"
+    }));
+    let (url, options) = source["searchUrl"]
+        .as_str()
+        .unwrap()
+        .split_once(',')
+        .unwrap();
+    assert_eq!(url, "/search?p={{page+1}}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(options).unwrap(),
+        json!({
+            "headers":{"X-Literal":"searchPage+1"}, "method":"POST", "body":"value=searchPage-1"
+        })
+    );
+    assert_eq!(migrate_legacy_book_source_value(source.clone()), source);
+}

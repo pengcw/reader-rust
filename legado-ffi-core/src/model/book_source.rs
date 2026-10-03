@@ -327,11 +327,7 @@ fn convert_legacy_url_rule(raw: &str) -> String {
                     part.to_string()
                 }
             } else {
-                convert_legacy_page_braces(
-                    &part
-                        .replace("searchKey", "{{key}}")
-                        .replace("searchPage", "{{page}}"),
-                )
+                convert_legacy_url_literal(part)
             }
         })
         .collect();
@@ -403,7 +399,18 @@ fn find_legacy_url_marker(input: &str, marker: &str) -> Option<usize> {
     })
 }
 
-fn convert_legacy_page_braces(input: &str) -> String {
-    let re = regex::Regex::new(r"\{([^{}]*,[^{}]*)\}").unwrap();
-    re.replace_all(input, "<$1>").into_owned()
+fn convert_legacy_url_literal(input: &str) -> String {
+    static OFFSETS: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"<searchPage([-+]1)>|\{searchPage([-+]1)\}|searchPage([-+]1)").unwrap()
+    });
+    static CHOICES: once_cell::sync::Lazy<regex::Regex> =
+        once_cell::sync::Lazy::new(|| regex::Regex::new(r"\{([^{}]*,[^{}]*)\}").unwrap());
+    let url = OFFSETS.replace_all(input, |captures: &regex::Captures<'_>| {
+        let offset = captures.iter().skip(1).flatten().next().unwrap().as_str();
+        format!("{{{{page{offset}}}}}")
+    });
+    let url = url
+        .replace("searchKey", "{{key}}")
+        .replace("searchPage", "{{page}}");
+    CHOICES.replace_all(&url, "<$1>").into_owned()
 }
