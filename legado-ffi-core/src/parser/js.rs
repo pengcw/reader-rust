@@ -2791,6 +2791,7 @@ fn eval_js_inner_with_source(
                             packages.forEach(pkg => exposeJavaValue(this, pkg));
                             return this;
                         };
+                        this.importClass = this.importPackage;
                     };
                     globalThis.URLEncoder = URLEncoder;
                     globalThis.URLDecoder = URLDecoder;
