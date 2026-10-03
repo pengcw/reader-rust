@@ -4349,13 +4349,17 @@ fn finalize_chapter_url(
 }
 
 fn is_truthy(value: String) -> bool {
+    // Legado checks the literal "null" before trimming or case folding.
+    if value == "null" {
+        return false;
+    }
     let value = value.trim();
     if value.is_empty() {
         return false;
     }
     !matches!(
         value.to_ascii_lowercase().as_str(),
-        "0" | "false" | "null" | "none" | "no" | "not" | "off"
+        "0" | "0.0" | "false" | "no" | "not"
     )
 }
 
