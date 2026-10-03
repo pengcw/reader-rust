@@ -270,3 +270,86 @@ fn page_offset_migration_does_not_rewrite_extracted_headers_or_post_body() {
     );
     assert_eq!(migrate_legacy_book_source_value(source.clone()), source);
 }
+
+#[test]
+fn legacy_explore_list_migrates_each_items_options_without_cross_contamination() {
+    let source = book_source_from_value(json!({
+        "bookSourceUrl":"https://example.com",
+        "ruleFindUrl":"排行::/rank?p=searchPage@Header:{\"X-List\":\"rank\"}&&搜索::/search?q=searchKey@body:value=searchPage\r\n分类::/category?p=searchPage|charset=gbk"
+    })).unwrap();
+    let lines = source
+        .explore_url
+        .as_deref()
+        .unwrap()
+        .lines()
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 3);
+    let expected = [
+        (
+            "排行",
+            "/rank?p={{page}}",
+            json!({"headers":{"X-List":"rank"}}),
+        ),
+        (
+            "搜索",
+            "/search?q={{key}}",
+            json!({"method":"POST","body":"value=searchPage"}),
+        ),
+        ("分类", "/category?p={{page}}", json!({"charset":"gbk"})),
+    ];
+    for (line, (title, expected_url, options)) in lines.iter().zip(expected) {
+        let (actual_title, rule) = line.split_once("::").unwrap();
+        assert_eq!(actual_title, title);
+        let (url, raw_options) = rule.split_once(',').unwrap();
+        assert_eq!(url, expected_url);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(raw_options).unwrap(),
+            options
+        );
+        analyze_url(rule, "reader", 2, &source.book_source_url, &source).unwrap();
+    }
+}
+
+#[test]
+fn legacy_explore_list_normalizes_mixed_delimiters_and_ignores_empty_entries() {
+    let migrated = migrate_legacy_book_source_value(json!({
+        "ruleFindUrl":"\r\n&&一::/one?p=searchPage&&\n二::/two?p=searchPage+1\r\n\n&&"
+    }));
+    assert_eq!(
+        migrated["exploreUrl"],
+        "一::/one?p={{page}}\n二::/two?p={{page+1}}"
+    );
+    assert_eq!(migrate_legacy_book_source_value(migrated.clone()), migrated);
+}
+
+#[test]
+fn explore_list_split_does_not_cut_templates_or_quoted_header_values() {
+    let raw = "一::/one?q={{searchPage > 1 && searchKey ? 'a' : 'b'}}@Header:{\"X-Value\":\"left&&right\"}\n二::/two?p=searchPage";
+    let source = book_source_from_value(json!({
+        "bookSourceUrl":"https://example.com", "ruleFindUrl":raw
+    }))
+    .unwrap();
+    let lines = source
+        .explore_url
+        .as_deref()
+        .unwrap()
+        .lines()
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(
+        lines[0],
+        "一::/one?q={{page > 1 && key ? 'a' : 'b'}},{\"headers\":{\"X-Value\":\"left&&right\"}}"
+    );
+    assert_eq!(lines[1], "二::/two?p={{page}}");
+}
+
+#[test]
+fn explore_titles_are_not_placeholders_and_bare_ipv6_urls_are_not_titles() {
+    let migrated = migrate_legacy_book_source_value(json!({
+        "ruleFindUrl":"searchPage榜::/list?p=searchPage\nhttp://[::1]/list?p=searchPage"
+    }));
+    assert_eq!(
+        migrated["exploreUrl"],
+        "searchPage榜::/list?p={{page}}\nhttp://[::1]/list?p={{page}}"
+    );
+}

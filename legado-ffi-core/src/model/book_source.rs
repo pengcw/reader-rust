@@ -135,10 +135,8 @@ pub fn migrate_legacy_book_source_value(mut value: Value) -> Value {
         if !obj.contains_key(new) {
             move_if_absent(obj, old, new);
             if let Some(Value::String(raw)) = obj.get(new).cloned() {
-                let converted = if new == "exploreUrl"
-                    && (raw.starts_with("@js:") || raw.starts_with("<js>"))
-                {
-                    raw
+                let converted = if new == "exploreUrl" {
+                    convert_legacy_explore_urls(&raw)
                 } else {
                     convert_legacy_url_rule(&raw)
                 };
@@ -276,6 +274,37 @@ fn migrate_rule_object(obj: &mut Map<String, Value>, target: &str, fields: &[(&s
     if !target_obj.is_empty() {
         obj.insert(target.to_string(), Value::Object(target_obj));
     }
+}
+
+fn convert_legacy_explore_urls(raw: &str) -> String {
+    if raw.starts_with("@js:") || raw.starts_with("<js>") {
+        return raw.to_string();
+    }
+    // Reuse syntax-aware splitting so delimiters inside templates and JSON
+    // strings cannot leak options into another category.
+    let mut items = vec![raw.to_string()];
+    for delimiter in ["&&", "\r\n", "\n"] {
+        items = items
+            .into_iter()
+            .flat_map(|item| {
+                crate::parser::rule_analyzer::split_top_level(&item, &[delimiter]).parts
+            })
+            .collect();
+    }
+    items
+        .into_iter()
+        .filter(|item| !item.is_empty())
+        .map(|item| {
+            if let Some((title, url)) = item.split_once("::") {
+                // An IPv6 literal in a bare URL is not a category separator.
+                if !title.contains("://") {
+                    return format!("{title}::{}", convert_legacy_url_rule(url.trim()));
+                }
+            }
+            convert_legacy_url_rule(&item)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn convert_legacy_url_rule(raw: &str) -> String {
