@@ -3899,7 +3899,7 @@ fn apply_regex_replace_first(text: &str, pattern: &str, replacement: &str) -> St
     }
 }
 
-fn normalize_list_rule(rule: &str) -> (&str, bool) {
+pub(crate) fn normalize_list_rule(rule: &str) -> (&str, bool) {
     let rule = rule.trim();
     if let Some(rest) = rule.strip_prefix('-') {
         return (rest.trim(), true);

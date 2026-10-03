@@ -10,7 +10,9 @@ use crate::crawler::{
 use crate::model::book_source::{book_source_from_value, BookSource};
 use crate::model::replace_rule::ReplaceRule;
 use crate::parser::js::{eval_js, eval_js_with_bindings, with_js_http_context, with_js_lib};
-use crate::parser::rule_engine::{apply_legado_regex, dedupe_chapters_last_wins, RuleEngine};
+use crate::parser::rule_engine::{
+    apply_legado_regex, dedupe_chapters_last_wins, normalize_list_rule, RuleEngine,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -729,6 +731,13 @@ fn execute_toc(
     let reuse_detail_response = same_resource_url(&toc_url, &initial_url)
         || same_resource_url(&toc_url, &detail_response.url);
     let mut detail_toc_response = reuse_detail_response.then(|| detail_response.clone());
+    let (_, reverse) = normalize_list_rule(
+        source
+            .rule_toc
+            .as_ref()
+            .and_then(|rule| rule.chapter_list.as_deref())
+            .unwrap_or(""),
+    );
     let mut pending = VecDeque::from([toc_url.clone()]);
     let mut visited_pages = HashSet::new();
     let mut chapters = Vec::new();
@@ -771,7 +780,7 @@ fn execute_toc(
             )?
         };
         visited_pages.insert(url);
-        let (page_chapters, next_urls) = engine.chapter_list_with_context(
+        let (mut page_chapters, next_urls) = engine.chapter_list_with_context(
             source,
             &response.body,
             &response.url,
@@ -779,6 +788,10 @@ fn execute_toc(
             Some(&book_info.name),
             Some(&book_fields),
         );
+        // Keep the single-page parser contract; reverse the complete TOC below.
+        if reverse {
+            page_chapters.reverse();
+        }
         chapters.extend(page_chapters);
         for next_url in next_urls {
             if !next_url.trim().is_empty() && !visited_pages.contains(&next_url) {
@@ -790,7 +803,13 @@ fn execute_toc(
 
     let response =
         final_response.ok_or_else(|| ExecuteError::url_rule("toc URL produced no request"))?;
-    let chapters = dedupe_chapters_last_wins(chapters);
+    let mut chapters = dedupe_chapters_last_wins(chapters);
+    if reverse {
+        chapters.reverse();
+        for (index, chapter) in chapters.iter_mut().enumerate() {
+            chapter.index = index as i32;
+        }
+    }
     Ok(success(
         json!({"chapters": chapters, "pages": visited_pages.len(), "truncated": truncated}),
         visited_pages.len(),

@@ -248,15 +248,17 @@ impl HttpSession {
         };
 
         let mut headers = spec.headers.clone();
-        if spec.render_with_rakers && let Ok(url) = url::Url::parse(&spec.url) {
-            let cookie = headers
-                .iter()
-                .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
-                .map(|(_, value)| value.as_str())
-                .collect::<Vec<_>>()
-                .join("; ");
-            if !cookie.is_empty() && client.seed_cookie_header(&cookie, &url) {
-                headers.retain(|(name, _)| !name.eq_ignore_ascii_case("cookie"));
+        if spec.render_with_rakers {
+            if let Ok(url) = url::Url::parse(&spec.url) {
+                let cookie = headers
+                    .iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+                    .map(|(_, value)| value.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                if !cookie.is_empty() && client.seed_cookie_header(&cookie, &url) {
+                    headers.retain(|(name, _)| !name.eq_ignore_ascii_case("cookie"));
+                }
             }
         }
 
