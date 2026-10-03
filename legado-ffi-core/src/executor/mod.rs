@@ -738,6 +738,11 @@ fn execute_toc(
             .and_then(|rule| rule.chapter_list.as_deref())
             .unwrap_or(""),
     );
+    // Formatting belongs to the final TOC, after global deduplication and ordering.
+    let mut page_source = source.clone();
+    if let Some(rule) = &mut page_source.rule_toc {
+        rule.format_js = None;
+    }
     let mut pending = VecDeque::from([toc_url.clone()]);
     let mut visited_pages = HashSet::new();
     let mut chapters = Vec::new();
@@ -781,7 +786,7 @@ fn execute_toc(
         };
         visited_pages.insert(url);
         let (mut page_chapters, next_urls) = engine.chapter_list_with_context(
-            source,
+            &page_source,
             &response.body,
             &response.url,
             book_info.variable.as_deref(),
@@ -810,6 +815,14 @@ fn execute_toc(
             chapter.index = index as i32;
         }
     }
+    engine.format_chapter_list_with_context(
+        source,
+        &mut chapters,
+        &toc_url,
+        book_info.variable.as_deref(),
+        Some(&book_info.name),
+        Some(&book_fields),
+    );
     Ok(success(
         json!({"chapters": chapters, "pages": visited_pages.len(), "truncated": truncated}),
         visited_pages.len(),

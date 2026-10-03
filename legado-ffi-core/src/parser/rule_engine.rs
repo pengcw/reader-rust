@@ -707,6 +707,29 @@ impl RuleEngine {
         })
     }
 
+    pub(crate) fn format_chapter_list_with_context(
+        &self,
+        source: &BookSource,
+        chapters: &mut [BookChapter],
+        base_url: &str,
+        variable: Option<&str>,
+        book_name: Option<&str>,
+        book_fields: Option<&HashMap<String, String>>,
+    ) {
+        let context = RuleVariableContext::for_book_with_fields(variable, book_name, book_fields);
+        with_js_lib(source.js_lib.as_deref(), || {
+            apply_toc_format_js(
+                chapters,
+                source
+                    .rule_toc
+                    .as_ref()
+                    .and_then(|rule| rule.format_js.as_deref()),
+                base_url,
+                &context,
+            );
+        });
+    }
+
     pub fn content(&self, source: &BookSource, body: &str, base_url: &str) -> String {
         self.content_with_variables(source, body, base_url, None, None, None, None)
     }

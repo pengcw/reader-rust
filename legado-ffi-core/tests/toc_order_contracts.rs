@@ -18,6 +18,10 @@ fn source(base: &str, prefix: &str) -> Value {
 }
 
 fn run(prefix: &str, pages: Vec<Value>) -> Value {
+    run_with_format(prefix, pages, None)
+}
+
+fn run_with_format(prefix: &str, pages: Vec<Value>, format_js: Option<&str>) -> Value {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -56,8 +60,12 @@ fn run(prefix: &str, pages: Vec<Value>) -> Value {
         }
         paths
     });
+    let mut source = source(&base, prefix);
+    if let Some(script) = format_js {
+        source["ruleToc"]["formatJs"] = json!(script);
+    }
     let result: Value = serde_json::from_str(&execute(
-        &source(&base, prefix).to_string(),
+        &source.to_string(),
         &json!({"api": 2, "op": "toc", "params": {"url": format!("{base}/toc/1")}}).to_string(),
     ))
     .unwrap();
@@ -83,6 +91,47 @@ fn titles(chapters: &Value) -> Vec<&str> {
         .iter()
         .map(|chapter| chapter["title"].as_str().unwrap())
         .collect()
+}
+
+#[test]
+fn format_js_numbers_the_complete_toc_without_page_resets() {
+    let chapters = run_with_format(
+        "",
+        vec![
+            page(&[(1, "One"), (2, "Two")], "/toc/2"),
+            page(&[(3, "Three"), (4, "Four")], ""),
+        ],
+        Some("gInt++; [gInt, index, chapter.index, title].join(':')"),
+    );
+    assert_eq!(
+        titles(&chapters),
+        ["1:1:0:One", "2:2:1:Two", "3:3:2:Three", "4:4:3:Four"]
+    );
+}
+
+#[test]
+fn format_js_runs_only_on_retained_chapters_in_final_reverse_order() {
+    let chapters = run_with_format(
+        "-",
+        vec![
+            page(&[(3, "Three"), (2, "Two old")], "/toc/2"),
+            page(&[(2, "Two updated"), (1, "One")], ""),
+        ],
+        Some("gInt++; [gInt, index, chapter.index, title].join(':')"),
+    );
+    assert_eq!(
+        titles(&chapters),
+        ["1:1:0:One", "2:2:1:Two updated", "3:3:2:Three"]
+    );
+}
+
+#[test]
+fn format_js_errors_keep_titles_and_do_not_stop_later_pages() {
+    let chapters = run_with_format("", vec![
+        page(&[(1, "One"), (2, "Two")], "/toc/2"),
+        page(&[(3, "Three")], ""),
+    ], Some("if (title === 'Two') throw new Error('synthetic formatting error'); `${index}:${title}`"));
+    assert_eq!(titles(&chapters), ["1:One", "Two", "3:Three"]);
 }
 
 #[test]
