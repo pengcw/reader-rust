@@ -1918,7 +1918,30 @@ fn eval_js_inner_with_source(
             }
             eval_script(
                 ctx.clone(),
-                "source.getLoginInfo = function() { if (globalThis.loginInfo == null) return null; return typeof globalThis.loginInfo === 'string' ? globalThis.loginInfo : JSON.stringify(globalThis.loginInfo); }; source.getLoginInfoMap = function() { const raw = source.getLoginInfo(); if (raw == null) return null; let value; try { value = JSON.parse(raw); } catch (_) { return null; } return value && typeof value === 'object' ? new Map(Object.entries(value).map(([key, item]) => [key, String(item)])) : null; }; java.reGetBook = function() { if (globalThis.__allowTocRefresh !== true) throw new Error('java.reGetBook is only available in preUpdateJs'); throw new Error('java.reGetBook is not supported by this host'); }; java.refreshTocUrl = function() { if (globalThis.__allowTocRefresh !== true) throw new Error('java.refreshTocUrl is only available in preUpdateJs'); throw new Error('java.refreshTocUrl is not supported by this host'); };",
+                r#"source.getLoginInfo = function() {
+                    if (globalThis.loginInfo == null) return null;
+                    return typeof globalThis.loginInfo === 'string'
+                        ? globalThis.loginInfo : JSON.stringify(globalThis.loginInfo);
+                };
+                source.getLoginInfoMap = function() {
+                    const raw = source.getLoginInfo();
+                    if (raw == null) return null;
+                    let value;
+                    try { value = JSON.parse(raw); } catch (_) { return null; }
+                    if (!value || typeof value !== 'object') return null;
+                    const map = new Map(Object.entries(value).map(([key, item]) => [key, String(item)]));
+                    // Config keys supplement, never shadow, native Map members.
+                    for (const key of map.keys()) {
+                        if (key in map) continue;
+                        Object.defineProperty(map, key, {
+                            get: () => map.get(key),
+                            configurable: true
+                        });
+                    }
+                    return map;
+                };
+                java.reGetBook = function() { if (globalThis.__allowTocRefresh !== true) throw new Error('java.reGetBook is only available in preUpdateJs'); throw new Error('java.reGetBook is not supported by this host'); };
+                java.refreshTocUrl = function() { if (globalThis.__allowTocRefresh !== true) throw new Error('java.refreshTocUrl is only available in preUpdateJs'); throw new Error('java.refreshTocUrl is not supported by this host'); };"#,
             )?;
 
             eval_script(
