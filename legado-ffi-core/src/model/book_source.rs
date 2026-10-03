@@ -125,8 +125,22 @@ pub fn migrate_legacy_book_source_value(mut value: Value) -> Value {
 
     move_if_absent(obj, "ruleBookUrlPattern", "bookUrlPattern");
     move_if_absent(obj, "serialNumber", "customOrder");
-    move_if_absent(obj, "ruleFindUrl", "exploreUrl");
-    move_if_absent(obj, "ruleSearchUrl", "searchUrl");
+    // Only URLs moved from legacy fields need conversion. Current fields may
+    // contain JavaScript or JSON options that must remain byte-for-byte intact.
+    for (old, new) in [
+        ("ruleFindUrl", "exploreUrl"),
+        ("ruleSearchUrl", "searchUrl"),
+    ] {
+        if !obj.contains_key(new) {
+            move_if_absent(obj, old, new);
+            if let Some(Value::String(raw)) = obj.get(new).cloned() {
+                obj.insert(
+                    new.to_string(),
+                    Value::String(convert_legacy_url_rule(&raw)),
+                );
+            }
+        }
+    }
     move_if_absent(obj, "enable", "enabled");
 
     if let Some(Value::String(kind)) = obj.get("bookSourceType").cloned() {
@@ -146,15 +160,6 @@ pub fn migrate_legacy_book_source_value(mut value: Value) -> Value {
                     Value::String(json!({ "User-Agent": ua }).to_string()),
                 );
             }
-        }
-    }
-
-    for key in ["searchUrl", "exploreUrl", "loginUrl"] {
-        if let Some(Value::String(raw)) = obj.get(key).cloned() {
-            obj.insert(
-                key.to_string(),
-                Value::String(convert_legacy_url_rule(&raw)),
-            );
         }
     }
 
