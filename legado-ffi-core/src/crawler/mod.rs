@@ -1046,8 +1046,9 @@ fn parse_source_headers(raw: &str) -> Vec<(String, String)> {
     }
 
     let normalized = raw.trim().trim_start_matches('{').trim_end_matches('}');
-    normalized
-        .split(',')
+    crate::parser::rule_analyzer::split_top_level(normalized, &[","])
+        .parts
+        .into_iter()
         .filter_map(|part| {
             let (name, value) = part.split_once(':')?;
             let name = name.trim().trim_matches(['\'', '"']);
@@ -1517,6 +1518,44 @@ mod tests {
             header: header.map(str::to_owned),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn loose_source_headers_preserve_quoted_delimiters() {
+        for raw in [
+            r#"{'User-Agent': 'Bot, Extra:1', 'Referer': 'https://a.test/a,b', 'X-Empty': ''}"#,
+            r#"{User-Agent: "Bot, Extra:1", Referer: "https://a.test/a,b", X-Empty: ""}"#,
+        ] {
+            assert_eq!(
+                parse_source_headers(raw),
+                vec![
+                    ("User-Agent".to_string(), "Bot, Extra:1".to_string()),
+                    ("Referer".to_string(), "https://a.test/a,b".to_string()),
+                    ("X-Empty".to_string(), "".to_string()),
+                ]
+            );
+        }
+        assert_eq!(
+            parse_source_headers(r#"{'X-Note': 'a\'b,c', 'X-End': 'ok'}"#),
+            vec![
+                ("X-Note".to_string(), r#"a\'b,c"#.to_string()),
+                ("X-End".to_string(), "ok".to_string())
+            ],
+        );
+    }
+
+    #[test]
+    fn source_headers_keep_json_decoding_and_unquoted_fallback() {
+        let headers = parse_source_headers(r#"{"X-Note":"a\"b,c", "X-Number":7}"#);
+        assert!(headers.contains(&("X-Note".to_string(), "a\"b,c".to_string())));
+        assert!(headers.contains(&("X-Number".to_string(), "7".to_string())));
+        assert_eq!(
+            parse_source_headers("X-One: first, X-Two: token:part"),
+            vec![
+                ("X-One".to_string(), "first".to_string()),
+                ("X-Two".to_string(), "token:part".to_string())
+            ]
+        );
     }
 
     #[test]

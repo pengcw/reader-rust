@@ -1664,6 +1664,16 @@ fn eval_js_inner_with_source(
                         String(url), String(body == null ? '' : body), headersJson(headers)));
                     java.head = (url, headers) => responseFromJson(java.__nativeHead(
                         String(url), headersJson(headers)));
+                    const callableString = text => new Proxy(() => text, {
+                        get(target, key) {
+                            if (key === Symbol.toPrimitive || key === 'toJSON') return () => text;
+                            if (key in String.prototype || key === 'length' || /^\d+$/.test(String(key))) {
+                                const value = text[key];
+                                return typeof value === 'function' ? value.bind(text) : value;
+                            }
+                            return Reflect.get(target, key);
+                        }
+                    });
                     const strResponseFromJson = value => {
                         let raw;
                         try { raw = typeof value === 'string' ? JSON.parse(value) : value || {}; }
@@ -1700,7 +1710,8 @@ fn eval_js_inner_with_source(
                         };
                         return {
                             __ffiStrResponse: true,
-                            body: () => bodyText,
+                            body: callableString(bodyText),
+                            header: name => responseHeaders.get(name),
                             url: () => url,
                             code: () => code,
                             message: () => message,
@@ -1988,6 +1999,7 @@ fn eval_js_inner_with_source(
                                 __readerIndex: item.__readerIndex,
                                 __readerXPathNode: context,
                                 attr(name) { return attrs[String(name)] || ''; },
+                                hasAttr(name) { return Object.prototype.hasOwnProperty.call(attrs, String(name)); },
                                 hasClass(name) {
                                     return String(attrs.class || '').split(/\s+/).includes(String(name));
                                 },
@@ -2051,6 +2063,16 @@ fn eval_js_inner_with_source(
                     jsoup_remove_elements(&source, &selector)
                 }),
             )?;
+            globals.get::<_, Object<'_>>("java")?.set(
+                "__jsoupAbsUrl",
+                Func::new(|value: String, base: String| -> String {
+                    url::Url::parse(&base)
+                        .and_then(|base| base.join(&value))
+                        .or_else(|_| url::Url::parse(&value))
+                        .map(|url| url.to_string())
+                        .unwrap_or_default()
+                }),
+            )?;
             eval_script(
                 ctx.clone(),
                 r#"(function() {
@@ -2060,12 +2082,44 @@ fn eval_js_inner_with_source(
                     globalThis.org.jsoup = asObject(globalThis.org.jsoup);
                     globalThis.org.jsoup.Jsoup = asObject(globalThis.org.jsoup.Jsoup);
                     if (typeof globalThis.org.jsoup.Jsoup.parse !== 'function') {
-                        globalThis.org.jsoup.Jsoup.parse = function(html) {
+                        globalThis.org.jsoup.Jsoup.parse = function(html, baseUri) {
                             let source = String(html == null ? '' : html);
+                            const base = String(baseUri == null ? '' : baseUri);
+                            const decorate = items => {
+                                for (const item of items) {
+                                    const attr = item.attr.bind(item);
+                                    const hasAttr = item.hasAttr.bind(item);
+                                    const select = item.select.bind(item);
+                                    item.attr = name => {
+                                        name = String(name);
+                                        if (!name.startsWith('abs:')) return attr(name);
+                                        const key = name.slice(4);
+                                        return hasAttr(key) ? java.__jsoupAbsUrl(attr(key), base) : '';
+                                    };
+                                    item.hasAttr = name => {
+                                        name = String(name);
+                                        return name.startsWith('abs:') ? item.attr(name) !== '' : hasAttr(name);
+                                    };
+                                    item.select = selector => decorate(select(selector));
+                                    item.selectFirst = selector => item.select(selector).first();
+                                }
+                                items.attr = name => {
+                                    const item = items.find(item => item.hasAttr(name));
+                                    return item ? item.attr(name) : '';
+                                };
+                                items.isEmpty = () => items.length === 0;
+                                return items;
+                            };
                             return {
+                                title() {
+                                    const title = this.selectFirst('title');
+                                    return title ? title.text() : '';
+                                },
+                                body() { return this.selectFirst('body'); },
+                                selectFirst(selector) { return this.select(selector).first(); },
                                 select(selector) {
                                     const rule = String(selector);
-                                    const items = globalThis.java.getElements(rule, source, true);
+                                    const items = decorate(globalThis.java.getElements(rule, source, true));
                                     items.remove = function() {
                                         const updated = globalThis.java.__jsoupRemove(source, rule);
                                         if (updated == null) throw new Error('invalid jsoup remove selector');
@@ -2649,6 +2703,7 @@ fn eval_js_inner_with_source(
                     };
 
                     globalThis.Packages = globalThis.Packages || {};
+                    Packages.org = globalThis.org;
                     Packages.java = Packages.java || {};
                     Packages.java.lang = Packages.java.lang || {};
                     Packages.java.net = Packages.java.net || {};
