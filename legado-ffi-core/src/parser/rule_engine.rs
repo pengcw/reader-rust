@@ -3660,15 +3660,19 @@ fn apply_content_replacement(
 }
 
 fn apply_regex_replace_all(text: &str, pattern: &str, replacement: &str) -> String {
-    source_regex::replace_all(text, pattern, replacement)
-        .unwrap_or_else(|_| text.replace(pattern, replacement))
+    match source_regex::replace_all(text, pattern, replacement) {
+        Ok(value) => value,
+        Err(source_regex::RegexError::InvalidPattern) => text.replace(pattern, replacement),
+        Err(source_regex::RegexError::InvalidReplacement { .. }) => text.to_string(),
+    }
 }
 
 fn apply_regex_replace_first(text: &str, pattern: &str, replacement: &str) -> String {
     match source_regex::replace_first_match(text, pattern, replacement) {
         Ok(Some(value)) => value,
         Ok(None) => String::new(),
-        Err(()) => replacement.to_string(),
+        Err(source_regex::RegexError::InvalidPattern) => replacement.to_string(),
+        Err(source_regex::RegexError::InvalidReplacement { .. }) => text.to_string(),
     }
 }
 

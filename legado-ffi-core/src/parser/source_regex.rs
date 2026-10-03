@@ -67,30 +67,248 @@ pub(crate) fn captures_all(pattern: &str, input: &str) -> Option<Vec<Vec<Option<
     Some(regex.find_iter(input).map(match_captures).collect())
 }
 
-pub(crate) fn replace_all(input: &str, pattern: &str, replacement: &str) -> Result<String, ()> {
-    let regex = get_cached_regex(pattern).ok_or(())?;
-    Ok(regex.replace_all(input, replacement))
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RegexError {
+    InvalidPattern,
+    InvalidReplacement { offset: usize, reason: &'static str },
+}
+
+impl std::fmt::Display for RegexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidPattern => f.write_str("invalid regex pattern"),
+            Self::InvalidReplacement { offset, reason } => {
+                write!(f, "invalid replacement at byte {offset}: {reason}")
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ReplacementToken {
+    Literal(String),
+    Group(usize),
+}
+
+fn parse_replacement(
+    replacement: &str,
+    regex: &Regex,
+) -> Result<Vec<ReplacementToken>, RegexError> {
+    let mut chars = replacement.char_indices().peekable();
+    let mut literal = String::new();
+    let mut tokens = Vec::new();
+    while let Some((offset, character)) = chars.next() {
+        let error = |reason| RegexError::InvalidReplacement { offset, reason };
+        match character {
+            '\\' => {
+                let (_, escaped) = chars.next().ok_or_else(|| error("trailing escape"))?;
+                literal.push(escaped);
+            }
+            '$' => {
+                let (_, next) = chars
+                    .next()
+                    .ok_or_else(|| error("missing group reference"))?;
+                let group = if next == '{' {
+                    let mut name = String::new();
+                    loop {
+                        let (_, character) =
+                            chars.next().ok_or_else(|| error("unclosed named group"))?;
+                        if character == '}' {
+                            break;
+                        }
+                        name.push(character);
+                    }
+                    let mut letters = name.chars();
+                    if !letters
+                        .next()
+                        .is_some_and(|character| character.is_ascii_alphabetic())
+                        || !letters.all(|character| character.is_ascii_alphanumeric())
+                    {
+                        return Err(error("invalid group name"));
+                    }
+                    *regex
+                        .named_groups()
+                        .get(&name)
+                        .ok_or_else(|| error("unknown named group"))?
+                } else if next.is_ascii_digit() {
+                    let mut group = (next as u8 - b'0') as usize;
+                    if group > regex.group_count() {
+                        return Err(error("unknown numbered group"));
+                    }
+                    while let Some((_, digit)) = chars.peek().copied() {
+                        if !digit.is_ascii_digit() {
+                            break;
+                        }
+                        let Some(candidate) = group
+                            .checked_mul(10)
+                            .and_then(|group| group.checked_add((digit as u8 - b'0') as usize))
+                            .filter(|candidate| *candidate <= regex.group_count())
+                        else {
+                            break;
+                        };
+                        group = candidate;
+                        chars.next();
+                    }
+                    group
+                } else {
+                    return Err(error("invalid group reference"));
+                };
+                if !literal.is_empty() {
+                    tokens.push(ReplacementToken::Literal(std::mem::take(&mut literal)));
+                }
+                tokens.push(ReplacementToken::Group(group));
+            }
+            character => literal.push(character),
+        }
+    }
+    if !literal.is_empty() {
+        tokens.push(ReplacementToken::Literal(literal));
+    }
+    Ok(tokens)
+}
+
+fn checked_replace(
+    regex: &Regex,
+    input: &str,
+    replacement: &str,
+    first: bool,
+) -> Result<String, RegexError> {
+    // Parse only after an actual match. The dependency's Replacer is infallible:
+    // after an error we finish its scan but discard the entire candidate output.
+    // This does not introduce or claim an interruptible regex execution budget.
+    let mut plan = None;
+    let mut expand = |matched: &MatchInfo| {
+        let plan = plan.get_or_insert_with(|| parse_replacement(replacement, regex));
+        let Ok(tokens) = plan else {
+            return matched.matched_text.clone();
+        };
+        let mut output = String::new();
+        for token in tokens {
+            match token {
+                ReplacementToken::Literal(literal) => output.push_str(literal),
+                ReplacementToken::Group(group) => {
+                    output.push_str(matched.group(*group).unwrap_or(""))
+                }
+            }
+        }
+        output
+    };
+    let output = if first {
+        regex.replace_first(input, &mut expand)
+    } else {
+        regex.replace_all(input, &mut expand)
+    };
+    match plan {
+        Some(Err(error)) => Err(error),
+        _ => Ok(output),
+    }
+}
+
+pub(crate) fn replace_all(
+    input: &str,
+    pattern: &str,
+    replacement: &str,
+) -> Result<String, RegexError> {
+    let regex = get_cached_regex(pattern).ok_or(RegexError::InvalidPattern)?;
+    checked_replace(&regex, input, replacement, false)
 }
 
 pub(crate) fn replace_first_match(
     input: &str,
     pattern: &str,
     replacement: &str,
-) -> Result<Option<String>, ()> {
-    let regex = get_cached_regex(pattern).ok_or(())?;
+) -> Result<Option<String>, RegexError> {
+    let regex = get_cached_regex(pattern).ok_or(RegexError::InvalidPattern)?;
     let Some(found) = regex.find_iter(input).next() else {
         return Ok(None);
     };
 
-    // Legado first finds the first match in the original input, then applies
-    // replaceFirst to matcher.group(0) and returns only that transformed match.
-    // Using matched_text also avoids depending on Java UTF-16 byte offsets.
-    Ok(Some(regex.replace_first(&found.matched_text, replacement)))
+    // Preserve Legado's second matching pass on group(0), including context loss.
+    checked_replace(&regex, &found.matched_text, replacement, true).map(Some)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_metadata_includes_nonparticipating_named_groups() {
+        let regex = Regex::new("(?<left>a)?(?<right>b)").unwrap();
+        assert_eq!(regex.group_count(), 2);
+        assert_eq!(regex.named_groups().get("left"), Some(&1));
+        assert_eq!(regex.named_groups().get("right"), Some(&2));
+        assert_eq!(
+            replace_all("b", "(?<left>a)?(?<right>b)", "${left}/${right}"),
+            Ok("/b".into())
+        );
+    }
+
+    #[test]
+    fn replacement_numbered_groups_use_java_greedy_downgrade_without_overflow() {
+        assert_eq!(replace_all("a", "(a)", "$0/$11"), Ok("a/a1".into()));
+        assert_eq!(
+            replace_all("abcdefghijk", "(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)", "$11"),
+            Ok("k".into())
+        );
+        let digits = "9".repeat(1000);
+        assert_eq!(
+            replace_all("a", "(a)", &format!("$1{digits}")),
+            Ok(format!("a{digits}"))
+        );
+        assert_eq!(replace_all("b", "(a)?b", "<$1>"), Ok("<>".into()));
+    }
+
+    #[test]
+    fn replacement_escape_tokens_preserve_java_literal_behavior() {
+        assert_eq!(replace_all("a", "a", r"\$1\\\q"), Ok(r"$1\q".into()));
+        assert_eq!(replace_all("a", "a", r"\中"), Ok("中".into()));
+    }
+
+    #[test]
+    fn replacement_invalid_references_are_typed_errors_not_partial_output() {
+        for replacement in [
+            "$9",
+            "$99",
+            "${missing}",
+            "${}",
+            "${1x}",
+            "${a_b}",
+            "${name",
+            "$",
+            "$x",
+            "$$",
+            "\\",
+        ] {
+            assert!(
+                matches!(
+                    replace_all("prefix a suffix a", "(a)", replacement),
+                    Err(RegexError::InvalidReplacement { .. })
+                ),
+                "{replacement:?}"
+            );
+        }
+        assert!(matches!(
+            replace_all("a", "(a)", "中$9"),
+            Err(RegexError::InvalidReplacement { offset: 3, .. })
+        ));
+        assert_eq!(replace_all("a", "[", "$9"), Err(RegexError::InvalidPattern));
+    }
+
+    #[test]
+    fn replacement_validation_only_runs_when_replacement_actually_matches() {
+        for replacement in ["$9", "${missing}", "$", "\\"] {
+            assert_eq!(replace_all("a", "b", replacement), Ok("a".into()));
+            assert_eq!(replace_first_match("a", "b", replacement), Ok(None));
+        }
+        assert_eq!(
+            replace_first_match("chapter-12", r"(?<=chapter-)\d+", "$99"),
+            Ok(Some("12".into()))
+        );
+        assert!(matches!(
+            replace_first_match("x12y34", r"(\d+)", "$99"),
+            Err(RegexError::InvalidReplacement { .. })
+        ));
+    }
 
     #[test]
     fn source_regex_preserves_java_match_shapes() {

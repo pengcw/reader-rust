@@ -1867,9 +1867,12 @@ fn eval_js_inner_with_source(
             globals.set(
                 "regex_replace",
                 Func::new(
-                    |input: String, pattern: String, replace: String| -> String {
-                        source_regex::replace_all(&input, &pattern, &replace)
-                            .unwrap_or(input)
+                    |ctx: rquickjs::Ctx<'_>, input: String, pattern: String, replace: String| -> rquickjs::Result<String> {
+                        match source_regex::replace_all(&input, &pattern, &replace) {
+                            Ok(value) => Ok(value),
+                            Err(source_regex::RegexError::InvalidPattern) => Ok(input),
+                            Err(error) => Err(rquickjs::Exception::throw_type(&ctx, &error.to_string())),
+                        }
                     },
                 ),
             )?;

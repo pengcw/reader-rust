@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""XPath ABI safety regression. Build first, then run with --library PATH.
+"""XPath safety and replacement ABI regression. Build first, then run with --library PATH.
 
 Each case loads the real cdylib in a fresh, disposable process. A crash,
 incorrect value, or timeout fails the parent. No third-party packages needed.
@@ -29,6 +29,14 @@ CASES = [
      "a|1|Book"),
     ("js-node-context-unknown-prefix", XML,
      '@js:java.getElement("//x:Item",result).select(".//unknown:Missing").size()', "0"),
+    ("replacement-invalid-number", "a", "##(a)##$99", "a"),
+    ("replacement-invalid-name-after-prefix", "prefix a suffix a",
+     "##(a)##ok$1/${missing}", "prefix a suffix a"),
+    ("replacement-number-downgrade", "a", "##(a)##$11", "a1"),
+    ("replacement-no-match-skips-validation", "a", "##b##$99", "a"),
+    ("replacement-js-throws", "a",
+     '@js:try { regex_replace(result, "(a)", "${missing}"); "not rejected" } catch (error) { error.name }',
+     "TypeError"),
 ]
 
 
@@ -52,7 +60,7 @@ def child(library, index):
         raw = ctypes.string_at(pointer).decode()
     finally:
         lib.reader_free_string(pointer)
-    actual = raw if rule.startswith('@js:') else json.loads(raw)
+    actual = raw if rule.startswith(('@js:', '##')) else json.loads(raw)
     if actual != expected:
         raise AssertionError(f"{name}: expected {expected!r}, got {actual!r}")
     # A second ABI call confirms the process remains usable after rejection.

@@ -28,7 +28,7 @@ scraper = "0.27"
 rakers = { path = "vendor/rakers" }
 jsonpath_lib = "0.3"
 regex = "1"
-java_regex = "0.1"
+java_regex = { path = "vendor/java_regex", version = "0.1.0" }
 urlencoding = "2"
 rand = "0.8"
 once_cell = "1"
