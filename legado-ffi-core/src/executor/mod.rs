@@ -1972,67 +1972,8 @@ mod tests {
             let base = format!("http://{}", listener.local_addr().unwrap());
             let server = thread::spawn(move || {
                 let (mut stream, _) = accept_with_timeout(&listener);
-                use std::io::{BufRead, BufReader};
-
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut reader = BufReader::new(&mut stream);
-                let mut line = String::new();
-                assert!(reader.read_line(&mut line).unwrap() > 0);
-                let method = line.split_whitespace().next().unwrap().to_string();
-                let mut content_length = 0usize;
-                let mut chunked = false;
-                loop {
-                    line.clear();
-                    assert!(reader.read_line(&mut line).unwrap() > 0);
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some((name, value)) = line.split_once(':') {
-                        if name.eq_ignore_ascii_case("content-length") {
-                            content_length = value.trim().parse().unwrap();
-                        }
-                        if name.eq_ignore_ascii_case("transfer-encoding") {
-                            assert!(value.trim().eq_ignore_ascii_case("chunked"));
-                            chunked = true;
-                        }
-                    }
-                }
-                // Closing with unread request bytes can reset the client's connection.
-                if chunked {
-                    let mut total = 0usize;
-                    loop {
-                        line.clear();
-                        assert!(reader.read_line(&mut line).unwrap() > 0);
-                        let size =
-                            usize::from_str_radix(line.trim().split(';').next().unwrap(), 16)
-                                .unwrap();
-                        if size == 0 {
-                            // Consume the trailer section, including its final CRLF.
-                            loop {
-                                line.clear();
-                                assert!(reader.read_line(&mut line).unwrap() > 0);
-                                if line == "\r\n" {
-                                    break;
-                                }
-                            }
-                            break;
-                        }
-                        assert!(size <= 1024 * 1024 - total);
-                        total += size;
-                        let mut chunk = vec![0; size];
-                        reader.read_exact(&mut chunk).unwrap();
-                        let mut terminator = [0; 2];
-                        reader.read_exact(&mut terminator).unwrap();
-                        assert_eq!(&terminator, b"\r\n");
-                    }
-                } else {
-                    assert!(content_length <= 1024 * 1024);
-                    let mut request_body = vec![0; content_length];
-                    reader.read_exact(&mut request_body).unwrap();
-                }
-                drop(reader);
+                let first_line = crate::util::test_http::consume_request(&mut stream);
+                let method = first_line.split_whitespace().next().unwrap().to_string();
                 let body = if method == "HEAD" {
                     ""
                 } else {
@@ -2102,8 +2043,7 @@ mod tests {
         let server = thread::spawn(move || {
             for index in 0..2 {
                 let (mut stream, _) = accept_with_timeout(&listener);
-                let mut buf = [0u8; 2048];
-                stream.read(&mut buf).unwrap();
+                crate::util::test_http::consume_request(&mut stream);
                 let body = if index == 0 {
                     r#"{"content":"first","title":"Original","next":"/chapter/1-2"}"#
                 } else {
@@ -2135,8 +2075,7 @@ mod tests {
             let base = format!("http://{}", listener.local_addr().unwrap());
             let server = thread::spawn(move || {
                 let (mut stream, _) = accept_with_timeout(&listener);
-                let mut buf = [0u8; 1024];
-                stream.read(&mut buf).unwrap();
+                crate::util::test_http::consume_request(&mut stream);
                 let body = r#"{"content":"main","title":"   "}"#;
                 write!(
                     stream,
@@ -2300,8 +2239,7 @@ mod tests {
         let server = thread::spawn(move || {
             for index in 0..2 {
                 let (mut stream, _) = accept_with_timeout(&listener);
-                let mut buf = [0u8; 2048];
-                stream.read(&mut buf).unwrap();
+                crate::util::test_http::consume_request(&mut stream);
                 let (status, body) = if index == 0 {
                     (
                         "200 OK",
@@ -2430,8 +2368,7 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
             let (mut stream, _) = accept_with_timeout(&listener);
-            let mut buf = [0u8; 1024];
-            stream.read(&mut buf).unwrap();
+            crate::util::test_http::consume_request(&mut stream);
             let body = r#"{"content":"main","append":"http://127.0.0.1:1/should-not-fetch"}"#;
             write!(
                 stream,
@@ -2459,8 +2396,7 @@ mod tests {
             let base = format!("http://{}", listener.local_addr().unwrap());
             let server = thread::spawn(move || {
                 let (mut stream, _) = accept_with_timeout(&listener);
-                let mut buf = [0u8; 1024];
-                stream.read(&mut buf).unwrap();
+                crate::util::test_http::consume_request(&mut stream);
                 let body = r#"{"content":"main","append":"extra"}"#;
                 write!(
                     stream,

@@ -3755,7 +3755,9 @@ fn eval_field_json_with_ctx(
     base_url: &str,
     ctx: &mut RuleVariableContext,
 ) -> Option<String> {
-    if let Some((script, remainder)) = split_leading_js_transform(rule) {
+    if let Some((script, remainder)) =
+        split_leading_js_transform(rule).filter(|(_, remainder)| !remainder.starts_with("##"))
+    {
         // Field stages receive the current JSON value, not the serialized body
         // used by list transforms. Feed each stage's output to the next rule.
         let script = interpolate_json_templates(script, v, base_url, ctx);
@@ -3802,8 +3804,20 @@ fn eval_field_json_with_ctx(
             .and_then(|row| row.get(1).or_else(|| row.first()).and_then(Clone::clone))
             .unwrap_or_default(),
         ParseMode::Js => {
-            eval_js_with_bindings(strip_js_rule(pure), &input, base_url, &ctx.js_bindings())
-                .unwrap_or_default()
+            let mut bindings = ctx.js_bindings();
+            bindings.insert("result".to_string(), v.clone());
+            let script = js.unwrap_or_else(|| strip_js_rule(pure));
+            // Preserve JSON.parse(result)/String(result) without replacing the
+            // JSON value with a string or changing the global JSON API.
+            let script = format!(
+                "if (globalThis.result !== null && typeof globalThis.result === 'object') {{\n\
+                 globalThis.Object.defineProperty(globalThis.result, globalThis.Symbol.toPrimitive, {{\n\
+                 value: function() {{ return globalThis.JSON.stringify(this); }} }});\n}}\n{script}"
+            );
+            return eval_js_with_bindings(&script, &input, base_url, &bindings)
+                .ok()
+                .map(|text| source_rule.apply_replacement(&text))
+                .filter(|text| !text.is_empty());
         }
         ParseMode::XPath => html::select_xpath(&input, pure)
             .first()

@@ -68,7 +68,7 @@ fn prefix_then_selector_trailing_js_and_replacement_keep_order() {
 }
 
 #[test]
-fn existing_pure_js_field_keeps_string_input_contract() {
+fn existing_pure_js_field_keeps_json_parse_compatibility() {
     assert_eq!(
         chapter_title("@js:JSON.parse(result).title", item()),
         "原始标题"

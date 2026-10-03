@@ -1685,7 +1685,7 @@ mod tests {
 
     #[test]
     fn android_body_js_transforms_response_unless_xml_header_is_inserted() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1704,8 +1704,7 @@ mod tests {
                 ("text/plain", "original"),
             ] {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0; 4096];
-                stream.read(&mut request).unwrap();
+                crate::util::test_http::consume_request(&mut stream);
                 write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
         });

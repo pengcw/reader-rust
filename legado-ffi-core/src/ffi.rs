@@ -889,7 +889,7 @@ function nextPage(html) {{ return org.jsoup.Jsoup.parse(html).select('a#next').f
 
     #[test]
     fn reader_execute_content_get_string_keeps_json_fallback_and_url_base() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::TcpListener;
         use std::thread;
 
@@ -897,11 +897,7 @@ function nextPage(html) {{ return org.jsoup.Jsoup.parse(html).select('a#next').f
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .unwrap();
-            let mut request = [0; 2048];
-            stream.read(&mut request).unwrap();
+            crate::util::test_http::consume_request(&mut stream);
             let body = r#"{"data":{"path":"/next","count":0,"fallback":"ok"}}"#;
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         });
