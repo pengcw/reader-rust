@@ -1293,6 +1293,7 @@ dependencies = [
  "jsonpath_lib",
  "md-5",
  "once_cell",
+ "publicsuffix",
  "rakers",
  "rand",
  "regex",

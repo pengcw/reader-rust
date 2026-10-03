@@ -933,6 +933,19 @@ fn eval_js_inner_with_source(
                 }),
             )?;
             java_obj.set(
+                "__httpUrl",
+                Func::new(|spec: String| -> Option<String> { super::http_url::parse(&spec) }),
+            )?;
+            let suffix_cache = crate::crawler::session::current_active_session()
+                .map(|session| session.public_suffix_cache.clone())
+                .unwrap_or_else(|| Arc::new(Mutex::new(None)));
+            java_obj.set(
+                "__topPrivateDomain",
+                Func::new(move |spec: String| -> String {
+                    super::http_url::top_private_domain(&spec, &suffix_cache).to_string()
+                }),
+            )?;
+            java_obj.set(
                 "__toURL",
                 Func::new(
                     |url: String, base_url: rquickjs::function::Opt<String>| -> String {
@@ -2770,6 +2783,44 @@ fn eval_js_inner_with_source(
                     Packages.javax.xml.bind.DatatypeConverter =
                         markClass('DatatypeConverter', DatatypeConverter);
                     Packages.android.util.Base64 = markClass('Base64', base64);
+
+                    // Thin URL facade: parsing stays in the existing Rust-backed helper.
+                    function JavaURL(spec) {
+                        if (!new.target) return new JavaURL(spec);
+                        const text = JsString(spec);
+                        const parsed = java.toURL(text);
+                        Object.defineProperties(this, {
+                            host: { value: parsed.host, enumerable: true },
+                            path: { value: parsed.pathname, enumerable: true },
+                            pathname: { value: parsed.pathname, enumerable: true }
+                        });
+                        this.toString = () => text;
+                    }
+                    JavaURL.prototype.getHost = function() { return this.host; };
+                    JavaURL.prototype.getPath = function() { return this.path; };
+                    Packages.java.net.URL = markClass('URL', JavaURL);
+                    const JavaHttpUrl = {
+                        parse(spec) {
+                            const payload = java.__httpUrl(JsString(spec));
+                            if (payload == null) return null;
+                            const parsed = JSON.parse(payload);
+                            return Object.freeze({
+                                host: parsed.host,
+                                toString: () => parsed.url,
+                                topPrivateDomain() {
+                                    const response = JSON.parse(java.__topPrivateDomain(parsed.url));
+                                    if (!response.ok) {
+                                        const error = new Error(response.error.message);
+                                        error.kind = response.error.kind;
+                                        throw error;
+                                    }
+                                    return response.data;
+                                }
+                            });
+                        }
+                    };
+                    Packages.okhttp3 = Packages.okhttp3 || {};
+                    Packages.okhttp3.HttpUrl = markClass('HttpUrl', JavaHttpUrl);
 
                     const exposeJavaValue = (target, value) => {
                         if (!value) return;

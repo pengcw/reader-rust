@@ -1,6 +1,7 @@
 pub(crate) mod compression;
 pub(crate) mod crypto;
 pub mod html;
+pub(crate) mod http_url;
 pub mod js;
 pub mod jsonpath;
 pub mod rule_analyzer;
