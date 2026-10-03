@@ -98,6 +98,9 @@ optional = true
 [dependencies.scraper]
 version = "0.27"
 
+[dependencies.serde_json]
+version = "1"
+
 [dependencies.similar]
 version = "2"
 optional = true

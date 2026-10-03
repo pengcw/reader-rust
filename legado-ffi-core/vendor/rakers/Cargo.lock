@@ -1424,6 +1424,7 @@ dependencies = [
  "predicates",
  "rquickjs",
  "scraper",
+ "serde_json",
  "similar",
  "tempfile",
  "ureq",

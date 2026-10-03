@@ -220,7 +220,25 @@ fn rakers_render_request(input: &str) -> char_p::Box {
                 },
                 None => None,
             };
-            match render_rakers_html(html, base_url.as_ref().map(url::Url::as_str), None, None) {
+            let client = match crate::crawler::HttpClient::new(
+                DEFAULT_RAKERS_EVAL_TIMEOUT_MS,
+                Some(crate::crawler::SharedCookieStore::default()),
+                None,
+            ) {
+                Ok(client) => client,
+                Err(error) => return rakers_eval_error(&format!("HTTP client setup failed: {error}")),
+            };
+            match render_rakers_html(
+                html,
+                base_url.as_ref().map(url::Url::as_str),
+                None,
+                None,
+                Some(crate::crawler::rakers_http_transport(
+                    &client,
+                    MAX_RAKERS_EVAL_HTML_BYTES,
+                )),
+                Some(std::time::Duration::from_millis(DEFAULT_RAKERS_EVAL_TIMEOUT_MS)),
+            ) {
                 Ok(rendered) => rendered,
                 Err(error) => return rakers_eval_error(&error),
             }
@@ -246,7 +264,7 @@ fn eval_http_request(input: &str) -> char_p::Box {
         return rakers_eval_error("@http_request requires url");
     };
     let response = match execute_eval_http_request(url, &request) {
-        Ok(response) => response,
+        Ok((response, _client)) => response,
         Err(error) => return rakers_eval_error(&error),
     };
     let content_type = response
@@ -319,7 +337,7 @@ fn fetch_and_render_rakers_url(
     raw_url: &str,
     request: &RakersEvalRequest,
 ) -> Result<String, String> {
-    let response = execute_eval_http_request(raw_url, request)?;
+    let (response, client) = execute_eval_http_request(raw_url, request)?;
     let content_type = response
         .headers
         .get(ureq::http::header::CONTENT_TYPE)
@@ -339,18 +357,29 @@ fn fetch_and_render_rakers_url(
         .filter(|proxy| !proxy.is_empty())
         .map(str::to_string);
 
-    render_rakers_html(&html, Some(&response.url), user_agent, proxy)
+    let render_timeout = std::time::Duration::from_millis(rakers_eval_timeout_ms(request)?);
+    render_rakers_html(
+        &html,
+        Some(&response.url),
+        user_agent,
+        proxy,
+        Some(crate::crawler::rakers_http_transport(
+            &client,
+            MAX_RAKERS_EVAL_HTML_BYTES,
+        )),
+        Some(render_timeout),
+    )
 }
 
 fn execute_eval_http_request(
     raw_url: &str,
     request: &RakersEvalRequest,
-) -> Result<crate::crawler::RawHttpResponse, String> {
+) -> Result<(crate::crawler::RawHttpResponse, crate::crawler::HttpClient), String> {
     if request.base_url.is_some() {
         return Err("baseUrl is only valid with html input".to_string());
     }
     let page_url = validate_rakers_http_url(raw_url)?;
-    let headers = rakers_eval_headers(request.headers.as_ref())?;
+    let mut headers = rakers_eval_headers(request.headers.as_ref())?;
     let cookie_header = rakers_eval_cookie_header(request.cookies.as_ref())?;
     let timeout_ms = rakers_eval_timeout_ms(request)?;
     let max_redirects = request.max_redirects.unwrap_or(MAX_RAKERS_EVAL_REDIRECTS);
@@ -369,12 +398,22 @@ fn execute_eval_http_request(
     if let Some(cookie_header) = cookie_header.as_deref() {
         cookies.add_cookie_header(cookie_header, &page_url);
     }
+    let header_cookie = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+        .map(|(_, value)| value.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if !header_cookie.is_empty() {
+        cookies.add_cookie_header(&header_cookie, &page_url);
+        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("cookie"));
+    }
     let client = crate::crawler::HttpClient::new(timeout_ms, Some(cookies), proxy)
         .map_err(|error| format!("HTTP client setup failed: {error}"))?;
     let method = request.method.as_deref().unwrap_or("GET");
     let method = ureq::http::Method::from_bytes(method.as_bytes())
         .map_err(|error| format!("invalid HTTP method: {error}"))?;
-    if request.redirect == Some(false) || max_redirects == 0 {
+    let response = if request.redirect == Some(false) || max_redirects == 0 {
         client.execute_once(
             method,
             page_url.as_str(),
@@ -392,7 +431,8 @@ fn execute_eval_http_request(
             max_redirects,
         )
     }
-    .map_err(|error| format!("HTTP request failed: {error}"))
+    .map_err(|error| format!("HTTP request failed: {error}"))?;
+    Ok((response, client))
 }
 
 fn validate_rakers_http_url(raw_url: &str) -> Result<url::Url, String> {
@@ -486,6 +526,8 @@ fn render_rakers_html(
     page_url: Option<&str>,
     user_agent: Option<String>,
     proxy: Option<String>,
+    transport: Option<std::sync::Arc<dyn rakers::HttpTransport>>,
+    render_timeout: Option<std::time::Duration>,
 ) -> Result<String, String> {
     if html.len() > MAX_RAKERS_EVAL_HTML_BYTES {
         return Err("Rakers render HTML exceeds 8 MiB".to_string());
@@ -495,6 +537,10 @@ fn render_rakers_html(
         headers: Vec::new(),
         proxy,
         forward_headers: false,
+        transport,
+        max_requests: Some(32),
+        max_response_bytes: Some(MAX_RAKERS_EVAL_HTML_BYTES),
+        render_timeout,
     };
     let rendered = rakers::render(
         html,

@@ -114,6 +114,7 @@ fn http_config_from_cli(cli: &Cli) -> anyhow::Result<HttpConfig> {
         headers,
         proxy: cli.proxy.clone(),
         forward_headers: cli.forward_headers,
+        ..Default::default()
     })
 }
 

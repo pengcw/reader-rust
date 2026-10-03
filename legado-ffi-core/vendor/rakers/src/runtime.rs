@@ -54,6 +54,90 @@ fn make_bootstrap(page_url: Option<&str>) -> String {
     BOOTSTRAP_TEMPLATE.replace("__HREF__", &escaped)
 }
 
+fn request_headers_from_json(raw: &str) -> Vec<(String, String)> {
+    let Ok(serde_json::Value::Object(headers)) = serde_json::from_str(raw) else {
+        return Vec::new();
+    };
+    headers
+        .into_iter()
+        .filter(|(name, _)| {
+            !matches!(
+                name.to_ascii_lowercase().as_str(),
+                "cookie"
+                    | "host"
+                    | "content-length"
+                    | "connection"
+                    | "transfer-encoding"
+                    | "proxy-authorization"
+            )
+        })
+        .filter_map(|(name, value)| match value {
+            serde_json::Value::String(value) => Some((name, value)),
+            serde_json::Value::Number(value) => Some((name, value.to_string())),
+            serde_json::Value::Bool(value) => Some((name, value.to_string())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn perform_http_request(
+    cfg: &crate::HttpConfig,
+    budget: &crate::RequestBudget,
+    method: &str,
+    url: &str,
+    headers_json: &str,
+    body: &str,
+) -> String {
+    let mut headers = request_headers_from_json(headers_json);
+    // Browser JavaScript cannot set transport-owned/credential headers directly.
+    // Cookie state comes only from the host cookie jar, so script code cannot
+    // replace or exfiltrate it by forging a raw Cookie header.
+    headers.retain(|(name, _)| {
+        !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "cookie"
+                | "host"
+                | "content-length"
+                | "connection"
+                | "proxy-authorization"
+                | "set-cookie"
+                | "transfer-encoding"
+                | "user-agent"
+        )
+    });
+    match cfg.execute(
+        budget,
+        method,
+        url,
+        &headers,
+        (!body.is_empty()).then_some(body),
+        cfg.forward_headers,
+    ) {
+        Ok(response) => {
+            let mut response_headers = serde_json::Map::new();
+            for (name, value) in response.headers {
+                if name.eq_ignore_ascii_case("set-cookie") || name.eq_ignore_ascii_case("set-cookie2") {
+                    continue;
+                }
+                response_headers.insert(name.to_ascii_lowercase(), serde_json::Value::String(value));
+            }
+            let status_text = ureq::http::StatusCode::from_u16(response.status)
+                .ok()
+                .and_then(|status| status.canonical_reason())
+                .unwrap_or("");
+            serde_json::json!({
+                "url": response.url,
+                "status": response.status,
+                "statusText": status_text,
+                "headers": response_headers,
+                "body": response.body,
+            })
+            .to_string()
+        }
+        Err(error) => serde_json::json!({"error": error}).to_string(),
+    }
+}
+
 // ── boa engine ────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "boa")]
@@ -70,12 +154,17 @@ mod boa_rt {
         static WRITTEN:         RefCell<String>      = const { RefCell::new(String::new()) };
         static LOGGED:          RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         static BODY_INNER_HTML: RefCell<String>      = const { RefCell::new(String::new()) };
-        // HttpConfig fields for XHR/_r_fetch_sync
-        static XHR_UA:          RefCell<Option<String>> = const { RefCell::new(None) };
-        static XHR_HEADERS:     RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
-        static XHR_PROXY:       RefCell<Option<String>> = const { RefCell::new(None) };
-        static XHR_TIMEOUT:     RefCell<Option<std::time::Duration>> = const { RefCell::new(None) };
-        static XHR_FORWARD_HEADERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static HTTP_CONFIG:     RefCell<Option<crate::HttpConfig>>    = const { RefCell::new(None) };
+        static HTTP_BUDGET:     RefCell<Option<crate::RequestBudget>> = const { RefCell::new(None) };
+    }
+
+    struct HttpContextGuard;
+
+    impl Drop for HttpContextGuard {
+        fn drop(&mut self) {
+            HTTP_CONFIG.with(|slot| *slot.borrow_mut() = None);
+            HTTP_BUDGET.with(|slot| *slot.borrow_mut() = None);
+        }
     }
 
     /// A sandboxed JavaScript execution context.
@@ -109,26 +198,23 @@ mod boa_rt {
             &self,
             scripts: &[String],
             page_url: Option<&str>,
-            _cfg: &crate::HttpConfig,
+            cfg: &crate::HttpConfig,
+            budget: &crate::RequestBudget,
         ) -> anyhow::Result<()> {
+            HTTP_CONFIG.with(|slot| *slot.borrow_mut() = Some(cfg.clone()));
+            HTTP_BUDGET.with(|slot| *slot.borrow_mut() = Some(budget.clone()));
+            let _http_guard = HttpContextGuard;
             let mut ctx = Context::default();
             ctx.runtime_limits_mut().set_stack_size_limit(65536);
             ctx.runtime_limits_mut().set_recursion_limit(65536);
             setup_document(&mut ctx)?;
             setup_console(&mut ctx)?;
-            // Register sync XHR fetch helper so bootstrap's XHR/send and appendChild can synchronously fetch resources.
-            setup_xhr_fetch(&mut ctx)?;
+            setup_http_bridge(&mut ctx)?;
 
             let bootstrap = super::make_bootstrap(page_url);
             ctx.eval(Source::from_bytes(bootstrap.as_bytes()))
                 .map_err(|e| anyhow!("bootstrap error: {:?}", e))?;
 
-            // Set XHR config from provided HttpConfig so _r_fetch_sync can use it.
-            XHR_UA.with(|u| u.borrow_mut().clone_from(&_cfg.user_agent));
-            XHR_HEADERS.with(|h| h.borrow_mut().clone_from(&_cfg.headers));
-            XHR_PROXY.with(|p| p.borrow_mut().clone_from(&_cfg.proxy));
-            XHR_TIMEOUT.with(|t| *t.borrow_mut() = None);
-            XHR_FORWARD_HEADERS.with(|f| f.set(false));
 
             for script in scripts {
                 if let Err(e) = ctx.eval(Source::from_bytes(script.as_bytes())) {
@@ -240,72 +326,40 @@ mod boa_rt {
         Ok(JsValue::undefined())
     }
 
-    // Synchronous fetch exposed to JS as `_r_fetch_sync(url)` so the bootstrap can
-    // perform blocking template fetches for frameworks that rely on sync XHR.
-    fn boa_fetch_sync(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-        let url = if let Some(first) = args.first() {
-            match first.to_string(ctx) {
-                Ok(sv) => sv.to_std_string_escaped(),
-                Err(_) => String::new(),
-            }
-        } else {
-            String::new()
+    fn boa_request_sync(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+        let arg = |index: usize, ctx: &mut Context| -> String {
+            args.get(index)
+                .and_then(|value| value.to_string(ctx).ok())
+                .map(|value| value.to_std_string_escaped())
+                .unwrap_or_default()
         };
-        if url.is_empty() || !(url.starts_with("http://") || url.starts_with("https://")) {
-            return Ok(JsValue::undefined());
-        }
-        let ua = XHR_UA.with(|u| u.borrow().clone());
-        let headers = XHR_HEADERS.with(|h| h.borrow().clone());
-        let proxy = XHR_PROXY.with(|p| p.borrow().clone());
-        let timeout = XHR_TIMEOUT.with(|t| *t.borrow());
-        let forward = XHR_FORWARD_HEADERS.with(std::cell::Cell::get);
-
-        let mut builder = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(std::time::Duration::from_secs(8)))
-            .timeout_connect(Some(std::time::Duration::from_secs(3)));
-        if let Some(ref proxy_url) = proxy
-            && let Ok(p) = ureq::Proxy::new(proxy_url)
-        {
-            builder = builder.proxy(Some(p));
-        }
-        if let Some(dur) = timeout {
-            builder = builder.timeout_global(Some(dur));
-        }
-        let agent = ureq::Agent::new_with_config(builder.build());
-        let mut req = agent.get(&url);
-        if let Some(ref ua_str) = ua {
-            req = req.header("User-Agent", ua_str);
-        }
-        if forward {
-            for (name, value) in &headers {
-                req = req.header(name, value);
+        let method = arg(0, ctx);
+        let url = arg(1, ctx);
+        let headers = arg(2, ctx);
+        let body = arg(3, ctx);
+        let cfg = HTTP_CONFIG.with(|slot| slot.borrow().clone());
+        let budget = HTTP_BUDGET.with(|slot| slot.borrow().clone());
+        let result = match (cfg, budget) {
+            (Some(cfg), Some(budget)) => {
+                super::perform_http_request(&cfg, &budget, &method, &url, &headers, &body)
             }
-        }
-        let body = match req.call() {
-            Ok(mut response) => response.body_mut().read_to_string().unwrap_or_default(),
-            Err(_) => String::new(),
+            _ => serde_json::json!({"error":"HTTP bridge is not initialized"}).to_string(),
         };
-        if body.is_empty() {
-            Ok(JsValue::undefined())
-        } else {
-            Ok(js_string!(body).into())
-        }
+        Ok(js_string!(result).into())
     }
 
-    fn setup_xhr_fetch(ctx: &mut Context) -> anyhow::Result<()> {
-        // Build a temporary object with the native function and assign its field to the global name.
+    fn setup_http_bridge(ctx: &mut Context) -> anyhow::Result<()> {
         let mut init = ObjectInitializer::new(ctx);
         init.function(
-            NativeFunction::from_fn_ptr(boa_fetch_sync),
+            NativeFunction::from_fn_ptr(boa_request_sync),
             js_string!("f"),
-            1,
+            4,
         );
         let obj = init.build();
-        ctx.register_global_property(js_string!("__r_fetch_tmp"), obj, Attribute::all())
+        ctx.register_global_property(js_string!("__r_request_tmp"), obj, Attribute::all())
             .map_err(|e| anyhow!("{e:?}"))?;
-        // Execute JS to move the function to a true global function and delete the temp.
-        ctx.eval(Source::from_bytes(b"(function(){this._r_fetch_sync = __r_fetch_tmp.f; try{ delete __r_fetch_tmp; }catch(e){} })();")).map_err(|e| anyhow!("register fetch fn failed: {e:?}"))?;
+        ctx.eval(Source::from_bytes(b"(function(){this._r_request_sync = __r_request_tmp.f; try{ delete __r_request_tmp; }catch(e){} })();"))
+            .map_err(|e| anyhow!("register request fn failed: {e:?}"))?;
         Ok(())
     }
 
@@ -363,22 +417,35 @@ mod quickjs_rt {
         static BODY_INNER_HTML: RefCell<String>                        = const { RefCell::new(String::new()) };
         // Deadline for the currently-executing script; None means no limit active.
         static SCRIPT_DEADLINE: RefCell<Option<Instant>>               = const { RefCell::new(None) };
-        // HttpConfig fields stored so the _r_fetch_sync native function can use them.
-        static XHR_UA:          RefCell<Option<String>>                = const { RefCell::new(None) };
-        static XHR_HEADERS:     RefCell<Vec<(String, String)>>         = const { RefCell::new(Vec::new()) };
-        static XHR_PROXY:       RefCell<Option<String>>                = const { RefCell::new(None) };
-        // Per-request timeout applied to XHR fetches; mirrors the script timeout.
-        static XHR_TIMEOUT:          RefCell<Option<Duration>>         = const { RefCell::new(None) };
-        // Whether to forward custom -H headers on XHR requests (off by default).
-        static XHR_FORWARD_HEADERS:  std::cell::Cell<bool>             = const { std::cell::Cell::new(false) };
+        static HTTP_CONFIG:     RefCell<Option<crate::HttpConfig>>     = const { RefCell::new(None) };
+        static HTTP_BUDGET:     RefCell<Option<crate::RequestBudget>>  = const { RefCell::new(None) };
     }
 
-    fn set_deadline(timeout: Duration) {
-        SCRIPT_DEADLINE.with(|d| *d.borrow_mut() = Some(Instant::now() + timeout));
+    struct HttpContextGuard;
+
+    impl Drop for HttpContextGuard {
+        fn drop(&mut self) {
+            HTTP_CONFIG.with(|slot| *slot.borrow_mut() = None);
+            HTTP_BUDGET.with(|slot| *slot.borrow_mut() = None);
+            SCRIPT_DEADLINE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    fn bounded_deadline(timeout: Option<Duration>, render_deadline: Option<Instant>) -> Option<Instant> {
+        let local = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+        match (local, render_deadline) {
+            (Some(local), Some(render)) => Some(local.min(render)),
+            (Some(local), None) => Some(local),
+            (None, render) => render,
+        }
+    }
+
+    fn set_deadline(deadline: Option<Instant>) {
+        SCRIPT_DEADLINE.with(|d| *d.borrow_mut() = deadline);
     }
 
     fn clear_deadline() {
-        SCRIPT_DEADLINE.with(|d| *d.borrow_mut() = None);
+        set_deadline(None);
     }
 
     /// A sandboxed JavaScript execution context.
@@ -416,12 +483,11 @@ mod quickjs_rt {
             scripts: &[String],
             page_url: Option<&str>,
             cfg: &crate::HttpConfig,
+            budget: &crate::RequestBudget,
         ) -> anyhow::Result<()> {
-            XHR_UA.with(|u| u.borrow_mut().clone_from(&cfg.user_agent));
-            XHR_HEADERS.with(|h| h.borrow_mut().clone_from(&cfg.headers));
-            XHR_PROXY.with(|p| p.borrow_mut().clone_from(&cfg.proxy));
-            XHR_TIMEOUT.with(|t| *t.borrow_mut() = self.timeout);
-            XHR_FORWARD_HEADERS.with(|f| f.set(cfg.forward_headers));
+            HTTP_CONFIG.with(|slot| *slot.borrow_mut() = Some(cfg.clone()));
+            HTTP_BUDGET.with(|slot| *slot.borrow_mut() = Some(budget.clone()));
+            let _http_guard = HttpContextGuard;
 
             let rt = Runtime::new().map_err(|e| anyhow!("quickjs runtime: {e:?}"))?;
             rt.set_loader(StubModuleSystem, StubModuleSystem);
@@ -443,7 +509,7 @@ mod quickjs_rt {
             ctx.with(|ctx| -> anyhow::Result<()> {
                 setup_document(&ctx)?;
                 setup_console(&ctx)?;
-                setup_xhr_fetch(&ctx)?;
+                setup_http_bridge(&ctx)?;
 
                 let sloppy = || {
                     let mut o = EvalOptions::default();
@@ -451,16 +517,19 @@ mod quickjs_rt {
                     o
                 };
 
+                let render_deadline = budget.deadline();
+                set_deadline(render_deadline);
                 let bootstrap = super::make_bootstrap(page_url);
-                ctx.eval_with_options::<Value, _>(bootstrap, sloppy())
-                    .map_err(|e| anyhow!("bootstrap error: {e:?}"))?;
+                let bootstrap_result = ctx.eval_with_options::<Value, _>(bootstrap, sloppy());
+                clear_deadline();
+                bootstrap_result.map_err(|e| anyhow!("bootstrap error: {e:?}"))?;
 
                 for script in scripts {
-                    if let Some(t) = self.timeout {
-                        set_deadline(t);
+                    if render_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        break;
                     }
+                    set_deadline(bounded_deadline(self.timeout, render_deadline));
                     let result = ctx.eval_with_options::<Value, _>(script.as_str(), sloppy());
-                    clear_deadline();
                     if result.is_err() {
                         let exc = ctx.catch();
                         if let Some(e) = exc.as_exception() {
@@ -473,19 +542,30 @@ mod quickjs_rt {
                             }
                         }
                     }
-                    // Drain Promise microtasks after each script so .then() chains fire
-                    // before the next script runs.
-                    while ctx.execute_pending_job() {}
+                    // rquickjs 0.8 has a known interrupt-handler hazard inside pending jobs.
+                    // Bound the queue cooperatively by count + wall clock instead of firing
+                    // the QuickJS interrupt from execute_pending_job().
+                    clear_deadline();
+                    let mut jobs = 0usize;
+                    while ctx.execute_pending_job() {
+                        jobs += 1;
+                        if jobs >= 2_000
+                            || render_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                        {
+                            break;
+                        }
+                    }
+                    clear_deadline();
                 }
 
-                // Flush _r_timers in a Rust loop, draining Promise microtasks between passes.
-                // Ember/Glimmer's Backburner run loop schedules rendering via Promise chains,
-                // so both queues must be drained together until both are empty.
+                // Flush timers and Promise jobs together until idle, bounded by both the
+                // render deadline and a hard pass/job cap.
                 let mut consecutive_empty = 0u32;
                 for _ in 0..128u32 {
-                    if let Some(t) = self.timeout {
-                        set_deadline(t);
+                    if render_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        break;
                     }
+                    set_deadline(bounded_deadline(self.timeout, render_deadline));
                     let remaining: i32 = ctx
                         .eval_with_options::<Value, _>(super::TIMER_FLUSH_JS, sloppy())
                         .ok()
@@ -493,9 +573,17 @@ mod quickjs_rt {
                         .unwrap_or(0);
                     clear_deadline();
                     let mut had_jobs = false;
+                    let mut jobs = 0usize;
                     while ctx.execute_pending_job() {
                         had_jobs = true;
+                        jobs += 1;
+                        if jobs >= 2_000
+                            || render_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                        {
+                            break;
+                        }
                     }
+                    clear_deadline();
                     if remaining == 0 && !had_jobs {
                         consecutive_empty += 1;
                         if consecutive_empty >= 3 {
@@ -506,9 +594,7 @@ mod quickjs_rt {
                     }
                 }
 
-                if let Some(t) = self.timeout {
-                    set_deadline(t);
-                }
+                set_deadline(bounded_deadline(self.timeout, render_deadline));
                 let body_html: String = ctx
                     .eval_with_options::<Value, _>(super::READBACK_JS, sloppy())
                     .ok()
@@ -635,49 +721,25 @@ mod quickjs_rt {
         Ok(())
     }
 
-    /// Register `_r_fetch_sync(url)` — a synchronous HTTP GET used by the XHR stub
-    /// so frameworks that XHR-load templates (e.g. `RiotJS`) get real response bodies.
-    fn setup_xhr_fetch(ctx: &Ctx<'_>) -> anyhow::Result<()> {
-        let fetch_fn = Function::new(ctx.clone(), |url: String| -> String {
-            let ua = XHR_UA.with(|u| u.borrow().clone());
-            let headers = XHR_HEADERS.with(|h| h.borrow().clone());
-            let proxy = XHR_PROXY.with(|p| p.borrow().clone());
-            let timeout = XHR_TIMEOUT.with(|t| *t.borrow());
-            let forward_hdrs = XHR_FORWARD_HEADERS.with(std::cell::Cell::get);
-            if !url.starts_with("http://") && !url.starts_with("https://") {
-                return String::new();
-            }
-            let mut builder = ureq::Agent::config_builder()
-                .http_status_as_error(false)
-                .timeout_global(Some(Duration::from_secs(8)))
-                .timeout_connect(Some(Duration::from_secs(3)));
-            if let Some(ref proxy_url) = proxy
-                && let Ok(p) = ureq::Proxy::new(proxy_url)
-            {
-                builder = builder.proxy(Some(p));
-            }
-            if let Some(dur) = timeout {
-                builder = builder.timeout_global(Some(dur));
-            }
-            let agent = ureq::Agent::new_with_config(builder.build());
-            let mut req = agent.get(&url);
-            if let Some(ref ua_str) = ua {
-                req = req.header("User-Agent", ua_str);
-            }
-            if forward_hdrs {
-                for (name, value) in &headers {
-                    req = req.header(name, value);
+    /// Register the single native HTTP bridge used by fetch, XHR and dynamic scripts.
+    fn setup_http_bridge(ctx: &Ctx<'_>) -> anyhow::Result<()> {
+        let request_fn = Function::new(
+            ctx.clone(),
+            |method: String, url: String, headers: String, body: String| -> String {
+                let cfg = HTTP_CONFIG.with(|slot| slot.borrow().clone());
+                let budget = HTTP_BUDGET.with(|slot| slot.borrow().clone());
+                match (cfg, budget) {
+                    (Some(cfg), Some(budget)) => {
+                        super::perform_http_request(&cfg, &budget, &method, &url, &headers, &body)
+                    }
+                    _ => serde_json::json!({"error":"HTTP bridge is not initialized"}).to_string(),
                 }
-            }
-            match req.call() {
-                Ok(mut response) => response.body_mut().read_to_string().unwrap_or_default(),
-                Err(_) => String::new(),
-            }
-        })
+            },
+        )
         .map_err(|e| anyhow!("{e:?}"))?;
 
         ctx.globals()
-            .set("_r_fetch_sync", fetch_fn)
+            .set("_r_request_sync", request_fn)
             .map_err(|e| anyhow!("{e:?}"))?;
         Ok(())
     }

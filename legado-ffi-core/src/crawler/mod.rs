@@ -247,7 +247,18 @@ impl HttpSession {
             self.client.clone()
         };
 
-        let headers = spec.headers.clone();
+        let mut headers = spec.headers.clone();
+        if spec.render_with_rakers && let Ok(url) = url::Url::parse(&spec.url) {
+            let cookie = headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            if !cookie.is_empty() && client.seed_cookie_header(&cookie, &url) {
+                headers.retain(|(name, _)| !name.eq_ignore_ascii_case("cookie"));
+            }
+        }
 
         let mut last_error = None;
         for attempt in 0..=spec.retry.min(3) {
@@ -309,7 +320,7 @@ impl HttpSession {
                     )
                     .map_err(FetchError::Rule)?;
                     let body = if spec.render_with_rakers {
-                        render_with_rakers(spec, &url, &body, max_response_bytes)?
+                        render_with_rakers(&client, spec, &url, &body, max_response_bytes)?
                     } else {
                         body
                     };
@@ -343,9 +354,61 @@ impl HttpSession {
 }
 
 const RAKERS_MAX_REMOTE_SCRIPTS: usize = 8;
+const RAKERS_MAX_REQUESTS: usize = 32;
 const RAKERS_SCRIPT_TIMEOUT: Duration = Duration::from_secs(3);
+const RAKERS_RENDER_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Clone)]
+struct RakersHttpTransport {
+    client: HttpClient,
+    max_response_bytes: usize,
+}
+
+impl rakers::HttpTransport for RakersHttpTransport {
+    fn execute(&self, request: rakers::HttpRequest) -> Result<rakers::HttpResponse, String> {
+        let method = Method::from_bytes(request.method.as_bytes())
+            .map_err(|error| format!("invalid HTTP method: {error}"))?;
+        let response = self
+            .client
+            .execute(
+                method,
+                &request.url,
+                &request.headers,
+                request.body.as_deref(),
+                Some(self.max_response_bytes.max(1)),
+            )
+            .map_err(|error| error.to_string())?;
+        let headers = response
+            .headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_string(), value.to_string()))
+            })
+            .collect();
+        Ok(rakers::HttpResponse {
+            url: response.url,
+            status: response.status,
+            headers,
+            body: String::from_utf8_lossy(&response.body).into_owned(),
+        })
+    }
+}
+
+pub(crate) fn rakers_http_transport(
+    client: &HttpClient,
+    max_response_bytes: usize,
+) -> std::sync::Arc<dyn rakers::HttpTransport> {
+    std::sync::Arc::new(RakersHttpTransport {
+        client: client.clone(),
+        max_response_bytes,
+    })
+}
 
 fn render_with_rakers(
+    client: &HttpClient,
     spec: &RequestSpec,
     page_url: &str,
     html: &str,
@@ -363,6 +426,10 @@ fn render_with_rakers(
         headers: Vec::new(),
         proxy: spec.proxy.clone(),
         forward_headers: false,
+        transport: Some(rakers_http_transport(client, max_response_bytes)),
+        max_requests: Some(RAKERS_MAX_REQUESTS),
+        max_response_bytes: Some(max_response_bytes.max(1)),
+        render_timeout: Some(RAKERS_RENDER_TIMEOUT),
     };
     let rendered = rakers::render(
         html,

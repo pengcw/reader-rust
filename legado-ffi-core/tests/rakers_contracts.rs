@@ -8,16 +8,16 @@
 //! 2. SPA novel review list client-side hydration (inline data & DOM rendering).
 //! 3. External script resolution and execution via baseUrl and loopback HTTP server.
 //! 4. Promise microtask and timer queue (setTimeout/then) flushing.
-//! 5. Synchronous XHR (XMLHttpRequest) data fetching via native `_r_fetch_sync`.
-//! 6. `window.fetch` stub safe non-crashing contract.
+//! 5. Synchronous and asynchronous page HTTP requests through the shared Rakers transport.
+//! 6. Real `window.fetch` body/status/JSON hydration.
 //! 7. Security limits, payload bounds, and syntax error resilience.
-//! 8. Full URL direct fetch and headless render pipeline.
+//! 8. Full URL direct fetch with cookie continuity across page subrequests.
 
 use reader_parser::ffi::{reader_eval, reader_free_string};
 use safer_ffi::prelude::*;
 use serde_json::{json, Value};
 use std::ffi::CString;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::thread;
 
@@ -220,31 +220,224 @@ fn rakers_xhr_sync_fetch_runtime_support() {
 }
 
 #[test]
-fn rakers_fetch_stub_safe_resolution() {
-    // Tests that window.fetch resolves without throwing exceptions in SPA code
-    let html = r#"
-        <html><body>
-            <div id="fetch-status">Pending</div>
-            <script>
-                fetch('/dummy-endpoint')
-                    .then(function(res) {
-                        return res.json();
-                    })
-                    .then(function(data) {
-                        // In rakers, fetch resolves with null
-                        if (data === null) {
-                            document.getElementById("fetch-status").innerHTML = "FetchStubHandledSafely";
-                        }
-                    })
-                    .catch(function(err) {
-                        document.getElementById("fetch-status").innerHTML = "FetchFailed";
-                    });
-            </script>
-        </body></html>
-    "#;
+fn rakers_fetch_real_json_hydration() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{port}");
 
-    let rendered = call_rakers_render(html);
-    assert!(rendered.contains("FetchStubHandledSafely"), "window.fetch must resolve cleanly without crashing runtime, got: {rendered}");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        assert!(request_line.starts_with("GET /api/data "), "fetch must perform the real GET");
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+        }
+        let body = r#"{"title":"Fetch Hydrated","count":7}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ).unwrap();
+    });
+
+    let input = json!({
+        "html": r#"<html><body><div id="fetch-status">Pending</div><script>
+            fetch('/api/data')
+                .then(function(res) { return res.json(); })
+                .then(function(data) {
+                    document.getElementById('fetch-status').innerHTML = data.title + ':' + data.count;
+                });
+        </script></body></html>"#,
+        "baseUrl": format!("{base_url}/chapter/1")
+    }).to_string();
+
+    let rendered = call_rakers_render(&input);
+    server.join().unwrap();
+    assert!(rendered.contains("Fetch Hydrated:7"), "fetch JSON must hydrate DOM, got: {rendered}");
+}
+
+#[test]
+fn rakers_fetch_post_preserves_method_headers_body_and_status() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{port}");
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        assert!(request_line.starts_with("POST /submit "));
+        let mut content_length = 0usize;
+        let mut saw_test_header = false;
+        let mut saw_script_cookie = false;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("content-length:") {
+                content_length = line.split_once(':').unwrap().1.trim().parse().unwrap();
+            }
+            if lower.starts_with("x-rakers-test:") && line.contains("yes") {
+                saw_test_header = true;
+            }
+            if lower.starts_with("cookie:") && line.contains("script_cookie=forbidden") {
+                saw_script_cookie = true;
+            }
+        }
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body).unwrap();
+        assert_eq!(String::from_utf8(body).unwrap(), "payload");
+        assert!(saw_test_header, "fetch request header must reach transport");
+        assert!(!saw_script_cookie, "page JavaScript must not inject a raw Cookie header");
+
+        let response = "accepted";
+        write!(
+            stream,
+            "HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+            response.len()
+        ).unwrap();
+    });
+
+    let input = json!({
+        "html": r#"<html><body><div id="out">Pending</div><script>
+            fetch('/submit', {method:'POST', headers:{'X-Rakers-Test':'yes','Cookie':'script_cookie=forbidden'}, body:'payload'})
+                .then(function(r){ var status=r.status; return r.text().then(function(t){ return status + ':' + t; }); })
+                .then(function(v){ document.getElementById('out').innerHTML=v; });
+        </script></body></html>"#,
+        "baseUrl": format!("{base_url}/page")
+    }).to_string();
+
+    let rendered = call_rakers_render(&input);
+    server.join().unwrap();
+    assert!(rendered.contains("201:accepted"), "POST fetch must expose real status/body, got: {rendered}");
+}
+
+#[test]
+fn rakers_direct_url_reuses_cookie_session_for_fetch() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let page_url = format!("http://127.0.0.1:{port}/page");
+
+    let server = thread::spawn(move || {
+        let (mut page_stream, _) = listener.accept().unwrap();
+        let mut page_reader = BufReader::new(page_stream.try_clone().unwrap());
+        let mut request_line = String::new();
+        page_reader.read_line(&mut request_line).unwrap();
+        assert!(request_line.starts_with("GET /page "));
+        let mut saw_seed_cookie = false;
+        loop {
+            let mut line = String::new();
+            if page_reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+            if line.to_ascii_lowercase().starts_with("cookie:") && line.contains("sid=seeded") {
+                saw_seed_cookie = true;
+            }
+        }
+        assert!(saw_seed_cookie, "input Cookie header must reach the main page request");
+        let html = r#"<html><body><div id="out">Pending</div><script>
+            fetch('/api').then(function(r){return r.text();})
+                .then(function(t){document.getElementById('out').innerHTML=t;});
+        </script></body></html>"#;
+        write!(
+            page_stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nSet-Cookie: server_cookie=updated; Path=/\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+            html.len()
+        ).unwrap();
+
+        let (mut api_stream, _) = listener.accept().unwrap();
+        let mut api_reader = BufReader::new(api_stream.try_clone().unwrap());
+        let mut api_line = String::new();
+        api_reader.read_line(&mut api_line).unwrap();
+        assert!(api_line.starts_with("GET /api "));
+        let mut saw_seed_cookie = false;
+        let mut saw_response_cookie = false;
+        loop {
+            let mut line = String::new();
+            if api_reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+            if line.to_ascii_lowercase().starts_with("cookie:") {
+                saw_seed_cookie |= line.contains("sid=seeded");
+                saw_response_cookie |= line.contains("server_cookie=updated");
+            }
+        }
+        assert!(saw_seed_cookie, "initial Cookie header must remain in the shared jar");
+        assert!(saw_response_cookie, "page Set-Cookie must be reused by JS fetch");
+        let body = "cookie-ok";
+        write!(
+            api_stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ).unwrap();
+    });
+
+    let input = json!({
+        "url": page_url,
+        "headers": {"Cookie": "sid=seeded"}
+    }).to_string();
+    let rendered = call_rakers_render(&input);
+    server.join().unwrap();
+    assert!(rendered.contains("cookie-ok"), "shared cookie session must hydrate DOM, got: {rendered}");
+}
+
+#[test]
+fn rakers_fetch_set_cookie_is_reused_by_next_subrequest() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{port}");
+
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        let mut first_reader = BufReader::new(first.try_clone().unwrap());
+        let mut line = String::new();
+        first_reader.read_line(&mut line).unwrap();
+        assert!(line.starts_with("GET /session/start "));
+        loop {
+            line.clear();
+            if first_reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+        }
+        let body = "seeded";
+        write!(
+            first,
+            "HTTP/1.1 200 OK\r\nSet-Cookie: api_sid=from_fetch; Path=/\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ).unwrap();
+
+        let (mut second, _) = listener.accept().unwrap();
+        let mut second_reader = BufReader::new(second.try_clone().unwrap());
+        line.clear();
+        second_reader.read_line(&mut line).unwrap();
+        assert!(line.starts_with("GET /session/check "));
+        let mut saw_cookie = false;
+        loop {
+            line.clear();
+            if second_reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+            if line.to_ascii_lowercase().starts_with("cookie:") && line.contains("api_sid=from_fetch") {
+                saw_cookie = true;
+            }
+        }
+        assert!(saw_cookie, "Set-Cookie from one fetch must be reused by the next fetch");
+        let body = "subrequest-cookie-ok";
+        write!(
+            second,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ).unwrap();
+    });
+
+    let input = json!({
+        "html": r#"<html><body><div id="out">Pending</div><script>
+            fetch('/session/start').then(function(){ return fetch('/session/check'); })
+                .then(function(r){ return r.text(); })
+                .then(function(t){ document.getElementById('out').innerHTML=t; });
+        </script></body></html>"#,
+        "baseUrl": format!("{base_url}/page")
+    }).to_string();
+
+    let rendered = call_rakers_render(&input);
+    server.join().unwrap();
+    assert!(rendered.contains("subrequest-cookie-ok"), "fetch cookie jar must persist within one render, got: {rendered}");
 }
 
 #[test]
@@ -321,36 +514,50 @@ fn rakers_direct_url_full_pipeline() {
 }
 
 #[test]
-fn rakers_fanqie_h5_spa_fetch_limitation_and_bypass_verification() {
-    // Verifies the exact boundary of Rakers when encountering modern SPA comment pages (such as Dahuilang's fanqie_comment H5):
-    // 1. Rakers executes safely without crashing/panicking, preserving the overall HTML structure.
-    // 2. However, because window.fetch is a stub returning null, the SPA cannot hydrate its dynamic comments, leaving contentArea empty.
-    let spa_html = r#"
-        <!DOCTYPE html><html><body>
+fn rakers_fanqie_h5_spa_fetch_hydrates() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{port}");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        assert!(request_line.starts_with("GET /api/fanqie/comment/chapter/list "));
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+        }
+        let body = r#"{"items":[{"content":"真实评论数据"}]}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ).unwrap();
+    });
+
+    let input = json!({
+        "html": r#"<!DOCTYPE html><html><body>
             <div class="main-tabs"><button class="active">本章说</button></div>
             <div class="loading" id="loading">加载中...</div>
             <div class="main-container" id="contentArea"></div>
             <script>
                 const API = { chapterList: '/api/fanqie/comment/chapter/list' };
                 async function loadComments() {
-                    try {
-                        var resp = await fetch(API.chapterList);
-                        var data = await resp.json();
-                        if (data && data.items) {
-                            document.getElementById("contentArea").innerHTML = "<div>Comments Loaded</div>";
-                            document.getElementById("loading").style.display = "none";
-                        }
-                    } catch(e) {}
+                    var resp = await fetch(API.chapterList);
+                    var data = await resp.json();
+                    if (data && data.items && data.items.length) {
+                        document.getElementById('contentArea').innerHTML = '<div>Comments Loaded:' + data.items[0].content + '</div>';
+                    }
                 }
                 loadComments();
             </script>
-        </body></html>
-    "#;
+        </body></html>"#,
+        "baseUrl": format!("{base_url}/comments/page")
+    }).to_string();
 
-    let rendered = call_rakers_render(spa_html);
-
-    // Documents Rakers limitation on modern fetch-based SPAs:
-    assert!(rendered.contains("本章说"), "DOM static structure is intact");
-    assert!(rendered.contains("id=\"contentArea\""), "Container element exists");
-    assert!(!rendered.contains("Comments Loaded"), "Documents Rakers limitation: fetch stub returning null prevents SPA async hydration");
+    let rendered = call_rakers_render(&input);
+    server.join().unwrap();
+    assert!(rendered.contains("本章说"));
+    assert!(rendered.contains("Comments Loaded:真实评论数据"), "fetch-based SPA must hydrate, got: {rendered}");
 }

@@ -16,7 +16,12 @@ pub use pretty::pretty_print;
 pub use select::select_html;
 
 use std::cell::Cell;
-use std::time::Duration;
+use std::io::Read;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+use std::time::{Duration, Instant};
 
 thread_local! {
     static VERBOSE: Cell<bool> = const { Cell::new(false) };
@@ -65,6 +70,77 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+/// A host-provided HTTP request used by page scripts and external resources.
+#[derive(Debug, Clone)]
+pub struct HttpRequest {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<String>,
+}
+
+/// A text HTTP response returned to the renderer.
+#[derive(Debug, Clone)]
+pub struct HttpResponse {
+    pub url: String,
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+/// Host HTTP boundary. Embedders can reuse their own cookies, redirects and proxy policy.
+pub trait HttpTransport: Send + Sync {
+    fn execute(&self, request: HttpRequest) -> Result<HttpResponse, String>;
+}
+
+/// Render-scoped request/deadline accounting shared by static scripts and JS requests.
+#[derive(Clone)]
+pub(crate) struct RequestBudget {
+    requests: Arc<AtomicUsize>,
+    max_requests: usize,
+    max_response_bytes: usize,
+    deadline: Option<Instant>,
+}
+
+impl RequestBudget {
+    fn new(cfg: &HttpConfig) -> Self {
+        Self {
+            requests: Arc::new(AtomicUsize::new(0)),
+            max_requests: cfg.max_requests.unwrap_or(32).max(1),
+            max_response_bytes: cfg.max_response_bytes.unwrap_or(8 * 1024 * 1024).max(1),
+            deadline: cfg.render_timeout.and_then(|timeout| Instant::now().checked_add(timeout)),
+        }
+    }
+
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    fn before_request(&self) -> Result<(), String> {
+        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err("Rakers render deadline exceeded".to_string());
+        }
+        let request = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
+        if request > self.max_requests {
+            return Err(format!("Rakers network request limit exceeded ({})", self.max_requests));
+        }
+        Ok(())
+    }
+
+    fn check_response(&self, bytes: usize) -> Result<(), String> {
+        if bytes > self.max_response_bytes {
+            return Err(format!(
+                "Rakers network response exceeds {} bytes",
+                self.max_response_bytes
+            ));
+        }
+        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err("Rakers render deadline exceeded".to_string());
+        }
+        Ok(())
+    }
+}
+
 /// HTTP options applied to every outbound request made by rakers.
 #[derive(Default, Clone)]
 pub struct HttpConfig {
@@ -79,31 +155,40 @@ pub struct HttpConfig {
     /// the page's JavaScript initiates. Defaults to `false` to avoid leaking
     /// credentials to cross-origin destinations controlled by page scripts.
     pub forward_headers: bool,
+    /// Optional host transport. When absent, rakers falls back to its own ureq client.
+    pub transport: Option<Arc<dyn HttpTransport>>,
+    /// Maximum total network requests made during one render.
+    pub max_requests: Option<usize>,
+    /// Maximum text bytes accepted from any single renderer subrequest.
+    pub max_response_bytes: Option<usize>,
+    /// Optional wall-clock deadline for the whole render, including subrequests.
+    pub render_timeout: Option<Duration>,
 }
 
 impl HttpConfig {
-    /// Build a `ureq` agent with proxy configured (if any).
-    #[must_use]
-    pub fn agent(&self) -> ureq::Agent {
+    fn build_agent(&self, http_status_as_error: bool) -> ureq::Agent {
         let mut builder = ureq::Agent::config_builder()
-            .http_status_as_error(true)
+            .http_status_as_error(http_status_as_error)
             .max_redirects(5)
             .timeout_global(Some(Duration::from_secs(8)))
             .timeout_connect(Some(Duration::from_secs(3)));
         if let Some(ref proxy_url) = self.proxy {
             match ureq::Proxy::new(proxy_url) {
-                Ok(proxy) => {
-                    builder = builder.proxy(Some(proxy));
-                }
-                Err(e) => {
-                    eprintln!("[proxy error] {proxy_url}: {e}");
-                }
+                Ok(proxy) => builder = builder.proxy(Some(proxy)),
+                Err(error) => eprintln!("[proxy error] {proxy_url}: {error}"),
             }
         }
         ureq::Agent::new_with_config(builder.build())
     }
 
-    /// Apply configured headers to a ureq 3 request builder.
+    /// Build the legacy public ureq agent. Preserve the original behavior where
+    /// non-success HTTP statuses are reported as request errors.
+    #[must_use]
+    pub fn agent(&self) -> ureq::Agent {
+        self.build_agent(true)
+    }
+
+    /// Apply the configured User-Agent and custom headers to a ureq request.
     pub fn apply<B>(&self, mut req: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
         if let Some(ua) = &self.user_agent {
             req = req.header("User-Agent", ua);
@@ -112,6 +197,99 @@ impl HttpConfig {
             req = req.header(name, value);
         }
         req
+    }
+
+    fn request_headers(
+        &self,
+        headers: &[(String, String)],
+        include_config_headers: bool,
+    ) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if let Some(ua) = &self.user_agent
+            && !headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        {
+            out.push(("User-Agent".to_string(), ua.clone()));
+        }
+        if include_config_headers {
+            out.extend(self.headers.iter().cloned());
+        }
+        out.extend(headers.iter().cloned());
+        out
+    }
+
+    pub(crate) fn execute(
+        &self,
+        budget: &RequestBudget,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: Option<&str>,
+        include_config_headers: bool,
+    ) -> Result<HttpResponse, String> {
+        let method = method.trim().to_ascii_uppercase();
+        if !matches!(method.as_str(), "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS") {
+            return Err(format!("unsupported Rakers HTTP method: {method}"));
+        }
+        let parsed = url::Url::parse(url).map_err(|error| format!("invalid URL: {error}"))?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return Err("Rakers requests require an absolute http(s) URL without credentials".to_string());
+        }
+        budget.before_request()?;
+        let headers = self.request_headers(headers, include_config_headers);
+        let request = HttpRequest {
+            method: method.clone(),
+            url: url.to_string(),
+            headers: headers.clone(),
+            body: body.map(str::to_string),
+        };
+        let response = if let Some(transport) = &self.transport {
+            transport.execute(request)?
+        } else {
+            let method = ureq::http::Method::from_bytes(method.as_bytes())
+                .map_err(|error| format!("invalid HTTP method: {error}"))?;
+            let mut builder = ureq::http::Request::builder().method(method).uri(url);
+            for (name, value) in &headers {
+                builder = builder.header(name.as_str(), value.as_str());
+            }
+            let mut response = if let Some(body) = body {
+                self.build_agent(false)
+                    .run(builder.body(body.to_string()).map_err(|error| error.to_string())?)
+            } else {
+                self.build_agent(false)
+                    .run(builder.body(()).map_err(|error| error.to_string())?)
+            }
+            .map_err(|error| error.to_string())?;
+            let status = response.status().as_u16();
+            let response_headers = response
+                .headers()
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.as_str().to_string(), value.to_string()))
+                })
+                .collect();
+            let mut bytes = Vec::new();
+            response
+                .body_mut()
+                .as_reader()
+                .take(budget.max_response_bytes.saturating_add(1) as u64)
+                .read_to_end(&mut bytes)
+                .map_err(|error| error.to_string())?;
+            HttpResponse {
+                url: url.to_string(),
+                status,
+                headers: response_headers,
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+            }
+        };
+        budget.check_response(response.body.len())?;
+        Ok(response)
     }
 }
 
@@ -139,14 +317,19 @@ fn resolve_url(src: &str, base: Option<&str>) -> Option<String> {
 /// Returns `None` on network error or if the response body is not valid UTF-8.
 /// Files that open with `import`/`export` are skipped — they are ES module entry
 /// points that require a full module loader with relative specifier resolution.
-fn fetch_script(url: &str, cfg: &HttpConfig) -> Option<String> {
-    let body = match cfg.apply(cfg.agent().get(url)).call() {
-        Ok(mut response) => response.body_mut().read_to_string().ok()?,
-        Err(e) => {
-            eprintln!("[fetch error] {url}: {e}");
+fn fetch_script(url: &str, cfg: &HttpConfig, budget: &RequestBudget) -> Option<String> {
+    let response = match cfg.execute(budget, "GET", url, &[], None, true) {
+        Ok(response) if (200..300).contains(&response.status) => response,
+        Ok(response) => {
+            eprintln!("[fetch error] {url}: HTTP {}", response.status);
+            return None;
+        }
+        Err(error) => {
+            eprintln!("[fetch error] {url}: {error}");
             return None;
         }
     };
+    let body = response.body;
     // Skip ES module files that use static import/export — they require a full
     // module loader with relative specifier resolution that we can't provide.
     // Self-contained bundles tagged type="module" by their bundler are fine.
@@ -164,7 +347,7 @@ fn fetch_script(url: &str, cfg: &HttpConfig) -> Option<String> {
             if is_verbose() {
                 eprintln!("[module-shim] {url} → {resolved}");
             }
-            return fetch_script(&resolved, cfg);
+            return fetch_script(&resolved, cfg, budget);
         }
         if is_verbose() {
             eprintln!("[skip] {url}: ES module syntax requires a module loader");
@@ -223,6 +406,7 @@ fn load_scripts(
     sources: Vec<dom::ScriptSource>,
     page_url: Option<&str>,
     cfg: &HttpConfig,
+    budget: &RequestBudget,
     max_remote: Option<usize>,
 ) -> Vec<String> {
     let mut remote_fetched = 0usize;
@@ -243,7 +427,7 @@ fn load_scripts(
                 if is_verbose() {
                     eprintln!("[fetch] {url}");
                 }
-                if let Some(code) = fetch_script(&url, cfg) {
+                if let Some(code) = fetch_script(&url, cfg, budget) {
                     remote_fetched += 1;
                     result.push(code);
                 }
@@ -304,9 +488,10 @@ pub fn render(
         input.to_owned()
     };
 
+    let budget = RequestBudget::new(cfg);
     let doc = dom::parse(&html)?;
     let meta_script = build_meta_script(&doc.collect_meta());
-    let mut scripts = load_scripts(doc.extract_scripts(), page_url, cfg, max_scripts);
+    let mut scripts = load_scripts(doc.extract_scripts(), page_url, cfg, &budget, max_scripts);
     if !meta_script.is_empty() {
         scripts.insert(0, meta_script);
     }
@@ -315,7 +500,7 @@ pub fn render(
         Some(t) => runtime::JsRuntime::with_timeout(t),
         None => runtime::JsRuntime::without_timeout(),
     };
-    rt.execute(&scripts, page_url, cfg)?;
+    rt.execute(&scripts, page_url, cfg, &budget)?;
 
     for msg in runtime::JsRuntime::logged_messages() {
         if is_verbose() {
@@ -489,6 +674,40 @@ mod tests {
         )
     }
 
+    struct TestTransport;
+
+    impl HttpTransport for TestTransport {
+        fn execute(&self, request: HttpRequest) -> Result<HttpResponse, String> {
+            let (status, body) = if request.url.ends_with("/api/data") {
+                (200, "payload".to_string())
+            } else if request.url.ends_with("/dynamic.js") {
+                (200, "document.write('<p>fetched</p>');".to_string())
+            } else if request.url.ends_with("/api") {
+                (200, r#"{"value":"json-ok"}"#.to_string())
+            } else if request.url.ends_with("/missing") {
+                (404, "missing".to_string())
+            } else {
+                return Err(format!("unexpected test URL: {}", request.url));
+            };
+            Ok(HttpResponse {
+                url: request.url,
+                status,
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body,
+            })
+        }
+    }
+
+    fn test_http_config() -> HttpConfig {
+        HttpConfig {
+            transport: Some(std::sync::Arc::new(TestTransport)),
+            max_requests: Some(16),
+            max_response_bytes: Some(64 * 1024),
+            render_timeout: Some(Duration::from_secs(2)),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn html_inline_script_document_write() {
         let input = concat!(
@@ -523,26 +742,33 @@ mod tests {
     }
 
     #[test]
-    fn dynamically_appended_script_with_src_is_fetched_via_stub() {
+    fn dynamically_appended_script_uses_http_transport() {
         let input = concat!(
             "<!DOCTYPE html><html><head></head><body>",
-            "<script>window._r_fetch_sync = function(u) { return \"document.write('<p>fetched</p>');\"; };</script>",
-            "<script>var s = document.createElement('script'); s.src = 'https://example.com/fetch.js'; document.body.appendChild(s);</script>",
+            "<script>var s = document.createElement('script'); s.src = '/dynamic.js'; document.body.appendChild(s);</script>",
             "</body></html>",
         );
-        let out = render_simple(input, false, None).unwrap();
-        assert!(
-            out.contains("<p>fetched</p>"),
-            "dynamically fetched script executed"
-        );
+        let cfg = test_http_config();
+        let out = render(
+            input,
+            false,
+            Some("https://example.test/page"),
+            &cfg,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(out.contains("<p>fetched</p>"), "dynamic script must use host transport");
     }
 
     #[test]
     fn console_messages_captured() {
         let js = r#"console.log("hello", "world"); console.warn("oops");"#;
         let rt = runtime::JsRuntime::with_timeout(std::time::Duration::from_secs(30));
-        rt.execute(&[js.to_owned()], None, &HttpConfig::default())
-            .unwrap();
+        let cfg = HttpConfig::default();
+        let budget = RequestBudget::new(&cfg);
+        rt.execute(&[js.to_owned()], None, &cfg, &budget).unwrap();
         let msgs = runtime::JsRuntime::logged_messages();
         assert_eq!(msgs[0], "hello world");
         assert_eq!(msgs[1], "oops");
@@ -723,13 +949,16 @@ mod tests {
     fn script_timeout_is_non_fatal() {
         // An infinite loop must be interrupted; the next script must still run.
         let rt = runtime::JsRuntime::with_timeout(std::time::Duration::from_millis(100));
+        let cfg = HttpConfig::default();
+        let budget = RequestBudget::new(&cfg);
         rt.execute(
             &[
                 "while(true){}".to_owned(),
                 "document.write('<p>survived</p>');".to_owned(),
             ],
             None,
-            &HttpConfig::default(),
+            &cfg,
+            &budget,
         )
         .unwrap();
         assert!(
@@ -761,66 +990,197 @@ mod tests {
 
     #[test]
     #[cfg_attr(not(feature = "rquickjs"), ignore = "boa microtask draining differs")]
-    fn fetch_stub_resolves_then_chain() {
-        // fetch() must return a resolved Promise so .then() chains fire, not crash.
-        // Assert the rendered string appears *after* </script> — not just in the source.
+    fn fetch_get_resolves_real_body() {
         let js = concat!(
             "window.fetch('/api/data')",
             ".then(function(r){ return r.text(); })",
-            ".then(function(t){ document.write('<p>fetch-ok</p>'); });",
+            ".then(function(t){ document.write('<p>' + t + '</p>'); });",
         );
-        let out = render(js, true, None, &HttpConfig::default(), false, None, None).unwrap();
-        let after_script = out.find("</script>").map(|i| &out[i..]).unwrap_or("");
-        assert!(
-            after_script.contains("<p>fetch-ok</p>"),
-            "fetch .then() chain must fire, got: {out}"
-        );
+        let cfg = test_http_config();
+        let out = render(
+            js,
+            true,
+            Some("https://example.test/page"),
+            &cfg,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(out.contains("<p>payload</p>"), "real fetch body must hydrate, got: {out}");
     }
 
     #[test]
     #[cfg_attr(not(feature = "rquickjs"), ignore = "boa microtask draining differs")]
-    fn fetch_stub_json_resolves() {
+    fn fetch_json_resolves_real_body() {
         let js = concat!(
             "window.fetch('/api').then(function(r){ return r.json(); })",
-            ".then(function(d){ document.write('<p>json-ok</p>'); });",
+            ".then(function(d){ document.write('<p>' + d.value + '</p>'); });",
         );
-        let out = render(js, true, None, &HttpConfig::default(), false, None, None).unwrap();
-        let after_script = out.find("</script>").map(|i| &out[i..]).unwrap_or("");
-        assert!(
-            after_script.contains("<p>json-ok</p>"),
-            "fetch.json() chain must fire, got: {out}"
-        );
+        let cfg = test_http_config();
+        let out = render(
+            js,
+            true,
+            Some("https://example.test/page"),
+            &cfg,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(out.contains("<p>json-ok</p>"), "fetch.json() must use response body, got: {out}");
     }
 
     #[test]
-    fn xhr_stub_fires_onload() {
+    fn fetch_transport_failure_rejects() {
+        let js = concat!(
+            "window.fetch('/network-fail')",
+            ".then(function(){ document.write('<p>unexpected</p>'); })",
+            ".catch(function(){ document.write('<p>rejected</p>'); });",
+        );
+        let cfg = test_http_config();
+        let out = render(
+            js,
+            true,
+            Some("https://example.test/page"),
+            &cfg,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(out.contains("<p>rejected</p>"), "transport failures must reject fetch, got: {out}");
+        assert!(!out.contains("<p>unexpected</p>"));
+    }
+
+    #[test]
+    fn fetch_http_error_resolves_with_real_status() {
+        let js = concat!(
+            "window.fetch('/missing')",
+            ".then(function(r){ document.write('<p>' + r.status + ':' + r.ok + '</p>'); })",
+            ".catch(function(){ document.write('<p>rejected</p>'); });",
+        );
+        let cfg = test_http_config();
+        let out = render(
+            js,
+            true,
+            Some("https://example.test/page"),
+            &cfg,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(out.contains("<p>404:false</p>"), "HTTP errors must resolve as responses, got: {out}");
+        assert!(!out.contains("<p>rejected</p>"));
+    }
+
+    #[test]
+    fn fetch_request_limit_rejects_cleanly() {
+        let js = concat!(
+            "window.fetch('/api/data');",
+            "window.fetch('/api').catch(function(e){ document.write('<p>limited</p>'); });",
+        );
+        let mut cfg = test_http_config();
+        cfg.max_requests = Some(1);
+        let out = render(
+            js,
+            true,
+            Some("https://example.test/page"),
+            &cfg,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(out.contains("<p>limited</p>"), "request budget must reject excess fetches, got: {out}");
+    }
+
+    #[test]
+    fn fetch_response_limit_rejects_cleanly() {
+        let js = concat!(
+            "window.fetch('/api/data')",
+            ".then(function(){ document.write('<p>unexpected</p>'); })",
+            ".catch(function(){ document.write('<p>too-large</p>'); });",
+        );
+        let mut cfg = test_http_config();
+        cfg.max_response_bytes = Some(3);
+        let out = render(
+            js,
+            true,
+            Some("https://example.test/page"),
+            &cfg,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(out.contains("<p>too-large</p>"), "response limit must reject fetch, got: {out}");
+        assert!(!out.contains("<p>unexpected</p>"));
+    }
+
+    #[test]
+    #[cfg_attr(not(feature = "rquickjs"), ignore = "boa has no interrupt handler")]
+    fn render_deadline_bounds_self_replenishing_microtasks() {
+        let js = concat!(
+            "Promise.resolve().then(function again(){ Promise.resolve().then(again); });",
+            "document.write('<p>started</p>');",
+        );
+        let cfg = HttpConfig {
+            render_timeout: Some(Duration::from_millis(20)),
+            ..Default::default()
+        };
+        let started = Instant::now();
+        let out = render(js, true, None, &cfg, false, None, None).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2), "microtask loop escaped render budget");
+        assert!(out.contains("<p>started</p>"));
+    }
+
+    #[test]
+    fn xhr_async_fires_onload_with_real_response() {
         let js = concat!(
             "var xhr = new XMLHttpRequest();",
             "xhr.open('GET', '/api/data');",
-            "xhr.onload = function() { document.write('<p>xhr-ok</p>'); };",
+            "xhr.onload = function() { document.write('<p>' + xhr.status + ':' + xhr.responseText + ':' + xhr.getResponseHeader('content-type') + '</p>'); };",
             "xhr.send();",
         );
-        let out = render(js, true, None, &HttpConfig::default(), false, None, None).unwrap();
-        let after_script = out.find("</script>").map(|i| &out[i..]).unwrap_or("");
+        let cfg = test_http_config();
+        let out = render(
+            js,
+            true,
+            Some("https://example.test/page"),
+            &cfg,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(
-            after_script.contains("<p>xhr-ok</p>"),
-            "XHR onload must fire, got: {out}"
+            out.contains("<p>200:payload:application/json</p>"),
+            "XHR must expose real response/status/headers, got: {out}"
         );
     }
 
     #[test]
-    fn xhr_stub_fires_addeventlistener_load() {
+    fn xhr_addeventlistener_load_fires() {
         let js = concat!(
             "var xhr = new XMLHttpRequest();",
             "xhr.open('GET', '/api');",
             "xhr.addEventListener('load', function() { document.write('<p>xhr-addev-ok</p>'); });",
             "xhr.send();",
         );
-        let out = render(js, true, None, &HttpConfig::default(), false, None, None).unwrap();
-        assert!(
-            out.contains("<p>xhr-addev-ok</p>"),
-            "XHR addEventListener('load') must fire, got: {out}"
-        );
+        let cfg = test_http_config();
+        let out = render(
+            js,
+            true,
+            Some("https://example.test/page"),
+            &cfg,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(out.contains("<p>xhr-addev-ok</p>"), "XHR load listener must fire, got: {out}");
     }
 
     #[test]

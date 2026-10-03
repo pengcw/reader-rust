@@ -125,8 +125,8 @@ function _r_el(tag) {
             // Script injection: Riot 2.x compiler sets script.text = compiledCode then
             // appends the script to document.documentElement to execute it.
             // Eval the code at global scope so riot.tag() registration takes effect.
-            // Also support scripts appended with a src attribute: attempt a synchronous fetch via
-            // native _r_fetch_sync() (if available), resolve against page URL, and eval the fetched text
+            // Also support scripts appended with a src attribute: use the shared synchronous
+            // request wrapper, resolve against page URL, and eval the fetched text
             // unless the script is a module (type === 'module'). This mirrors browser behavior for
             // non-module scripts injected dynamically.
             if ((child.tagName === 'SCRIPT' || child.tagName === 'script')) {
@@ -555,78 +555,229 @@ window.prompt  = function(msg, def) { return null; };
 window.open    = function() { return null; };
 window.close   = function() {};
 window.postMessage     = function() {};
-window.fetch = function(url) {
-    var res = {
-        ok: true, status: 200, statusText: 'OK',
-        url: String(url || ''), redirected: false, type: 'basic',
-        headers: { get: function() { return null; }, has: function() { return false; },
-                   forEach: function() {}, entries: function() { return []; } },
-        json:        function() { return Promise.resolve(null); },
-        text:        function() { return Promise.resolve(''); },
-        blob:        function() { return Promise.resolve(new window.Blob()); },
-        arrayBuffer: function() { return Promise.resolve(null); },
-        clone:       function() { return this; }
+window.Headers = function(init) {
+    this._h = {};
+    var self = this;
+    var put = function(k, v, append) {
+        k = String(k || '').toLowerCase();
+        if (!k) return;
+        v = String(v == null ? '' : v);
+        self._h[k] = append && self._h[k] ? self._h[k] + ', ' + v : v;
     };
-    return Promise.resolve(res);
+    if (init instanceof window.Headers) {
+        init.forEach(function(v, k) { put(k, v, false); });
+    } else if (Array.isArray(init)) {
+        init.forEach(function(pair) { if (pair && pair.length >= 2) put(pair[0], pair[1], true); });
+    } else if (init && typeof init === 'object') {
+        Object.keys(init).forEach(function(k) { put(k, init[k], false); });
+    }
+    this.append = function(k, v) { put(k, v, true); };
+    this.set = function(k, v) { put(k, v, false); };
+    this.get = function(k) { k=String(k||'').toLowerCase(); return Object.prototype.hasOwnProperty.call(this._h,k) ? this._h[k] : null; };
+    this.has = function(k) { return this.get(k) !== null; };
+    this.delete = function(k) { delete this._h[String(k||'').toLowerCase()]; };
+    this.forEach = function(fn) { Object.keys(this._h).forEach(function(k) { fn(self._h[k], k, self); }); };
+    this.entries = function() { return Object.keys(this._h).map(function(k) { return [k, self._h[k]]; }); };
 };
-// RiotJS: loads component templates at runtime via XHR (`src="todo.html"` in a riot/tag script).
-// send() performs a real HTTP GET via the native _r_fetch_sync() function (registered by Rust)
-// so responseText contains the template body when onload fires.
-window.XMLHttpRequest  = function() {
+
+function _r_headers_object(headers) {
+    var out = {};
+    if (!headers) return out;
+    var h = headers instanceof window.Headers ? headers : new window.Headers(headers);
+    h.forEach(function(v, k) { out[k] = v; });
+    return out;
+}
+
+function _r_make_response(raw, requestedUrl) {
+    var bodyText = String(raw.body == null ? '' : raw.body);
+    var headers = new window.Headers(raw.headers || {});
+    var response = {
+        ok: Number(raw.status) >= 200 && Number(raw.status) < 300,
+        status: Number(raw.status) || 0,
+        statusText: String(raw.statusText || ''),
+        url: String(raw.url || requestedUrl || ''),
+        redirected: !!raw.url && String(raw.url) !== String(requestedUrl || ''),
+        type: 'basic',
+        bodyUsed: false,
+        headers: headers,
+        text: function() { this.bodyUsed = true; return Promise.resolve(bodyText); },
+        json: function() {
+            this.bodyUsed = true;
+            try { return Promise.resolve(JSON.parse(bodyText)); }
+            catch (e) { return Promise.reject(e); }
+        },
+        blob: function() { this.bodyUsed = true; return Promise.resolve(new window.Blob([bodyText])); },
+        arrayBuffer: function() { this.bodyUsed = true; return Promise.resolve(null); },
+        clone: function() { return _r_make_response(raw, requestedUrl); }
+    };
+    return response;
+}
+
+window.fetch = function(input, init) {
+    init = init || {};
+    var inputObj = input && typeof input === 'object' ? input : null;
+    var rawUrl = inputObj && inputObj.url != null ? inputObj.url : input;
+    var abs = _r_parse_url(String(rawUrl || ''), window.location && window.location.href).href;
+    var method = String(init.method || (inputObj && inputObj.method) || 'GET').toUpperCase();
+    var headers = init.headers || (inputObj && inputObj.headers) || {};
+    var body = init.body;
+    if (body == null && inputObj) body = inputObj.body;
+    body = body == null ? '' : String(body);
+    return new Promise(function(resolve, reject) {
+        if (typeof _r_request_sync !== 'function') {
+            reject(new Error('Rakers HTTP bridge is unavailable'));
+            return;
+        }
+        try {
+            var raw = JSON.parse(_r_request_sync(method, abs, JSON.stringify(_r_headers_object(headers)), body) || '{}');
+            if (raw.error) {
+                reject(new Error(String(raw.error)));
+                return;
+            }
+            resolve(_r_make_response(raw, abs));
+        } catch (e) {
+            reject(e);
+        }
+    });
+};
+
+window.Request = function(input, init) {
+    init = init || {};
+    this.url = _r_parse_url(String(input && input.url || input || ''), window.location && window.location.href).href;
+    this.method = String(init.method || input && input.method || 'GET').toUpperCase();
+    this.headers = new window.Headers(init.headers || input && input.headers || {});
+    this.body = init.body == null ? (input && input.body || '') : init.body;
+};
+window.Response = function(body, init) {
+    init = init || {};
+    return _r_make_response({
+        body: body == null ? '' : String(body),
+        status: init.status == null ? 200 : Number(init.status),
+        statusText: init.statusText || '',
+        headers: _r_headers_object(init.headers || {}),
+        url: ''
+    }, '');
+};
+
+// Keep the legacy synchronous helper for dynamically inserted scripts and sync XHR.
+window._r_fetch_sync = function(url) {
+    if (typeof _r_request_sync !== 'function') return '';
+    try {
+        var abs = _r_parse_url(String(url || ''), window.location && window.location.href).href;
+        var raw = JSON.parse(_r_request_sync('GET', abs, '{}', '') || '{}');
+        var status = Number(raw.status) || 0;
+        return raw.error || status < 200 || status >= 300 ? '' : String(raw.body == null ? '' : raw.body);
+    } catch (e) { return ''; }
+};
+
+window.XMLHttpRequest = function() {
     var self = this;
     this.readyState=0; this.status=0; this.statusText='';
     this.responseText=''; this.responseXML=null; this.response='';
-    this.responseType=''; this.withCredentials=false; this.timeout=0;
+    this.responseURL=''; this.responseType=''; this.withCredentials=false; this.timeout=0;
     this.onreadystatechange=null; this.onload=null; this.onerror=null;
-    this.onprogress=null; this.ontimeout=null; this.onabort=null;
-    this._url=''; this._method='GET'; this._async=true;
+    this.onloadstart=null; this.onloadend=null; this.onprogress=null; this.ontimeout=null; this.onabort=null;
+    this._url=''; this._method='GET'; this._async=true; this._headers={}; this._responseHeaders={};
+    this._listeners={}; this._aborted=false;
+
+    function fire(type) {
+        var event = {type:type,target:self};
+        var handler = self['on' + type];
+        if (typeof handler === 'function') try { handler.call(self, event); } catch(e) {}
+        var list = self._listeners[type] || [];
+        list.slice().forEach(function(fn) { try { fn.call(self, event); } catch(e) {} });
+    }
+    function state(value) {
+        self.readyState = value;
+        fire('readystatechange');
+    }
+    function applyResponse(raw) {
+        self.status = Number(raw.status) || 0;
+        self.statusText = String(raw.statusText || '');
+        self.responseURL = String(raw.url || self._url);
+        self._responseHeaders = _r_headers_object(raw.headers || {});
+        state(2);
+        state(3);
+        self.responseText = String(raw.body == null ? '' : raw.body);
+        if (self.responseType === 'json') {
+            try { self.response = JSON.parse(self.responseText); } catch(e) { self.response = null; }
+        } else {
+            self.response = self.responseText;
+        }
+        state(4);
+        fire('load');
+        fire('loadend');
+    }
+    function fail() {
+        state(4);
+        fire('error');
+        fire('loadend');
+    }
+
     this.open=function(method, url, async) {
-        self._method = method || 'GET'; self._url = url || '';
-        // Riot 2.x compiler: xhr.open('GET', url, false) — synchronous mode.
+        self._method = String(method || 'GET').toUpperCase();
+        self._url = String(url || '');
         self._async = (async !== false);
+        self._aborted = false;
+        state(1);
     };
-    this.send=function() {
-        var url = self._url;
-        // Resolve relative URLs against the page URL before the native fetch.
-        var abs = (typeof _r_parse_url === 'function')
-            ? _r_parse_url(url, window.location && window.location.href).href
-            : url;
+    this.setRequestHeader=function(k,v){ self._headers[String(k)] = String(v); };
+    this.getResponseHeader=function(k){
+        var key=String(k||'').toLowerCase();
+        var names=Object.keys(self._responseHeaders);
+        for (var i=0;i<names.length;i++) if (names[i].toLowerCase()===key) return self._responseHeaders[names[i]];
+        return null;
+    };
+    this.getAllResponseHeaders=function(){
+        return Object.keys(self._responseHeaders).map(function(k){return k+': '+self._responseHeaders[k]+'\r\n';}).join('');
+    };
+    this.send=function(body) {
+        var abs = _r_parse_url(self._url, window.location && window.location.href).href;
+        var payload = body == null ? '' : String(body);
+        fire('loadstart');
         if (!self._async) {
-            // Synchronous XHR: fetch immediately so responseText is available before send() returns.
-            if (typeof _r_fetch_sync === 'function') {
-                try {
-                    var sbody = _r_fetch_sync(abs) || '';
-                    self.readyState=4; self.status=200; self.statusText='OK';
-                    self.responseText=sbody; self.response=sbody;
-                    if (typeof self.onreadystatechange==='function') try { self.onreadystatechange.call(self); } catch(e) {}
-                    if (typeof self.onload==='function')             try { self.onload.call(self, {target:self}); } catch(e) {}
-                } catch(e) {}
-            }
+            if (typeof _r_request_sync !== 'function') { fail(); return; }
+            try {
+                var raw = JSON.parse(_r_request_sync(self._method, abs, JSON.stringify(self._headers), payload) || '{}');
+                if (raw.error) { fail(); return; }
+                applyResponse(raw);
+            } catch(e) { fail(); }
             return;
         }
-        _r_timers.push(function() {
-            var body = '';
-            if (typeof _r_fetch_sync === 'function') {
-                try { body = _r_fetch_sync(abs) || ''; } catch(e) {}
-            }
-            self.readyState=4; self.status=200; self.statusText='OK';
-            self.responseText=body; self.response=body;
-            if (typeof self.onreadystatechange==='function') try { self.onreadystatechange.call(self); } catch(e) {}
-            if (typeof self.onload==='function')             try { self.onload.call(self, {target:self}); } catch(e) {}
-        });
+        window.fetch(abs, {method:self._method, headers:self._headers, body:payload})
+            .then(function(resp) {
+                self.status=resp.status; self.statusText=resp.statusText; self.responseURL=resp.url;
+                self._responseHeaders=_r_headers_object(resp.headers);
+                state(2); state(3);
+                return resp.text();
+            })
+            .then(function(text) {
+                if (self._aborted) return;
+                self.responseText=String(text == null ? '' : text);
+                if (self.responseType==='json') {
+                    try { self.response=JSON.parse(self.responseText); } catch(e) { self.response=null; }
+                } else self.response=self.responseText;
+                state(4); fire('load'); fire('loadend');
+            })
+            .catch(function(){ if (!self._aborted) fail(); });
     };
-    this.abort=function(){};
-    this.setRequestHeader=function(){};
-    this.getResponseHeader=function(){return null;};
-    this.getAllResponseHeaders=function(){return '';};
+    this.abort=function(){ self._aborted=true; state(4); fire('abort'); fire('loadend'); };
     this.overrideMimeType=function(){};
     this.addEventListener=function(t,fn){
-        if (t==='load') self.onload=fn;
-        else if (t==='error') self.onerror=fn;
-        else if (t==='readystatechange') self.onreadystatechange=fn;
+        if (!self._listeners[t]) self._listeners[t]=[];
+        self._listeners[t].push(fn);
     };
-    this.removeEventListener=function(){};
+    this.removeEventListener=function(t,fn){
+        if (!self._listeners[t]) return;
+        self._listeners[t]=self._listeners[t].filter(function(f){return f!==fn;});
+    };
+    this.dispatchEvent=function(){return true;};
 };
+window.XMLHttpRequest.UNSENT=0;
+window.XMLHttpRequest.OPENED=1;
+window.XMLHttpRequest.HEADERS_RECEIVED=2;
+window.XMLHttpRequest.LOADING=3;
+window.XMLHttpRequest.DONE=4;
 window.FormData = function() {
     this.append=function(){}; this.delete=function(){};
     this.get=function(){return null;}; this.has=function(){return false;};

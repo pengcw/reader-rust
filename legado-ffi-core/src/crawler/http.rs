@@ -218,6 +218,14 @@ impl HttpClient {
         Self::new(self.timeout_ms, self.cookies.clone(), Some(proxy))
     }
 
+    pub(crate) fn seed_cookie_header(&self, cookie_header: &str, url: &Url) -> bool {
+        let Some(cookies) = &self.cookies else {
+            return false;
+        };
+        cookies.add_cookie_header(cookie_header, url);
+        true
+    }
+
     pub(crate) fn request_text(
         &self,
         method: Method,

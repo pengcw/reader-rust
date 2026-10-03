@@ -174,6 +174,7 @@ fn custom_user_agent_is_sent() {
         headers: vec![],
         proxy: None,
         forward_headers: false,
+        ..Default::default()
     };
     let raw = ureq::get("https://httpbin.org/user-agent")
         .set("User-Agent", "rakers-test/1.0")
