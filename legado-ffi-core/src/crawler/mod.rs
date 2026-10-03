@@ -927,7 +927,7 @@ fn replace_page_choices(rule: &str, page: i32) -> String {
     .into_owned()
 }
 
-fn split_url_options(rule: &str) -> (&str, Option<&str>) {
+pub(crate) fn split_url_options(rule: &str) -> (&str, Option<&str>) {
     let mut in_string = false;
     let mut quote = '\0';
     let mut escaped = false;

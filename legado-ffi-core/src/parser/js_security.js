@@ -1,4 +1,4 @@
-// Deliberately narrow Java security facade; algorithms stay in createSign.
+// Bounded Java security facade; algorithms stay in the existing Rust helpers.
 (() => {
     const specs = new WeakMap();
     const keys = new WeakMap();
@@ -191,12 +191,70 @@
             });
         }
     };
+    const digestAlgorithms = new Map([
+        ['MD5', ['MD5', 16]], ['SHA1', ['SHA-1', 20]],
+        ['SHA256', ['SHA-256', 32]], ['SHA384', ['SHA-384', 48]],
+        ['SHA512', ['SHA-512', 64]]
+    ]);
+    const MessageDigest = {
+        getInstance(algorithm) {
+            if (arguments.length !== 1) fail('unsupported MessageDigest provider overload');
+            const name = String(algorithm).toUpperCase().replace(/^SHA-/, 'SHA');
+            const entry = digestAlgorithms.get(name);
+            if (!entry) fail('unsupported MessageDigest algorithm');
+            const [canonical, length] = entry;
+            let message = [];
+            const append = chunk => {
+                if (message.length + chunk.length > MAX_DATA) fail('MessageDigest message too large');
+                return message.concat(chunk);
+            };
+            return Object.freeze({
+                getAlgorithm() {
+                    if (arguments.length) fail('unsupported getAlgorithm overload');
+                    return canonical;
+                },
+                getDigestLength() {
+                    if (arguments.length) fail('unsupported getDigestLength overload');
+                    return length;
+                },
+                update(value, offset, length) {
+                    if (arguments.length !== 1 && arguments.length !== 3) fail('unsupported update overload');
+                    let chunk;
+                    if (typeof value === 'number') {
+                        if (arguments.length !== 1) fail('unsupported byte update overload');
+                        chunk = bytes([value], 1);
+                    } else {
+                        chunk = bytes(value, MAX_DATA);
+                        if (arguments.length === 3) {
+                            if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length)
+                                || offset < 0 || length < 0 || offset > chunk.length - length) fail('invalid update range');
+                            chunk = chunk.slice(offset, offset + length);
+                        }
+                    }
+                    message = append(chunk);
+                },
+                reset() {
+                    if (arguments.length) fail('unsupported reset overload');
+                    message = [];
+                },
+                digest(value) {
+                    if (arguments.length > 1) fail('unsupported digest overload');
+                    const input = arguments.length ? append(bytes(value, MAX_DATA)) : message;
+                    const result = java.__digestBytes(input, canonical);
+                    if (result == null) fail('MessageDigest computation failed');
+                    message = [];
+                    return result;
+                }
+            });
+        }
+    };
     const mark = (name, value) => {
         Object.defineProperty(value, '__javaName', {value: name});
         return value;
     };
     Packages.java.security = Packages.java.security || {};
     Packages.java.security.spec = Packages.java.security.spec || {};
+    Packages.java.security.MessageDigest = mark('MessageDigest', MessageDigest);
     Packages.java.security.Signature = mark('Signature', Signature);
     Packages.java.security.KeyFactory = mark('KeyFactory', KeyFactory);
     Packages.java.security.spec.PKCS8EncodedKeySpec = mark('PKCS8EncodedKeySpec', PKCS8EncodedKeySpec);

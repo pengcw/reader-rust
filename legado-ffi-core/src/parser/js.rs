@@ -882,14 +882,24 @@ fn eval_js_inner_with_source(
             java_obj.set(
                 "__digestHex",
                 Func::new(|data: String, algorithm: String| -> Option<String> {
-                    java_digest_bytes(&data, &algorithm).map(hex::encode)
+                    java_digest_bytes(data.as_bytes(), &algorithm).map(hex::encode)
                 }),
             )?;
             java_obj.set(
                 "__digestBase64",
                 Func::new(|data: String, algorithm: String| -> Option<String> {
-                    java_digest_bytes(&data, &algorithm)
+                    java_digest_bytes(data.as_bytes(), &algorithm)
                         .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
+                }),
+            )?;
+            java_obj.set(
+                "__digestBytes",
+                Func::new(|data: Vec<u8>, algorithm: String| -> Option<Vec<i8>> {
+                    if data.len() > 16384 {
+                        return None;
+                    }
+                    java_digest_bytes(&data, &algorithm)
+                        .map(|bytes| bytes.into_iter().map(|byte| byte as i8).collect())
                 }),
             )?;
             java_obj.set(
@@ -1413,7 +1423,8 @@ fn eval_js_inner_with_source(
             let variable_overrides_for_put = variable_overrides.clone();
             java_obj.set(
                 "put",
-                Func::new(move |key: String, val: String| -> String {
+                Func::new(move |key: String, val: rquickjs::Coerced<String>| -> String {
+                    let val = val.0;
                     variable_overrides_for_put
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -4042,30 +4053,20 @@ fn normalize_crypto_algorithm(algorithm: &str) -> String {
         .collect()
 }
 
-fn java_digest_bytes(data: &str, algorithm: &str) -> Option<Vec<u8>> {
+fn java_digest_bytes(data: &[u8], algorithm: &str) -> Option<Vec<u8>> {
+    use md5::{Digest, Md5};
+
     let normalized = normalize_crypto_algorithm(algorithm);
     match normalized.as_str() {
-        "MD5" => hex::decode(md5_hex(data)).ok(),
+        "MD5" => Some(Md5::digest(data).to_vec()),
         "SHA1" => Some(
-            digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, data.as_bytes())
+            digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, data)
                 .as_ref()
                 .to_vec(),
         ),
-        "SHA256" => Some(
-            digest::digest(&digest::SHA256, data.as_bytes())
-                .as_ref()
-                .to_vec(),
-        ),
-        "SHA384" => Some(
-            digest::digest(&digest::SHA384, data.as_bytes())
-                .as_ref()
-                .to_vec(),
-        ),
-        "SHA512" => Some(
-            digest::digest(&digest::SHA512, data.as_bytes())
-                .as_ref()
-                .to_vec(),
-        ),
+        "SHA256" => Some(digest::digest(&digest::SHA256, data).as_ref().to_vec()),
+        "SHA384" => Some(digest::digest(&digest::SHA384, data).as_ref().to_vec()),
+        "SHA512" => Some(digest::digest(&digest::SHA512, data).as_ref().to_vec()),
         _ => None,
     }
 }

@@ -1049,7 +1049,7 @@ fn parse_attr_extractor(extractor: &str) -> Option<&str> {
 /// Jsoup collapses its "actual whitespace" set (ASCII whitespace plus NBSP) to
 /// a single regular space and removes zero-width spaces / soft hyphens. Keep
 /// other Unicode whitespace, such as U+3000 IDEOGRAPHIC SPACE, untouched.
-fn normalize_jsoup_text_node(text: &str) -> String {
+pub(crate) fn normalize_jsoup_text_node(text: &str) -> String {
     let mut normalized = String::with_capacity(text.len());
     let mut last_was_whitespace = false;
 

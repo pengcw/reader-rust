@@ -392,11 +392,11 @@ fn classify_rule_mode(
     if rule.starts_with("<js>") {
         return (ParseMode::Js, rule.to_string());
     }
-    if content_is_json || rule.starts_with("$.") || rule.starts_with("$[") {
-        return (ParseMode::JsonPath, rule.to_string());
-    }
     if rule.starts_with(':') {
         return (ParseMode::Regex, rule.to_string());
+    }
+    if content_is_json || rule.starts_with("$.") || rule.starts_with("$[") {
+        return (ParseMode::JsonPath, rule.to_string());
     }
     (fallback, rule.to_string())
 }
@@ -995,7 +995,16 @@ impl RuleEngine {
             .unwrap_or_default(),
             ParseMode::Css => {
                 let doc = html::parse_document(&content_body);
-                if extract_js(&content_rule).1.is_some() {
+                let (selection, js) = extract_js(&content_rule);
+                let has_stages = rule_analyzer::split_top_level(selection, &["##"])
+                    .delimiter
+                    .is_some()
+                    || rule_analyzer::split_top_level(selection, &["&&", "||", "%%"])
+                        .delimiter
+                        .is_some();
+                if has_stages {
+                    eval_content_html_doc_with_ctx(&content_rule, &doc, base_url, context)
+                } else if js.is_some() {
                     eval_field_html_doc_with_ctx(&content_rule, &doc, base_url, context)
                         .unwrap_or_default()
                 } else {
@@ -1253,29 +1262,67 @@ impl RuleEngine {
         let mut out = Vec::new();
         for captures in rows {
             let mut context = RuleVariableContext::for_search_item();
-            let name = capture_rule_values_with_ctx(rule.name.as_deref(), &captures, &mut context)
-                .unwrap_or_default();
+            let name = capture_rule_values_with_ctx(
+                rule.name.as_deref(),
+                &captures,
+                base_url,
+                &mut context,
+            )
+            .unwrap_or_default();
             if name.is_empty() {
                 continue;
             }
-            let author =
-                capture_rule_values_with_ctx(rule.author.as_deref(), &captures, &mut context)
-                    .unwrap_or_default();
-            let book_url =
-                capture_rule_values_with_ctx(rule.book_url.as_deref(), &captures, &mut context)
-                    .unwrap_or_default();
-            let cover_url =
-                capture_rule_values_with_ctx(rule.cover_url.as_deref(), &captures, &mut context)
-                    .map(|u| resolve_url(base_url, &u));
-            let intro =
-                capture_rule_values_with_ctx(rule.intro.as_deref(), &captures, &mut context);
-            let kind = capture_rule_values_with_ctx(rule.kind.as_deref(), &captures, &mut context);
-            let last_chapter =
-                capture_rule_values_with_ctx(rule.last_chapter.as_deref(), &captures, &mut context);
-            let update_time =
-                capture_rule_values_with_ctx(rule.update_time.as_deref(), &captures, &mut context);
-            let word_count =
-                capture_rule_values_with_ctx(rule.word_count.as_deref(), &captures, &mut context);
+            let author = capture_rule_values_with_ctx(
+                rule.author.as_deref(),
+                &captures,
+                base_url,
+                &mut context,
+            )
+            .unwrap_or_default();
+            let book_url = capture_rule_values_with_ctx(
+                rule.book_url.as_deref(),
+                &captures,
+                base_url,
+                &mut context,
+            )
+            .unwrap_or_default();
+            let cover_url = capture_rule_values_with_ctx(
+                rule.cover_url.as_deref(),
+                &captures,
+                base_url,
+                &mut context,
+            )
+            .map(|u| resolve_url(base_url, &u));
+            let intro = capture_rule_values_with_ctx(
+                rule.intro.as_deref(),
+                &captures,
+                base_url,
+                &mut context,
+            );
+            let kind = capture_rule_values_with_ctx(
+                rule.kind.as_deref(),
+                &captures,
+                base_url,
+                &mut context,
+            );
+            let last_chapter = capture_rule_values_with_ctx(
+                rule.last_chapter.as_deref(),
+                &captures,
+                base_url,
+                &mut context,
+            );
+            let update_time = capture_rule_values_with_ctx(
+                rule.update_time.as_deref(),
+                &captures,
+                base_url,
+                &mut context,
+            );
+            let word_count = capture_rule_values_with_ctx(
+                rule.word_count.as_deref(),
+                &captures,
+                base_url,
+                &mut context,
+            );
             out.push(SearchBook {
                 name,
                 author,
@@ -1468,6 +1515,7 @@ impl RuleEngine {
             let title = capture_rule_values_with_ctx(
                 rule.chapter_name.as_deref(),
                 &captures,
+                base_url,
                 &mut chapter_ctx,
             )
             .unwrap_or_default();
@@ -1478,29 +1526,40 @@ impl RuleEngine {
             let raw_url = capture_rule_values_with_ctx(
                 rule.chapter_url.as_deref(),
                 &captures,
+                base_url,
                 &mut chapter_ctx,
             )
             .unwrap_or_default();
             let tag = capture_rule_values_with_ctx(
                 rule.update_time.as_deref(),
                 &captures,
+                base_url,
                 &mut chapter_ctx,
             );
             let is_volume = capture_rule_values_with_ctx(
                 rule.is_volume.as_deref(),
                 &captures,
+                base_url,
                 &mut chapter_ctx,
             )
             .map(is_truthy)
             .unwrap_or(false);
-            let is_vip =
-                capture_rule_values_with_ctx(rule.is_vip.as_deref(), &captures, &mut chapter_ctx)
-                    .map(is_truthy)
-                    .unwrap_or(false);
-            let is_pay =
-                capture_rule_values_with_ctx(rule.is_pay.as_deref(), &captures, &mut chapter_ctx)
-                    .map(is_truthy)
-                    .unwrap_or(false);
+            let is_vip = capture_rule_values_with_ctx(
+                rule.is_vip.as_deref(),
+                &captures,
+                base_url,
+                &mut chapter_ctx,
+            )
+            .map(is_truthy)
+            .unwrap_or(false);
+            let is_pay = capture_rule_values_with_ctx(
+                rule.is_pay.as_deref(),
+                &captures,
+                base_url,
+                &mut chapter_ctx,
+            )
+            .map(is_truthy)
+            .unwrap_or(false);
             let url = finalize_chapter_url(base_url, &raw_url, &title, is_volume, out.len());
             out.push(BookChapter {
                 title,
@@ -1708,7 +1767,7 @@ impl RuleEngine {
         let (list_rule, list_js) = extract_js(list_rule);
         let list_context = RuleVariableContext::for_search_item();
         let items = apply_json_list_js(
-            jsonpath::jsonpath_query(&v, self.strip_mode_prefix(list_rule)),
+            query_json_list(&v, list_rule),
             list_js,
             base_url,
             &list_context,
@@ -2640,19 +2699,24 @@ fn pick_json_field(v: &Value, rule: Option<&str>) -> Option<String> {
     jsonpath::jsonpath_first_string(v, &normalized)
 }
 
-// A next-content URL may carry AnalyzeUrl options for the following request.
-// Keep a valid option object after resolving only the URL portion.
 fn resolve_content_page_url(base: &str, value: &str) -> String {
-    for (index, _) in value.match_indices(',').rev() {
-        let options = value[index + 1..].trim();
-        if serde_json::from_str::<Value>(options).is_ok_and(|value| value.is_object()) {
-            return format!("{}{}", resolve_url(base, &value[..index]), &value[index..]);
-        }
-    }
     resolve_url(base, value)
 }
 
 pub(crate) fn resolve_url(base: &str, url: &str) -> String {
+    let url = normalize_source_url(url);
+    if url.starts_with("data:") {
+        return url;
+    }
+    let (path, options) = crate::crawler::split_url_options(&url);
+    let resolved = resolve_url_path(crate::crawler::strip_url_options(base), path);
+    match options {
+        Some(_) => format!("{resolved}{}", &url[path.len()..]),
+        None => resolved,
+    }
+}
+
+fn resolve_url_path(base: &str, url: &str) -> String {
     let base = normalize_source_url(base);
     let url = normalize_source_url(strip_url_config(url));
 
@@ -3070,6 +3134,35 @@ fn apply_html_list_js<'a>(
         .collect()
 }
 
+fn query_json_list(value: &Value, rule: &str) -> Vec<Value> {
+    let split = rule_analyzer::split_top_level(strip_mode_prefix(rule.trim()), &["&&", "||", "%%"]);
+    match split.delimiter.as_deref() {
+        Some("||") => split
+            .parts
+            .iter()
+            .map(|branch| query_json_list(value, branch))
+            .find(|items| !items.is_empty())
+            .unwrap_or_default(),
+        Some("&&") => split
+            .parts
+            .iter()
+            .flat_map(|branch| query_json_list(value, branch))
+            .collect(),
+        Some("%%") => rule_analyzer::interleave_result_groups(
+            split
+                .parts
+                .iter()
+                .map(|branch| query_json_list(value, branch))
+                .filter(|items| !items.is_empty())
+                .collect(),
+        )
+        .into_iter()
+        .filter(|item| !item.is_null())
+        .collect(),
+        _ => jsonpath::jsonpath_query(value, &split.parts[0]),
+    }
+}
+
 fn apply_json_list_js(
     items: Vec<Value>,
     script: Option<&str>,
@@ -3234,12 +3327,21 @@ impl FieldInput<'_> {
         let had_templates = expanded != source.rule;
         source.make_up_rule(&expanded);
         let (pure, js) = extract_js(&source.rule);
+        if let Self::XPath(node, true) = self {
+            if source.mode == ParseMode::XPath
+                && html::xpath_rule(rule).is_none()
+                && xpath_default_extractor(node, pure)
+            {
+                source.mode = ParseMode::Css;
+            }
+        }
         let mut values = if let Some(key) = direct_get_key(pure) {
             ctx.get(key).into_iter().collect()
         } else {
             match source.mode {
                 ParseMode::Css => match self {
                     Self::Html(el) => html::select_text_list_from_element(&el, pure),
+                    Self::XPath(node, true) => xpath_css_field_values(node, pure),
                     _ => html::select_text_list(&html::parse_document(&input), pure),
                 },
                 ParseMode::XPath => match self {
@@ -3432,6 +3534,39 @@ fn eval_field_html_with_ctx(
     (!text.is_empty()).then_some(text)
 }
 
+fn eval_content_html_doc_with_ctx(
+    rule: &str,
+    doc: &scraper::Html,
+    base_url: &str,
+    ctx: &RuleVariableContext,
+) -> String {
+    let mut stage = SourceRule::compile(rule, ParseMode::Css, false);
+    stage.make_up_rule(&stage.rule.clone());
+    let (selection, js) = extract_js(&stage.rule);
+    let split = rule_analyzer::split_top_level(selection, &["&&", "||", "%%"]);
+    let mut text = if split.delimiter.as_deref() == Some("%%") {
+        rule_analyzer::interleave_result_groups(
+            split
+                .parts
+                .iter()
+                .map(|branch| html::select_text_list(doc, branch))
+                .filter(|items| !items.is_empty())
+                .collect(),
+        )
+        .join("\n")
+    } else if split.delimiter.is_some() {
+        html::select_text_list(doc, selection).join("\n")
+    } else {
+        html::select_all_text(doc, selection).unwrap_or_default()
+    };
+    if let Some(script) = js {
+        if let Ok(result) = eval_js_with_bindings(script, &text, base_url, &ctx.js_bindings()) {
+            text = result;
+        }
+    }
+    stage.apply_replacement(&text)
+}
+
 fn eval_field_html_doc_with_ctx(
     rule: &str,
     doc: &scraper::Html,
@@ -3478,6 +3613,59 @@ fn eval_field_html_doc_with_ctx(
     (!text.is_empty()).then_some(text)
 }
 
+fn xpath_default_extractor(node: sxd_xpath::nodeset::Node<'_>, rule: &str) -> bool {
+    let sxd_xpath::nodeset::Node::Element(element) = node else {
+        return false;
+    };
+    let rule = rule.trim();
+    matches!(
+        rule,
+        "text" | "textNodes" | "ownText" | "html" | "all" | "href" | "src"
+    ) || (rule.starts_with("attr[") && rule.ends_with(']'))
+        || element
+            .attributes()
+            .iter()
+            .any(|attr| attr.name().local_part() == rule)
+}
+
+fn xpath_css_field_values(node: sxd_xpath::nodeset::Node<'_>, rule: &str) -> Vec<String> {
+    let sxd_xpath::nodeset::Node::Element(element) = node else {
+        return Vec::new();
+    };
+    let tag = element.name().local_part();
+    let outer = html::sxd_element_to_html(element, true);
+    // HTML fragment parsing needs table context to retain these selected nodes.
+    let content = match tag {
+        "td" | "th" => format!("<table><tr>{outer}</tr></table>"),
+        "tr" | "tbody" | "thead" | "tfoot" | "caption" | "colgroup" => {
+            format!("<table>{outer}</table>")
+        }
+        _ => outer,
+    };
+    let document = html::parse_document(&content);
+    let Ok(selector) = scraper::Selector::parse(tag) else {
+        return Vec::new();
+    };
+    let parts = rule_analyzer::split_top_level(rule, &["@"]).parts;
+    let normalize_text = parts
+        .last()
+        .is_some_and(|part| matches!(part.trim(), "text" | "ownText"));
+    document
+        .select(&selector)
+        .next()
+        .map(|element| html::select_text_list_from_element(&element, rule))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|text| {
+            if normalize_text {
+                html::normalize_jsoup_text_node(&text)
+            } else {
+                text
+            }
+        })
+        .collect()
+}
+
 fn eval_field_xpath_with_ctx(
     rule: &str,
     node: sxd_xpath::nodeset::Node<'_>,
@@ -3503,6 +3691,13 @@ fn eval_field_xpath_with_ctx(
     let had_templates = expanded != source_rule.rule;
     source_rule.make_up_rule(&expanded);
     let (pure, js) = extract_js(&source_rule.rule);
+    if source_rule.mode == ParseMode::XPath
+        && html_mode
+        && html::xpath_rule(rule).is_none()
+        && xpath_default_extractor(node, pure)
+    {
+        source_rule.mode = ParseMode::Css;
+    }
 
     let mut text = match source_rule.mode {
         ParseMode::XPath if pure.trim().is_empty() => input.clone(),
@@ -3517,6 +3712,10 @@ fn eval_field_xpath_with_ctx(
             eval_js_with_bindings(strip_js_rule(pure), &input, base_url, &ctx.js_bindings())
                 .unwrap_or_default()
         }
+        ParseMode::Css if html_mode => xpath_css_field_values(node, pure)
+            .into_iter()
+            .next()
+            .unwrap_or_default(),
         ParseMode::Css => {
             let doc = html::parse_document(&input);
             html::select_text(&doc, pure).unwrap_or_default()
@@ -3556,6 +3755,16 @@ fn eval_field_json_with_ctx(
     base_url: &str,
     ctx: &mut RuleVariableContext,
 ) -> Option<String> {
+    if let Some((script, remainder)) = split_leading_js_transform(rule) {
+        // Field stages receive the current JSON value, not the serialized body
+        // used by list transforms. Feed each stage's output to the next rule.
+        let script = interpolate_json_templates(script, v, base_url, ctx);
+        let mut bindings = ctx.js_bindings();
+        bindings.insert("result".to_string(), v.clone());
+        let output = eval_js_with_bindings(&script, "", base_url, &bindings).ok()?;
+        let value = serde_json::from_str(&output).unwrap_or(Value::String(output));
+        return eval_field_json_with_ctx(remainder, &value, base_url, ctx);
+    }
     if let Some(result) = FieldInput::Json(v).combined(rule, base_url, ctx) {
         return result;
     }
@@ -4042,14 +4251,39 @@ fn regex_capture_all(rule: &str, input: &str) -> Vec<Vec<Option<String>>> {
 fn capture_rule_values_with_ctx(
     rule: Option<&str>,
     captures: &[Option<String>],
+    base_url: &str,
     context: &mut RuleVariableContext,
 ) -> Option<String> {
     let rule = rule?;
     let (rule, entries) = extract_put_entries(rule);
-    evaluate_put_entries(&entries, context, |value_rule, _| {
-        capture_rule_values(Some(value_rule), captures)
+    evaluate_put_entries(&entries, context, |value_rule, context| {
+        capture_rule_values_with_ctx(Some(value_rule), captures, base_url, context)
     });
-    capture_rule_values(Some(&rule), captures)
+    if extract_js(&rule).1.is_none() {
+        return capture_rule_values(Some(&rule), captures);
+    }
+
+    // Separate replacement groups before expanding list captures: `$1` in a
+    // replacement belongs to its own regex, not to the AllInOne list pattern.
+    let mut stage = SourceRule::compile(&rule, ParseMode::Regex, false);
+    stage.make_up_rule(&rule);
+    let (pure, script) = extract_js(&stage.rule);
+    let mut bindings = context.js_bindings();
+    let input = if pure.is_empty() {
+        bindings.insert("result".to_string(), json!(captures));
+        captures
+            .first()
+            .and_then(Option::as_deref)
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        capture_rule_values(Some(pure), captures).unwrap_or_default()
+    };
+    let script = substitute_capture_values(script?, captures);
+    let script = interpolate_common_templates(&script, &input, base_url, context);
+    let output = eval_js_with_bindings(&script, &input, base_url, &bindings).ok()?;
+    let output = stage.apply_replacement(&output);
+    (!output.is_empty()).then_some(output)
 }
 
 fn capture_rule_values(rule: Option<&str>, captures: &[Option<String>]) -> Option<String> {
@@ -4057,6 +4291,15 @@ fn capture_rule_values(rule: Option<&str>, captures: &[Option<String>]) -> Optio
     if rule.is_empty() {
         return None;
     }
+    let replaced = substitute_capture_values(rule, captures);
+    let (pure, regex_part) = split_legado_regex(&replaced);
+    let output = regex_part
+        .map(|replacement| apply_legado_regex(&pure, replacement))
+        .unwrap_or(pure);
+    (!output.is_empty()).then_some(output)
+}
+
+fn substitute_capture_values(rule: &str, captures: &[Option<String>]) -> String {
     let placeholder = regex::Regex::new(r"\$(\d{1,2})").expect("valid capture placeholder");
     let replaced = placeholder.replace_all(rule, |cap: &regex::Captures| {
         let index = cap
@@ -4072,11 +4315,7 @@ fn capture_rule_values(rule: Option<&str>, captures: &[Option<String>]) -> Optio
             .map(str::to_string)
             .unwrap_or_else(|| cap[0].to_string())
     });
-    let (pure, regex_part) = split_legado_regex(&replaced);
-    let output = regex_part
-        .map(|replacement| apply_legado_regex(&pure, replacement))
-        .unwrap_or(pure);
-    (!output.is_empty()).then_some(output)
+    replaced.into_owned()
 }
 
 fn finalize_chapter_url(
@@ -5589,6 +5828,82 @@ arr;"#
             ),
             "B/C/B/C/Original"
         );
+    }
+
+    #[test]
+    fn resolved_url_options_reach_request_rendering_flag() {
+        let source = BookSource::default();
+        for options in [r#"{"webView":true}"#, "{'webView':true}"] {
+            let resolved = resolve_url(
+                "https://fixture.test/books/",
+                &format!("../chapter,{options}"),
+            );
+            let request = crate::crawler::analyze_url(
+                &resolved,
+                "",
+                1,
+                "https://fixture.test/books/",
+                &source,
+            )
+            .unwrap();
+            assert_eq!(request.url, "https://fixture.test/chapter");
+            assert!(request.render_with_rakers);
+        }
+        let resolved = resolve_url(
+            r#"https://fixture.test/books/,{"webView":true}"#,
+            "../chapter",
+        );
+        let request =
+            crate::crawler::analyze_url(&resolved, "", 1, "https://fixture.test/books/", &source)
+                .unwrap();
+        assert!(!request.render_with_rakers);
+    }
+
+    #[test]
+    fn shuba69_content_replacement_uses_book_fields_without_overwriting_chapter_title() {
+        let source = BookSource {
+            rule_content: Some(ContentRule {
+                content: Some("class.txtnav@html".to_string()),
+                replace_regex: Some(r"##(^(.+\n){2}({{book.durChapterTitle}}.*\n)?)|(\n\uE5E5.*)+|(\n.*\(本章完\)$)|(\n最.新.小.说.+)".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let fields = HashMap::from([("durChapterTitle".to_string(), "第1章 绯红".to_string())]);
+        let engine = RuleEngine::new().unwrap();
+        for (tail, expected) in [
+            ("(本章完)", "第一段正常正文内容。\n第二段正常正文内容。"),
+            (
+                "(本章完)\n最.新.小.说.发布",
+                "第一段正常正文内容。\n第二段正常正文内容。\n(本章完)",
+            ),
+        ] {
+            let body = format!("<div class=\"txtnav\">广告行1\n广告行2\n第1章 绯红\n第一段正常正文内容。\n第二段正常正文内容。\n{tail}</div>");
+            let mut context = RuleVariableContext::for_content_with_fields(
+                None,
+                None,
+                Some("诡秘之主"),
+                Some("请求章节，不等于阅读进度"),
+                Some(&fields),
+            );
+            assert_eq!(
+                engine.content_with_context(
+                    &source,
+                    &body,
+                    "https://69shuba.cx/txt/123/1.htm",
+                    &mut context
+                ),
+                expected
+            );
+            assert_eq!(
+                context.js_bindings()["book"]["durChapterTitle"],
+                "第1章 绯红"
+            );
+            assert_eq!(
+                context.js_bindings()["chapter"]["title"],
+                "请求章节，不等于阅读进度"
+            );
+        }
     }
 
     #[test]
