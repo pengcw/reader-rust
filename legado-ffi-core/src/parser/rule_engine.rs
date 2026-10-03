@@ -4034,7 +4034,7 @@ fn apply_toc_format_js(
     let script = strip_js_rule(script);
     let script_literal = serde_json::to_string(script).unwrap_or_else(|_| "\"\"".to_string());
     let wrapped_script = format!(
-        "(()=>{{const __value=eval({script_literal});return JSON.stringify({{value:__value,gInt:Number(globalThis.gInt)||0}});}})()"
+        "(()=>{{let __value;let __failed=false;try{{__value=eval({script_literal});}}catch(_){{__failed=true;}}return JSON.stringify({{value:__value,failed:__failed,gInt:Number(globalThis.gInt)||0}});}})()"
     );
     let mut g_int = 0i64;
     for (index, chapter) in chapters.iter_mut().enumerate() {
@@ -4055,8 +4055,8 @@ fn apply_toc_format_js(
         {
             if let Ok(value) = serde_json::from_str::<Value>(&result) {
                 g_int = value.get("gInt").and_then(Value::as_i64).unwrap_or(g_int);
-                if let Some(title) = value.get("value").and_then(jsonpath::value_to_string) {
-                    if !title.trim().is_empty() {
+                if value.get("failed").and_then(Value::as_bool) == Some(false) {
+                    if let Some(title) = value.get("value").and_then(jsonpath::value_to_string) {
                         chapter.title = title;
                     }
                 }
