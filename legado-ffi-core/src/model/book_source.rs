@@ -1,3 +1,4 @@
+use crate::util::text::find_template_close;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Map, Value};
@@ -134,10 +135,14 @@ pub fn migrate_legacy_book_source_value(mut value: Value) -> Value {
         if !obj.contains_key(new) {
             move_if_absent(obj, old, new);
             if let Some(Value::String(raw)) = obj.get(new).cloned() {
-                obj.insert(
-                    new.to_string(),
-                    Value::String(convert_legacy_url_rule(&raw)),
-                );
+                let converted = if new == "exploreUrl"
+                    && (raw.starts_with("@js:") || raw.starts_with("<js>"))
+                {
+                    raw
+                } else {
+                    convert_legacy_url_rule(&raw)
+                };
+                obj.insert(new.to_string(), Value::String(converted));
             }
         }
     }
@@ -274,6 +279,14 @@ fn migrate_rule_object(obj: &mut Map<String, Value>, target: &str, fields: &[(&s
 }
 
 fn convert_legacy_url_rule(raw: &str) -> String {
+    if raw
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("<js>"))
+    {
+        return raw
+            .replace("=searchKey", "={{key}}")
+            .replace("=searchPage", "={{page}}");
+    }
     let mut url = raw.to_string();
     let mut option = Map::new();
 
@@ -286,7 +299,7 @@ fn convert_legacy_url_rule(raw: &str) -> String {
         }
     }
 
-    if let Some(idx) = url.find("|charset=") {
+    if let Some(idx) = find_legacy_url_marker(&url, "|charset=") {
         let charset = url[idx + "|charset=".len()..].trim().to_string();
         url.truncate(idx);
         if !charset.is_empty() {
@@ -294,7 +307,7 @@ fn convert_legacy_url_rule(raw: &str) -> String {
         }
     }
 
-    if let Some(idx) = url.find("@body") {
+    if let Some(idx) = find_legacy_url_marker(&url, "@body") {
         let body = url[idx + "@body".len()..]
             .trim_start_matches([':', '='])
             .trim()
@@ -304,10 +317,24 @@ fn convert_legacy_url_rule(raw: &str) -> String {
         option.insert("body".to_string(), Value::String(body));
     }
 
-    url = url
-        .replace("searchKey", "{{key}}")
-        .replace("searchPage", "{{page}}");
-    url = convert_legacy_page_braces(&url);
+    url = legacy_url_segments(&url)
+        .map(|(_, part, template)| {
+            if template {
+                if find_template_close(&part[2..]).is_some() {
+                    part.replace("searchKey", "key")
+                        .replace("searchPage", "page")
+                } else {
+                    part.to_string()
+                }
+            } else {
+                convert_legacy_page_braces(
+                    &part
+                        .replace("searchKey", "{{key}}")
+                        .replace("searchPage", "{{page}}"),
+                )
+            }
+        })
+        .collect();
 
     if option.is_empty() {
         url
@@ -317,7 +344,7 @@ fn convert_legacy_url_rule(raw: &str) -> String {
 }
 
 fn extract_legacy_header(input: &str) -> Option<(usize, usize, String)> {
-    let start = input.find("@Header:")?;
+    let start = find_legacy_url_marker(input, "@Header:")?;
     let object_start = start + "@Header:".len();
     let rest = input.get(object_start..)?.trim_start();
     let skipped = input.get(object_start..)?.len() - rest.len();
@@ -340,6 +367,40 @@ fn extract_legacy_header(input: &str) -> Option<(usize, usize, String)> {
         }
     }
     None
+}
+
+// Borrow segments rather than masking templates with collision-prone placeholders.
+fn legacy_url_segments(input: &str) -> impl Iterator<Item = (usize, &str, bool)> {
+    let mut cursor = 0;
+    std::iter::from_fn(move || {
+        if cursor == input.len() {
+            return None;
+        }
+        let start = cursor;
+        let remaining = &input[start..];
+        let template = remaining.starts_with("{{");
+        cursor = if template {
+            find_template_close(&remaining[2..])
+                .map(|end| start + 2 + end + 2)
+                .unwrap_or(input.len())
+        } else {
+            remaining
+                .find("{{")
+                .map(|end| start + end)
+                .unwrap_or(input.len())
+        };
+        Some((start, &input[start..cursor], template))
+    })
+}
+
+fn find_legacy_url_marker(input: &str, marker: &str) -> Option<usize> {
+    legacy_url_segments(input).find_map(|(offset, part, template)| {
+        if template {
+            None
+        } else {
+            part.find(marker).map(|index| offset + index)
+        }
+    })
 }
 
 fn convert_legacy_page_braces(input: &str) -> String {

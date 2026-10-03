@@ -32,3 +32,65 @@ pub fn repair_encoded_url(input: &str) -> String {
         .replace("%23", "#")
         .replace("%23", "#")
 }
+
+// Find a {{...}} terminator without stopping inside JS braces, strings or comments.
+pub(crate) fn find_template_close(expression: &str) -> Option<usize> {
+    enum State {
+        Code,
+        Quoted(u8),
+        LineComment,
+        BlockComment,
+    }
+
+    let bytes = expression.as_bytes();
+    let mut state = State::Code;
+    let mut brace_depth = 0usize;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+        match state {
+            State::Quoted(quote) => {
+                if byte == b'\\' {
+                    index += 2;
+                    continue;
+                }
+                if byte == quote {
+                    state = State::Code;
+                }
+            }
+            State::LineComment => {
+                if matches!(byte, b'\n' | b'\r') {
+                    state = State::Code;
+                }
+            }
+            State::BlockComment => {
+                if byte == b'*' && next == Some(b'/') {
+                    state = State::Code;
+                    index += 2;
+                    continue;
+                }
+            }
+            State::Code => match (byte, next) {
+                (b'\'' | b'"' | b'`', _) => state = State::Quoted(byte),
+                (b'/', Some(b'/')) => {
+                    state = State::LineComment;
+                    index += 2;
+                    continue;
+                }
+                (b'/', Some(b'*')) => {
+                    state = State::BlockComment;
+                    index += 2;
+                    continue;
+                }
+                (b'{', _) => brace_depth += 1,
+                (b'}', _) if brace_depth > 0 => brace_depth -= 1,
+                (b'}', Some(b'}')) => return Some(index),
+                _ => {}
+            },
+        }
+        index += 1;
+    }
+    // Returned offsets always point to ASCII braces, hence UTF-8 boundaries.
+    None
+}

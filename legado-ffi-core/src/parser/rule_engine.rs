@@ -8,7 +8,7 @@ use crate::parser::{
     js::{eval_js_template_with_bindings, eval_js_with_bindings, with_js_lib},
     jsonpath, rule_analyzer, source_regex,
 };
-use crate::util::text::normalize_source_url;
+use crate::util::text::{find_template_close, normalize_source_url};
 use serde_json::{json, Value};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -2955,67 +2955,6 @@ fn interpolate_templates(
         cursor += ch.len_utf8();
     }
     output
-}
-
-fn find_template_close(expression: &str) -> Option<usize> {
-    enum State {
-        Code,
-        Quoted(u8),
-        LineComment,
-        BlockComment,
-    }
-
-    let bytes = expression.as_bytes();
-    let mut state = State::Code;
-    let mut brace_depth = 0usize;
-    let mut index = 0;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        let next = bytes.get(index + 1).copied();
-        match state {
-            State::Quoted(quote) => {
-                if byte == b'\\' {
-                    index += 2;
-                    continue;
-                }
-                if byte == quote {
-                    state = State::Code;
-                }
-            }
-            State::LineComment => {
-                if matches!(byte, b'\n' | b'\r') {
-                    state = State::Code;
-                }
-            }
-            State::BlockComment => {
-                if byte == b'*' && next == Some(b'/') {
-                    state = State::Code;
-                    index += 2;
-                    continue;
-                }
-            }
-            State::Code => match (byte, next) {
-                (b'\'' | b'"' | b'`', _) => state = State::Quoted(byte),
-                (b'/', Some(b'/')) => {
-                    state = State::LineComment;
-                    index += 2;
-                    continue;
-                }
-                (b'/', Some(b'*')) => {
-                    state = State::BlockComment;
-                    index += 2;
-                    continue;
-                }
-                (b'{', _) => brace_depth += 1,
-                (b'}', _) if brace_depth > 0 => brace_depth -= 1,
-                (b'}', Some(b'}')) => return Some(index),
-                _ => {}
-            },
-        }
-        index += 1;
-    }
-    // Returned offsets always point to ASCII braces, hence UTF-8 boundaries.
-    None
 }
 
 fn evaluate_template_expression(

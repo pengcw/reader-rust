@@ -122,3 +122,90 @@ fn migration_is_idempotent_and_does_not_convert_the_new_url_twice() {
         json!({"method":"POST", "body":"literal=searchPage"})
     );
 }
+
+#[test]
+fn legacy_explore_javascript_is_preserved_before_url_option_conversion() {
+    for script in [
+        "@js: const routes = {a:1,b:2}; const text = 'searchKey|charset=gbk@body:payload'; '/list';",
+        "<js>const routes = {a:1,b:2}; '/list?q=searchKey';</js>",
+    ] {
+        let source = book_source_from_value(json!({
+            "bookSourceUrl":"https://example.com", "ruleFindUrl":script
+        })).unwrap();
+        assert_eq!(source.explore_url.as_deref(), Some(script));
+    }
+}
+
+#[test]
+fn legacy_search_js_only_rewrites_equals_placeholders_as_in_original_importer() {
+    let source = book_source_from_value(json!({
+        "bookSourceUrl":"https://example.com",
+        "ruleSearchUrl":"<js>const routes = {a:1,b:2}; const searchKeyName = 'unchanged'; '/search?q=searchKey&p=searchPage';</js>"
+    })).unwrap();
+    assert_eq!(source.search_url.as_deref(), Some(
+        "<js>const routes = {a:1,b:2}; const searchKeyName = 'unchanged'; '/search?q={{key}}&p={{page}}';</js>"));
+}
+
+#[test]
+fn old_url_templates_keep_nested_braces_and_convert_legacy_js_bindings() {
+    let raw = "/search?q={{encodeURIComponent(searchKey)}}&p={{searchPage+1}}&choice={1,2}&token={{JSON.stringify({a:1,b:2})}}";
+    let source = book_source_from_value(json!({
+        "bookSourceUrl":"https://example.com", "ruleSearchUrl":raw
+    }))
+    .unwrap();
+    assert_eq!(source.search_url.as_deref(), Some(
+        "/search?q={{encodeURIComponent(key)}}&p={{page+1}}&choice=<1,2>&token={{JSON.stringify({a:1,b:2})}}"));
+    let spec = analyze_url(
+        source.search_url.as_deref().unwrap(),
+        "reader",
+        2,
+        &source.book_source_url,
+        &source,
+    )
+    .unwrap();
+    assert!(spec.url.contains("q=reader&p=3&choice=2"), "{}", spec.url);
+}
+
+#[test]
+fn legacy_option_markers_and_closing_braces_inside_templates_are_not_metadata() {
+    let raw =
+        r#"/search?literal={{'@Header:{"A":"1","B":"2"}|charset=gbk@body:x}}'}}&choice={1,2}"#;
+    let source = book_source_from_value(json!({
+        "bookSourceUrl":"https://example.com", "ruleSearchUrl":raw
+    }))
+    .unwrap();
+    assert_eq!(
+        source.search_url.as_deref(),
+        Some(
+            r#"/search?literal={{'@Header:{"A":"1","B":"2"}|charset=gbk@body:x}}'}}&choice=<1,2>"#
+        )
+    );
+}
+
+#[test]
+fn template_protection_preserves_literal_dollar_indices_and_unclosed_templates() {
+    for (raw, expected) in [
+        (
+            "/search?literal=$0&value={{searchPage}}&choice={1,2}",
+            "/search?literal=$0&value={{page}}&choice=<1,2>",
+        ),
+        (
+            "/search?value={{JSON.stringify({a:1,b:2})",
+            "/search?value={{JSON.stringify({a:1,b:2})",
+        ),
+        (
+            "/search?value={{'searchPage}}",
+            "/search?value={{'searchPage}}",
+        ),
+        (
+            "/search?value={{searchPage /* quoted }} */}}",
+            "/search?value={{page /* quoted }} */}}",
+        ),
+    ] {
+        let source = book_source_from_value(json!({
+            "bookSourceUrl":"https://example.com", "ruleSearchUrl":raw
+        }))
+        .unwrap();
+        assert_eq!(source.search_url.as_deref(), Some(expected));
+    }
+}
