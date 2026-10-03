@@ -53,7 +53,6 @@ pub struct ActiveSession {
     script_cache: Mutex<HashMap<String, String>>,
     // Legado's putMemory stores process-local values; never serialize them to session.
     memory_cache: Mutex<HashMap<String, Value>>,
-    pub(crate) public_suffix_cache: Arc<crate::parser::http_url::SuffixCache>,
     unknown_method_fallback: AtomicBool,
     initial_session: ExecuteSession,
 }
@@ -135,7 +134,6 @@ impl ActiveSession {
             variables: Mutex::new(initial_variables.clone().unwrap_or_default()),
             script_cache: Mutex::new(HashMap::new()),
             memory_cache: Mutex::new(HashMap::new()),
-            public_suffix_cache: Arc::new(Mutex::new(None)),
             unknown_method_fallback: AtomicBool::new(false),
             initial_session: ExecuteSession {
                 cookies: initial_cookies,

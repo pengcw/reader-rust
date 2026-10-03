@@ -35,7 +35,6 @@ once_cell = "1"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 url = "2"
-publicsuffix = "2.3"
 sxd-xpath = "0.4"
 sxd-document = "0.3"
 safer-ffi = { version = "0.1", features = ["headers"] }

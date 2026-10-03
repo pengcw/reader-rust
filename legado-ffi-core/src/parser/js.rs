@@ -936,15 +936,6 @@ fn eval_js_inner_with_source(
                 "__httpUrl",
                 Func::new(|spec: String| -> Option<String> { super::http_url::parse(&spec) }),
             )?;
-            let suffix_cache = crate::crawler::session::current_active_session()
-                .map(|session| session.public_suffix_cache.clone())
-                .unwrap_or_else(|| Arc::new(Mutex::new(None)));
-            java_obj.set(
-                "__topPrivateDomain",
-                Func::new(move |spec: String| -> String {
-                    super::http_url::top_private_domain(&spec, &suffix_cache).to_string()
-                }),
-            )?;
             java_obj.set(
                 "__toURL",
                 Func::new(
@@ -2808,13 +2799,9 @@ fn eval_js_inner_with_source(
                                 host: parsed.host,
                                 toString: () => parsed.url,
                                 topPrivateDomain() {
-                                    const response = JSON.parse(java.__topPrivateDomain(parsed.url));
-                                    if (!response.ok) {
-                                        const error = new Error(response.error.message);
-                                        error.kind = response.error.kind;
-                                        throw error;
-                                    }
-                                    return response.data;
+                                    const error = new Error('HttpUrl.topPrivateDomain requires public suffix support');
+                                    error.kind = 'unsupported';
+                                    throw error;
                                 }
                             });
                         }
