@@ -3929,6 +3929,11 @@ fn apply_content_replacement(
     let Some(rule) = rule else {
         return content;
     };
+    let script = strip_js_rule(rule);
+    if script != rule.trim() {
+        return eval_js_template_with_bindings(script, &content, base_url, &context.js_bindings())
+            .unwrap_or(content);
+    }
     let rule = interpolate_common_templates(rule, input, base_url, context);
     apply_legado_regex(&content, &rule)
 }

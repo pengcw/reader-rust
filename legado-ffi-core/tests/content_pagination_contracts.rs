@@ -14,6 +14,16 @@ fn source(base: &str, replacement: &str, content_rule: &str) -> Value {
 }
 
 fn run(pages: Vec<Value>, replacement: &str, content_rule: &str) -> Value {
+    run_with_context(pages, replacement, content_rule, None, Value::Null)
+}
+
+fn run_with_context(
+    pages: Vec<Value>,
+    replacement: &str,
+    content_rule: &str,
+    js_lib: Option<&str>,
+    book: Value,
+) -> Value {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -53,8 +63,12 @@ fn run(pages: Vec<Value>, replacement: &str, content_rule: &str) -> Value {
         }
         requests
     });
-    let response: Value = serde_json::from_str(&execute(&source(&base, replacement, content_rule).to_string(),
-        &json!({"api": 2, "op": "content", "params": {"url": format!("{base}/chapter/1")}, "options": {"timeoutMs": 1000}}).to_string())).unwrap();
+    let mut source = source(&base, replacement, content_rule);
+    if let Some(script) = js_lib {
+        source["jsLib"] = json!(script);
+    }
+    let response: Value = serde_json::from_str(&execute(&source.to_string(),
+        &json!({"api": 2, "op": "content", "params": {"url": format!("{base}/chapter/1"), "book": book}, "options": {"timeoutMs": 1000}}).to_string())).unwrap();
     let requests = server.join().unwrap();
     assert_eq!(response["ok"], true, "{response}");
     assert_eq!(response["data"]["pages"], expected_pages);
@@ -77,6 +91,72 @@ fn two_pages(first: &str, second: &str) -> Vec<Value> {
         json!({"content": first, "next": "/chapter/1?p=2"}),
         json!({"content": second, "next": ""}),
     ]
+}
+
+#[test]
+fn pure_js_source_replacement_receives_the_complete_string_once() {
+    for rule in ["@js: '[' + result + ']'", "<js>'[' + result + ']'</js>"] {
+        let result = run(two_pages("A", "B"), rule, "$.content");
+        assert_eq!(result["data"]["content"], "[A\nB]");
+    }
+}
+
+#[test]
+fn js_hash_markers_are_script_text_not_regex_separators() {
+    for rule in [
+        "@js: result + '##literal##suffix'",
+        "<js>result + '##literal##suffix'</js>",
+    ] {
+        let result = run(two_pages("A", "B"), rule, "$.content");
+        assert_eq!(result["data"]["content"], "A\nB##literal##suffix");
+    }
+}
+
+#[test]
+fn js_source_replacement_keeps_library_book_and_final_chapter_variables() {
+    let result = run_with_context(vec![
+        json!({"content": "A", "cid": "c1", "next": "/chapter/1?p=2"}),
+        json!({"content": "B", "cid": "c2", "next": ""}),
+    ], "@js: decorate(result, book.variableMap.bid, chapter.variableMap.cid, book.name)",
+        "$.content@put:{cid:$.cid}",
+        Some("function decorate(text, bid, cid, name) { return 'lib:' + bid + '/' + cid + '/' + name + ':' + text; }"),
+        json!({"name": "Book", "variableMap": {"bid": "book-1"}}));
+    assert_eq!(result["data"]["content"], "lib:book-1/c2/Book:A\nB");
+}
+
+#[test]
+fn failing_js_source_replacement_keeps_the_complete_stage_input() {
+    for rule in [
+        "@js: throw new Error('synthetic failure')",
+        "<js>throw new Error('synthetic failure')</js>",
+        "@js: (syntax error",
+    ] {
+        let result = run(two_pages("A", "B"), rule, "$.content");
+        assert_eq!(result["data"]["content"], "A\nB");
+    }
+}
+
+#[test]
+fn single_page_js_source_replacement_uses_its_direct_result() {
+    for (script, expected) in [
+        ("result.toLowerCase()", "a"),
+        ("null", ""),
+        ("undefined", ""),
+        ("''", ""),
+    ] {
+        let source: BookSource = serde_json::from_value(source(
+            "https://content-js.test/",
+            &format!("@js:{script}"),
+            "$.content",
+        ))
+        .unwrap();
+        let result = RuleEngine::new().unwrap().content(
+            &source,
+            "{\"content\":\"A\"}",
+            "https://content-js.test/1",
+        );
+        assert_eq!(result, expected, "{script}");
+    }
 }
 
 #[test]
