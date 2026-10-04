@@ -858,6 +858,99 @@ mod tests {
     }
 
     #[test]
+    fn virtual_timers_preserve_order_cancellation_and_clock() {
+        let js = r#"
+            document.body.innerHTML = '';
+            var start = Date.now();
+            queueMicrotask(function() { document.body.innerHTML += 'micro>'; });
+            var cancelled = setTimeout(function() { document.body.innerHTML += 'cancelled>'; }, 5);
+            clearTimeout(cancelled);
+            setTimeout(function() { document.body.innerHTML += 't1>'; }, 1);
+            var count = 0;
+            var interval = setInterval(function() {
+                count += 1;
+                document.body.innerHTML += 'i' + count + '>';
+                if (count === 2) clearInterval(interval);
+            }, 2);
+            setTimeout(function() {
+                document.body.innerHTML += 't10:' + performance.now() + ':' + (Date.now() - start);
+            }, 10);
+        "#;
+        let out = render_simple(js, true, None).unwrap();
+        assert!(
+            out.contains("micro&gt;t1&gt;i1&gt;i2&gt;t10:10:10")
+                || out.contains("micro>t1>i1>i2>t10:10:10"),
+            "virtual timers must preserve deadline order and virtual clock: {out}"
+        );
+        assert!(!out.contains("cancelled"));
+    }
+
+    #[test]
+    fn timer_microtasks_run_before_the_next_timer_task() {
+        let js = r#"
+            document.body.innerHTML = '';
+            setTimeout(function() {
+                document.body.innerHTML += 'first>';
+                Promise.resolve().then(function() { document.body.innerHTML += 'micro>'; });
+            }, 0);
+            setTimeout(function() { document.body.innerHTML += 'second'; }, 0);
+        "#;
+        let out = render_simple(js, true, None).unwrap();
+        assert!(
+            out.contains("first&gt;micro&gt;second") || out.contains("first>micro>second"),
+            "microtasks from one timer must drain before the next timer: {out}"
+        );
+    }
+
+    #[test]
+    fn long_timer_is_outside_render_horizon() {
+        let js = r#"
+            document.body.innerHTML = 'ready';
+            setTimeout(function() { document.body.innerHTML = 'too-late'; }, 5000);
+        "#;
+        let out = render_simple(js, true, None).unwrap();
+        assert!(out.contains("ready"));
+        assert!(!out.contains("too-late"));
+    }
+
+    #[test]
+    fn document_and_window_lifecycle_events_fire_once() {
+        let js = r#"
+            document.body.innerHTML = 'start:' + document.readyState + '>';
+            document.addEventListener('DOMContentLoaded', function() {
+                document.body.innerHTML += 'dom:' + document.readyState + '>';
+            });
+            window.addEventListener('load', function() {
+                document.body.innerHTML += 'load:' + document.readyState;
+            });
+        "#;
+        let out = render_simple(js, true, None).unwrap();
+        assert!(
+            out.contains("start:loading&gt;dom:interactive&gt;load:complete")
+                || out.contains("start:loading>dom:interactive>load:complete")
+        );
+    }
+
+    #[test]
+    fn navigator_uses_configured_user_agent() {
+        let cfg = HttpConfig {
+            user_agent: Some("reader-rust-test/1.0".to_string()),
+            ..Default::default()
+        };
+        let out = render(
+            "document.body.innerHTML = navigator.userAgent;",
+            true,
+            None,
+            &cfg,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(out.contains("reader-rust-test/1.0"));
+    }
+
+    #[test]
     fn body_inner_html_set_directly() {
         let js = r#"document.body.innerHTML = '<h1>Set directly</h1>';"#;
         let out = render_simple(js, true, None).unwrap();

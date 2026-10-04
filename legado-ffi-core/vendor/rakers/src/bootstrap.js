@@ -1,5 +1,5 @@
 // rakers browser-globals bootstrap.
-// Evaluated before every user script. __HREF__ is replaced by Rust with the page URL.
+// Evaluated before every user script. Page URL and User-Agent placeholders are replaced by Rust.
 
 var window = globalThis;
 var self   = window;
@@ -12,6 +12,47 @@ var process = {
     browser: true, version: 'v18.0.0', versions: {},
     nextTick: function(fn) {}  // some polyfill shims (e.g. promise-polyfill) call process.nextTick
 };
+
+// Minimal EventTarget used by window, document, and synthetic elements. Rakers only
+// needs target-local listeners for page bootstrapping; capture/bubble are intentionally
+// out of scope for the lightweight renderer.
+function _r_install_event_target(target) {
+    if (!target || target._r_listeners) return target;
+    Object.defineProperty(target, '_r_listeners', {value:{}, writable:true, configurable:true});
+    target.addEventListener = function(type, listener) {
+        type = String(type || '');
+        if (!type || (!listener || (typeof listener !== 'function' && typeof listener.handleEvent !== 'function'))) return;
+        var list = this._r_listeners[type] || (this._r_listeners[type] = []);
+        if (list.indexOf(listener) < 0) list.push(listener);
+    };
+    target.removeEventListener = function(type, listener) {
+        var list = this._r_listeners[String(type || '')];
+        if (!list) return;
+        var i = list.indexOf(listener);
+        if (i >= 0) list.splice(i, 1);
+    };
+    target.dispatchEvent = function(event) {
+        if (typeof event === 'string') event = {type:event};
+        if (!event || !event.type) return true;
+        if (typeof event.preventDefault !== 'function') {
+            event.defaultPrevented = false;
+            event.preventDefault = function() { if (event.cancelable) event.defaultPrevented = true; };
+        }
+        event.target = event.target || this;
+        event.currentTarget = this;
+        var list = (this._r_listeners[String(event.type)] || []).slice();
+        for (var i = 0; i < list.length; i++) {
+            try {
+                if (typeof list[i] === 'function') list[i].call(this, event);
+                else list[i].handleEvent.call(list[i], event);
+            } catch(e) {}
+        }
+        var handler = this['on' + event.type];
+        if (typeof handler === 'function') { try { handler.call(this, event); } catch(e) {} }
+        return !event.defaultPrevented;
+    };
+    return target;
+}
 
 // ─── URL parser (used by element setAttribute and window.URL) ───────────────
 
@@ -296,7 +337,7 @@ function _r_el(tag) {
             configurable: true
         });
     }
-    return el;
+    return _r_install_event_target(el);
 }
 
 // ─── Serializer ──────────────────────────────────────────────────────────────
@@ -437,14 +478,12 @@ document.querySelectorAll = function(sel) {
 document.body            = _r_el('body');
 document.head            = _r_el('head');
 document.documentElement = _r_el('html');
-document.readyState      = 'complete';
+document.readyState      = 'loading';
 document.cookie          = '';
 document.referrer        = '';
 document.domain          = '';
 document.title           = '';
-document.addEventListener    = function() {};
-document.removeEventListener = function() {};
-document.dispatchEvent       = function() {};
+_r_install_event_target(document);
 document.execCommand         = function() { return false; };
 document.hasFocus            = function() { return false; };
 document.getSelection        = function() { return null; };
@@ -455,7 +494,7 @@ document.defaultView         = window;
 // webpack: reads document.currentScript.src to determine the public asset path.
 // SvelteKit: reads document.currentScript.parentElement to detect the mount context.
 document.currentScript = {
-    src: '__HREF__', type: 'text/javascript', nodeType: 1, tagName: 'SCRIPT',
+    src: "__HREF__", type: 'text/javascript', nodeType: 1, tagName: 'SCRIPT',
     parentElement: document.head, parentNode: document.head,
     getAttribute: function(n) { return n === 'src' ? this.src : n === 'type' ? this.type : null; },
     setAttribute: function() {}, hasAttribute: function(n) { return n === 'src' || n === 'type'; }
@@ -481,11 +520,9 @@ document.currentScript = {
             var prev = _hash;
             _hash = String(v);
             if (prev !== _hash) {
-                _r_timers.push(function() {
-                    if (typeof window.onhashchange === 'function') {
-                        try { window.onhashchange({ type: 'hashchange', oldURL: prev, newURL: _hash }); } catch(e) {}
-                    }
-                });
+                window.setTimeout(function() {
+                    window.dispatchEvent({ type: 'hashchange', oldURL: prev, newURL: _hash });
+                }, 0);
             }
         },
         enumerable: true, configurable: true
@@ -494,10 +531,10 @@ document.currentScript = {
     document.location = _loc;
 })();
 window.navigator = {
-    userAgent: 'rakers/0.1.0', appName: 'rakers', appVersion: '0.1.0',
+    userAgent: "__USER_AGENT__", appName: 'rakers', appVersion: '0.1.0',
     language: 'en-US', languages: ['en-US', 'en'],
     platform: 'Linux', vendor: '',
-    onLine: false, cookieEnabled: false,
+    onLine: true, cookieEnabled: true,
     javaEnabled: function() { return false; }
 };
 window.screen = {width:1920, height:1080, availWidth:1920, availHeight:1080, colorDepth:24};
@@ -535,20 +572,80 @@ window.sessionStorage = {
     clear:      function()  { this._s = {}; },
     key:        function()  { return null; }
 };
-// Deferred callbacks flushed in a loop after all scripts run (see READBACK_JS in runtime.rs).
-// setTimeout: Backbone/KnockoutJS defer their initial render via setTimeout(fn, 0).
-// requestAnimationFrame: Mithril schedules redraws via rAF; Vue 2 also uses rAF as a nextTick fallback.
-// queueMicrotask: Vue 3 nextTick uses queueMicrotask when available.
-var _r_timers = [];
-window.setTimeout            = function(fn, delay) { if (typeof fn === 'function') _r_timers.push(fn); return _r_timers.length; };
-window.clearTimeout          = function(id) {};
-window.setInterval           = function(fn, delay) { return 0; };
-window.clearInterval         = function(id) {};
-window.requestAnimationFrame = function(fn) { if (typeof fn === 'function') _r_timers.push(fn); return _r_timers.length; };
-window.cancelAnimationFrame  = function(id) {};
-window.queueMicrotask        = function(fn) { if (typeof fn === 'function') _r_timers.push(fn); };
-window.setImmediate          = function(fn) { if (typeof fn === 'function') _r_timers.push(fn); return 0; };
-window.clearImmediate        = function(id) {};
+// Pull-based virtual timer loop. Rust advances to the next deadline rather than
+// sleeping, so browser ordering is preserved without turning the renderer async.
+var _r_timer_epoch = Date.now();
+var _r_virtual_now = 0;
+var _r_timers = {};
+var _r_next_timer_id = 1;
+Date.now = function() { return _r_timer_epoch + _r_virtual_now; };
+window.performance.now = function() { return _r_virtual_now; };
+window.performance.timing.navigationStart = _r_timer_epoch;
+window.performance.timeOrigin = _r_timer_epoch;
+
+function _r_schedule_timer(fn, delay, interval) {
+    if (typeof fn !== 'function') return 0;
+    delay = Math.max(0, Number(delay) || 0);
+    var id = _r_next_timer_id++;
+    _r_timers[id] = { callback:fn, deadline:_r_virtual_now + delay, interval:interval };
+    return id;
+}
+window.setTimeout = function(fn, delay) { return _r_schedule_timer(fn, delay, null); };
+window.clearTimeout = function(id) { delete _r_timers[id]; };
+window.setInterval = function(fn, delay) {
+    delay = Math.max(1, Number(delay) || 1);
+    return _r_schedule_timer(fn, delay, delay);
+};
+window.clearInterval = window.clearTimeout;
+window.requestAnimationFrame = function(fn) {
+    return window.setTimeout(function() { fn(_r_virtual_now); }, 16);
+};
+window.cancelAnimationFrame = window.clearTimeout;
+window.queueMicrotask = function(fn) { if (typeof fn === 'function') Promise.resolve().then(fn); };
+process.nextTick = window.queueMicrotask;
+window.setImmediate = function(fn) { return window.setTimeout(fn, 0); };
+window.clearImmediate = window.clearTimeout;
+
+// Execute exactly one earliest timer. Rust drains QuickJS's microtask queue after
+// every call, matching the browser rule that each timer callback is its own task.
+globalThis._r_pump_timers = function(maxVirtualMs) {
+    var nextId = null;
+    var nextDeadline = Infinity;
+    var ids = Object.keys(_r_timers);
+    for (var i = 0; i < ids.length; i++) {
+        var id = ids[i];
+        var timer = _r_timers[id];
+        if (!timer) continue;
+        if (timer.deadline < nextDeadline
+            || (timer.deadline === nextDeadline && Number(id) < Number(nextId))) {
+            nextId = id;
+            nextDeadline = timer.deadline;
+        }
+    }
+    if (nextId == null || nextDeadline > maxVirtualMs) return 0;
+    if (nextDeadline > _r_virtual_now) _r_virtual_now = nextDeadline;
+    var timer = _r_timers[nextId];
+    if (!timer) return 0;
+    if (timer.interval == null) delete _r_timers[nextId];
+    else timer.deadline = _r_virtual_now + timer.interval;
+    try { timer.callback(); } catch(e) {
+        if (typeof console !== 'undefined') console.error('[rakers timer error]', e && (e.message || String(e)));
+    }
+    return 1;
+};
+
+globalThis._r_dispatch_dom_content_loaded = function() {
+    document.readyState = 'interactive';
+    document.dispatchEvent({type:'readystatechange'});
+    document.dispatchEvent({type:'DOMContentLoaded'});
+    window.performance.timing.domContentLoadedEventEnd = Date.now();
+};
+globalThis._r_dispatch_load = function() {
+    document.readyState = 'complete';
+    document.dispatchEvent({type:'readystatechange'});
+    window.dispatchEvent({type:'load'});
+    window.performance.timing.loadEventEnd = Date.now();
+};
 window.alert   = function(msg) {};
 window.confirm = function(msg) { return false; };
 window.prompt  = function(msg, def) { return null; };
@@ -799,8 +896,8 @@ window.matchMedia   = function(q) {
     return {matches:false, media:q, addEventListener:function(){}, removeEventListener:function(){}, addListener:function(){}, removeListener:function(){}};
 };
 window.getComputedStyle = function(el) { return {}; };
-window.requestIdleCallback  = function(fn) { return 0; };
-window.cancelIdleCallback   = function(id) {};
+window.requestIdleCallback  = function(fn) { return window.setTimeout(function(){ fn({didTimeout:false,timeRemaining:function(){return 0;}}); }, 1); };
+window.cancelIdleCallback   = window.clearTimeout;
 window.MutationObserver     = function(cb) { this.observe=function(){}; this.disconnect=function(){}; this.takeRecords=function(){return [];}; };  // Angular zone.js, Vue: patch MutationObserver to detect async DOM changes
 window.ResizeObserver       = function(cb) { this.observe=function(){}; this.disconnect=function(){}; this.unobserve=function(){}; };
 window.IntersectionObserver = function(cb) { this.observe=function(){}; this.disconnect=function(){}; this.unobserve=function(){}; };
@@ -821,15 +918,13 @@ window.WheelEvent   = window.Event;
 window.MessageChannel = function() {
     var self = this;
     this.port1 = { onmessage: null, postMessage: function(msg) {
-        if (typeof self.port2.onmessage === 'function') _r_timers.push(function(){ self.port2.onmessage({data:msg}); });
+        if (typeof self.port2.onmessage === 'function') window.setTimeout(function(){ self.port2.onmessage({data:msg}); }, 0);
     }};
     this.port2 = { onmessage: null, postMessage: function(msg) {
-        if (typeof self.port1.onmessage === 'function') _r_timers.push(function(){ self.port1.onmessage({data:msg}); });
+        if (typeof self.port1.onmessage === 'function') window.setTimeout(function(){ self.port1.onmessage({data:msg}); }, 0);
     }};
 };
-window.addEventListener    = function() {};
-window.removeEventListener = function() {};
-window.dispatchEvent       = function() { return true; };
+_r_install_event_target(window);
 // Google Analytics / GTM: many pages include GA4 which references dataLayer and gtag
 window.dataLayer = [];
 window.gtag = function() { window.dataLayer.push(arguments); };

@@ -12,23 +12,15 @@ compile_error!("Enable only one JS engine at a time: 'boa' or 'rquickjs'");
 #[cfg(not(any(feature = "boa", feature = "rquickjs")))]
 compile_error!("Enable exactly one JS engine feature: 'boa' or 'rquickjs'");
 
-// The JS bootstrap is embedded at compile time; `__HREF__` is substituted at runtime.
+// The JS bootstrap is embedded at compile time; request context is substituted at runtime.
 const BOOTSTRAP_TEMPLATE: &str = include_str!("bootstrap.js");
 
-// Flush one batch of _r_timers; returns the number of timers remaining after the flush.
-// Called in a Rust loop so execute_pending_job() can drain Promise microtasks between passes.
-const TIMER_FLUSH_JS: &str = r"
-(function() {
-    if (_r_timers.length === 0) return 0;
-    var batch = _r_timers.splice(0, _r_timers.length);
-    for (var i = 0; i < batch.length; i++) {
-        try { batch[i](); } catch(e) {
-            if (typeof console !== 'undefined') console.error('[rakers timer error]', e && (e.message || String(e)));
-        }
-    }
-    return _r_timers.length;
-})()
-";
+// The virtual scheduler advances instantly to the next deadline, but never beyond
+// two seconds of page time. This is enough for startup/debounce work without waiting
+// on ads, clocks, or long-poll timers.
+const TIMER_PUMP_JS: &str = "_r_pump_timers(2000)";
+const DOM_CONTENT_LOADED_JS: &str = "_r_dispatch_dom_content_loaded()";
+const LOAD_JS: &str = "_r_dispatch_load()";
 
 // Read the rendered DOM state after all timers and microtasks have been flushed.
 const READBACK_JS: &str = r"
@@ -47,11 +39,27 @@ const READBACK_JS: &str = r"
 })()
 ";
 
-/// Produce the browser-globals bootstrap by substituting the page URL into the template.
-fn make_bootstrap(page_url: Option<&str>) -> String {
-    let href = page_url.unwrap_or("about:blank");
-    let escaped = href.replace('\\', "\\\\").replace('"', "\\\"");
-    BOOTSTRAP_TEMPLATE.replace("__HREF__", &escaped)
+fn escape_js_string(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+/// Produce the browser-globals bootstrap from the actual page request context.
+fn make_bootstrap(page_url: Option<&str>, user_agent: Option<&str>) -> String {
+    let href = escape_js_string(page_url.unwrap_or("about:blank"));
+    let user_agent = escape_js_string(user_agent.unwrap_or("rakers/0.1.0"));
+    // Replace placeholders with sentinels first so values that happen to contain
+    // the other placeholder text are never rewritten on the second substitution.
+    BOOTSTRAP_TEMPLATE
+        .replace("__HREF__", "\u{1}")
+        .replace("__USER_AGENT__", "\u{2}")
+        .replace('\u{1}', &href)
+        .replace('\u{2}', &user_agent)
 }
 
 fn request_headers_from_json(raw: &str) -> Vec<(String, String)> {
@@ -211,7 +219,7 @@ mod boa_rt {
             setup_console(&mut ctx)?;
             setup_http_bridge(&mut ctx)?;
 
-            let bootstrap = super::make_bootstrap(page_url);
+            let bootstrap = super::make_bootstrap(page_url, cfg.user_agent.as_deref());
             ctx.eval(Source::from_bytes(bootstrap.as_bytes()))
                 .map_err(|e| anyhow!("bootstrap error: {:?}", e))?;
 
@@ -220,18 +228,32 @@ mod boa_rt {
                 if let Err(e) = ctx.eval(Source::from_bytes(script.as_bytes())) {
                     eprintln!("[js error] {:?}", e);
                 }
+                let _ = ctx.run_jobs();
             }
 
-            // Flush timers in passes (boa has no separate microtask drain API).
-            for _ in 0..64 {
-                let remaining: i32 = ctx
-                    .eval(Source::from_bytes(super::TIMER_FLUSH_JS.as_bytes()))
+            // Complete the synthetic page lifecycle, draining Promise jobs at each
+            // task boundary just like the QuickJS backend.
+            let _ = ctx.eval(Source::from_bytes(super::DOM_CONTENT_LOADED_JS.as_bytes()));
+            let _ = ctx.run_jobs();
+            let _ = ctx.eval(Source::from_bytes(super::LOAD_JS.as_bytes()));
+            let _ = ctx.run_jobs();
+
+            let mut empty_passes = 0u8;
+            for _ in 0..128 {
+                let fired: i32 = ctx
+                    .eval(Source::from_bytes(super::TIMER_PUMP_JS.as_bytes()))
                     .ok()
                     .and_then(|v| v.to_number(&mut ctx).ok())
                     .map(|n| n as i32)
                     .unwrap_or(0);
-                if remaining == 0 {
-                    break;
+                let _ = ctx.run_jobs();
+                if fired == 0 {
+                    empty_passes += 1;
+                    if empty_passes >= 2 {
+                        break;
+                    }
+                } else {
+                    empty_passes = 0;
                 }
             }
 
@@ -448,6 +470,23 @@ mod quickjs_rt {
         set_deadline(None);
     }
 
+    // rquickjs 0.8 has a known interrupt-handler hazard inside pending jobs, so
+    // promise/microtask work is bounded cooperatively between jobs.
+    fn drain_pending_jobs(ctx: &Ctx<'_>, render_deadline: Option<Instant>) -> bool {
+        let mut had_jobs = false;
+        let mut jobs = 0usize;
+        while ctx.execute_pending_job() {
+            had_jobs = true;
+            jobs += 1;
+            if jobs >= 2_000
+                || render_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                break;
+            }
+        }
+        had_jobs
+    }
+
     /// A sandboxed JavaScript execution context.
     pub struct JsRuntime {
         timeout: Option<Duration>,
@@ -519,7 +558,7 @@ mod quickjs_rt {
 
                 let render_deadline = budget.deadline();
                 set_deadline(render_deadline);
-                let bootstrap = super::make_bootstrap(page_url);
+                let bootstrap = super::make_bootstrap(page_url, cfg.user_agent.as_deref());
                 let bootstrap_result = ctx.eval_with_options::<Value, _>(bootstrap, sloppy());
                 clear_deadline();
                 bootstrap_result.map_err(|e| anyhow!("bootstrap error: {e:?}"))?;
@@ -542,55 +581,39 @@ mod quickjs_rt {
                             }
                         }
                     }
-                    // rquickjs 0.8 has a known interrupt-handler hazard inside pending jobs.
-                    // Bound the queue cooperatively by count + wall clock instead of firing
-                    // the QuickJS interrupt from execute_pending_job().
                     clear_deadline();
-                    let mut jobs = 0usize;
-                    while ctx.execute_pending_job() {
-                        jobs += 1;
-                        if jobs >= 2_000
-                            || render_deadline.is_some_and(|deadline| Instant::now() >= deadline)
-                        {
-                            break;
-                        }
-                    }
-                    clear_deadline();
+                    drain_pending_jobs(&ctx, render_deadline);
                 }
 
-                // Flush timers and Promise jobs together until idle, bounded by both the
-                // render deadline and a hard pass/job cap.
-                let mut consecutive_empty = 0u32;
+                // Initial scripts have finished: fire the minimal browser lifecycle,
+                // draining promise reactions after each event before advancing timers.
+                for lifecycle in [super::DOM_CONTENT_LOADED_JS, super::LOAD_JS] {
+                    if render_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        break;
+                    }
+                    set_deadline(bounded_deadline(self.timeout, render_deadline));
+                    let _ = ctx.eval_with_options::<Value, _>(lifecycle, sloppy());
+                    clear_deadline();
+                    drain_pending_jobs(&ctx, render_deadline);
+                }
+
+                // Alternate one virtual timer deadline with QuickJS's native job queue.
+                // No real sleeping is needed, and long-lived polling is bounded by both
+                // the two-second virtual horizon and the hard pass cap.
                 for _ in 0..128u32 {
                     if render_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         break;
                     }
                     set_deadline(bounded_deadline(self.timeout, render_deadline));
-                    let remaining: i32 = ctx
-                        .eval_with_options::<Value, _>(super::TIMER_FLUSH_JS, sloppy())
+                    let fired: i32 = ctx
+                        .eval_with_options::<Value, _>(super::TIMER_PUMP_JS, sloppy())
                         .ok()
                         .and_then(|v| v.as_int())
                         .unwrap_or(0);
                     clear_deadline();
-                    let mut had_jobs = false;
-                    let mut jobs = 0usize;
-                    while ctx.execute_pending_job() {
-                        had_jobs = true;
-                        jobs += 1;
-                        if jobs >= 2_000
-                            || render_deadline.is_some_and(|deadline| Instant::now() >= deadline)
-                        {
-                            break;
-                        }
-                    }
-                    clear_deadline();
-                    if remaining == 0 && !had_jobs {
-                        consecutive_empty += 1;
-                        if consecutive_empty >= 3 {
-                            break;
-                        }
-                    } else {
-                        consecutive_empty = 0;
+                    let had_jobs = drain_pending_jobs(&ctx, render_deadline);
+                    if fired == 0 && !had_jobs {
+                        break;
                     }
                 }
 

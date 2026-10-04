@@ -549,7 +549,7 @@ fn render_rakers_html(
         return Err("Rakers render HTML exceeds 8 MiB".to_string());
     }
     let config = rakers::HttpConfig {
-        user_agent,
+        user_agent: user_agent.or_else(|| Some(crate::crawler::DEFAULT_USER_AGENT.to_string())),
         headers: Vec::new(),
         proxy,
         forward_headers: false,

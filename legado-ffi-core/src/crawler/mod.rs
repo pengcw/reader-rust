@@ -37,11 +37,12 @@ struct CachedSession {
 static SESSION_CACHE: Lazy<Mutex<VecDeque<CachedSession>>> =
     Lazy::new(|| Mutex::new(VecDeque::new()));
 
-/// 每次 `reader_execute` 使用一个同步会话。启用 Cookie jar 的书源会复用一个
-/// 有上限、会过期的客户端，借此在 operation 与 operation 之间保持 Cookie。
+/// 每次 `reader_execute` 使用一个同步会话。普通请求遵循书源 CookieJar 策略；
+/// WebView 请求始终使用浏览器式 Cookie 会话，以匹配 Android WebView 行为。
 #[derive(Clone)]
 pub struct HttpSession {
     client: HttpClient,
+    webview_client: HttpClient,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -189,9 +190,21 @@ impl HttpSession {
         let timeout_ms = timeout_ms.max(1);
 
         if let Some(active) = current_active_session() {
-            let cookies = cookie_enabled.then(|| active.cookie_store().clone());
-            let client = build_client(timeout_ms, cookies, None)?;
-            return Ok(Self { client });
+            let webview_cookies = active.cookie_store().clone();
+            let client = build_client(
+                timeout_ms,
+                cookie_enabled.then(|| webview_cookies.clone()),
+                None,
+            )?;
+            let webview_client = if cookie_enabled {
+                client.clone()
+            } else {
+                build_client(timeout_ms, Some(webview_cookies), None)?
+            };
+            return Ok(Self {
+                client,
+                webview_client,
+            });
         }
 
         let cache_key = format!("{}\u{1f}{timeout_ms}", source.book_source_url);
@@ -208,7 +221,10 @@ impl HttpSession {
                 entry.last_used = now;
                 let client = entry.client.clone();
                 cache.push_back(entry);
-                return Ok(Self { client });
+                return Ok(Self {
+                    webview_client: client.clone(),
+                    client,
+                });
             }
 
             let client = build_client(timeout_ms, Some(SharedCookieStore::default()), None)?;
@@ -220,11 +236,19 @@ impl HttpSession {
                 client: client.clone(),
                 last_used: now,
             });
-            return Ok(Self { client });
+            return Ok(Self {
+                webview_client: client.clone(),
+                client,
+            });
         }
 
         Ok(Self {
             client: build_client(timeout_ms, None, None)?,
+            webview_client: build_client(
+                timeout_ms,
+                Some(SharedCookieStore::default()),
+                None,
+            )?,
         })
     }
 
@@ -237,11 +261,19 @@ impl HttpSession {
         spec: &RequestSpec,
         max_response_bytes: usize,
     ) -> Result<HttpResponse, FetchError> {
-        let client = if let Some(proxy) = spec
+        let proxy = spec
             .proxy
             .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
+            .filter(|value| !value.trim().is_empty());
+        let client = if spec.render_with_rakers {
+            match proxy {
+                Some(proxy) => self
+                    .webview_client
+                    .with_proxy(proxy)
+                    .map_err(map_http_client_error)?,
+                None => self.webview_client.clone(),
+            }
+        } else if let Some(proxy) = proxy {
             build_client_from_existing_policy(spec, proxy)?
         } else {
             self.client.clone()
@@ -420,9 +452,10 @@ fn render_with_rakers(
         .headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
-        .map(|(_, value)| value.clone());
-    // Do not forward book-source cookies or authorization headers to external
-    // scripts or JavaScript-initiated requests.
+        .map(|(_, value)| value.clone())
+        .or_else(|| Some(DEFAULT_USER_AGENT.to_string()));
+    // Do not copy raw source credentials into page-controlled requests. Cookies
+    // flow through the shared WebView-style jar with normal domain/path rules.
     let config = rakers::HttpConfig {
         user_agent,
         headers: Vec::new(),
@@ -585,19 +618,23 @@ fn detect_auth_challenge(
     None
 }
 
-fn build_client(
-    timeout_ms: u64,
-    cookies: Option<SharedCookieStore>,
-    proxy: Option<&str>,
-) -> Result<HttpClient, FetchError> {
-    HttpClient::new(timeout_ms, cookies, proxy).map_err(|error| match error {
+fn map_http_client_error(error: HttpClientError) -> FetchError {
+    match error {
         HttpClientError::InvalidUrl(message) => FetchError::InvalidUrl(message),
         HttpClientError::Timeout(message) => FetchError::Timeout { url: None, message },
         HttpClientError::Network(message) => FetchError::Network(message),
         HttpClientError::ResponseTooLarge { url, limit } => {
             FetchError::ResponseTooLarge { url, limit }
         }
-    })
+    }
+}
+
+fn build_client(
+    timeout_ms: u64,
+    cookies: Option<SharedCookieStore>,
+    proxy: Option<&str>,
+) -> Result<HttpClient, FetchError> {
+    HttpClient::new(timeout_ms, cookies, proxy).map_err(map_http_client_error)
 }
 
 // Proxy URL rules intentionally use an isolated client, so they never contaminate

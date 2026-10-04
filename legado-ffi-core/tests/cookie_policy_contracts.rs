@@ -96,6 +96,79 @@ fn js_requests(script: &str) -> Vec<String> {
 }
 
 #[test]
+fn disabled_jar_webview_shares_cookies_with_rakers_subrequests() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let read_request_cookie = |stream: &mut std::net::TcpStream| {
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            String::from_utf8(request)
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("cookie")
+                        .then(|| value.trim().to_string())
+                })
+                .unwrap_or_default()
+        };
+
+        let (mut page, _) = listener.accept().unwrap();
+        let page_cookie = read_request_cookie(&mut page);
+        let html = r#"<html><body><div id="out">pending</div><script>
+            fetch('/api').then(function(r){return r.text();})
+                .then(function(t){document.getElementById('out').innerHTML=t;});
+        </script></body></html>"#;
+        write!(
+            page,
+            "HTTP/1.1 200 OK\r\nSet-Cookie: automatic=from_webview; Path=/\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+            html.len()
+        )
+        .unwrap();
+
+        let (mut api, _) = listener.accept().unwrap();
+        let api_cookie = read_request_cookie(&mut api);
+        write!(api, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone")
+            .unwrap();
+        (page_cookie, api_cookie)
+    });
+
+    let source = BookSource {
+        book_source_url: base.clone(),
+        enabled_cookie_jar: Some(false),
+        ..Default::default()
+    };
+    with_active_session(None, &base, |active| {
+        active.set_cookie(&base, "manual=kept");
+        let session = HttpSession::new(&source, 2000).unwrap();
+        let spec = analyze_url(
+            r#"/page,{"webView":true}"#,
+            "",
+            1,
+            &base,
+            &source,
+        )
+        .unwrap();
+        let response = session.fetch(&spec, 4096).unwrap();
+        assert!(response.body.contains("done"));
+        let stored = active.get_cookie(&base).unwrap_or_default();
+        assert!(stored.contains("manual=kept"));
+        assert!(stored.contains("automatic=from_webview"));
+    });
+
+    let (page_cookie, api_cookie) = server.join().unwrap();
+    assert!(page_cookie.contains("manual=kept"));
+    assert!(!page_cookie.contains("automatic=from_webview"));
+    assert!(api_cookie.contains("manual=kept"));
+    assert!(api_cookie.contains("automatic=from_webview"));
+}
+
+#[test]
 fn disabled_jar_ajax_uses_analyze_url_cookie_policy() {
     assert_eq!(
         js_requests("java.ajax(URL); java.ajax(URL)"),
