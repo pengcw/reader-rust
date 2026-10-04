@@ -16,6 +16,12 @@ use std::collections::HashMap;
 #[derive(Clone, Default)]
 pub struct RuleEngine;
 
+pub(crate) struct TocPageResult {
+    pub chapters: Vec<BookChapter>,
+    pub next_urls: Vec<String>,
+    pub book_variable: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ContentPageResult {
     pub content: String,
@@ -644,6 +650,26 @@ impl RuleEngine {
         book_name: Option<&str>,
         book_fields: Option<&HashMap<String, String>>,
     ) -> (Vec<BookChapter>, Vec<String>) {
+        let page = self.chapter_list_page_with_context(
+            source,
+            body,
+            base_url,
+            variable,
+            book_name,
+            book_fields,
+        );
+        (page.chapters, page.next_urls)
+    }
+
+    pub(crate) fn chapter_list_page_with_context(
+        &self,
+        source: &BookSource,
+        body: &str,
+        base_url: &str,
+        variable: Option<&str>,
+        book_name: Option<&str>,
+        book_fields: Option<&HashMap<String, String>>,
+    ) -> TocPageResult {
         with_js_lib(source.js_lib.as_deref(), || {
             let rule = source.rule_toc.clone().unwrap_or_default();
             let mut context =
@@ -703,7 +729,11 @@ impl RuleEngine {
             for (index, chapter) in chapters.iter_mut().enumerate() {
                 chapter.index = index as i32;
             }
-            (chapters, next_urls)
+            TocPageResult {
+                chapters,
+                next_urls,
+                book_variable: context.book_variable(),
+            }
         })
     }
 

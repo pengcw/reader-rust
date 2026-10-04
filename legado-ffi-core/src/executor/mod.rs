@@ -721,13 +721,7 @@ fn execute_toc(
         book_fields.insert("latestChapterTitle".to_string(), latest.clone());
     }
 
-    let toc_context = url_rule_context_with_fields(
-        book_info.variable.as_deref(),
-        None,
-        Some(&book_info.name),
-        None,
-        Some(&book_fields),
-    );
+    let mut book_variable = book_info.variable.clone();
     let reuse_detail_response = same_resource_url(&toc_url, &initial_url)
         || same_resource_url(&toc_url, &detail_response.url);
     let mut detail_toc_response = reuse_detail_response.then(|| detail_response.clone());
@@ -757,6 +751,13 @@ fn execute_toc(
             truncated = true;
             break;
         }
+        let toc_context = url_rule_context_with_fields(
+            book_variable.as_deref(),
+            None,
+            Some(&book_info.name),
+            None,
+            Some(&book_fields),
+        );
         let response = if same_resource_url(&url, &toc_url) {
             if let Some(response) = detail_toc_response.take() {
                 response
@@ -785,20 +786,21 @@ fn execute_toc(
             )?
         };
         visited_pages.insert(url);
-        let (mut page_chapters, next_urls) = engine.chapter_list_with_context(
+        let mut page = engine.chapter_list_page_with_context(
             &page_source,
             &response.body,
             &response.url,
-            book_info.variable.as_deref(),
+            book_variable.as_deref(),
             Some(&book_info.name),
             Some(&book_fields),
         );
+        book_variable = page.book_variable;
         // Keep the single-page parser contract; reverse the complete TOC below.
         if reverse {
-            page_chapters.reverse();
+            page.chapters.reverse();
         }
-        chapters.extend(page_chapters);
-        for next_url in next_urls {
+        chapters.extend(page.chapters);
+        for next_url in page.next_urls {
             if !next_url.trim().is_empty() && !visited_pages.contains(&next_url) {
                 pending.push_back(next_url);
             }
@@ -819,12 +821,16 @@ fn execute_toc(
         source,
         &mut chapters,
         &toc_url,
-        book_info.variable.as_deref(),
+        book_variable.as_deref(),
         Some(&book_info.name),
         Some(&book_fields),
     );
+    let mut data = json!({"chapters": chapters, "pages": visited_pages.len(), "truncated": truncated});
+    if let Some(variable) = book_variable {
+        data["variable"] = json!(variable);
+    }
     Ok(success(
-        json!({"chapters": chapters, "pages": visited_pages.len(), "truncated": truncated}),
+        data,
         visited_pages.len(),
         truncated,
         &response,
