@@ -115,6 +115,18 @@ pub fn reader_eval(input: char_p::Ref<'_>, rule: char_p::Ref<'_>) -> char_p::Box
     if rule == "@validate" {
         return ffi_string(validate_source(input));
     }
+    if rule == "@normalize_source" {
+        let response = match serde_json::from_str::<Value>(input) {
+            Ok(value) if value.is_object() => json!({
+                "ok": true,
+                "data": crate::model::book_source::migrate_legacy_book_source_value(value),
+            }),
+            _ => json!({"ok":false,"error":{
+                "kind":"invalid_argument","message":"source must be a JSON object"
+            }}),
+        };
+        return ffi_string(response.to_string());
+    }
 
     if rule.contains(" -") || rule.starts_with('-') {
         let parts = rule.split(" -").collect::<Vec<_>>();
@@ -226,7 +238,9 @@ fn rakers_render_request(input: &str) -> char_p::Box {
                 None,
             ) {
                 Ok(client) => client,
-                Err(error) => return rakers_eval_error(&format!("HTTP client setup failed: {error}")),
+                Err(error) => {
+                    return rakers_eval_error(&format!("HTTP client setup failed: {error}"))
+                }
             };
             match render_rakers_html(
                 html,
@@ -237,7 +251,9 @@ fn rakers_render_request(input: &str) -> char_p::Box {
                     &client,
                     MAX_RAKERS_EVAL_HTML_BYTES,
                 )),
-                Some(std::time::Duration::from_millis(DEFAULT_RAKERS_EVAL_TIMEOUT_MS)),
+                Some(std::time::Duration::from_millis(
+                    DEFAULT_RAKERS_EVAL_TIMEOUT_MS,
+                )),
             ) {
                 Ok(rendered) => rendered,
                 Err(error) => return rakers_eval_error(&error),

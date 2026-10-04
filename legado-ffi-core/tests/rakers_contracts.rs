@@ -55,10 +55,22 @@ fn rakers_headless_dom_and_script_execution() {
 
     let rendered = call_rakers_render(raw_html);
 
-    assert!(rendered.contains("Hydrated by Rakers"), "Must execute DOM creation script");
-    assert!(rendered.contains("dynamic-p"), "Must retain injected classes");
-    assert!(rendered.contains("Static Header"), "Must preserve static sibling nodes outside container");
-    assert!(!rendered.contains("Placeholder to replace"), "Must replace mount container placeholder");
+    assert!(
+        rendered.contains("Hydrated by Rakers"),
+        "Must execute DOM creation script"
+    );
+    assert!(
+        rendered.contains("dynamic-p"),
+        "Must retain injected classes"
+    );
+    assert!(
+        rendered.contains("Static Header"),
+        "Must preserve static sibling nodes outside container"
+    );
+    assert!(
+        !rendered.contains("Placeholder to replace"),
+        "Must replace mount container placeholder"
+    );
 }
 
 #[test]
@@ -95,12 +107,27 @@ fn rakers_spa_novel_review_hydration() {
 
     let rendered = call_rakers_render(spa_html);
 
-    assert!(!rendered.contains("正在加载评论..."), "Loading placeholder must be removed");
-    assert!(rendered.contains("书友墨客"), "First author must be rendered");
-    assert!(rendered.contains("这章伏笔写的绝了！"), "First comment content must be rendered");
+    assert!(
+        !rendered.contains("正在加载评论..."),
+        "Loading placeholder must be removed"
+    );
+    assert!(
+        rendered.contains("书友墨客"),
+        "First author must be rendered"
+    );
+    assert!(
+        rendered.contains("这章伏笔写的绝了！"),
+        "First comment content must be rendered"
+    );
     assert!(rendered.contains("42赞"), "Likes count must be rendered");
-    assert!(rendered.contains("追更狂魔"), "Second author must be rendered");
-    assert!(rendered.contains("生产队的驴都不敢这么歇，快更新！"), "Second comment content must be rendered");
+    assert!(
+        rendered.contains("追更狂魔"),
+        "Second author must be rendered"
+    );
+    assert!(
+        rendered.contains("生产队的驴都不敢这么歇，快更新！"),
+        "Second comment content must be rendered"
+    );
 }
 
 #[test]
@@ -115,7 +142,10 @@ fn rakers_external_script_resolution_with_base_url() {
         let mut request_line = String::new();
         reader.read_line(&mut request_line).unwrap();
 
-        assert!(request_line.starts_with("GET /static/remote_render.js "), "Must request external script");
+        assert!(
+            request_line.starts_with("GET /static/remote_render.js "),
+            "Must request external script"
+        );
 
         // Drain headers
         loop {
@@ -141,8 +171,14 @@ fn rakers_external_script_resolution_with_base_url() {
     let rendered = call_rakers_render(&input_req);
     server.join().unwrap();
 
-    assert!(rendered.contains("Remote JS Injected Successfully"), "Rendered HTML must reflect external script execution");
-    assert!(!rendered.contains("Pending"), "Pending placeholder must be replaced");
+    assert!(
+        rendered.contains("Remote JS Injected Successfully"),
+        "Rendered HTML must reflect external script execution"
+    );
+    assert!(
+        !rendered.contains("Pending"),
+        "Pending placeholder must be replaced"
+    );
 }
 
 #[test]
@@ -165,7 +201,10 @@ fn rakers_timer_and_promise_microtask_flushing() {
     "#;
 
     let rendered = call_rakers_render(html);
-    assert!(rendered.contains("MicrotaskDone+TimeoutDone"), "Must flush Promise microtasks and setTimeout before snapshot, got: {rendered}");
+    assert!(
+        rendered.contains("MicrotaskDone+TimeoutDone"),
+        "Must flush Promise microtasks and setTimeout before snapshot, got: {rendered}"
+    );
 }
 
 #[test]
@@ -180,7 +219,10 @@ fn rakers_xhr_sync_fetch_runtime_support() {
         let mut request_line = String::new();
         reader.read_line(&mut request_line).unwrap();
 
-        assert!(request_line.starts_with("GET /api/comments.json "), "Must request comments API");
+        assert!(
+            request_line.starts_with("GET /api/comments.json "),
+            "Must request comments API"
+        );
 
         loop {
             let mut line = String::new();
@@ -211,12 +253,16 @@ fn rakers_xhr_sync_fetch_runtime_support() {
             </body></html>
         "#),
         "baseUrl": base_url
-    }).to_string();
+    })
+    .to_string();
 
     let rendered = call_rakers_render(&input_req);
     server.join().unwrap();
 
-    assert!(rendered.contains("XHR测试:99"), "Must fetch and render data via synchronous XHR, got: {rendered}");
+    assert!(
+        rendered.contains("XHR测试:99"),
+        "Must fetch and render data via synchronous XHR, got: {rendered}"
+    );
 }
 
 #[test]
@@ -230,10 +276,15 @@ fn rakers_fetch_real_json_hydration() {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut request_line = String::new();
         reader.read_line(&mut request_line).unwrap();
-        assert!(request_line.starts_with("GET /api/data "), "fetch must perform the real GET");
+        assert!(
+            request_line.starts_with("GET /api/data "),
+            "fetch must perform the real GET"
+        );
         loop {
             let mut line = String::new();
-            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                break;
+            }
         }
         let body = r#"{"title":"Fetch Hydrated","count":7}"#;
         write!(
@@ -256,7 +307,10 @@ fn rakers_fetch_real_json_hydration() {
 
     let rendered = call_rakers_render(&input);
     server.join().unwrap();
-    assert!(rendered.contains("Fetch Hydrated:7"), "fetch JSON must hydrate DOM, got: {rendered}");
+    assert!(
+        rendered.contains("Fetch Hydrated:7"),
+        "fetch JSON must hydrate DOM, got: {rendered}"
+    );
 }
 
 #[test]
@@ -276,7 +330,9 @@ fn rakers_fetch_post_preserves_method_headers_body_and_status() {
         let mut saw_script_cookie = false;
         loop {
             let mut line = String::new();
-            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                break;
+            }
             let lower = line.to_ascii_lowercase();
             if lower.starts_with("content-length:") {
                 content_length = line.split_once(':').unwrap().1.trim().parse().unwrap();
@@ -292,7 +348,10 @@ fn rakers_fetch_post_preserves_method_headers_body_and_status() {
         reader.read_exact(&mut body).unwrap();
         assert_eq!(String::from_utf8(body).unwrap(), "payload");
         assert!(saw_test_header, "fetch request header must reach transport");
-        assert!(!saw_script_cookie, "page JavaScript must not inject a raw Cookie header");
+        assert!(
+            !saw_script_cookie,
+            "page JavaScript must not inject a raw Cookie header"
+        );
 
         let response = "accepted";
         write!(
@@ -313,7 +372,10 @@ fn rakers_fetch_post_preserves_method_headers_body_and_status() {
 
     let rendered = call_rakers_render(&input);
     server.join().unwrap();
-    assert!(rendered.contains("201:accepted"), "POST fetch must expose real status/body, got: {rendered}");
+    assert!(
+        rendered.contains("201:accepted"),
+        "POST fetch must expose real status/body, got: {rendered}"
+    );
 }
 
 #[test]
@@ -331,12 +393,17 @@ fn rakers_direct_url_reuses_cookie_session_for_fetch() {
         let mut saw_seed_cookie = false;
         loop {
             let mut line = String::new();
-            if page_reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+            if page_reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                break;
+            }
             if line.to_ascii_lowercase().starts_with("cookie:") && line.contains("sid=seeded") {
                 saw_seed_cookie = true;
             }
         }
-        assert!(saw_seed_cookie, "input Cookie header must reach the main page request");
+        assert!(
+            saw_seed_cookie,
+            "input Cookie header must reach the main page request"
+        );
         let html = r#"<html><body><div id="out">Pending</div><script>
             fetch('/api').then(function(r){return r.text();})
                 .then(function(t){document.getElementById('out').innerHTML=t;});
@@ -356,14 +423,22 @@ fn rakers_direct_url_reuses_cookie_session_for_fetch() {
         let mut saw_response_cookie = false;
         loop {
             let mut line = String::new();
-            if api_reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+            if api_reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                break;
+            }
             if line.to_ascii_lowercase().starts_with("cookie:") {
                 saw_seed_cookie |= line.contains("sid=seeded");
                 saw_response_cookie |= line.contains("server_cookie=updated");
             }
         }
-        assert!(saw_seed_cookie, "initial Cookie header must remain in the shared jar");
-        assert!(saw_response_cookie, "page Set-Cookie must be reused by JS fetch");
+        assert!(
+            saw_seed_cookie,
+            "initial Cookie header must remain in the shared jar"
+        );
+        assert!(
+            saw_response_cookie,
+            "page Set-Cookie must be reused by JS fetch"
+        );
         let body = "cookie-ok";
         write!(
             api_stream,
@@ -375,10 +450,14 @@ fn rakers_direct_url_reuses_cookie_session_for_fetch() {
     let input = json!({
         "url": page_url,
         "headers": {"Cookie": "sid=seeded"}
-    }).to_string();
+    })
+    .to_string();
     let rendered = call_rakers_render(&input);
     server.join().unwrap();
-    assert!(rendered.contains("cookie-ok"), "shared cookie session must hydrate DOM, got: {rendered}");
+    assert!(
+        rendered.contains("cookie-ok"),
+        "shared cookie session must hydrate DOM, got: {rendered}"
+    );
 }
 
 #[test]
@@ -395,7 +474,9 @@ fn rakers_fetch_set_cookie_is_reused_by_next_subrequest() {
         assert!(line.starts_with("GET /session/start "));
         loop {
             line.clear();
-            if first_reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+            if first_reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                break;
+            }
         }
         let body = "seeded";
         write!(
@@ -412,18 +493,26 @@ fn rakers_fetch_set_cookie_is_reused_by_next_subrequest() {
         let mut saw_cookie = false;
         loop {
             line.clear();
-            if second_reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
-            if line.to_ascii_lowercase().starts_with("cookie:") && line.contains("api_sid=from_fetch") {
+            if second_reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                break;
+            }
+            if line.to_ascii_lowercase().starts_with("cookie:")
+                && line.contains("api_sid=from_fetch")
+            {
                 saw_cookie = true;
             }
         }
-        assert!(saw_cookie, "Set-Cookie from one fetch must be reused by the next fetch");
+        assert!(
+            saw_cookie,
+            "Set-Cookie from one fetch must be reused by the next fetch"
+        );
         let body = "subrequest-cookie-ok";
         write!(
             second,
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
-        ).unwrap();
+        )
+        .unwrap();
     });
 
     let input = json!({
@@ -433,11 +522,15 @@ fn rakers_fetch_set_cookie_is_reused_by_next_subrequest() {
                 .then(function(t){ document.getElementById('out').innerHTML=t; });
         </script></body></html>"#,
         "baseUrl": format!("{base_url}/page")
-    }).to_string();
+    })
+    .to_string();
 
     let rendered = call_rakers_render(&input);
     server.join().unwrap();
-    assert!(rendered.contains("subrequest-cookie-ok"), "fetch cookie jar must persist within one render, got: {rendered}");
+    assert!(
+        rendered.contains("subrequest-cookie-ok"),
+        "fetch cookie jar must persist within one render, got: {rendered}"
+    );
 }
 
 #[test]
@@ -452,7 +545,10 @@ fn rakers_security_limits_and_syntax_error_resilience() {
         </body></html>
     "#;
     let rendered_broken = call_rakers_render(broken_syntax);
-    assert!(rendered_broken.contains("Still Alive"), "Syntax error must not crash or wipe DOM");
+    assert!(
+        rendered_broken.contains("Still Alive"),
+        "Syntax error must not crash or wipe DOM"
+    );
 
     // 2. Input exceeding MAX_RAKERS_EVAL_JSON_BYTES (16MB)
     let huge_input = "a".repeat(17 * 1024 * 1024);
@@ -464,7 +560,8 @@ fn rakers_security_limits_and_syntax_error_resilience() {
     let invalid_both = json!({
         "url": "http://example.com",
         "html": "<html></html>"
-    }).to_string();
+    })
+    .to_string();
     let both_res = call_rakers_render(&invalid_both);
     let both_err: Value = serde_json::from_str(&both_res).unwrap();
     assert_eq!(both_err["error"], "provide either url or html, not both");
@@ -482,7 +579,10 @@ fn rakers_direct_url_full_pipeline() {
         let mut request_line = String::new();
         reader.read_line(&mut request_line).unwrap();
 
-        assert!(request_line.starts_with("GET /review_page "), "Must request page via HTTP");
+        assert!(
+            request_line.starts_with("GET /review_page "),
+            "Must request page via HTTP"
+        );
 
         loop {
             let mut line = String::new();
@@ -510,7 +610,10 @@ fn rakers_direct_url_full_pipeline() {
     let rendered = call_rakers_render(&server_url);
     server.join().unwrap();
 
-    assert!(rendered.contains("Headless Hydrated"), "Full URL fetch & render pipeline must succeed, got: {rendered}");
+    assert!(
+        rendered.contains("Headless Hydrated"),
+        "Full URL fetch & render pipeline must succeed, got: {rendered}"
+    );
 }
 
 #[test]
@@ -526,7 +629,9 @@ fn rakers_fanqie_h5_spa_fetch_hydrates() {
         assert!(request_line.starts_with("GET /api/fanqie/comment/chapter/list "));
         loop {
             let mut line = String::new();
-            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                break;
+            }
         }
         let body = r#"{"items":[{"content":"真实评论数据"}]}"#;
         write!(
@@ -559,5 +664,8 @@ fn rakers_fanqie_h5_spa_fetch_hydrates() {
     let rendered = call_rakers_render(&input);
     server.join().unwrap();
     assert!(rendered.contains("本章说"));
-    assert!(rendered.contains("Comments Loaded:真实评论数据"), "fetch-based SPA must hydrate, got: {rendered}");
+    assert!(
+        rendered.contains("Comments Loaded:真实评论数据"),
+        "fetch-based SPA must hydrate, got: {rendered}"
+    );
 }

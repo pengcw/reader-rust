@@ -9,7 +9,10 @@ use crate::crawler::{
 };
 use crate::model::book_source::{book_source_from_value, BookSource};
 use crate::model::replace_rule::ReplaceRule;
-use crate::parser::js::{eval_js, eval_js_with_bindings, with_js_http_context, with_js_lib};
+use crate::parser::js::{
+    eval_js, eval_js_with_bindings, with_js_http_context, with_js_info_map, with_js_lib,
+    InfoMapState,
+};
 use crate::parser::rule_engine::{
     apply_legado_regex, dedupe_chapters_last_wins, normalize_list_rule, RuleEngine,
 };
@@ -217,7 +220,8 @@ fn execute_inner(source_json: &str, request_json: &str) -> ExecuteResult<Value> 
         return Err(ExecuteError::unsupported("不支持远程本地书籍"));
     }
     let source = parse_source(source_json)?;
-    let (operation, params, options, request_session) = parse_request(request_json)?;
+    let (operation, params, options, request_session, request_info_map) =
+        parse_request(request_json)?;
     let engine = RuleEngine::new().map_err(|error| ExecuteError::internal(error.to_string()))?;
 
     let (result, session_delta) = with_active_session(
@@ -231,9 +235,19 @@ fn execute_inner(source_json: &str, request_json: &str) -> ExecuteResult<Value> 
                         "search" => {
                             execute_search(&source, &engine, &http_session, &params, &options)
                         }
-                        "explore" => {
-                            execute_explore(&source, &engine, &http_session, &params, &options)
-                        }
+                        "explore" => execute_explore(
+                            &source,
+                            &engine,
+                            &http_session,
+                            &params,
+                            &options,
+                            request_info_map.clone(),
+                        ),
+                        "explore_kinds" => execute_explore_kinds_with_state(
+                            &source,
+                            &options,
+                            request_info_map.clone(),
+                        ),
                         "info" => execute_info(&source, &engine, &http_session, &params, &options),
                         "toc" => execute_toc(&source, &engine, &http_session, &params, &options),
                         "content" => {
@@ -351,7 +365,13 @@ fn parse_source(raw: &str) -> ExecuteResult<BookSource> {
 
 fn parse_request(
     raw: &str,
-) -> ExecuteResult<(String, Value, ValidatedOptions, Option<ExecuteSession>)> {
+) -> ExecuteResult<(
+    String,
+    Value,
+    ValidatedOptions,
+    Option<ExecuteSession>,
+    Option<InfoMapState>,
+)> {
     let value = serde_json::from_str::<Value>(raw)
         .map_err(|error| ExecuteError::invalid_request(format!("invalid request JSON: {error}")))?;
     let object = value
@@ -370,7 +390,7 @@ fn parse_request(
         .to_string();
     if !matches!(
         operation.as_str(),
-        "search" | "explore" | "info" | "toc" | "content" | "login_ui" | "login"
+        "search" | "explore" | "explore_kinds" | "info" | "toc" | "content" | "login_ui" | "login"
     ) {
         return Err(ExecuteError::invalid_request(format!(
             "unsupported op: {operation}"
@@ -394,7 +414,36 @@ fn parse_request(
             })?,
         ),
     };
-    Ok((operation, params, options, session))
+    let info_map = object
+        .get("infoMap")
+        .cloned()
+        .map(InfoMapState::from_value)
+        .transpose()
+        .map_err(|error| ExecuteError::invalid_request(format!("invalid infoMap: {error}")))?;
+    Ok((operation, params, options, session, info_map))
+}
+
+fn load_info_map_state(supplied: Option<InfoMapState>) -> ExecuteResult<InfoMapState> {
+    if let Some(state) = supplied {
+        return Ok(state);
+    }
+    let response = crate::host_services::call("info_map.load", &json!({}));
+    if response["ok"] == true {
+        return InfoMapState::from_value(response["data"].clone()).map_err(|error| {
+            ExecuteError::internal(format!("invalid infoMap load response: {error}"))
+        });
+    }
+    if matches!(
+        response["error"]["kind"].as_str(),
+        Some("unavailable" | "unsupported")
+    ) {
+        return Ok(InfoMapState::default());
+    }
+    Err(ExecuteError::internal(
+        response["error"]["message"]
+            .as_str()
+            .unwrap_or("infoMap load failed"),
+    ))
 }
 
 fn validate_options(options: ExecuteOptions) -> ExecuteResult<ValidatedOptions> {
@@ -470,21 +519,140 @@ fn execute_explore(
     session: &HttpSession,
     params: &Value,
     options: &ValidatedOptions,
+    supplied: Option<InfoMapState>,
 ) -> ExecuteResult<Value> {
     let rule = required_string(params, "url")?;
     let page = optional_page(params)?;
-    let response = fetch_rule(
-        session,
-        source,
-        &rule,
-        "",
-        page,
-        &source.book_source_url,
-        options,
-    )?;
+    let state = load_info_map_state(supplied)?;
+    // URL stages and loginCheckJs share the Map; independent list fields do not.
+    let (response, state) = with_js_info_map(state, || {
+        fetch_rule(
+            session,
+            source,
+            &rule,
+            "",
+            page,
+            &source.book_source_url,
+            options,
+        )
+    });
+    let response = response?;
     let data = serde_json::to_value(engine.explore_books(source, &response.body, &response.url))
         .map_err(|error| ExecuteError::internal(error.to_string()))?;
-    Ok(success(data, 1, false, &response, options))
+    let mut result = success(data, 1, false, &response, options);
+    publish_info_map_state(&mut result, state, false)?;
+    Ok(result)
+}
+
+// Classification flushes pending saves; exploration only carries state forward.
+fn execute_explore_kinds_with_state(
+    source: &BookSource,
+    options: &ValidatedOptions,
+    supplied: Option<InfoMapState>,
+) -> ExecuteResult<Value> {
+    let state = load_info_map_state(supplied)?;
+    let (result, state) = with_js_info_map(state, || execute_explore_kinds(source, options));
+    let mut response = result?;
+    publish_info_map_state(&mut response, state, true)?;
+    Ok(response)
+}
+
+fn publish_info_map_state(
+    response: &mut Value,
+    state: InfoMapState,
+    flush: bool,
+) -> ExecuteResult<()> {
+    let committed =
+        crate::host_services::call("info_map.commit", &json!({"state": state, "flush": flush}));
+    if committed["ok"] == true {
+        response["infoMap"] = committed["data"]["state"].clone();
+        if let Some(error) = committed["data"].get("persistenceError") {
+            response["infoMapError"] = error.clone();
+        }
+    } else if matches!(
+        committed["error"]["kind"].as_str(),
+        Some("unavailable" | "unsupported")
+    ) {
+        response["infoMap"] = json!(state);
+    } else {
+        return Err(ExecuteError::internal(
+            committed["error"]["message"]
+                .as_str()
+                .unwrap_or("infoMap commit failed"),
+        ));
+    }
+    Ok(())
+}
+
+fn execute_explore_kinds(source: &BookSource, options: &ValidatedOptions) -> ExecuteResult<Value> {
+    let raw = source.explore_url.as_deref().unwrap_or("").trim();
+    let script = if raw
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("@js:"))
+    {
+        Some(&raw[4..])
+    } else if raw
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("<js>"))
+    {
+        let end = raw.len().saturating_sub(5);
+        if !raw
+            .get(end..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case("</js>"))
+        {
+            return Err(ExecuteError::parse("exploreUrl is missing </js>"));
+        }
+        Some(&raw[4..end])
+    } else {
+        None
+    };
+    let text = match script {
+        Some(script) => with_js_lib(source.js_lib.as_deref(), || {
+            eval_js(script, "", &source.book_source_url)
+        })
+        .map_err(|error| ExecuteError::parse(format!("exploreUrl JavaScript failed: {error}")))?,
+        None => raw.to_string(),
+    };
+    if text.len() > options.max_response_bytes {
+        return Err(ExecuteError::parse(
+            "exploreUrl output exceeds maxResponseBytes",
+        ));
+    }
+    let text = text.trim();
+    let kinds: Vec<crate::model::book_source::ExploreKind> = if text.starts_with('[') {
+        serde_json::from_str(text).map_err(|error| {
+            ExecuteError::parse(format!("invalid explore categories JSON: {error}"))
+        })?
+    } else {
+        let mut entries = vec![text.to_string()];
+        for delimiter in ["&&", "\r\n", "\n"] {
+            entries = entries
+                .into_iter()
+                .flat_map(|entry| {
+                    crate::parser::rule_analyzer::split_top_level(&entry, &[delimiter]).parts
+                })
+                .collect();
+        }
+        entries
+            .into_iter()
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| {
+                let (title, url) = entry.split_once("::").unwrap_or((&entry, ""));
+                crate::model::book_source::ExploreKind {
+                    title: title.trim().to_string(),
+                    url: (!url.trim().is_empty()).then(|| url.trim().to_string()),
+                    style: None,
+                }
+            })
+            .collect()
+    };
+    let kinds = kinds
+        .into_iter()
+        .filter(|kind| !kind.title.trim().is_empty())
+        .collect::<Vec<_>>();
+    let data =
+        serde_json::to_value(kinds).map_err(|error| ExecuteError::internal(error.to_string()))?;
+    Ok(success_without_http(data))
 }
 
 fn serialized_variable(value: Option<&Value>) -> Option<String> {
@@ -825,7 +993,8 @@ fn execute_toc(
         Some(&book_info.name),
         Some(&book_fields),
     );
-    let mut data = json!({"chapters": chapters, "pages": visited_pages.len(), "truncated": truncated});
+    let mut data =
+        json!({"chapters": chapters, "pages": visited_pages.len(), "truncated": truncated});
     if let Some(variable) = book_variable {
         data["variable"] = json!(variable);
     }
@@ -1172,6 +1341,12 @@ fn execute_content(
         return Err(ExecuteError::parse("content is empty"));
     }
     let mut data = json!({"content": content, "pages": visited_urls.len() + sub_requests, "truncated": truncated});
+    if let Some(variable) = book_variable {
+        data["bookVariable"] = json!(variable);
+    }
+    if let Some(variable) = chapter_variable {
+        data["variable"] = json!(variable);
+    }
     if let Some(title) = title {
         data["title"] = json!(title);
     }
@@ -1231,7 +1406,7 @@ fn execute_login(
         return Err(web_login_error(
             source,
             action.unwrap_or_default(),
-            "登录按钮需要通过外部浏览器打开；浏览器 Cookie 不会自动导入书源会话".to_string(),
+            "需使用外部浏览器登录，Cookie 不支持同步".to_string(),
         ));
     }
 
@@ -1242,8 +1417,7 @@ fn execute_login(
         return Err(web_login_error(
             source,
             &url,
-            "该书源使用网页登录；当前解析器不提供内嵌 WebView，外部浏览器 Cookie 不会自动同步"
-                .to_string(),
+            "需使用外部浏览器进行网页登录，Cookie 不支持同步".to_string(),
         ));
     }
 
@@ -1455,7 +1629,9 @@ fn validate_login_response(
     let value = serde_json::from_str::<Value>(&output)
         .map_err(|_| ExecuteError::parse("loginCheckJs must return a StrResponse"))?;
     if !value.is_object() {
-        return Err(ExecuteError::parse("loginCheckJs must return a StrResponse"));
+        return Err(ExecuteError::parse(
+            "loginCheckJs must return a StrResponse",
+        ));
     }
     response_from_login_check(value, response).ok_or_else(|| {
         auth_required_error(

@@ -86,20 +86,32 @@ impl SharedCookieStore {
 
     /// Validate in a private candidate while holding the live jar lock; publish only
     /// after every pair succeeds, so concurrent response cookies are not overwritten.
-    pub(crate) fn import_login_cookies(&self, cookie_header: &str, url: &Url) -> Result<(), String> {
-        let mut store = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    pub(crate) fn import_login_cookies(
+        &self,
+        cookie_header: &str,
+        url: &Url,
+    ) -> Result<(), String> {
+        let mut store = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut candidate = store.clone();
         if !cookie_header.trim().is_empty() {
             for part in cookie_header.split(';') {
-                let (name, value) = part.trim().split_once('=')
+                let (name, value) = part
+                    .trim()
+                    .split_once('=')
                     .ok_or_else(|| "invalid login Cookie pair".to_string())?;
                 let name = name.trim();
-                if name.is_empty() || !name.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
-                }) {
+                if name.is_empty()
+                    || !name.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+                    })
+                {
                     return Err("invalid login Cookie name".into());
                 }
-                candidate.parse(&format!("{name}={}; Path=/", value.trim()), url)
+                candidate
+                    .parse(&format!("{name}={}; Path=/", value.trim()), url)
                     .map_err(|_| "invalid login Cookie value".to_string())?;
             }
         }

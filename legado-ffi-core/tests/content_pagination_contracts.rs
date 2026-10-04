@@ -24,6 +24,14 @@ fn run_with_context(
     js_lib: Option<&str>,
     book: Value,
 ) -> Value {
+    let mut source = source("", replacement, content_rule);
+    if let Some(script) = js_lib {
+        source["jsLib"] = json!(script);
+    }
+    run_with_config(pages, source, json!({"book": book}))
+}
+
+fn run_with_config(pages: Vec<Value>, mut source: Value, mut params: Value) -> Value {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -63,12 +71,14 @@ fn run_with_context(
         }
         requests
     });
-    let mut source = source(&base, replacement, content_rule);
-    if let Some(script) = js_lib {
-        source["jsLib"] = json!(script);
-    }
-    let response: Value = serde_json::from_str(&execute(&source.to_string(),
-        &json!({"api": 2, "op": "content", "params": {"url": format!("{base}/chapter/1"), "book": book}, "options": {"timeoutMs": 1000}}).to_string())).unwrap();
+    source["bookSourceUrl"] = json!(base);
+    params["url"] = json!(format!("{base}/chapter/1"));
+    let response: Value = serde_json::from_str(&execute(
+        &source.to_string(),
+        &json!({"api": 2, "op": "content", "params": params, "options": {"timeoutMs": 1000}})
+            .to_string(),
+    ))
+    .unwrap();
     let requests = server.join().unwrap();
     assert_eq!(response["ok"], true, "{response}");
     assert_eq!(response["data"]["pages"], expected_pages);
@@ -91,6 +101,63 @@ fn two_pages(first: &str, second: &str) -> Vec<Value> {
         json!({"content": first, "next": "/chapter/1?p=2"}),
         json!({"content": second, "next": ""}),
     ]
+}
+
+fn pages_with_sub_content() -> Vec<Value> {
+    vec![
+        json!({"content": "A", "extra": "C", "next": "/chapter/1?p=2"}),
+        json!({"content": "B", "extra": "must-not-append", "next": ""}),
+    ]
+}
+
+#[test]
+fn pipeline_appends_sub_content_before_source_and_host_replacements() {
+    for (rule, source_output) in [
+        ("##^A\\nB\\nC$##source", "source"),
+        ("@js: '[' + result + ']'", "[A\nB\nC]"),
+    ] {
+        let mut source = source("", rule, "$.content");
+        source["ruleContent"]["subContent"] = json!("$.extra");
+        let result = run_with_config(
+            pages_with_sub_content(),
+            source,
+            json!({
+                "replaceRules": [{"pattern": source_output, "replacement": "host-final", "isEnabled": true, "isRegex": false}]
+            }),
+        );
+        assert_eq!(result["data"]["content"], "host-final", "{rule}");
+    }
+}
+
+#[test]
+fn failing_source_js_keeps_sub_content_for_later_host_replacement() {
+    let mut source = source("", "@js: throw new Error('synthetic failure')", "$.content");
+    source["ruleContent"]["subContent"] = json!("$.extra");
+    let result = run_with_config(
+        pages_with_sub_content(),
+        source,
+        json!({
+            "replaceRules": [
+                {"pattern": "^A\\nB\\nC$", "replacement": "host-result", "isEnabled": true, "isRegex": true},
+                {"pattern": "host-result", "replacement": "must-not-apply", "isEnabled": false, "isRegex": false}
+            ]
+        }),
+    );
+    assert_eq!(result["data"]["content"], "host-result");
+}
+
+#[test]
+fn sub_content_keeps_the_existing_book_type_gate() {
+    for (kind, expected) in [(0, "[A\nB\nC]"), (2, "[A\nB]")] {
+        let mut source = source("", "@js: '[' + result + ']'", "$.content");
+        source["ruleContent"]["subContent"] = json!("$.extra");
+        let result = run_with_config(
+            pages_with_sub_content(),
+            source,
+            json!({"book": {"type": kind}}),
+        );
+        assert_eq!(result["data"]["content"], expected);
+    }
 }
 
 #[test]

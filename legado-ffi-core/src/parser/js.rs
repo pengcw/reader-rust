@@ -18,9 +18,10 @@ use once_cell::sync::Lazy;
 use ring::{digest, hmac};
 use rquickjs::function::Func;
 use rquickjs::{Context, Object, Runtime, Value};
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -60,7 +61,47 @@ impl Drop for TimerGuard {
     }
 }
 
+const MAX_INFO_MAP_BYTES: usize = 256 * 1024;
+const MAX_INFO_MAP_ENTRIES: usize = 64;
+const MAX_INFO_MAP_KEY_BYTES: usize = 1024;
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InfoMapState {
+    pub(crate) values: BTreeMap<String, String>,
+    pub(crate) need_save: bool,
+    pub(crate) save_time: i32,
+}
+
+impl InfoMapState {
+    pub(crate) fn from_value(value: JsonValue) -> anyhow::Result<Self> {
+        let encoded = serde_json::to_vec(&value)?;
+        anyhow::ensure!(
+            encoded.len() <= MAX_INFO_MAP_BYTES,
+            "infoMap state is too large"
+        );
+        let state: Self = serde_json::from_value(value)?;
+        anyhow::ensure!(
+            state.save_time >= 0,
+            "infoMap saveTime must not be negative"
+        );
+        anyhow::ensure!(
+            state.values.len() <= MAX_INFO_MAP_ENTRIES,
+            "infoMap has too many entries"
+        );
+        anyhow::ensure!(
+            state
+                .values
+                .keys()
+                .all(|key| key.len() <= MAX_INFO_MAP_KEY_BYTES),
+            "infoMap key is too large"
+        );
+        Ok(state)
+    }
+}
+
 thread_local! {
+    static ACTIVE_JS_INFO_MAP: RefCell<Option<InfoMapState>> = const { RefCell::new(None) };
     static ACTIVE_JS_LIB: RefCell<Option<String>> = const { RefCell::new(None) };
     // reader_execute installs its source-bound HTTP session here so JavaScript
     // java.ajax/get/post shares the same cookies and request policy as Rust HTTP.
@@ -99,6 +140,26 @@ thread_local! {
 pub fn with_js_lib<T>(js_lib: Option<&str>, f: impl FnOnce() -> T) -> T {
     ACTIVE_JS_LIB
         .with(|cell| crate::util::scoped::with_scoped_value(cell, js_lib.map(str::to_string), f))
+}
+
+pub(crate) fn with_js_info_map<T>(state: InfoMapState, f: impl FnOnce() -> T) -> (T, InfoMapState) {
+    ACTIVE_JS_INFO_MAP.with(|cell| {
+        crate::util::scoped::with_scoped_value(cell, Some(state), || {
+            let result = f();
+            (
+                result,
+                cell.borrow().as_ref().expect("scoped infoMap").clone(),
+            )
+        })
+    })
+}
+
+fn active_info_map_state() -> Option<InfoMapState> {
+    ACTIVE_JS_INFO_MAP.with(|cell| cell.borrow().clone())
+}
+
+fn update_active_info_map(state: InfoMapState) {
+    ACTIVE_JS_INFO_MAP.with(|cell| *cell.borrow_mut() = Some(state));
 }
 
 /// Bind a source-specific synchronous HTTP client for the duration of a rule
@@ -369,6 +430,99 @@ fn install_header_map<'js>(
             } }
         });
     })(java.headerMap)"#,
+    )?;
+    Ok(())
+}
+
+fn install_info_map<'js>(ctx: &rquickjs::Ctx<'js>, state: &InfoMapState) -> anyhow::Result<()> {
+    ctx.globals().set(
+        "__readerInfoMapInitial",
+        ctx.json_parse(serde_json::to_string(state)?)?,
+    )?;
+    eval_script(
+        ctx.clone(),
+        r#"(() => {
+            const initial = globalThis.__readerInfoMapInitial;
+            delete globalThis.__readerInfoMapInitial;
+            let backing = new Map(Object.entries(initial.values));
+            let needSave = initial.needSave;
+            let saveTime = initial.saveTime;
+            const views = new WeakMap();
+            const entriesOf = value => {
+                if (value instanceof Map) return Array.from(value.entries());
+                if (value && typeof value === 'object' && views.has(value)) {
+                    return Array.from(views.get(value)().entries());
+                }
+                if (!value || typeof value !== 'object' || Array.isArray(value)) {
+                    throw new TypeError('infoMap.set expects a map or object');
+                }
+                return Object.keys(value).map(key => [key, value[key]]);
+            };
+            // The root follows replacement; returned views keep their original Map.
+            const makeView = current => {
+                const view = Object.create(null);
+                views.set(view, current);
+                const put = (key, value) => {
+                    const target = current();
+                    key = String(key); value = String(value);
+                    const previous = target.has(key) ? target.get(key) : null;
+                    target.set(key, value); return previous;
+                };
+                Object.defineProperties(view, {
+                    size: { get: () => current().size },
+                    get: { configurable: true, value: key => current().has(String(key)) ? current().get(String(key)) : null },
+                    put: { value: put },
+                    set: { configurable: true, value: put },
+                    remove: { value: key => {
+                        const target = current();
+                        key = String(key);
+                        const previous = target.has(key) ? target.get(key) : null;
+                        target.delete(key); return previous;
+                    } },
+                    putAll: { value: value => { for (const [key, item] of entriesOf(value)) put(key, item); } },
+                    containsKey: { value: key => current().has(String(key)) },
+                    containsValue: { value: value => Array.from(current().values()).includes(String(value)) },
+                    isEmpty: { value: () => current().size === 0 },
+                    clear: { value: () => current().clear() }
+                });
+                return view;
+            };
+            const api = makeView(() => backing);
+            const snapshot = () => ({ values: Object.fromEntries(backing), needSave, saveTime });
+            const get = api.get;
+            Object.defineProperties(api, {
+                get: { value: function(key) {
+                    const target = backing;
+                    return arguments.length === 0 ? makeView(() => target) : get(key);
+                } },
+                set: { value: value => { backing = new Map(entriesOf(value).map(([key, item]) => [String(key), String(item)])); } },
+                save: { value: function(time, need) {
+                    time = arguments.length > 0 ? time : 0;
+                    need = arguments.length > 1 ? need : true;
+                    if (!Number.isInteger(time) || time < 0 || time > 2147483647) {
+                        throw new RangeError('infoMap saveTime must be a non-negative 32-bit integer');
+                    }
+                    if (typeof need !== 'boolean') throw new TypeError('infoMap needSave must be boolean');
+                    saveTime = time; needSave = need;
+                } },
+                saveNow: { value: () => {
+                    const response = JSON.parse(java.__infoMapSaveNow(JSON.stringify(snapshot())));
+                    if (!response.ok) {
+                        needSave = true;
+                        const error = new Error(response.error.message);
+                        error.kind = response.error.kind; throw error;
+                    }
+                    needSave = false;
+                } }
+            });
+            Object.defineProperty(globalThis, 'infoMap', {
+                configurable: true, enumerable: true, writable: true, value: api
+            });
+            Object.defineProperty(java, '__infoMapSnapshot', {
+                configurable: false, enumerable: false, writable: false,
+                value: () => JSON.stringify(snapshot())
+            });
+        })();"#,
     )?;
     Ok(())
 }
@@ -932,6 +1086,29 @@ fn eval_js_inner_with_source(
                     }
                 }),
             )?;
+            let info_map_source_key = source_key_val.clone();
+            java_obj.set(
+                "__infoMapSaveNow",
+                Func::new(move |payload: String| -> String {
+                    if info_map_source_key.is_empty() || payload.len() > MAX_INFO_MAP_BYTES {
+                        return serde_json::json!({"ok":false,"error":{"kind":"invalid_argument","message":"invalid infoMap save request"}}).to_string();
+                    }
+                    let active_source_key = ACTIVE_JS_BOOK_SOURCE.with(|cell| {
+                        cell.borrow().as_ref().map(|source| source.book_source_url.clone())
+                    });
+                    if active_source_key.as_deref().is_some_and(|key| key != info_map_source_key) {
+                        return serde_json::json!({"ok":false,"error":{"kind":"permission_denied","message":"infoMap source context mismatch"}}).to_string();
+                    }
+                    let Ok(value) = serde_json::from_str::<JsonValue>(&payload) else {
+                        return serde_json::json!({"ok":false,"error":{"kind":"invalid_argument","message":"invalid infoMap save request"}}).to_string();
+                    };
+                    let Ok(state) = InfoMapState::from_value(value) else {
+                        return serde_json::json!({"ok":false,"error":{"kind":"invalid_argument","message":"invalid infoMap state"}}).to_string();
+                    };
+                    let arguments = serde_json::json!({"values":state.values,"saveTime":state.save_time});
+                    crate::host_services::call("info_map.save_now", &arguments).to_string()
+                }),
+            )?;
             java_obj.set(
                 "__httpUrl",
                 Func::new(|spec: String| -> Option<String> { super::http_url::parse(&spec) }),
@@ -1327,7 +1504,7 @@ fn eval_js_inner_with_source(
             java_obj.set(
                 "getString",
                 Func::new(
-                    move |rule: Option<String>,
+                    move |ctx: rquickjs::Ctx<'_>, rule: Option<String>,
                           content: Option<String>,
                           is_url: Option<bool>,
                           unescape: Option<bool>|
@@ -1340,14 +1517,14 @@ fn eval_js_inner_with_source(
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .clone();
-                        java_get_string(
+                        with_js_reentrant_ctx(&ctx, || java_get_string(
                             rule.as_deref(),
                             content.as_deref(),
                             &default_content,
                             &base_url,
                             is_url.unwrap_or(false),
                             unescape.unwrap_or(true),
-                        )
+                        ))
                     },
                 ),
             )?;
@@ -2851,6 +3028,9 @@ fn eval_js_inner_with_source(
             eval_script(ctx.clone(), include_str!("js_security.js"))?;
             eval_script(ctx.clone(), include_str!("js_des.js"))?;
 
+            if let Some(state) = active_info_map_state() {
+                install_info_map(&ctx, &state)?;
+            }
             if !shared_js.trim().is_empty() {
                 eval_script(ctx.clone(), &shared_js)?;
             }
@@ -2915,6 +3095,15 @@ fn eval_js_inner_with_source(
                 }
             };
 
+            if active_info_map_state().is_some() {
+                let snapshot = eval_script(ctx.clone(), "java.__infoMapSnapshot()")?;
+                let snapshot = snapshot
+                    .into_string()
+                    .ok_or_else(|| anyhow::anyhow!("invalid infoMap snapshot"))?
+                    .to_string()?;
+                let state = InfoMapState::from_value(serde_json::from_str(&snapshot)?)?;
+                update_active_info_map(state);
+            }
             Ok(result)
         }) // closes ctx.with
     }) // closes JS_ENV.with
