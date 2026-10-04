@@ -1031,11 +1031,15 @@ impl RuleEngine {
                 context,
             );
         }
-        if matches!(
-            self.detect_mode(&content_rule, &content_body),
-            ParseMode::Js
-        ) {
-            let script = self.strip_mode_prefix(&content_rule);
+        // Preserve template expansion above, then advance leading JS stages.
+        let (content_body, content_rule) = prepare_list_rule_and_body(
+            Cow::Borrowed(&content_body),
+            &content_rule,
+            base_url,
+            context,
+        );
+        if matches!(self.detect_mode(content_rule, &content_body), ParseMode::Js) {
+            let script = self.strip_mode_prefix(content_rule);
             if let Ok(res) =
                 eval_js_with_bindings(script, &content_body, base_url, &context.js_bindings())
             {
@@ -1050,24 +1054,24 @@ impl RuleEngine {
             }
         }
 
-        let mode = self.detect_mode(&content_rule, &content_body);
+        let mode = self.detect_mode(content_rule, &content_body);
         let mut content = match mode {
             ParseMode::JsonPath => {
                 if let Ok(v) = serde_json::from_str::<Value>(&content_body) {
-                    jsonpath::jsonpath_first_string(&v, self.strip_mode_prefix(&content_rule))
+                    jsonpath::jsonpath_first_string(&v, self.strip_mode_prefix(content_rule))
                         .unwrap_or_default()
                 } else {
                     String::new()
                 }
             }
             ParseMode::XPath => {
-                html::select_xpath_content(&content_body, self.strip_mode_prefix(&content_rule))
+                html::select_xpath_content(&content_body, self.strip_mode_prefix(content_rule))
                     .first()
                     .cloned()
                     .unwrap_or_default()
             }
             ParseMode::Regex => regex_capture_first(
-                self.strip_mode_prefix(&content_rule)
+                self.strip_mode_prefix(content_rule)
                     .trim_start_matches(':')
                     .trim(),
                 &content_body,
@@ -1076,7 +1080,7 @@ impl RuleEngine {
             .unwrap_or_default(),
             ParseMode::Css => {
                 let doc = html::parse_document(&content_body);
-                let (selection, js) = extract_js(&content_rule);
+                let (selection, js) = extract_js(content_rule);
                 let has_stages = rule_analyzer::split_top_level(selection, &["##"])
                     .delimiter
                     .is_some()
@@ -1084,12 +1088,12 @@ impl RuleEngine {
                         .delimiter
                         .is_some();
                 if has_stages {
-                    eval_content_html_doc_with_ctx(&content_rule, &doc, base_url, context)
+                    eval_content_html_doc_with_ctx(content_rule, &doc, base_url, context)
                 } else if js.is_some() {
-                    eval_field_html_doc_with_ctx(&content_rule, &doc, base_url, context)
+                    eval_field_html_doc_with_ctx(content_rule, &doc, base_url, context)
                         .unwrap_or_default()
                 } else {
-                    html::select_all_text(&doc, self.strip_mode_prefix(&content_rule))
+                    html::select_all_text(&doc, self.strip_mode_prefix(content_rule))
                         .unwrap_or_default()
                 }
             }
@@ -1934,12 +1938,18 @@ impl RuleEngine {
     }
 }
 
+enum BookInfoInitScope {
+    Html(scraper::Html),
+    Json(Value),
+}
+
 fn prepare_html_init_scope(
     init: &str,
+    body: &str,
     doc: &scraper::Html,
     base_url: &str,
     ctx: &mut RuleVariableContext,
-) -> Option<scraper::Html> {
+) -> Option<BookInfoInitScope> {
     let init = init.trim();
     if init.is_empty() {
         return None;
@@ -1952,18 +1962,35 @@ fn prepare_html_init_scope(
 
     let is_js_rule = init.starts_with("js:") || extract_js(init).1.is_some();
     if is_js_rule {
-        let result = if init.starts_with("js:") {
-            eval_js_with_bindings(
-                strip_js_rule(init),
-                &doc.html(),
-                base_url,
-                &ctx.js_bindings(),
-            )
-            .ok()
+        let pure_js = starts_with_ascii_case(init, "js:")
+            || starts_with_ascii_case(init, "@js:")
+            || init
+                .strip_prefix("<js>")
+                .is_some_and(|rest| rest.ends_with("</js>"));
+        let transform = split_leading_js_transform(init);
+        let result = if let Some((script, _)) = transform {
+            eval_js_with_bindings(script, body, base_url, &ctx.js_bindings()).ok()
+        } else if pure_js {
+            eval_js_with_bindings(strip_js_rule(init), body, base_url, &ctx.js_bindings()).ok()
         } else {
             eval_field_html_doc_with_ctx(init, doc, base_url, ctx)
         }?;
-        return looks_like_html_fragment(&result).then(|| html::parse_document(&result));
+        if let Ok(value @ (Value::Object(_) | Value::Array(_))) = serde_json::from_str(&result) {
+            let scope = select_json_scope(&value, transform.map(|(_, rest)| rest), base_url, ctx);
+            return Some(BookInfoInitScope::Json(scope));
+        }
+        if !looks_like_html_fragment(&result) {
+            return None;
+        }
+        let transformed_doc = html::parse_document(&result);
+        if let Some((_, remainder)) = transform {
+            if let Some(scope) =
+                prepare_html_init_scope(remainder, &result, &transformed_doc, base_url, ctx)
+            {
+                return Some(scope);
+            }
+        }
+        return Some(BookInfoInitScope::Html(transformed_doc));
     }
 
     let selector = if let Some(selector) = init
@@ -1981,7 +2008,9 @@ fn prepare_html_init_scope(
     };
 
     let selected = html::select_list(doc, selector).into_iter().next()?;
-    Some(html::parse_document(&selected.html()))
+    Some(BookInfoInitScope::Html(html::parse_document(
+        &selected.html(),
+    )))
 }
 
 fn looks_like_html_fragment(value: &str) -> bool {
@@ -2004,8 +2033,17 @@ fn parse_book_info_html(
     let scoped_doc = rule
         .init
         .as_deref()
-        .and_then(|init| prepare_html_init_scope(init, &original_doc, base_url, ctx));
-    let doc = scoped_doc.unwrap_or(original_doc);
+        .and_then(|init| prepare_html_init_scope(init, body, &original_doc, base_url, ctx));
+    let doc = match scoped_doc {
+        Some(BookInfoInitScope::Json(value)) => {
+            // init is already evaluated: switch field scope without repeating its side effects.
+            let mut scoped_rule = rule.clone();
+            scoped_rule.init = None;
+            return parse_book_info_json(source, &value, base_url, &scoped_rule, book_url, ctx);
+        }
+        Some(BookInfoInitScope::Html(doc)) => doc,
+        None => original_doc,
+    };
 
     let name = rule
         .name

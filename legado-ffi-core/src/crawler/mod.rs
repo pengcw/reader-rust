@@ -8,6 +8,7 @@ use crate::parser::js::{
     eval_js_url_template_with_headers, eval_js_url_with_bindings, eval_js_url_with_headers,
     with_js_lib,
 };
+use base64::{engine::general_purpose, Engine};
 use chardetng::EncodingDetector;
 use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8};
 use once_cell::sync::Lazy;
@@ -244,11 +245,7 @@ impl HttpSession {
 
         Ok(Self {
             client: build_client(timeout_ms, None, None)?,
-            webview_client: build_client(
-                timeout_ms,
-                Some(SharedCookieStore::default()),
-                None,
-            )?,
+            webview_client: build_client(timeout_ms, Some(SharedCookieStore::default()), None)?,
         })
     }
 
@@ -261,6 +258,18 @@ impl HttpSession {
         spec: &RequestSpec,
         max_response_bytes: usize,
     ) -> Result<HttpResponse, FetchError> {
+        if let Some(response) = data_uri_response(spec, Some(max_response_bytes)) {
+            let response = response.map_err(map_http_client_error)?;
+            let body =
+                format_analyzed_body(spec, &response.body, String::new(), None, &response.url)
+                    .map_err(FetchError::Rule)?;
+            return Ok(HttpResponse {
+                url: response.url,
+                status: response.status,
+                headers: HashMap::new(),
+                body,
+            });
+        }
         let proxy = spec
             .proxy
             .as_deref()
@@ -486,6 +495,63 @@ fn render_with_rakers(
     Ok(rendered)
 }
 
+/// Typed data URIs carry bytes locally; type-less data requests remain unsupported.
+fn data_uri_response(
+    spec: &RequestSpec,
+    max_response_bytes: Option<usize>,
+) -> Option<Result<RawHttpResponse, HttpClientError>> {
+    if !spec.url.starts_with("data:") {
+        return None;
+    }
+    Some((|| {
+        let invalid = || HttpClientError::InvalidUrl("invalid typed Base64 data URI".to_string());
+        if spec.response_type.is_none() {
+            return Err(invalid());
+        }
+        let (_, payload) = spec.url.split_once(";base64,").ok_or_else(invalid)?;
+        // Android Base64.DEFAULT accepts whitespace and optional padding.
+        // Bound decoded allocation before copying/decoding the payload.
+        let digits = payload
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace() && *byte != b'=')
+            .count();
+        let limit = max_response_bytes
+            .unwrap_or(crate::executor::DEFAULT_MAX_RESPONSE_BYTES)
+            .max(1);
+        let symbols = payload
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .count();
+        if digits.saturating_mul(6) / 8 > limit || symbols > limit.div_ceil(3).saturating_mul(4) {
+            return Err(HttpClientError::ResponseTooLarge {
+                url: "data:".to_string(),
+                limit,
+            });
+        }
+        let compact: Vec<u8> = payload
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect();
+        let config = general_purpose::GeneralPurposeConfig::new()
+            .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent);
+        let body = general_purpose::GeneralPurpose::new(&base64::alphabet::STANDARD, config)
+            .decode(&compact)
+            .map_err(|_| invalid())?;
+        if body.len() > limit {
+            return Err(HttpClientError::ResponseTooLarge {
+                url: "data:".to_string(),
+                limit,
+            });
+        }
+        Ok(RawHttpResponse {
+            url: spec.url.clone(),
+            status: 200,
+            headers: HeaderMap::new(),
+            body,
+        })
+    })())
+}
+
 /// Execute an AnalyzeUrl request for JavaScript APIs while preserving its request
 /// options and the source-bound cookie session. Unlike `fetch`, this returns
 /// non-2xx HTTP responses instead of converting their status into an error.
@@ -501,6 +567,9 @@ pub(crate) fn execute_request_spec_limited(
     spec: &RequestSpec,
     max_response_bytes: Option<usize>,
 ) -> Result<RawHttpResponse, HttpClientError> {
+    if let Some(response) = data_uri_response(spec, max_response_bytes) {
+        return response;
+    }
     let client = match spec
         .proxy
         .as_deref()
@@ -774,7 +843,9 @@ fn compile_url_request(
         .map_err(|error| format!("URL option JavaScript failed: {error}"))?;
         url = absolute_url(base, &rewritten);
     }
-    validate_http_url(&url)?;
+    if !url.starts_with("data:") {
+        validate_http_url(&url)?;
+    }
 
     if let Some(raw_proxy) = options
         .get("proxy")
@@ -815,7 +886,6 @@ fn compile_url_request(
     let response_type = options
         .get("type")
         .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
         .map(str::to_owned);
     let body_js = options
         .get("bodyJs")
@@ -1299,7 +1369,10 @@ fn ensure_user_agent(headers: &mut Vec<(String, String)>) {
 
 fn absolute_url(base: &str, raw_url: &str) -> String {
     let raw_url = raw_url.trim();
-    if raw_url.starts_with("http://") || raw_url.starts_with("https://") {
+    if raw_url.starts_with("data:")
+        || raw_url.starts_with("http://")
+        || raw_url.starts_with("https://")
+    {
         return raw_url.to_string();
     }
     if raw_url.starts_with("//") {
@@ -1320,6 +1393,9 @@ fn validate_http_url(raw_url: &str) -> Result<(), String> {
 }
 
 fn encode_get_query(raw_url: &str, charset: Option<&str>) -> String {
+    if raw_url.starts_with("data:") {
+        return raw_url.to_string();
+    }
     let Some(charset) = charset.filter(|value| {
         !value.eq_ignore_ascii_case("utf-8") && !value.eq_ignore_ascii_case("utf8")
     }) else {
@@ -1517,11 +1593,7 @@ pub(crate) fn format_analyzed_body(
     content_type: Option<&str>,
     response_url: &str,
 ) -> Result<String, String> {
-    if spec
-        .response_type
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
-    {
+    if spec.response_type.is_some() {
         return Ok(raw_body.iter().map(|byte| format!("{byte:02x}")).collect());
     }
     // Android AnalyzeUrl's XML declaration branch precedes bodyJs.

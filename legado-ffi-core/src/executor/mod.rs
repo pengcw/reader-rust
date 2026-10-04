@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 const DEFAULT_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_MAX_PAGES: usize = 100;
-const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TIMEOUT_MS: u64 = 120_000;
 const MAX_PAGES: usize = 100;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -1145,7 +1145,9 @@ fn execute_content(
     let is_volume = input_chapter_is_volume(params);
     let replace_rules = parse_replace_rules(params.get("replaceRules"))?;
 
-    if uses_js_ajax_content_rule(source) {
+    if uses_js_ajax_content_rule(source)
+        && !strip_url_options(&initial_url).trim().starts_with("data:")
+    {
         let page = engine.content_first_page_with_context(
             source,
             "",
