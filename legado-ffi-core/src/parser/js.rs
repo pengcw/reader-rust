@@ -1445,24 +1445,35 @@ fn eval_js_inner_with_source(
                         .unwrap_or_default()
                 }),
             )?;
-            java_obj.set(
-                "__gunzipBytes",
-                Func::new(|input: String| -> String {
-                    use crate::parser::compression::{self, Error};
-                    let result = if input.len() > compression::MAX_INPUT * 4 + 2 {
-                        Err(Error::LimitExceeded)
-                    } else {
-                        serde_json::from_str::<Vec<u8>>(&input)
-                            .map_err(|_| Error::InvalidInput)
-                            .and_then(|bytes| compression::gunzip(&bytes))
-                    };
-                    match result {
-                        Ok(bytes) => serde_json::json!({"ok":true,"data":bytes}),
-                        Err(error) => serde_json::json!({"ok":false,"error":{
-                            "kind":error.kind(),"message":"gzip operation failed"}}),
-                    }.to_string()
-                }),
-            )?;
+            for (name, nowrap) in [
+                ("__gunzipBytes", None),
+                ("__inflateRawBytes", Some(true)),
+                ("__inflateZlibBytes", Some(false)),
+            ] {
+                java_obj.set(
+                    name,
+                    Func::new(move |input: String| -> String {
+                        use crate::parser::compression::{self, Error};
+                        let result = if input.len() > compression::MAX_INPUT * 4 + 2 {
+                            Err(Error::LimitExceeded)
+                        } else {
+                            serde_json::from_str::<Vec<u8>>(&input)
+                                .map_err(|_| Error::InvalidInput)
+                                .and_then(|bytes| match nowrap {
+                                    Some(nowrap) => compression::inflate(&bytes, nowrap),
+                                    None => compression::gunzip(&bytes),
+                                })
+                        };
+                        match result {
+                            Ok(bytes) => serde_json::json!({"ok":true,"data":bytes}),
+                            Err(error) => serde_json::json!({"ok":false,"error":{
+                                "kind":error.kind(),"message":if nowrap.is_some() {
+                                    "inflate operation failed"
+                                } else { "gzip operation failed" }}}),
+                        }.to_string()
+                    }),
+                )?;
+            }
             java_obj.set(
                 "encodeURIComponent",
                 Func::new(|input: String| -> String { urlencoding::encode(&input).into_owned() }),
@@ -1818,6 +1829,7 @@ fn eval_js_inner_with_source(
                         });
                         return {
                             body: () => body,
+                            bodyAsBytes: () => java.base64DecodeToByteArray(raw.bodyBase64 || ''),
                             statusCode: () => status,
                             code: () => status,
                             url: () => String(raw.url || ''),
@@ -2824,6 +2836,48 @@ fn eval_js_inner_with_source(
                         reset() { throw new Error('gzip mark/reset is unsupported'); },
                         close() { if (!this.closed) { this.closed = true; this.input.close(); } }
                     });
+                    function Inflater(nowrap = false) {
+                        if (!new.target) return new Inflater(nowrap);
+                        if (typeof nowrap !== 'boolean') throw new Error('boolean nowrap required');
+                        this.nowrap = nowrap;
+                        this.ended = false;
+                    }
+                    Inflater.prototype.end = function() { this.ended = true; };
+                    function InflaterInputStream(input, inflater, size) {
+                        if (!new.target) return new InflaterInputStream(input, inflater, size);
+                        if (!(input instanceof ByteArrayInputStream)) throw new Error('ByteArrayInputStream required');
+                        if (size !== undefined && (!Number.isInteger(size) || size <= 0 || size > 262144)) {
+                            throw new Error('invalid inflater buffer size');
+                        }
+                        this.ownsInflater = inflater === undefined;
+                        inflater = this.ownsInflater ? new Inflater() : inflater;
+                        if (!(inflater instanceof Inflater) || inflater.ended) throw new Error('active Inflater required');
+                        input.checkOpen();
+                        const decode = inflater.nowrap ? java.__inflateRawBytes : java.__inflateZlibBytes;
+                        const response = JSON.parse(decode(JSON.stringify(input.bytes.slice(input.position))));
+                        if (!response.ok) {
+                            const error = new Error(response.error.message);
+                            error.kind = response.error.kind; throw error;
+                        }
+                        input.position = input.bytes.length;
+                        this.bytes = response.data;
+                        this.position = 0;
+                        this.closed = false;
+                        this.input = input;
+                        this.inflater = inflater;
+                    }
+                    InflaterInputStream.prototype = Object.create(GZIPInputStream.prototype);
+                    Object.assign(InflaterInputStream.prototype, {
+                        checkOpen() {
+                            ByteArrayInputStream.prototype.checkOpen.call(this);
+                            if (this.inflater.ended) throw new Error('inflater is ended');
+                        },
+                        reset() { throw new Error('inflater mark/reset is unsupported'); },
+                        close() {
+                            GZIPInputStream.prototype.close.call(this);
+                            if (this.ownsInflater) this.inflater.end();
+                        }
+                    });
                     function ByteArrayOutputStream(size) {
                         if (!new.target) return new ByteArrayOutputStream(size);
                         if (size !== undefined && (!Number.isInteger(size) || size < 0 || size > 262144)) {
@@ -2857,7 +2911,23 @@ fn eval_js_inner_with_source(
                     function IvParameterSpec(iv) {
                         return { iv: toBytes(iv) };
                     }
+                    class JavaHashMap extends Map {
+                        get(key) { return this.has(key) ? super.get(key) : null; }
+                        put(key, value) {
+                            const previous = this.get(key);
+                            this.set(key, value);
+                            return previous;
+                        }
+                        toJSON() { return Object.fromEntries(this); }
+                    }
                     const Arrays = {
+                        copyOf(value, length) {
+                            if ((!Array.isArray(value) && !(value instanceof Uint8Array))
+                                || !Number.isInteger(length) || length < 0 || length > 524288) {
+                                throw new Error('invalid byte array copy');
+                            }
+                            return Arrays.copyOfRange(value, 0, length);
+                        },
                         copyOfRange(value, start, end) {
                             const bytes = Array.from(value == null ? [] : value).slice(start, end);
                             while (bytes.length < end - start) bytes.push(0);
@@ -2927,6 +2997,7 @@ fn eval_js_inner_with_source(
                     Packages.java.lang = Packages.java.lang || {};
                     Packages.java.net = Packages.java.net || {};
                     Packages.java.io = Packages.java.io || {};
+                    Packages.java.nio = Packages.java.nio || {};
                     Packages.java.util = Packages.java.util || {};
                     Packages.java.util.zip = Packages.java.util.zip || {};
                     Packages.javax = Packages.javax || {};
@@ -2937,13 +3008,25 @@ fn eval_js_inner_with_source(
                     Packages.android = Packages.android || {};
                     Packages.android.util = Packages.android.util || {};
 
+                    Packages.java.nio.ByteBuffer = markClass('ByteBuffer', {
+                        allocate(capacity) {
+                            if (!Number.isInteger(capacity) || capacity < 0 || capacity > 262144) {
+                                throw new Error('invalid byte buffer capacity');
+                            }
+                            const bytes = new Array(capacity).fill(0);
+                            return { array: () => bytes };
+                        }
+                    });
                     Packages.java.lang.String = markClass('String', JavaString);
                     Packages.java.io.ByteArrayInputStream = markClass('ByteArrayInputStream', ByteArrayInputStream);
                     Packages.java.io.ByteArrayOutputStream = markClass('ByteArrayOutputStream', ByteArrayOutputStream);
                     Packages.java.util.zip.GZIPInputStream = markClass('GZIPInputStream', GZIPInputStream);
+                    Packages.java.util.zip.Inflater = markClass('Inflater', Inflater);
+                    Packages.java.util.zip.InflaterInputStream = markClass('InflaterInputStream', InflaterInputStream);
                     Packages.java.net.URLEncoder = markClass('URLEncoder', URLEncoder);
                     Packages.java.net.URLDecoder = markClass('URLDecoder', URLDecoder);
                     Packages.java.util.Arrays = markClass('Arrays', Arrays);
+                    Packages.java.util.HashMap = markClass('HashMap', JavaHashMap);
                     Packages.java.util.Base64 = markClass('Base64', javaBase64);
                     Packages.java.util.UUID = markClass('UUID', java.util.UUID);
                     Packages.javax.crypto.Mac = markClass('Mac', Mac);
@@ -4514,6 +4597,7 @@ fn java_request_simple_response_with_client(
             serde_json::json!({
                 "__ffiStrResponse": true,
                 "body": String::from_utf8_lossy(&response.body).into_owned(),
+                "bodyBase64": base64::engine::general_purpose::STANDARD.encode(&response.body),
                 "url": response.url,
                 "code": status,
                 "message": http_status_message(status),
@@ -5112,6 +5196,74 @@ mod tests {
             "https://example.com",
         ).unwrap();
         assert_eq!(result, "255,0,127|PKCS#8|SHA256withRSA|11");
+    }
+
+    #[test]
+    fn java_arrays_copy_of_preserves_bytes_padding_and_isolation() {
+        let result = eval_js(
+            r#"const arrays = Packages.java.util.Arrays;
+            const original = [-128, 0, 255];
+            const copy = arrays.copyOf(original, 3);
+            copy[0] = 7;
+            let rejected = 0;
+            for (const [value, length] of [[null, 0], [[], -1], [[], 1.5], [[], NaN], [[], 524289]]) {
+                try { arrays.copyOf(value, length); } catch (_) { rejected++; }
+            }
+            [original.join(','), copy.join(','), arrays.copyOf(original, 2).join(','),
+             arrays.copyOf(original, 5).join(','), arrays.copyOf(original, 0).length,
+             arrays.copyOf(new Uint8Array([128, 255]), 2).join(','), rejected].join('|')"#,
+            "",
+            "https://example.com/",
+        ).unwrap();
+        assert_eq!(
+            result,
+            "-128,0,255|7,0,255|-128,0|-128,0,255,0,0|0|128,255|5"
+        );
+    }
+
+    #[test]
+    fn java_hash_map_keeps_native_map_and_header_keys_intact() {
+        let result = eval_js(
+            r#"const j = new JavaImporter(Packages.java.util);
+            const map = new j.HashMap();
+            const initial = map.put('get', 'one');
+            const previous = map.put('get', 'two');
+            map.put('__proto__', 'header');
+            [initial === null, previous, map.get('missing') === null,
+             map.get('get'), JSON.stringify(map),
+             new j.HashMap().get('get') === null,
+             new Map().get('missing') === undefined,
+             Map.prototype.put === undefined].join('|')"#,
+            "",
+            "https://example.com/",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            "true|one|true|two|{\"get\":\"two\",\"__proto__\":\"header\"}|true|true|true"
+        );
+    }
+
+    #[test]
+    fn java_byte_buffer_exposes_fresh_zeroed_backing_arrays() {
+        let result = eval_js(
+            r#"const j = new JavaImporter(Packages.java.nio);
+            const buffer = j.ByteBuffer.allocate(32);
+            const bytes = buffer.array();
+            bytes[0] = -128;
+            const fresh = j.ByteBuffer.allocate(32).array();
+            let rejected = 0;
+            for (const size of [-1, 1.5, NaN, Infinity, 262145]) {
+                try { j.ByteBuffer.allocate(size); } catch (_) { rejected++; }
+            }
+            [bytes === buffer.array(), bytes.length, buffer.array()[0],
+             fresh.every(value => value === 0), j.ByteBuffer.allocate(0).array().length,
+             rejected].join('|')"#,
+            "",
+            "https://example.com",
+        )
+        .unwrap();
+        assert_eq!(result, "true|32|-128|true|0|5");
     }
 
     #[test]
@@ -6399,6 +6551,42 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
             )
         })
         .is_err());
+    }
+
+    #[test]
+    fn simple_http_response_preserves_binary_bytes_and_text_behavior() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/bytes", listener.local_addr().unwrap());
+        let bytes = [0, 255, 128, b'A'];
+        let server = thread::spawn(move || {
+            let (mut stream, _) = accept_with_timeout(&listener);
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(request.len() <= 8192);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.write_all(&bytes).unwrap();
+        });
+        let result = with_js_http_client(&HttpClient::standalone(), || {
+            eval_js(
+                &format!(
+                    r#"const response = java.get('{url}', {{}});
+                const bytes = response.bodyAsBytes(); bytes[0] = 7;
+                [response.bodyAsBytes().join(','), response.body() === '\u0000\ufffd\ufffdA',
+                 response.statusCode()].join('|')"#
+                ),
+                "",
+                &url,
+            )
+            .unwrap()
+        });
+        server.join().unwrap();
+        assert_eq!(result, "0,255,128,65|true|200");
     }
 
     #[test]
