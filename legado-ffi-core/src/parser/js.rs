@@ -2036,6 +2036,9 @@ fn eval_js_inner_with_source(
                             return {
                                 __readerIndex: item.__readerIndex,
                                 __readerXPathNode: context,
+                                // HTML data survives the JS return boundary without
+                                // replacing the public node methods. XPath IDs stay local.
+                                ...(context ? {} : { toJSON() { return item; } }),
                                 attr(name) { return attrs[String(name)] || ''; },
                                 hasAttr(name) { return Object.prototype.hasOwnProperty.call(attrs, String(name)); },
                                 hasClass(name) {

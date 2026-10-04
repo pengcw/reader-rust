@@ -3775,6 +3775,16 @@ fn eval_field_json_with_ctx(
     base_url: &str,
     ctx: &mut RuleVariableContext,
 ) -> Option<String> {
+    // JS lists can contain HTML nodes as well as ordinary JSON items.
+    // Reuse element-field evaluation only for the explicit HTML carrier;
+    // XPath document references require their own context-preserving path.
+    if v.get("__readerHtmlElement").and_then(Value::as_bool) == Some(true)
+        && v.get("__readerXPathNode").is_none()
+    {
+        let document = scraper::Html::parse_fragment(v.get("outerHtml")?.as_str()?);
+        let element = document.root_element().child_elements().next()?;
+        return eval_field_html_with_ctx(rule, &element, base_url, ctx);
+    }
     if let Some((script, remainder)) =
         split_leading_js_transform(rule).filter(|(_, remainder)| !remainder.starts_with("##"))
     {
