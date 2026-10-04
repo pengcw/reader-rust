@@ -1164,6 +1164,12 @@ fn execute_content(
             return Err(ExecuteError::parse("content is empty"));
         }
         let mut data = json!({"content": content});
+        if let Some(variable) = page.book_variable {
+            data["bookVariable"] = json!(variable);
+        }
+        if let Some(variable) = page.chapter_variable {
+            data["variable"] = json!(variable);
+        }
         if let Some(title) = page.title {
             data["title"] = json!(title);
         }
