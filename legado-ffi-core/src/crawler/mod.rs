@@ -8,6 +8,7 @@ use crate::parser::js::{
     eval_js_url_template_with_headers, eval_js_url_with_bindings, eval_js_url_with_headers,
     with_js_lib,
 };
+use crate::util::text::find_template_close;
 use base64::{engine::general_purpose, Engine};
 use chardetng::EncodingDetector;
 use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8};
@@ -1031,7 +1032,7 @@ fn expand_url_templates(
         let start = cursor + relative_start;
         output.push_str(&rule[cursor..start]);
         let expression_start = start + 2;
-        let Some(relative_end) = find_url_template_close(&rule[expression_start..]) else {
+        let Some(relative_end) = find_template_close(&rule[expression_start..]) else {
             output.push_str(&rule[start..]);
             return Ok(output);
         };
@@ -1064,32 +1065,6 @@ fn expand_url_templates(
     }
     output.push_str(&rule[cursor..]);
     Ok(output)
-}
-
-fn find_url_template_close(expression: &str) -> Option<usize> {
-    let mut brace_depth = 0usize;
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, ch) in expression.char_indices() {
-        if let Some(active_quote) = quote {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == active_quote {
-                quote = None;
-            }
-            continue;
-        }
-        match ch {
-            '\'' | '"' | '`' => quote = Some(ch),
-            '{' => brace_depth += 1,
-            '}' if brace_depth > 0 => brace_depth -= 1,
-            '}' if expression[index..].starts_with("}}") => return Some(index),
-            _ => {}
-        }
-    }
-    None
 }
 
 fn replace_legacy_placeholders(rule: &str, key: &str, page: i32) -> String {
