@@ -215,7 +215,7 @@ pub struct Engine<'a> {
     pub flags: Flags,
     pub group_count: usize,
     pub named_groups: &'a BTreeMap<String, usize>,
-    steps: u64,
+    pub(crate) steps: u64,
     max_steps: u64,
     depth: u32,
     max_depth: u32,
@@ -266,6 +266,10 @@ impl<'a> Engine<'a> {
     /// Effective end-of-text for matching: `text_end`, mirroring `Matcher.to`.
     #[inline]
     pub fn text_len(&self) -> usize { self.text_end }
+
+    pub(crate) fn budget_exhausted(&self) -> bool {
+        self.steps >= self.max_steps
+    }
 
     fn step(&mut self) -> bool {
         self.steps += 1;

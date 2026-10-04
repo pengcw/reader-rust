@@ -210,6 +210,8 @@ impl Regex {
             search_pos: 0,
             prev_match_end: 0,
             end,
+            steps: 0,
+            exhausted: false,
             state: State::new(self.group_count),
         }
     }
@@ -332,17 +334,28 @@ impl Regex {
     /// ```
     pub fn replace_all<R: Replacer>(&self, input: &str, replacer: R) -> String {
         let input_chars: Vec<char> = input.chars().collect();
-        self.replace_internal(&input_chars, replacer, false)
+        self.replace_internal(&input_chars, replacer, false).unwrap_or_else(|_| input.to_string())
+    }
+
+    /// Report step-budget exhaustion without returning partial output.
+    /// Side effects of a custom Replacer are not rolled back.
+    pub fn try_replace_all<R: Replacer>(&self, input: &str, replacer: R) -> Result<String, MatchError> {
+        self.replace_internal(&input.chars().collect::<Vec<_>>(), replacer, false)
     }
 
     /// Replace the first match only. Same accept-any-Replacer semantics as
     /// [`replace_all`](Regex::replace_all).
     pub fn replace_first<R: Replacer>(&self, input: &str, replacer: R) -> String {
         let input_chars: Vec<char> = input.chars().collect();
-        self.replace_internal(&input_chars, replacer, true)
+        self.replace_internal(&input_chars, replacer, true).unwrap_or_else(|_| input.to_string())
     }
 
-    fn replace_internal<R: Replacer>(&self, input_chars: &[char], mut replacer: R, first_only: bool) -> String {
+    /// Like `try_replace_all`, stopping after the first complete match.
+    pub fn try_replace_first<R: Replacer>(&self, input: &str, replacer: R) -> Result<String, MatchError> {
+        self.replace_internal(&input.chars().collect::<Vec<_>>(), replacer, true)
+    }
+
+    fn replace_internal<R: Replacer>(&self, input_chars: &[char], mut replacer: R, first_only: bool) -> Result<String, MatchError> {
         let input_len = input_chars.len();
         let mut result = String::new();
         let mut last_end = 0;
@@ -359,7 +372,11 @@ impl Regex {
         while search_pos <= input_len {
             engine.search_start = prev_match_end;
 
-            if let Some(end_pos) = engine.try_match_at_persistent(&self.pattern, search_pos, &mut state) {
+            let matched = engine.try_match_at_persistent(&self.pattern, search_pos, &mut state);
+            if engine.budget_exhausted() {
+                return Err(MatchError::BudgetExceeded);
+            }
+            if let Some(end_pos) = matched {
                 result.extend(&input_chars[last_end..search_pos]);
 
                 if !state.captures.is_empty() {
@@ -389,7 +406,7 @@ impl Regex {
         }
 
         result.extend(&input_chars[last_end..]);
-        result
+        Ok(result)
     }
 
 }
@@ -398,12 +415,19 @@ impl Regex {
 // Matches iterator
 // ---------------------------------------------------------------------------
 
+/// An incomplete match operation must not publish partial output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchError {
+    BudgetExceeded,
+}
+
 /// Lazy iterator over non-overlapping matches, returned by
 /// [`Regex::find_iter`]. Yields one [`MatchInfo`] per `next()` call.
 ///
 /// Holds its own char-indexed copy of the input plus a persistent matcher
 /// `State` so capture-leak semantics across successive `next()` calls match
 /// what an equivalent `Matcher.find()` loop in Java would produce.
+/// Check `budget_exhausted()` after scanning before publishing results.
 pub struct Matches<'r, 'h> {
     re: &'r Regex,
     input_chars: Vec<char>,
@@ -411,14 +435,21 @@ pub struct Matches<'r, 'h> {
     search_pos: usize,
     prev_match_end: usize,
     end: usize,
+    steps: u64,
+    exhausted: bool,
     state: State,
+}
+
+impl Matches<'_, '_> {
+    /// A partial scan must be discarded when this is true.
+    pub fn budget_exhausted(&self) -> bool { self.exhausted }
 }
 
 impl<'r, 'h> Iterator for Matches<'r, 'h> {
     type Item = MatchInfo;
 
     fn next(&mut self) -> Option<MatchInfo> {
-        while self.search_pos <= self.end {
+        while !self.exhausted && self.search_pos <= self.end {
             let mut engine = Engine::new(
                 &self.input_chars, self.re.flags,
                 self.re.group_count, &self.re.named_groups,
@@ -426,10 +457,15 @@ impl<'r, 'h> Iterator for Matches<'r, 'h> {
             engine.text_start = 0;
             engine.text_end = self.end;
             engine.search_start = self.prev_match_end;
+            engine.steps = self.steps;
 
-            if let Some(end_pos) = engine.try_match_at_persistent(
+            let matched = engine.try_match_at_persistent(
                 &self.re.pattern, self.search_pos, &mut self.state,
-            ) {
+            );
+            self.steps = engine.steps;
+            self.exhausted = engine.budget_exhausted();
+            if self.exhausted { return None; }
+            if let Some(end_pos) = matched {
                 let m = self.re.build_match_info(
                     &self.input_chars, self.search_pos, end_pos, &self.state.captures);
                 self.prev_match_end = end_pos;
@@ -1926,5 +1962,21 @@ mod tests {
         assert_eq!(re.find_iter("").count(), 0);
         let re = Regex::new(r"").unwrap();
         assert_eq!(re.find_iter("").count(), 1);
+    }
+
+    #[test]
+    fn iterator_budget_is_shared_and_exhaustion_is_terminal() {
+        let re = Regex::new(".").unwrap();
+        let input = "a".repeat(200);
+        let mut scan = re.find_iter(&input);
+        // A tiny remaining budget exercises the boundary without expensive backtracking.
+        scan.steps = 4_999_900;
+        let prefix = scan.by_ref().count();
+        assert!(prefix > 0 && prefix < 200);
+        assert!(scan.budget_exhausted());
+        assert!(scan.next().is_none());
+        let mut fresh = re.find_iter(&input);
+        assert_eq!(fresh.by_ref().count(), 200);
+        assert!(!fresh.budget_exhausted());
     }
 }

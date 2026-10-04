@@ -3911,7 +3911,10 @@ fn apply_regex_replace_all(text: &str, pattern: &str, replacement: &str) -> Stri
     match source_regex::replace_all(text, pattern, replacement) {
         Ok(value) => value,
         Err(source_regex::RegexError::InvalidPattern) => text.replace(pattern, replacement),
-        Err(source_regex::RegexError::InvalidReplacement { .. }) => text.to_string(),
+        Err(
+            source_regex::RegexError::InvalidReplacement { .. }
+            | source_regex::RegexError::BudgetExceeded,
+        ) => text.to_string(),
     }
 }
 
@@ -3920,7 +3923,10 @@ fn apply_regex_replace_first(text: &str, pattern: &str, replacement: &str) -> St
         Ok(Some(value)) => value,
         Ok(None) => String::new(),
         Err(source_regex::RegexError::InvalidPattern) => replacement.to_string(),
-        Err(source_regex::RegexError::InvalidReplacement { .. }) => text.to_string(),
+        Err(
+            source_regex::RegexError::InvalidReplacement { .. }
+            | source_regex::RegexError::BudgetExceeded,
+        ) => text.to_string(),
     }
 }
 

@@ -47,11 +47,22 @@ pub(crate) fn is_full_match(pattern: &str, input: &str) -> bool {
     get_cached_regex(pattern).is_some_and(|regex| regex.matches(input))
 }
 
+fn collect_matches(regex: &Regex, input: &str) -> Result<Vec<MatchInfo>, RegexError> {
+    let mut matches = regex.find_iter(input);
+    let found = matches.by_ref().collect();
+    if matches.budget_exhausted() {
+        Err(RegexError::BudgetExceeded)
+    } else {
+        Ok(found)
+    }
+}
+
 pub(crate) fn find_all(pattern: &str, input: &str) -> Option<Vec<String>> {
     let regex = get_cached_regex(pattern)?;
     Some(
-        regex
-            .find_iter(input)
+        collect_matches(&regex, input)
+            .ok()?
+            .into_iter()
             .map(|found| found.matched_text)
             .collect(),
     )
@@ -64,12 +75,19 @@ pub(crate) fn captures_first(pattern: &str, input: &str) -> Option<Vec<Option<St
 
 pub(crate) fn captures_all(pattern: &str, input: &str) -> Option<Vec<Vec<Option<String>>>> {
     let regex = get_cached_regex(pattern)?;
-    Some(regex.find_iter(input).map(match_captures).collect())
+    Some(
+        collect_matches(&regex, input)
+            .ok()?
+            .into_iter()
+            .map(match_captures)
+            .collect(),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RegexError {
     InvalidPattern,
+    BudgetExceeded,
     InvalidReplacement { offset: usize, reason: &'static str },
 }
 
@@ -77,6 +95,7 @@ impl std::fmt::Display for RegexError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidPattern => f.write_str("invalid regex pattern"),
+            Self::BudgetExceeded => f.write_str("regex execution budget exceeded"),
             Self::InvalidReplacement { offset, reason } => {
                 write!(f, "invalid replacement at byte {offset}: {reason}")
             }
@@ -173,9 +192,7 @@ fn checked_replace(
     replacement: &str,
     first: bool,
 ) -> Result<String, RegexError> {
-    // Parse only after an actual match. The dependency's Replacer is infallible:
-    // after an error we finish its scan but discard the entire candidate output.
-    // This does not introduce or claim an interruptible regex execution budget.
+    // Parse only after an actual match; discard all output on replacement or budget errors.
     let mut plan = None;
     let mut expand = |matched: &MatchInfo| {
         let plan = plan.get_or_insert_with(|| parse_replacement(replacement, regex));
@@ -194,10 +211,11 @@ fn checked_replace(
         output
     };
     let output = if first {
-        regex.replace_first(input, &mut expand)
+        regex.try_replace_first(input, &mut expand)
     } else {
-        regex.replace_all(input, &mut expand)
-    };
+        regex.try_replace_all(input, &mut expand)
+    }
+    .map_err(|_| RegexError::BudgetExceeded)?;
     match plan {
         Some(Err(error)) => Err(error),
         _ => Ok(output),
@@ -219,7 +237,12 @@ pub(crate) fn replace_first_match(
     replacement: &str,
 ) -> Result<Option<String>, RegexError> {
     let regex = get_cached_regex(pattern).ok_or(RegexError::InvalidPattern)?;
-    let Some(found) = regex.find_iter(input).next() else {
+    let mut matches = regex.find_iter(input);
+    let found = matches.next();
+    if matches.budget_exhausted() {
+        return Err(RegexError::BudgetExceeded);
+    }
+    let Some(found) = found else {
         return Ok(None);
     };
 
@@ -308,6 +331,29 @@ mod tests {
             replace_first_match("x12y34", r"(\d+)", "$99"),
             Err(RegexError::InvalidReplacement { .. })
         ));
+    }
+
+    #[test]
+    fn budget_exhaustion_discards_partial_scans_and_replacements() {
+        let input = format!("{}!", "a".repeat(16)).repeat(12);
+        let pattern = "(a+)+b|.";
+        let regex = get_cached_regex(pattern).unwrap();
+        assert!(matches!(
+            collect_matches(&regex, &input),
+            Err(RegexError::BudgetExceeded)
+        ));
+        assert_eq!(find_all(pattern, &input), None);
+        assert_eq!(captures_all(pattern, &input), None);
+        assert_eq!(
+            replace_all(&input, pattern, "X"),
+            Err(RegexError::BudgetExceeded)
+        );
+        assert_eq!(
+            replace_first_match(&"a".repeat(20), "(a+)+b|.", "X"),
+            Err(RegexError::BudgetExceeded)
+        );
+        // Budgets belong to each scan, not the cached compiled pattern.
+        assert_eq!(find_all(pattern, "ok"), Some(vec!["o".into(), "k".into()]));
     }
 
     #[test]
