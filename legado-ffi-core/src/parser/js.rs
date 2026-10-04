@@ -16,6 +16,7 @@ use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvI
 use chrono::{FixedOffset, Local, TimeZone};
 use once_cell::sync::Lazy;
 use ring::{digest, hmac};
+use rquickjs::context::EvalOptions;
 use rquickjs::function::Func;
 use rquickjs::{Context, Object, Runtime, Value};
 use serde::{Deserialize, Serialize};
@@ -3823,38 +3824,22 @@ fn java_symmetric_crypto(
     serde_json::to_string(&output).ok()
 }
 
-// 修复：sloppy 全局模式（见下）
+// Legado rules commonly assign undeclared globals, so evaluate them as sloppy
+// global scripts rather than modules/strict scripts.
 fn eval_script<'js>(ctx: rquickjs::Ctx<'js>, script: &str) -> anyhow::Result<Value<'js>> {
-    use std::ffi::CString;
-    // Legado 规则普遍使用隐式全局变量（如 `time=...;t=...` 不带 var 声明），
-    // 必须用 sloppy（JS_EVAL_TYPE_GLOBAL=0）模式求值；module/strict 模式会抛
-    // ReferenceError，导致规则走 catch 降级分支（如 qmbook 目录 URL 退化为
-    // 无签名 COS 地址而 403）。
-    // 注：rquickjs 的 EvalOptions 为 #[non_exhaustive] 且 Ctx::eval 默认 Module
-    // （strict）模式，无法在外部构造/修改，故直接调用 qjs::JS_Eval 显式指定
-    // JS_EVAL_TYPE_GLOBAL。
-    let src = CString::new(script)?;
-    let file_name = c"eval_script";
-    let val = unsafe {
-        rquickjs::qjs::JS_Eval(
-            ctx.as_raw().as_ptr(),
-            src.as_ptr(),
-            src.as_bytes().len() as _,
-            file_name.as_ptr(),
-            rquickjs::qjs::JS_EVAL_TYPE_GLOBAL as i32,
-        )
-    };
-    // 与 rquickjs Ctx::handle_exception 等价：JS_TAG_EXCEPTION 时取异常信息
-    unsafe {
-        if rquickjs::qjs::JS_VALUE_GET_NORM_TAG(val) != rquickjs::qjs::JS_TAG_EXCEPTION {
-            let v = Value::from_raw(ctx.clone(), val);
-            return Ok(v);
+    let mut options = EvalOptions::default();
+    options.global = true;
+    options.strict = false;
+    match ctx.eval_with_options::<Value, _>(script, options) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if let Some(exception) = ctx.catch().into_exception() {
+                Err(anyhow::anyhow!("JS Exception: {:?}", exception))
+            } else {
+                Err(anyhow::anyhow!("JS eval error: {error:?}"))
+            }
         }
     }
-    if let Some(exception) = ctx.catch().into_exception() {
-        return Err(anyhow::anyhow!("JS Exception: {:?}", exception));
-    }
-    Err(anyhow::anyhow!("JS Exception"))
 }
 
 fn active_js_lib_script() -> anyhow::Result<String> {

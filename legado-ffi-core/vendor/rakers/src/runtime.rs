@@ -416,19 +416,31 @@ mod quickjs_rt {
     use rquickjs::{
         Context, Ctx, Function, Module, Object, Runtime, Value,
         context::EvalOptions,
-        loader::{Loader, Resolver},
+        loader::{ImportAttributes, Loader, Resolver},
+        module::Declared,
     };
 
     struct StubModuleSystem;
 
     impl Resolver for StubModuleSystem {
-        fn resolve(&mut self, _ctx: &Ctx<'_>, _base: &str, name: &str) -> rquickjs::Result<String> {
+        fn resolve<'js>(
+            &mut self,
+            _ctx: &Ctx<'js>,
+            _base: &str,
+            name: &str,
+            _attributes: Option<ImportAttributes<'js>>,
+        ) -> rquickjs::Result<String> {
             Ok(name.to_string())
         }
     }
 
     impl Loader for StubModuleSystem {
-        fn load<'js>(&mut self, ctx: &Ctx<'js>, name: &str) -> rquickjs::Result<Module<'js>> {
+        fn load<'js>(
+            &mut self,
+            ctx: &Ctx<'js>,
+            name: &str,
+            _attributes: Option<ImportAttributes<'js>>,
+        ) -> rquickjs::Result<Module<'js, Declared>> {
             Module::declare(ctx.clone(), name, "export default {};")
         }
     }
@@ -470,20 +482,26 @@ mod quickjs_rt {
         set_deadline(None);
     }
 
-    // rquickjs 0.8 has a known interrupt-handler hazard inside pending jobs, so
-    // promise/microtask work is bounded cooperatively between jobs.
-    fn drain_pending_jobs(ctx: &Ctx<'_>, render_deadline: Option<Instant>) -> bool {
+    // Pending jobs execute while Context::with holds the runtime lock, so use
+    // Ctx directly. rquickjs 0.12 fixes interrupt handling during pending jobs,
+    // allowing Promise callbacks to share the same deadline as their parent task.
+    fn drain_pending_jobs(ctx: &Ctx<'_>, deadline: Option<Instant>) -> bool {
         let mut had_jobs = false;
         let mut jobs = 0usize;
-        while ctx.execute_pending_job() {
+        set_deadline(deadline);
+        while jobs < 2_000
+            && !deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            && ctx.execute_pending_job()
+        {
             had_jobs = true;
             jobs += 1;
-            if jobs >= 2_000
-                || render_deadline.is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                break;
-            }
         }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            // Clear a timeout exception left by an interrupted Promise job so the
+            // next page script starts with a clean exception state.
+            let _ = ctx.catch();
+        }
+        clear_deadline();
         had_jobs
     }
 
@@ -551,9 +569,10 @@ mod quickjs_rt {
                 setup_http_bridge(&ctx)?;
 
                 let sloppy = || {
-                    let mut o = EvalOptions::default();
-                    o.strict = false;
-                    o
+                    let mut options = EvalOptions::default();
+                    options.global = true;
+                    options.strict = false;
+                    options
                 };
 
                 let render_deadline = budget.deadline();
@@ -567,7 +586,8 @@ mod quickjs_rt {
                     if render_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         break;
                     }
-                    set_deadline(bounded_deadline(self.timeout, render_deadline));
+                    let task_deadline = bounded_deadline(self.timeout, render_deadline);
+                    set_deadline(task_deadline);
                     let result = ctx.eval_with_options::<Value, _>(script.as_str(), sloppy());
                     if result.is_err() {
                         let exc = ctx.catch();
@@ -582,7 +602,7 @@ mod quickjs_rt {
                         }
                     }
                     clear_deadline();
-                    drain_pending_jobs(&ctx, render_deadline);
+                    drain_pending_jobs(&ctx, task_deadline);
                 }
 
                 // Initial scripts have finished: fire the minimal browser lifecycle,
@@ -591,10 +611,11 @@ mod quickjs_rt {
                     if render_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         break;
                     }
-                    set_deadline(bounded_deadline(self.timeout, render_deadline));
+                    let task_deadline = bounded_deadline(self.timeout, render_deadline);
+                    set_deadline(task_deadline);
                     let _ = ctx.eval_with_options::<Value, _>(lifecycle, sloppy());
                     clear_deadline();
-                    drain_pending_jobs(&ctx, render_deadline);
+                    drain_pending_jobs(&ctx, task_deadline);
                 }
 
                 // Alternate one virtual timer deadline with QuickJS's native job queue.
@@ -604,14 +625,15 @@ mod quickjs_rt {
                     if render_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         break;
                     }
-                    set_deadline(bounded_deadline(self.timeout, render_deadline));
+                    let task_deadline = bounded_deadline(self.timeout, render_deadline);
+                    set_deadline(task_deadline);
                     let fired: i32 = ctx
                         .eval_with_options::<Value, _>(super::TIMER_PUMP_JS, sloppy())
                         .ok()
                         .and_then(|v| v.as_int())
                         .unwrap_or(0);
                     clear_deadline();
-                    let had_jobs = drain_pending_jobs(&ctx, render_deadline);
+                    let had_jobs = drain_pending_jobs(&ctx, task_deadline);
                     if fired == 0 && !had_jobs {
                         break;
                     }

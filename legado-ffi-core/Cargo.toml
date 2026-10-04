@@ -41,10 +41,10 @@ safer-ffi = { version = "0.1", features = ["headers"] }
 flate2 = "1.0"
 
 [target.'cfg(any(all(target_arch = "aarch64", target_os = "linux"), all(target_arch = "arm", target_os = "linux"), target_os = "android"))'.dependencies]
-rquickjs = { version = "0.8", features = ["bindgen"] }
+rquickjs = { version = "=0.12.0", default-features = false, features = ["std", "bindgen"] }
 
 [target.'cfg(not(any(all(target_arch = "aarch64", target_os = "linux"), all(target_arch = "arm", target_os = "linux"), target_os = "android")))'.dependencies]
-rquickjs = { version = "0.8" }
+rquickjs = { version = "=0.12.0", default-features = false, features = ["std"] }
 
 [profile.release]
 opt-level = "z"

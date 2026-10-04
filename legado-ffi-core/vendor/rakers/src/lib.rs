@@ -1061,6 +1061,29 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(feature = "rquickjs"), ignore = "boa has no interrupt handler")]
+    fn promise_callback_timeout_is_non_fatal() {
+        // Pending Promise jobs must obey the same interrupt deadline as scripts.
+        let rt = runtime::JsRuntime::with_timeout(std::time::Duration::from_millis(100));
+        let cfg = HttpConfig::default();
+        let budget = RequestBudget::new(&cfg);
+        rt.execute(
+            &[
+                "Promise.resolve().then(function(){ while(true){} });".to_owned(),
+                "document.write('<p>survived-job</p>');".to_owned(),
+            ],
+            None,
+            &cfg,
+            &budget,
+        )
+        .unwrap();
+        assert!(
+            runtime::JsRuntime::written_html().contains("<p>survived-job</p>"),
+            "second script must run after a pending job is interrupted"
+        );
+    }
+
+    #[test]
     fn to_json_fields() {
         let out = to_json(100, "<h1>hi</h1>");
         assert!(out.contains("\"raw_bytes\": 100"), "raw_bytes field");

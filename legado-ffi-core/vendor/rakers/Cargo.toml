@@ -90,7 +90,7 @@ version = "0.39"
 version = "0.39.0+unofficial"
 
 [dependencies.rquickjs]
-version = "0.8"
+version = "=0.12.0"
 default-features = false
 features = ["loader"]
 optional = true
