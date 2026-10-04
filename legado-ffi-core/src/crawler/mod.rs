@@ -833,10 +833,11 @@ fn compile_url_request(
         retry,
         proxy,
         response_type,
-        render_with_rakers: options
-            .get("webView")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        render_with_rakers: match options.get("webView") {
+            None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+            Some(Value::String(value)) => !matches!(value.as_str(), "" | "false"),
+            Some(_) => true,
+        },
         body_js,
     })
 }
@@ -1847,6 +1848,47 @@ mod tests {
             matches!(session.fetch(&bad_spec, 1024), Err(FetchError::Rule(message)) if message.contains("bodyJs") && message.contains("boom"))
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn webview_option_follows_android_value_contract() {
+        let base = "https://webview-value.test";
+        let source = BookSource {
+            book_source_url: base.into(),
+            ..Default::default()
+        };
+        assert!(
+            !analyze_url("/page", "", 1, base, &source)
+                .unwrap()
+                .render_with_rakers
+        );
+        for (value, expected) in [
+            (serde_json::json!(null), false),
+            (serde_json::json!(false), false),
+            (serde_json::json!(""), false),
+            (serde_json::json!("false"), false),
+            (serde_json::json!(true), true),
+            (serde_json::json!("true"), true),
+            (serde_json::json!(0), true),
+            (serde_json::json!(1), true),
+            (serde_json::json!(-1), true),
+            (serde_json::json!("FALSE"), true),
+            (serde_json::json!(" false "), true),
+            (serde_json::json!([]), true),
+            (serde_json::json!({}), true),
+        ] {
+            let rule = format!(
+                "/page,{}",
+                serde_json::json!({"webView":value,"headers":{"X-Test":"keep"}})
+            );
+            let spec = analyze_url(&rule, "", 1, base, &source).unwrap();
+            assert_eq!(spec.render_with_rakers, expected, "webView={value}");
+            assert_eq!(spec.url, format!("{base}/page"));
+            assert!(spec
+                .headers
+                .iter()
+                .any(|(name, value)| name == "X-Test" && value == "keep"));
+        }
     }
 
     #[test]
