@@ -4330,7 +4330,7 @@ fn substitute_capture_values(rule: &str, captures: &[Option<String>]) -> String 
 fn finalize_chapter_url(
     base_url: &str,
     raw_url: &str,
-    title: &str,
+    _title: &str,
     is_volume: bool,
     index: usize,
 ) -> String {
@@ -4338,7 +4338,8 @@ fn finalize_chapter_url(
         return resolve_url(base_url, raw_url);
     }
     if is_volume {
-        return format!("{}{}", title, index);
+        // A non-network identity scoped to the page and original item position.
+        return format!("legado-volume:{}", json!([base_url, index]));
     }
     base_url.to_string()
 }

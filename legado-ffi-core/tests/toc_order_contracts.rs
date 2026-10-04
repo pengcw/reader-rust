@@ -14,7 +14,8 @@ fn page(items: &[(u32, &str)], next: &str) -> Value {
 
 fn source(base: &str, prefix: &str) -> Value {
     json!({"bookSourceUrl": base, "bookSourceName": "TOC order fixture",
-        "ruleToc": {"chapterList": format!("{prefix}$.chapters[*]"), "chapterName": "$.title", "chapterUrl": "$.url", "nextTocUrl": "$.next"}})
+        "ruleToc": {"chapterList": format!("{prefix}$.chapters[*]"), "chapterName": "$.title", "chapterUrl": "$.url", "nextTocUrl": "$.next",
+            "isVolume": "$.isVolume", "isVip": "$.isVip", "isPay": "$.isPay", "updateTime": "$.tag"}})
 }
 
 fn run(prefix: &str, pages: Vec<Value>) -> Value {
@@ -32,6 +33,11 @@ fn run_with_context(
     js_lib: Option<&str>,
     book: Value,
 ) -> Value {
+    let page_count = pages.len();
+    let truncated = pages
+        .last()
+        .and_then(|page| page["next"].as_str())
+        .is_some_and(|next| !next.is_empty());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -79,14 +85,18 @@ fn run_with_context(
     }
     let result: Value = serde_json::from_str(&execute(
         &source.to_string(),
-        &json!({"api": 2, "op": "toc", "params": {"url": format!("{base}/toc/1"), "book": book}})
-            .to_string(),
+        &json!({"api": 2, "op": "toc", "params": {"url": format!("{base}/toc/1"), "book": book},
+            "options": {"maxPages": page_count}})
+        .to_string(),
     ))
     .unwrap();
     assert_eq!(result["ok"], true, "{result}");
-    assert_eq!(server.join().unwrap(), ["/toc/1", "/toc/2"]);
-    assert_eq!(result["data"]["pages"], 2);
-    assert_eq!(result["data"]["truncated"], false);
+    let expected_paths: Vec<_> = (1..=page_count)
+        .map(|index| format!("/toc/{index}"))
+        .collect();
+    assert_eq!(server.join().unwrap(), expected_paths);
+    assert_eq!(result["data"]["pages"], page_count);
+    assert_eq!(result["data"]["truncated"], truncated);
     for (index, chapter) in result["data"]["chapters"]
         .as_array()
         .unwrap()
@@ -270,4 +280,147 @@ fn single_page_parser_keeps_its_existing_reverse_contract() {
             .collect::<Vec<_>>(),
         [0, 1]
     );
+}
+
+fn volume_page(tag: &str, next: &str, linked: bool) -> Value {
+    json!({"chapters": [
+        {"title":"同名卷", "url":if linked {"/volume/1"} else {""}, "isVolume":true,
+            "isVip":true, "isPay":true, "tag":tag, "variable":json!({"page":tag}).to_string()},
+        {"title":format!("章节{tag}"), "url":format!("/chapter/{tag}")}
+    ], "next":next})
+}
+
+#[test]
+fn unlinked_volumes_on_different_pages_keep_both_identities_and_metadata() {
+    for prefix in ["", "-"] {
+        let chapters = run(
+            prefix,
+            vec![
+                volume_page("one", "/toc/2", false),
+                volume_page("two", "", false),
+            ],
+        );
+        assert_eq!(chapters.as_array().unwrap().len(), 4);
+        let volumes: Vec<&Value> = chapters
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|chapter| chapter["isVolume"] == true)
+            .collect();
+        assert_eq!(volumes.len(), 2);
+        assert_ne!(volumes[0]["url"], volumes[1]["url"]);
+        let expected = if prefix.is_empty() {
+            ["one", "two"]
+        } else {
+            ["two", "one"]
+        };
+        for (volume, page) in volumes.iter().zip(expected) {
+            assert!(volume["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("legado-volume:"));
+            assert_eq!(volume["tag"], page);
+            assert_eq!(volume["isVip"], true);
+            assert_eq!(volume["isPay"], true);
+            let variable: Value =
+                serde_json::from_str(volume["variable"].as_str().unwrap()).unwrap();
+            assert_eq!(variable["page"], page);
+        }
+    }
+}
+
+#[test]
+fn linked_volumes_still_dedupe_by_real_url_and_keep_last_metadata() {
+    let chapters = run(
+        "",
+        vec![
+            volume_page("one", "/toc/2", true),
+            volume_page("two", "", true),
+        ],
+    );
+    assert_eq!(titles(&chapters), ["章节one", "同名卷", "章节two"]);
+    assert_eq!(chapters[1]["tag"], "two");
+    assert!(chapters[1]["url"].as_str().unwrap().ends_with("/volume/1"));
+    assert!(chapters[1]["url"].as_str().unwrap().starts_with("http://"));
+}
+
+#[test]
+fn volume_identity_does_not_depend_on_title_formatting_or_final_order() {
+    let chapters = run_with_format(
+        "-",
+        vec![
+            volume_page("one", "/toc/2", false),
+            volume_page("two", "", false),
+        ],
+        Some("`${index}:${title}`"),
+    );
+    assert_eq!(
+        titles(&chapters),
+        ["1:章节two", "2:同名卷", "3:章节one", "4:同名卷"]
+    );
+    let second_page: Value = serde_json::from_str(
+        chapters[1]["url"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("legado-volume:")
+            .unwrap(),
+    )
+    .unwrap();
+    let first_page: Value = serde_json::from_str(
+        chapters[3]["url"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("legado-volume:")
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(second_page[0].as_str().unwrap().ends_with("/toc/2"));
+    assert!(first_page[0].as_str().unwrap().ends_with("/toc/1"));
+    assert_eq!(second_page[1], 0);
+    assert_eq!(first_page[1], 0);
+}
+
+#[test]
+fn single_page_volume_identity_is_stable_and_scoped_to_page_and_position() {
+    let source: BookSource = serde_json::from_value(source("https://volume.test/", "")).unwrap();
+    let engine = RuleEngine::new().unwrap();
+    let mut body = volume_page("one", "", false);
+    let volume = body["chapters"][0].clone();
+    body["chapters"].as_array_mut().unwrap().push(volume);
+    let parse = |base| engine.chapter_list(&source, &body.to_string(), base).0;
+    let first = parse("https://volume.test/toc?page=1");
+    let repeat = parse("https://volume.test/toc?page=1");
+    let other = parse("https://volume.test/toc?page=2");
+    assert_eq!(first.len(), 3);
+    assert_eq!(first[0].url, repeat[0].url);
+    assert_ne!(first[0].url, first[2].url);
+    assert_ne!(first[0].url, other[0].url);
+    assert_eq!(first[1].url, "https://volume.test/chapter/one");
+}
+
+#[test]
+fn repeated_toc_content_is_bounded_by_the_shared_page_budget() {
+    let chapters = run(
+        "",
+        vec![
+            page(&[(1, "One"), (2, "Two")], "/toc/2"),
+            page(&[(1, "One"), (2, "Two")], "/toc/3"),
+            page(&[(1, "One"), (2, "Two")], "/toc/4"),
+        ],
+    );
+    // Fixture asserts exactly three requests and truncated=true; no fourth request.
+    assert_eq!(titles(&chapters), ["One", "Two"]);
+}
+
+#[test]
+fn a_duplicate_middle_page_must_not_hide_later_unique_chapters() {
+    let chapters = run(
+        "",
+        vec![
+            page(&[(1, "One"), (2, "Two")], "/toc/2"),
+            page(&[(1, "One"), (2, "Two")], "/toc/3"),
+            page(&[(3, "Three")], ""),
+        ],
+    );
+    assert_eq!(titles(&chapters), ["One", "Two", "Three"]);
 }
