@@ -1145,36 +1145,8 @@ fn execute_content(
     let is_volume = input_chapter_is_volume(params);
     let replace_rules = parse_replace_rules(params.get("replaceRules"))?;
 
-    if uses_js_ajax_content_rule(source)
-        && !strip_url_options(&initial_url).trim().starts_with("data:")
-    {
-        let page = engine.content_first_page_with_context(
-            source,
-            "",
-            &initial_url,
-            book_variable.as_deref(),
-            chapter_variable.as_deref(),
-            book_name.as_deref(),
-            chapter_title.as_deref(),
-            Some(&book_fields),
-            true,
-        );
-        let content = apply_replace_rules(&page.content, &replace_rules);
-        if content.is_empty() && !is_volume {
-            return Err(ExecuteError::parse("content is empty"));
-        }
-        let mut data = json!({"content": content});
-        if let Some(variable) = page.book_variable {
-            data["bookVariable"] = json!(variable);
-        }
-        if let Some(variable) = page.chapter_variable {
-            data["variable"] = json!(variable);
-        }
-        if let Some(title) = page.title {
-            data["title"] = json!(title);
-        }
-        return Ok(success_without_http(data));
-    }
+    let self_fetch = uses_js_ajax_content_rule(source)
+        && !strip_url_options(&initial_url).trim().starts_with("data:");
 
     // Source replaceRegex is applied once after all content fragments are joined.
     let mut page_source = source.clone();
@@ -1187,6 +1159,7 @@ fn execute_content(
     let mut initial_response_url = None;
     let mut first_page = None;
     let mut final_response = None;
+    let mut final_url = initial_url.clone();
     let mut title = None;
     let mut sub_requests = 0;
     let text_book = params
@@ -1205,36 +1178,45 @@ fn execute_content(
             truncated = true;
             break;
         }
-        let mut request_context = url_rule_context_with_fields(
-            book_variable.as_deref(),
-            chapter_variable.as_deref(),
-            book_name.as_deref(),
-            chapter_title.as_deref(),
-            Some(&book_fields),
-        );
-        request_context.chapter_fields = input_chapter_fields(params, &initial_url);
-        let response = fetch_rule_with_context(
-            session,
-            source,
-            &current_url,
-            "",
-            1,
-            &source.book_source_url,
-            options,
-            Some(&request_context),
-        )?;
+        let response = if self_fetch {
+            None
+        } else {
+            let mut request_context = url_rule_context_with_fields(
+                book_variable.as_deref(),
+                chapter_variable.as_deref(),
+                book_name.as_deref(),
+                chapter_title.as_deref(),
+                Some(&book_fields),
+            );
+            request_context.chapter_fields = input_chapter_fields(params, &initial_url);
+            Some(fetch_rule_with_context(
+                session,
+                source,
+                &current_url,
+                "",
+                1,
+                &source.book_source_url,
+                options,
+                Some(&request_context),
+            )?)
+        };
+        let body = response
+            .as_ref()
+            .map_or("", |response| response.body.as_str());
+        let response_url = response
+            .as_ref()
+            .map_or_else(|| current_url.clone(), |response| response.url.clone());
         visited_urls.insert(current_url.clone());
         let is_first_page = first_page.is_none();
         if is_first_page {
-            first_page = Some((response.body.clone(), response.url.clone()));
+            first_page = Some((body.to_string(), response_url.clone()));
         }
-        let response_url = response.url.clone();
         let chapter_url = initial_response_url.get_or_insert_with(|| response_url.clone());
         let page = if is_first_page {
             engine.content_first_page_with_context(
                 &page_source,
-                &response.body,
-                &response.url,
+                body,
+                &response_url,
                 book_variable.as_deref(),
                 chapter_variable.as_deref(),
                 book_name.as_deref(),
@@ -1245,8 +1227,8 @@ fn execute_content(
         } else {
             engine.content_page_with_context_follow(
                 &page_source,
-                &response.body,
-                &response.url,
+                body,
+                &response_url,
                 book_variable.as_deref(),
                 chapter_variable.as_deref(),
                 book_name.as_deref(),
@@ -1264,7 +1246,8 @@ fn execute_content(
         }
         book_variable = page.book_variable;
         chapter_variable = page.chapter_variable;
-        final_response = Some(response);
+        final_url = response_url.clone();
+        final_response = response;
 
         let recursive = page.next_urls.len() == 1;
         for next_url in page.next_urls {
@@ -1283,9 +1266,10 @@ fn execute_content(
         }
     }
 
-    let response =
-        final_response.ok_or_else(|| ExecuteError::url_rule("content URL produced no request"))?;
-    if text_book {
+    if !self_fetch && final_response.is_none() {
+        return Err(ExecuteError::url_rule("content URL produced no request"));
+    }
+    if text_book && !self_fetch {
         if let Some((body, url)) = first_page.as_ref() {
             if let Some(sub_content) = engine.sub_content_with_context(
                 source,
@@ -1341,14 +1325,18 @@ fn execute_content(
     let content = engine.replace_content_with_context(
         source,
         &fragments.join("\n"),
-        &response.url,
+        &final_url,
         &replacement_context,
     );
     let content = apply_replace_rules(&content, &replace_rules);
     if content.is_empty() && !is_volume {
         return Err(ExecuteError::parse("content is empty"));
     }
-    let mut data = json!({"content": content, "pages": visited_urls.len() + sub_requests, "truncated": truncated});
+    let mut data = json!({"content": content});
+    if !self_fetch {
+        data["pages"] = json!(visited_urls.len() + sub_requests);
+        data["truncated"] = json!(truncated);
+    }
     if let Some(variable) = book_variable {
         data["bookVariable"] = json!(variable);
     }
@@ -1358,13 +1346,20 @@ fn execute_content(
     if let Some(title) = title {
         data["title"] = json!(title);
     }
-    Ok(success(
-        data,
-        visited_urls.len() + sub_requests,
-        truncated,
-        &response,
-        options,
-    ))
+    match final_response {
+        Some(response) => Ok(success(
+            data,
+            visited_urls.len() + sub_requests,
+            truncated,
+            &response,
+            options,
+        )),
+        None => {
+            let mut response = success_without_http(data);
+            response["meta"]["truncated"] = json!(truncated);
+            Ok(response)
+        }
+    }
 }
 
 fn execute_login_ui(source: &BookSource) -> ExecuteResult<Value> {
