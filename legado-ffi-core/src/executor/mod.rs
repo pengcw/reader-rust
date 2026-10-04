@@ -1437,14 +1437,7 @@ fn validate_login_response(
     let output = with_js_lib(source.js_lib.as_deref(), || {
         eval_js_with_bindings(script, "", &response.url, &bindings)
     })
-    .map_err(|error| {
-        auth_required_error(
-            source,
-            Some(response.status),
-            &response.url,
-            format!("loginCheckJs failed: {error}"),
-        )
-    })?;
+    .map_err(|error| ExecuteError::parse(format!("loginCheckJs failed: {error}")))?;
 
     let trimmed = output.trim();
     if trimmed.eq_ignore_ascii_case("false") || login_check_failed_text(trimmed) {
@@ -1459,14 +1452,11 @@ fn validate_login_response(
         return Ok(response);
     }
 
-    let value = serde_json::from_str::<Value>(&output).map_err(|_| {
-        auth_required_error(
-            source,
-            Some(response.status),
-            &response.url,
-            "loginCheckJs must return a StrResponse".to_string(),
-        )
-    })?;
+    let value = serde_json::from_str::<Value>(&output)
+        .map_err(|_| ExecuteError::parse("loginCheckJs must return a StrResponse"))?;
+    if !value.is_object() {
+        return Err(ExecuteError::parse("loginCheckJs must return a StrResponse"));
+    }
     response_from_login_check(value, response).ok_or_else(|| {
         auth_required_error(
             source,
