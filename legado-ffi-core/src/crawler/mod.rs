@@ -799,6 +799,31 @@ fn compile_url_request(
         charset.as_deref(),
     );
 
+    // AnalyzeUrl sends stored cookies even when automatic response storage is off.
+    // Direct java.get/post bypass this compiler and retain their explicit-header policy.
+    if source.enabled_cookie_jar == Some(false) {
+        if let Some(stored) = current_active_session().and_then(|active| active.get_cookie(&url)) {
+            let explicit = headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+                .map(|(_, value)| value.as_str());
+            let pairs: HashMap<_, _> = std::iter::once(stored.as_str())
+                .chain(explicit)
+                .flat_map(|cookie| cookie.split(';'))
+                .filter_map(|pair| pair.trim().split_once('='))
+                .map(|(name, value)| (name.trim(), value.trim()))
+                .filter(|(name, _)| !name.is_empty())
+                .collect();
+            let cookie = pairs
+                .into_iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            headers.retain(|(name, _)| !name.eq_ignore_ascii_case("cookie"));
+            headers.push(("Cookie".to_string(), cookie));
+        }
+    }
+
     Ok(RequestSpec {
         url: encode_get_query(&url, charset.as_deref()),
         method,
