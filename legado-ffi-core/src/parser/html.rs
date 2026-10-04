@@ -208,13 +208,10 @@ fn normalize_jsoup_eq(selector: &str) -> Option<String> {
                     .find(|kind| selector[index..].starts_with(&format!(":{kind}(")));
                 if let Some(kind) = kind {
                     let start = index + kind.len() + 2;
-                    let end = start
-                        + selector[start..]
-                            .bytes()
-                            .take_while(u8::is_ascii_digit)
-                            .count();
-                    if end > start && selector[end..].starts_with(')') {
-                        let index_value = selector[start..end].parse::<usize>().ok()?;
+                    let close = start + selector[start..].find(')')?;
+                    let arg = selector[start..close].trim();
+                    if !arg.is_empty() && arg.bytes().all(|b| b.is_ascii_digit()) {
+                        let index_value = arg.parse::<usize>().ok()?;
                         let css = match kind {
                             "eq" => format!(":nth-child({})", index_value.checked_add(1)?),
                             "lt" => format!(":nth-child(-n+{index_value})"),
@@ -223,7 +220,7 @@ fn normalize_jsoup_eq(selector: &str) -> Option<String> {
                         };
                         output.push_str(&selector[cursor..index]);
                         output.push_str(&css);
-                        cursor = end + 1;
+                        cursor = close + 1;
                     }
                 }
             }
@@ -275,9 +272,8 @@ fn split_jsoup_matches(selector: &str) -> Option<(&str, &str, &str, bool)> {
                 } else {
                     continue;
                 };
-                if selector[..index].trim().is_empty() {
-                    return None;
-                }
+                let prefix = selector[..index].trim();
+                let prefix = if prefix.is_empty() { "*" } else { prefix };
                 let mut depth = 1usize;
                 let mut in_class = false;
                 let mut quoted_literal = false;
@@ -309,7 +305,7 @@ fn split_jsoup_matches(selector: &str) -> Option<(&str, &str, &str, bool)> {
                             if depth == 0 {
                                 let end = start + offset;
                                 return Some((
-                                    &selector[..index],
+                                    prefix,
                                     &selector[start..end],
                                     &selector[end + 1..],
                                     own,
@@ -335,7 +331,8 @@ fn matches_suffix_valid(suffix: &str) -> bool {
     if let Some(rest) = trimmed.strip_prefix(['+', '~']) {
         let (sibling, descendant) = split_contains_sibling(rest);
         return parse_css_selector(sibling).is_some()
-            && (descendant.is_empty() || parse_css_selector(descendant).is_some());
+            && (descendant.is_empty()
+                || parse_css_selector(&scope_child_selector(descendant)).is_some());
     }
     suffix.chars().next().is_some_and(char::is_whitespace)
         && !trimmed.starts_with('>')
@@ -403,9 +400,9 @@ fn select_css_with_matches<'a>(
     )
 }
 
-// Keep the text predicate attached to the element before a descendant or +
+// Keep the text predicate attached to the element before a descendant or +/~
 // combinator. Filtering the final selector results would inspect the wrong node.
-fn split_jsoup_contains(selector: &str) -> Option<(&str, &str, &str)> {
+fn split_jsoup_contains(selector: &str) -> Option<(&str, &str, &str, bool)> {
     let mut quote = None;
     let mut bracket_depth = 0usize;
     let mut escaped = false;
@@ -428,14 +425,52 @@ fn split_jsoup_contains(selector: &str) -> Option<(&str, &str, &str)> {
             '\'' | '"' => quote = Some(ch),
             '[' => bracket_depth += 1,
             ']' => bracket_depth = bracket_depth.saturating_sub(1),
-            ':' if bracket_depth == 0 && selector[index..].starts_with(":contains(") => {
-                let start = index + ":contains(".len();
-                let end = selector[start..].find(')')? + start;
+            ':' if bracket_depth == 0 => {
+                let (start, own) = if selector[index..].starts_with(":containsOwn(") {
+                    (index + ":containsOwn(".len(), true)
+                } else if selector[index..].starts_with(":contains(") {
+                    (index + ":contains(".len(), false)
+                } else {
+                    continue;
+                };
+                let mut depth = 1usize;
+                let mut escaped = false;
+                let mut quote = None;
+                let end = selector[start..].char_indices().find_map(|(offset, ch)| {
+                    if escaped {
+                        escaped = false;
+                        return None;
+                    }
+                    if ch == '\\' {
+                        escaped = true;
+                        return None;
+                    }
+                    if let Some(active) = quote {
+                        if ch == active {
+                            quote = None;
+                        }
+                        return None;
+                    }
+                    match ch {
+                        '\'' | '"' => quote = Some(ch),
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return Some(start + offset);
+                            }
+                        }
+                        _ => {}
+                    }
+                    None
+                })?;
                 let needle = selector[start..end].trim().trim_matches(['\'', '"']);
-                if needle.is_empty() || selector[..index].trim().is_empty() {
+                if needle.is_empty() {
                     return None;
                 }
-                return Some((&selector[..index], needle, &selector[end + 1..]));
+                let prefix = selector[..index].trim();
+                let prefix = if prefix.is_empty() { "*" } else { prefix };
+                return Some((prefix, needle, &selector[end + 1..], own));
             }
             _ => {}
         }
@@ -447,19 +482,31 @@ fn contains_suffix_valid(suffix: &str) -> bool {
     if suffix.is_empty() {
         return true;
     }
-    let descendant = suffix.chars().next().is_some_and(char::is_whitespace);
-    let suffix = suffix.trim();
-    if let Some(rest) = suffix.strip_prefix('+') {
+    let trimmed = suffix.trim();
+    if let Some(rest) = trimmed.strip_prefix(['+', '~']) {
         let (sibling, descendant) = split_contains_sibling(rest);
         return parse_css_selector(sibling).is_some()
-            && (descendant.is_empty() || parse_css_selector(descendant).is_some());
+            && (descendant.is_empty()
+                || parse_css_selector(&scope_child_selector(descendant)).is_some());
     }
-    descendant && !suffix.starts_with(['>', '~']) && parse_css_selector(suffix).is_some()
+    suffix.chars().next().is_some_and(char::is_whitespace)
+        && !trimmed.starts_with('>')
+        && parse_css_selector(trimmed).is_some()
+}
+
+fn scope_child_selector(selector: &str) -> std::borrow::Cow<'_, str> {
+    let selector = selector.trim();
+    if selector.starts_with('>') {
+        std::borrow::Cow::Owned(format!(":scope {selector}"))
+    } else {
+        std::borrow::Cow::Borrowed(selector)
+    }
 }
 
 fn split_contains_sibling(suffix: &str) -> (&str, &str) {
     let suffix = suffix.trim();
-    let end = suffix.find(char::is_whitespace).unwrap_or(suffix.len());
+    let split = split_top_level(suffix, &[" ", "\t", "\n", "\r", "\x0c", ">", "+", "~"]);
+    let end = split.parts.first().map_or(0, String::len);
     (&suffix[..end], suffix[end..].trim())
 }
 
@@ -479,35 +526,72 @@ fn select_css_with_contains<'a>(
     selector: &str,
     select: impl Fn(&str) -> Vec<ElementRef<'a>>,
 ) -> Vec<ElementRef<'a>> {
-    let Some((prefix, needle, suffix)) = split_jsoup_contains(selector) else {
+    let Some((prefix, needle, suffix, own)) = split_jsoup_contains(selector) else {
         return select(selector);
     };
     if !contains_suffix_valid(suffix) {
         return Vec::new();
     }
+    // Jsoup TokenQueue.unescape removes escape markers, retaining doubled slashes.
+    let mut chars = needle.chars();
+    let mut unescaped = String::with_capacity(needle.len());
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(next) = chars.next() {
+                unescaped.push(next);
+            }
+        } else {
+            unescaped.push(ch);
+        }
+    }
+    let needle = unescaped.as_str();
     select(prefix)
         .into_iter()
-        .filter(|el| css_contains_text(el, needle))
+        .filter(|el| {
+            if own {
+                let text = own_text(el);
+                let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                normalized.to_lowercase().contains(
+                    &needle
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .to_lowercase(),
+                )
+            } else {
+                css_contains_text(el, needle)
+            }
+        })
         .flat_map(|el| {
             let suffix = suffix.trim();
             if suffix.is_empty() {
                 return vec![el];
             }
-            if let Some(rest) = suffix.strip_prefix('+') {
+            if let Some(rest) = suffix.strip_prefix(['+', '~']) {
+                let adjacent = suffix.starts_with('+');
                 let (sibling, descendant) = split_contains_sibling(rest);
-                let Some(next) = el.next_siblings().find_map(ElementRef::wrap) else {
-                    return Vec::new();
-                };
                 let Some(sel) = parse_css_selector(sibling) else {
                     return Vec::new();
                 };
-                if !sel.matches(&next) {
-                    return Vec::new();
-                }
+                let matches: Vec<_> = if adjacent {
+                    el.next_siblings()
+                        .find_map(ElementRef::wrap)
+                        .filter(|next| sel.matches(next))
+                        .into_iter()
+                        .collect()
+                } else {
+                    el.next_siblings()
+                        .filter_map(ElementRef::wrap)
+                        .filter(|next| sel.matches(next))
+                        .collect()
+                };
                 if descendant.is_empty() {
-                    return vec![next];
+                    return matches;
                 }
-                return select_css_from_element(next, descendant);
+                return matches
+                    .into_iter()
+                    .flat_map(|next| select_css_from_element(next, descendant))
+                    .collect();
             }
             select_css_from_element(el, suffix)
         })
@@ -555,14 +639,32 @@ pub(crate) fn css_rule_is_valid(rule: &str) -> bool {
                 .unwrap_or_default();
             match parse_selector_with_index(&selector).base {
                 SelectorBase::Css(css) => {
-                    if let Some((prefix, pattern, suffix, _)) = split_jsoup_matches(&css) {
+                    let groups = split_top_level(&css, &[","]);
+                    if groups.parts.len() > 1 {
+                        return groups
+                            .parts
+                            .iter()
+                            .all(|group| !group.trim().is_empty() && css_rule_is_valid(group));
+                    }
+                    if let Some((prefix, inner, _suffix)) = split_jsoup_has(&css) {
+                        parse_css_selector(prefix).is_some()
+                            && split_top_level(inner, &[","]).parts.iter().all(|branch| {
+                                let branch = branch.trim();
+                                let scoped = if branch.starts_with('>') {
+                                    format!(":scope {branch}")
+                                } else {
+                                    branch.to_owned()
+                                };
+                                !branch.is_empty() && css_rule_is_valid(&scoped)
+                            })
+                    } else if let Some((prefix, pattern, suffix, _)) = split_jsoup_matches(&css) {
                         parse_css_selector(prefix).is_some()
                             && crate::parser::source_regex::is_valid(pattern)
                             && matches_suffix_valid(suffix)
                     } else {
                         split_jsoup_contains(&css).map_or_else(
                             || parse_css_selector(&css).is_some(),
-                            |(prefix, _, suffix)| {
+                            |(prefix, _, suffix, _)| {
                                 parse_css_selector(prefix).is_some()
                                     && contains_suffix_valid(suffix)
                             },
@@ -703,7 +805,162 @@ fn unique_in_document_order<'a>(
         .collect()
 }
 
+fn split_jsoup_has(selector: &str) -> Option<(&str, &str, &str)> {
+    let mut quote = None;
+    let mut bracket_depth = 0usize;
+    let mut escaped = false;
+    for (index, ch) in selector.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active) = quote {
+            if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            ':' if bracket_depth == 0 && selector[index..].starts_with(":has(") => {
+                let start = index + ":has(".len();
+                let mut depth = 1usize;
+                let mut in_quote = None;
+                let mut end = None;
+                let mut escaped = false;
+                for (offset, ch) in selector[start..].char_indices() {
+                    if escaped {
+                        escaped = false;
+                        continue;
+                    }
+                    if ch == '\\' {
+                        escaped = true;
+                        continue;
+                    }
+                    if let Some(q) = in_quote {
+                        if ch == q {
+                            in_quote = None;
+                        }
+                        continue;
+                    }
+                    match ch {
+                        '\'' | '"' => in_quote = Some(ch),
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(start + offset);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let end = end?;
+                let inner = selector[start..end].trim();
+                if inner.is_empty() {
+                    return None;
+                }
+                let prefix = selector[..index].trim();
+                let prefix = if prefix.is_empty() { "*" } else { prefix };
+                return Some((prefix, inner, &selector[end + 1..]));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn has_condition_matches(el: ElementRef<'_>, inner: &str) -> bool {
+    let sub_selectors = split_top_level(inner, &[","]);
+    for sub in sub_selectors.parts {
+        let sub = sub.trim();
+        if sub.is_empty() {
+            continue;
+        }
+        if sub.starts_with('>') {
+            if !select_css_from_element(el, &format!(":scope {sub}")).is_empty() {
+                return true;
+            }
+        } else if !select_css_from_element(el, sub).is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
+fn select_css_with_has<'a>(
+    selector: &str,
+    select: impl Fn(&str) -> Vec<ElementRef<'a>>,
+) -> Option<Vec<ElementRef<'a>>> {
+    if parse_css_selector(selector).is_some() {
+        return None;
+    }
+    let (prefix, inner, suffix) = split_jsoup_has(selector)?;
+    let candidates = select(prefix);
+    let matched_candidates = candidates
+        .into_iter()
+        .filter(|el| has_condition_matches(*el, inner))
+        .collect::<Vec<_>>();
+    let suffix = suffix.trim();
+    if suffix.is_empty() {
+        return Some(matched_candidates);
+    }
+    let mut results = Vec::new();
+    for el in matched_candidates {
+        if let Some(rest) = suffix.strip_prefix(['+', '~']) {
+            let adjacent = suffix.starts_with('+');
+            let (sibling, descendant) = split_contains_sibling(rest);
+            let Some(sel) = parse_css_selector(sibling) else {
+                continue;
+            };
+            let matches: Vec<_> = if adjacent {
+                el.next_siblings()
+                    .find_map(ElementRef::wrap)
+                    .filter(|next| sel.matches(next))
+                    .into_iter()
+                    .collect()
+            } else {
+                el.next_siblings()
+                    .filter_map(ElementRef::wrap)
+                    .filter(|next| sel.matches(next))
+                    .collect()
+            };
+            if descendant.is_empty() {
+                results.extend(matches);
+            } else {
+                for next in matches {
+                    results.extend(select_css_from_element(next, descendant));
+                }
+            }
+        } else {
+            results.extend(select_css_from_element(el, suffix));
+        }
+    }
+    Some(results)
+}
+
 fn select_css<'a>(doc: &'a Html, css_selector: &str) -> Vec<ElementRef<'a>> {
+    let groups = split_top_level(css_selector, &[","]);
+    if groups.parts.len() > 1 {
+        let matches = groups
+            .parts
+            .iter()
+            .flat_map(|part| select_css(doc, part))
+            .collect();
+        let all = Selector::parse("*").expect("valid universal selector");
+        return unique_in_document_order(matches, doc.select(&all));
+    }
+    if let Some(matches) = select_css_with_has(css_selector, |part| select_css(doc, part)) {
+        let all = Selector::parse("*").expect("valid universal selector");
+        return unique_in_document_order(matches, doc.select(&all));
+    }
     if let Some(matches) = select_css_with_matches(css_selector, |part| {
         parse_css_selector(part)
             .map(|sel| doc.select(&sel).collect())
@@ -725,6 +982,24 @@ pub(crate) fn select_css_list<'a>(doc: &'a Html, css_selector: &str) -> Vec<Elem
 }
 
 fn select_css_from_element<'a>(el: ElementRef<'a>, css_selector: &str) -> Vec<ElementRef<'a>> {
+    let scoped = scope_child_selector(css_selector);
+    let css_selector = scoped.as_ref();
+    let groups = split_top_level(css_selector, &[","]);
+    if groups.parts.len() > 1 {
+        let matches = groups
+            .parts
+            .iter()
+            .flat_map(|part| select_css_from_element(el, part))
+            .collect();
+        let all = Selector::parse("*").expect("valid universal selector");
+        return unique_in_document_order(matches, el.select(&all));
+    }
+    if let Some(matches) =
+        select_css_with_has(css_selector, |part| select_css_from_element(el, part))
+    {
+        let all = Selector::parse("*").expect("valid universal selector");
+        return unique_in_document_order(matches, el.select(&all));
+    }
     if let Some(matches) = select_css_with_matches(css_selector, |part| {
         parse_css_selector(part)
             .map(|sel| el.select(&sel).collect())

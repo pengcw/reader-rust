@@ -61,15 +61,15 @@ fn find_next_delimiter<'a>(
     let mut escaped = false;
 
     for (idx, ch) in rule.char_indices().filter(|(idx, _)| *idx >= from) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
         if let Some(active_quote) = quote {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            if ch == '\\' {
-                escaped = true;
-                continue;
-            }
             if ch == active_quote {
                 quote = None;
             }
@@ -87,10 +87,6 @@ fn find_next_delimiter<'a>(
             ')' => paren_depth -= 1,
             '{' => brace_depth += 1,
             '}' => brace_depth -= 1,
-            '\\' => {
-                escaped = true;
-                continue;
-            }
             _ => {}
         }
 
@@ -116,6 +112,20 @@ mod tests {
 
         assert_eq!(result.delimiter.as_deref(), Some("&&"));
         assert_eq!(result.parts, vec![r#"div[a="x&&y"]"#, "span"]);
+    }
+
+    #[test]
+    fn split_consumes_escapes_outside_quotes() {
+        for rule in [r"span:contains(A\)B,C), p", r"span:contains(A\(B,C), p"] {
+            let split = split_top_level(rule, &[","]);
+            assert_eq!(split.parts.len(), 2, "{rule}");
+            assert_eq!(split.parts[1], "p");
+        }
+        assert_eq!(
+            split_top_level(r"A\&&B&&C", &["&&"]).parts,
+            vec![r"A\&&B", "C"]
+        );
+        assert_eq!(split_top_level(r"A\\&&B", &["&&"]).parts, vec![r"A\\", "B"]);
     }
 
     #[test]
