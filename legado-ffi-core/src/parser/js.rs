@@ -660,6 +660,8 @@ fn eval_js_inner_with_source(
             if let Some(active_source) = ACTIVE_JS_BOOK_SOURCE.with(|cell| cell.borrow().clone()) {
                 source_obj.set("bookSourceUrl", active_source.book_source_url)?;
                 source_obj.set("header", active_source.header.unwrap_or_default())?;
+                source_obj.set("loginUi", active_source.login_ui.unwrap_or_default())?;
+                source_obj.set("loginUrl", active_source.login_url.unwrap_or_default())?;
             }
 
             let source_key_for_get = source_key_val.clone();
@@ -706,6 +708,27 @@ fn eval_js_inner_with_source(
                 }),
             )?;
 
+            let login_storage_key = format!("userInfo_{source_key_val}");
+            let login_storage_key_for_get = login_storage_key.clone();
+            source_obj.set("__getLoginInfo", Func::new(move || -> Option<String> {
+                if let Some(active) = crate::crawler::session::current_active_session() {
+                    return active.get_variable(&login_storage_key_for_get).map(|value| match value {
+                        JsonValue::String(value) => value,
+                        other => other.to_string(),
+                    });
+                }
+                JS_KV.lock().unwrap_or_else(|error| error.into_inner())
+                    .get(&login_storage_key_for_get).cloned()
+            }))?;
+            source_obj.set("__putLoginInfo", Func::new(move |value: String| -> bool {
+                if let Some(active) = crate::crawler::session::current_active_session() {
+                    active.set_variable_exact(&login_storage_key, JsonValue::String(value));
+                } else {
+                    JS_KV.lock().unwrap_or_else(|error| error.into_inner())
+                        .insert(login_storage_key.clone(), value);
+                }
+                true
+            }))?;
             let source_key_for_login_info = source_key_val.clone();
             source_obj.set(
                 "__removeLoginInfo",
@@ -1145,6 +1168,13 @@ fn eval_js_inner_with_source(
             java_obj.set("deviceID", Func::new(|| -> String { JS_DEVICE_ID.clone() }))?;
             java_obj.set("randomUUID", Func::new(|| -> String { Uuid::new_v4().to_string() }))?;
             java_obj.set(
+                "__secureRandomNextInt",
+                Func::new(|ctx: rquickjs::Ctx<'_>, bound: i32| -> rquickjs::Result<i32> {
+                    super::secure_random::next_int(bound)
+                        .map_err(|error| rquickjs::Exception::throw_type(&ctx, &error.to_string()))
+                }),
+            )?;
+            java_obj.set(
                 "__nativeConnect",
                 Func::new(
                     |ctx: rquickjs::Ctx<'_>, url: String, headers_json: String| -> String {
@@ -1294,6 +1324,13 @@ fn eval_js_inner_with_source(
             java_obj.set(
                 "aesDecryptBytes",
                 Func::new(|input: String| -> String { java_aes_decrypt_bytes(&input) }),
+            )?;
+            java_obj.set(
+                "__chacha20Poly1305Decrypt",
+                Func::new(|ctx: rquickjs::Ctx<'_>, input: String| -> rquickjs::Result<String> {
+                    super::chacha20::decrypt_json(&input)
+                        .map_err(|error| rquickjs::Exception::throw_type(&ctx, &error.to_string()))
+                }),
             )?;
             java_obj.set(
                 "__aesDecryptByteArray",
@@ -2113,16 +2150,62 @@ fn eval_js_inner_with_source(
             eval_script(
                 ctx.clone(),
                 r#"source.getLoginInfo = function() {
-                    if (globalThis.loginInfo == null) return null;
+                    if (globalThis.loginInfo == null) return source.__getLoginInfo() ?? null;
                     return typeof globalThis.loginInfo === 'string'
                         ? globalThis.loginInfo : JSON.stringify(globalThis.loginInfo);
                 };
+                source.putLoginInfo = function(info) {
+                    const raw = String(info);
+                    const saved = source.__putLoginInfo(raw);
+                    if (saved) globalThis.loginInfo = raw;
+                    return saved;
+                };
+                let initializingLoginInfo = false;
                 source.getLoginInfoMap = function() {
                     const raw = source.getLoginInfo();
-                    if (raw == null) return null;
-                    let value;
-                    try { value = JSON.parse(raw); } catch (_) { return null; }
-                    if (!value || typeof value !== 'object') return null;
+                    let value = {};
+                    if (raw != null) {
+                        try { value = JSON.parse(raw); } catch (_) {}
+                        if (!value || typeof value !== 'object') value = {};
+                    } else if (!initializingLoginInfo) {
+                        const rule = String(source.loginUi || '').trim();
+                        let ui;
+                        try { ui = JSON.parse(rule); } catch (_) {}
+                        // V2 defaults belong to the interactive login state, not this Map.
+                        if (!(ui && !Array.isArray(ui) && Number(ui.version) === 2) && rule) {
+                            initializingLoginInfo = true;
+                            const savedBindings = [globalThis.result, globalThis.book, globalThis.chapter];
+                            try {
+                                const inlineJs = text => {
+                                    const match = String(text || '').trim().match(/^(?:@js:([\s\S]*)|<js>([\s\S]*)<\/js>)$/i);
+                                    return match ? (match[1] === undefined ? match[2] : match[1]).trim() : null;
+                                };
+                                const script = inlineJs(rule);
+                                if (script !== null) {
+                                    globalThis.result = new Map();
+                                    globalThis.book = null;
+                                    globalThis.chapter = null;
+                                    const login = inlineJs(source.loginUrl) ?? String(source.loginUrl || '').trim();
+                                    const output = (0, eval)(login + '\n' + script);
+                                    try { ui = JSON.parse(output == null ? '' : String(output)); } catch (_) { ui = null; }
+                                }
+                                if (Array.isArray(ui)) {
+                                    const defaults = new Map();
+                                    for (const row of ui) {
+                                        if (!row || typeof row !== 'object') {
+                                            defaults.clear(); break;
+                                        }
+                                        if (row.type !== 'button') defaults.set(String(row.name ?? ''), String(row.default ?? ''));
+                                    }
+                                    value = Object.fromEntries(defaults);
+                                    if (defaults.size) source.putLoginInfo(JSON.stringify(value));
+                                }
+                            } finally {
+                                [globalThis.result, globalThis.book, globalThis.chapter] = savedBindings;
+                                initializingLoginInfo = false;
+                            }
+                        }
+                    }
                     const map = new Map(Object.entries(value).map(([key, item]) => [key, String(item)]));
                     // Config keys supplement, never shadow, native Map members.
                     for (const key of map.keys()) {
@@ -2746,13 +2829,18 @@ fn eval_js_inner_with_source(
                     }
 
                     const JsString = globalThis.String;
+                    const javaStrings = new WeakMap();
                     function JavaString(value, charset) {
                         const text = Array.isArray(value) || value instanceof Uint8Array
                             ? java.bytesToStr(
                                 value, charset == null ? 'UTF-8' : JsString(charset))
                             : JsString(value == null ? '' : value);
-                        return new.target ? new JsString(text) : text;
+                        if (!new.target) return text;
+                        const wrapped = new JsString(text);
+                        javaStrings.set(wrapped, text);
+                        return wrapped;
                     }
+                    java.__javaStringResult = value => javaStrings.get(value);
                     const streamRange = (bytes, offset, length) => {
                         if (!Array.isArray(bytes) && !(bytes instanceof Uint8Array)) {
                             throw new Error('byte array required');
@@ -2905,8 +2993,23 @@ fn eval_js_inner_with_source(
                         flush() {},
                         close() {} // JDK ByteArrayOutputStream close is a no-op.
                     };
+                    function SecureRandom() {
+                        if (arguments.length !== 0) throw new TypeError('unsupported SecureRandom constructor');
+                        if (!new.target) return new SecureRandom();
+                    }
+                    SecureRandom.prototype.nextInt = function(bound) {
+                        if (arguments.length !== 1 || !Number.isInteger(bound)
+                            || bound <= 0 || bound > 2147483647) {
+                            throw new TypeError('positive Java int bound required');
+                        }
+                        return java.__secureRandomNextInt(bound);
+                    };
                     function SecretKeySpec(key, algorithm) {
-                        return { key: toBytes(key), algorithm: JsString(algorithm) };
+                        const name = JsString(algorithm);
+                        return {
+                            key: name.toUpperCase() === 'CHACHA20' ? chachaBytes(key, 32) : toBytes(key),
+                            algorithm: name
+                        };
                     }
                     function IvParameterSpec(iv) {
                         return { iv: toBytes(iv) };
@@ -2920,6 +3023,42 @@ fn eval_js_inner_with_source(
                         }
                         toJSON() { return Object.fromEntries(this); }
                     }
+                    class JavaArrayList extends Array {
+                        constructor() {
+                            if (arguments.length !== 0) throw new TypeError('unsupported ArrayList constructor');
+                            super();
+                        }
+                        static get [Symbol.species]() { return Array; }
+                        add(value) {
+                            if (arguments.length !== 1) throw new TypeError('unsupported ArrayList.add overload');
+                            this.push(value);
+                            return true;
+                        }
+                        size() {
+                            if (arguments.length !== 0) throw new TypeError('ArrayList.size takes no arguments');
+                            return this.length;
+                        }
+                        get(index) {
+                            if (arguments.length !== 1 || !Number.isInteger(index) || index < 0 || index >= this.length) {
+                                throw new RangeError('ArrayList index out of bounds');
+                            }
+                            return this[index];
+                        }
+                    }
+                    function JavaLinkedHashMap(values) {
+                        if (arguments.length > 1) throw new TypeError('unsupported LinkedHashMap constructor');
+                        let entries = [];
+                        if (arguments.length === 1) {
+                            if (values instanceof Map) entries = values;
+                            else if (values && (Object.getPrototypeOf(values) === Object.prototype
+                                || Object.getPrototypeOf(values) === null)) entries = Object.entries(values);
+                            else throw new TypeError('LinkedHashMap source must be a Map or object');
+                        }
+                        const map = new JavaHashMap(entries);
+                        Object.setPrototypeOf(map, JavaLinkedHashMap.prototype);
+                        return map;
+                    }
+                    Object.setPrototypeOf(JavaLinkedHashMap.prototype, JavaHashMap.prototype);
                     const Arrays = {
                         copyOf(value, length) {
                             if ((!Array.isArray(value) && !(value instanceof Uint8Array))
@@ -2934,17 +3073,76 @@ fn eval_js_inner_with_source(
                             return bytes;
                         }
                     };
+                    const chachaBytes = (value, limit) => {
+                        if ((!Array.isArray(value) && !(value instanceof Uint8Array)) || value.length > limit) {
+                            throw new TypeError('invalid ChaCha20 byte array');
+                        }
+                        return Array.from(value, byte => {
+                            if (!Number.isInteger(byte) || byte < -128 || byte > 255) {
+                                throw new TypeError('invalid ChaCha20 byte');
+                            }
+                            return byte & 255;
+                        });
+                    };
+                    function GCMParameterSpec(tagBits, nonce) {
+                        if (arguments.length !== 2 || tagBits !== 128) {
+                            throw new TypeError('only 128-bit authentication tags are supported');
+                        }
+                        const iv = chachaBytes(nonce, 12);
+                        if (iv.length !== 12) throw new TypeError('nonce must be 12 bytes');
+                        return {tLen: tagBits, iv};
+                    }
+                    const chachaCipher = () => {
+                        let state = null;
+                        return {
+                            init(mode, key, parameters) {
+                                state = null;
+                                if (arguments.length !== 3 || mode !== 2) {
+                                    throw new TypeError('only ChaCha20 decryption is supported');
+                                }
+                                const bytes = chachaBytes(key && key.key, 32);
+                                const nonce = chachaBytes(parameters && parameters.iv, 12);
+                                if (bytes.length !== 32 || nonce.length !== 12
+                                    || JsString(key.algorithm).toUpperCase() !== 'CHACHA20'
+                                    || (parameters.tLen !== undefined && parameters.tLen !== 128)) {
+                                    throw new TypeError('invalid ChaCha20 parameters');
+                                }
+                                state = {key: bytes, nonce};
+                            },
+                            doFinal(data) {
+                                if (arguments.length !== 1 || state === null) {
+                                    throw new TypeError('ChaCha20 cipher must be initialized; only doFinal(bytes) is supported');
+                                }
+                                try {
+                                    const bytes = chachaBytes(data, 262160);
+                                    const output = JSON.parse(java.__chacha20Poly1305Decrypt(JSON.stringify({
+                                        key: state.key, nonce: state.nonce, data: bytes
+                                    })));
+                                    return output.map(byte => byte > 127 ? byte - 256 : byte);
+                                } catch (error) {
+                                    state = null;
+                                    throw error;
+                                }
+                            }
+                        };
+                    };
                     const Cipher = {
                         DECRYPT_MODE: 2,
-                        getInstance: algorithm => ({
-                            init(mode, key, iv) { this.mode = mode; this.key = key; this.iv = iv; },
-                            doFinal(data) {
-                                return JSON.parse(java.__aesDecryptByteArray(JSON.stringify({
-                                    algorithm, mode: this.mode, key: this.key.key,
-                                    iv: this.iv.iv, data: toBytes(data)
-                                })));
+                        getInstance(algorithm) {
+                            if (JsString(algorithm).toUpperCase() === 'CHACHA20-POLY1305') {
+                                if (arguments.length !== 1) throw new TypeError('unsupported ChaCha20 provider overload');
+                                return chachaCipher();
                             }
-                        })
+                            return {
+                                init(mode, key, iv) { this.mode = mode; this.key = key; this.iv = iv; },
+                                doFinal(data) {
+                                    return JSON.parse(java.__aesDecryptByteArray(JSON.stringify({
+                                        algorithm, mode: this.mode, key: this.key.key,
+                                        iv: this.iv.iv, data: toBytes(data)
+                                    })));
+                                }
+                            };
+                        }
                     };
                     const Mac = {
                         getInstance: algorithm => ({
@@ -3017,7 +3215,10 @@ fn eval_js_inner_with_source(
                             return { array: () => bytes };
                         }
                     });
+                    Packages.java.security = Packages.java.security || {};
+                    Packages.java.security.SecureRandom = markClass('SecureRandom', SecureRandom);
                     Packages.java.lang.String = markClass('String', JavaString);
+                    Packages.java.lang.System = markClass('System', globalThis.System);
                     Packages.java.io.ByteArrayInputStream = markClass('ByteArrayInputStream', ByteArrayInputStream);
                     Packages.java.io.ByteArrayOutputStream = markClass('ByteArrayOutputStream', ByteArrayOutputStream);
                     Packages.java.util.zip.GZIPInputStream = markClass('GZIPInputStream', GZIPInputStream);
@@ -3027,6 +3228,8 @@ fn eval_js_inner_with_source(
                     Packages.java.net.URLDecoder = markClass('URLDecoder', URLDecoder);
                     Packages.java.util.Arrays = markClass('Arrays', Arrays);
                     Packages.java.util.HashMap = markClass('HashMap', JavaHashMap);
+                    Packages.java.util.ArrayList = markClass('ArrayList', JavaArrayList);
+                    Packages.java.util.LinkedHashMap = markClass('LinkedHashMap', JavaLinkedHashMap);
                     Packages.java.util.Base64 = markClass('Base64', javaBase64);
                     Packages.java.util.UUID = markClass('UUID', java.util.UUID);
                     Packages.javax.crypto.Mac = markClass('Mac', Mac);
@@ -3035,9 +3238,25 @@ fn eval_js_inner_with_source(
                         markClass('SecretKeySpec', SecretKeySpec);
                     Packages.javax.crypto.spec.IvParameterSpec =
                         markClass('IvParameterSpec', IvParameterSpec);
+                    Packages.javax.crypto.spec.GCMParameterSpec =
+                        markClass('GCMParameterSpec', GCMParameterSpec);
+                    // Rhino-style aliases used by the real decrypt script; java remains the host helper.
+                    java.lang = Packages.java.lang;
+                    globalThis.javax = Packages.javax;
                     Packages.javax.xml.bind.DatatypeConverter =
                         markClass('DatatypeConverter', DatatypeConverter);
                     Packages.android.util.Base64 = markClass('Base64', base64);
+                    Packages.android.text = Packages.android.text || {};
+                    Packages.android.text.TextUtils = markClass('TextUtils', {
+                        isEmpty(value) {
+                            if (arguments.length !== 1) throw new TypeError('TextUtils.isEmpty requires one argument');
+                            if (value == null) return true;
+                            if (typeof value !== 'string' && !(value instanceof JsString)) {
+                                throw new TypeError('TextUtils.isEmpty requires a string');
+                            }
+                            return value.length === 0;
+                        }
+                    });
 
                     // Thin URL facade: parsing stays in the existing Rust-backed helper.
                     function JavaURL(spec) {
@@ -3109,6 +3328,17 @@ fn eval_js_inner_with_source(
                 })();"#,
             )?;
 
+            // Capture before source scripts can replace the helper; only marked wrappers unwrap.
+            let java_string_result: rquickjs::Function<'_> = globals
+                .get::<_, Object<'_>>("java")?
+                .get("__javaStringResult")?;
+            let java_string_value = |value| -> rquickjs::Result<Option<String>> {
+                let unwrapped: Value<'_> = java_string_result.call((value,))?;
+                unwrapped
+                    .into_string()
+                    .map(|string| string.to_string())
+                    .transpose()
+            };
             eval_script(ctx.clone(), include_str!("js_security.js"))?;
             eval_script(ctx.clone(), include_str!("js_des.js"))?;
 
@@ -3148,6 +3378,8 @@ fn eval_js_inner_with_source(
                                 s.to_string()
                                     .map(|value| value.to_string())
                                     .unwrap_or_default()
+                            } else if let Some(value) = java_string_value(res_val.clone())? {
+                                value
                             } else {
                                 match ctx.json_stringify(res_val) {
                                     Ok(Some(json)) => json.to_string().unwrap_or_default(),
@@ -3172,6 +3404,8 @@ fn eval_js_inner_with_source(
                 s.to_string()
                     .map(|value| value.to_string())
                     .unwrap_or_default()
+            } else if let Some(value) = java_string_value(v.clone())? {
+                value
             } else {
                 match ctx.json_stringify(v) {
                     Ok(Some(json)) => json.to_string().unwrap_or_default(),

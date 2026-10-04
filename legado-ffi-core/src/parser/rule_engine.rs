@@ -676,13 +676,9 @@ impl RuleEngine {
                 RuleVariableContext::for_book_with_fields(variable, book_name, book_fields);
             let (list_rule, reverse) =
                 normalize_list_rule(rule.chapter_list.as_deref().unwrap_or(""));
-            let prepared_body = prepare_toc_body(body, base_url, &rule, &context);
-            let (prepared_body, list_rule) = prepare_list_rule_and_body(
-                Cow::Owned(prepared_body),
-                list_rule,
-                base_url,
-                &context,
-            );
+            // preUpdateJs is a pre-request lifecycle hook, not a TOC body transform.
+            let (prepared_body, list_rule) =
+                prepare_list_rule_and_body(Cow::Borrowed(body), list_rule, base_url, &context);
             let mode = self.detect_mode(list_rule, &prepared_body);
             let (chapters, next_urls) = match mode {
                 ParseMode::JsonPath => parse_chapter_list_json(
@@ -4109,27 +4105,6 @@ pub(crate) fn strip_js_rule(rule: &str) -> &str {
         .unwrap_or(rule)
 }
 
-fn prepare_toc_body(
-    body: &str,
-    base_url: &str,
-    rule: &TocRule,
-    ctx: &RuleVariableContext,
-) -> String {
-    let Some(script) = rule
-        .pre_update_js
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-    else {
-        return body.to_string();
-    };
-    let mut bindings = ctx.js_bindings();
-    bindings.insert("__allowTocRefresh".to_string(), json!(true));
-    match eval_js_with_bindings(strip_js_rule(script), body, base_url, &bindings) {
-        Ok(result) if !result.trim().is_empty() => result,
-        _ => body.to_string(),
-    }
-}
-
 fn apply_toc_format_js(
     chapters: &mut [BookChapter],
     format_js: Option<&str>,
@@ -5548,7 +5523,7 @@ arr;"#
     }
 
     #[test]
-    fn compat_pre_update_js_allows_toc_refresh_shims() {
+    fn compat_toc_parsing_does_not_apply_pre_update_js() {
         let source = BookSource {
             rule_toc: Some(TocRule {
                 pre_update_js: Some("java.reGetBook(); java.refreshTocUrl(); result".to_string()),

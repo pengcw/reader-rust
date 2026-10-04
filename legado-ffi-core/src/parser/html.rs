@@ -4,6 +4,11 @@ use std::collections::HashSet;
 
 use crate::parser::rule_analyzer::{self, split_top_level};
 
+#[cfg(test)]
+thread_local! {
+    static SELECTOR_VISITS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum SelectorBase {
     Css(String),
@@ -638,43 +643,78 @@ pub(crate) fn css_rule_is_valid(rule: &str) -> bool {
                 .next()
                 .unwrap_or_default();
             match parse_selector_with_index(&selector).base {
-                SelectorBase::Css(css) => {
-                    let groups = split_top_level(&css, &[","]);
-                    if groups.parts.len() > 1 {
-                        return groups
-                            .parts
-                            .iter()
-                            .all(|group| !group.trim().is_empty() && css_rule_is_valid(group));
-                    }
-                    if let Some((prefix, inner, _suffix)) = split_jsoup_has(&css) {
-                        parse_css_selector(prefix).is_some()
-                            && split_top_level(inner, &[","]).parts.iter().all(|branch| {
-                                let branch = branch.trim();
-                                let scoped = if branch.starts_with('>') {
-                                    format!(":scope {branch}")
-                                } else {
-                                    branch.to_owned()
-                                };
-                                !branch.is_empty() && css_rule_is_valid(&scoped)
-                            })
-                    } else if let Some((prefix, pattern, suffix, _)) = split_jsoup_matches(&css) {
-                        parse_css_selector(prefix).is_some()
-                            && crate::parser::source_regex::is_valid(pattern)
-                            && matches_suffix_valid(suffix)
-                    } else {
-                        split_jsoup_contains(&css).map_or_else(
-                            || parse_css_selector(&css).is_some(),
-                            |(prefix, _, suffix, _)| {
-                                parse_css_selector(prefix).is_some()
-                                    && contains_suffix_valid(suffix)
-                            },
-                        )
-                    }
-                }
+                SelectorBase::Css(css) => css_fragment_is_valid(&css),
                 SelectorBase::Children | SelectorBase::Text(_) => true,
             }
         })
     })
+}
+
+// Validate nested CSS fragments without interpreting Legado rule-level extractors.
+fn css_fragment_is_valid(css: &str) -> bool {
+    if parse_css_selector(css).is_some() {
+        return true;
+    }
+    let groups = split_top_level(css, &[","]);
+    if groups.parts.len() > 1 {
+        return groups
+            .parts
+            .iter()
+            .all(|group| !group.trim().is_empty() && css_fragment_is_valid(group));
+    }
+    if let Some((prefix, inner, suffix)) = split_jsoup_not(css) {
+        let prefix = if prefix.trim().is_empty() {
+            "*"
+        } else {
+            prefix
+        };
+        let suffix_valid = if suffix.starts_with([':', '.', '#', '[']) {
+            let (condition, relation) = split_contains_sibling(suffix);
+            css_fragment_is_valid(&format!("{prefix}{condition}"))
+                && (relation.is_empty()
+                    || if relation.starts_with(['+', '~']) {
+                        contains_suffix_valid(relation)
+                    } else {
+                        css_fragment_is_valid(&scope_child_selector(relation))
+                    })
+        } else if suffix.trim_start().starts_with('>') {
+            css_fragment_is_valid(&scope_child_selector(suffix))
+        } else {
+            contains_suffix_valid(suffix)
+        };
+        css_fragment_is_valid(prefix)
+            && !inner.trim().is_empty()
+            && css_fragment_is_valid(inner)
+            && suffix_valid
+    } else if let Some((prefix, inner, suffix)) = split_jsoup_has(css) {
+        parse_css_selector(prefix).is_some()
+            && (suffix.is_empty()
+                || if suffix.trim_start().starts_with('>') {
+                    css_fragment_is_valid(&scope_child_selector(suffix))
+                } else {
+                    contains_suffix_valid(suffix)
+                })
+            && split_top_level(inner, &[","]).parts.iter().all(|branch| {
+                let branch = branch.trim();
+                let scoped = if branch.starts_with('>') {
+                    format!(":scope {branch}")
+                } else {
+                    branch.to_owned()
+                };
+                !branch.is_empty() && css_fragment_is_valid(&scoped)
+            })
+    } else if let Some((prefix, pattern, suffix, _)) = split_jsoup_matches(css) {
+        parse_css_selector(prefix).is_some()
+            && crate::parser::source_regex::is_valid(pattern)
+            && matches_suffix_valid(suffix)
+    } else {
+        split_jsoup_contains(css).map_or_else(
+            || parse_css_selector(css).is_some(),
+            |(prefix, _, suffix, _)| {
+                parse_css_selector(prefix).is_some() && contains_suffix_valid(suffix)
+            },
+        )
+    }
 }
 
 fn parse_selector_base(selector: &str) -> SelectorBase {
@@ -877,6 +917,88 @@ fn split_jsoup_has(selector: &str) -> Option<(&str, &str, &str)> {
     None
 }
 
+// Choose the last outer :not so chained predicates are evaluated left to right.
+fn split_jsoup_not(selector: &str) -> Option<(&str, &str, &str)> {
+    let mut depth = 0usize;
+    let mut bracket = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut start = None;
+    let mut found = None;
+    for (index, ch) in selector.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active) = quote {
+            if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            ':' if bracket == 0 && depth == 0 && selector[index..].starts_with(":not(") => {
+                start = Some(index);
+            }
+            '(' if bracket == 0 => depth += 1,
+            ')' if bracket == 0 => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    if let Some(begin) = start.take() {
+                        found = Some((
+                            &selector[..begin],
+                            &selector[begin + 5..index],
+                            &selector[index + 1..],
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    found
+}
+
+fn select_css_with_not<'a>(
+    selector: &str,
+    select: impl Fn(&str) -> Vec<ElementRef<'a>>,
+) -> Option<Vec<ElementRef<'a>>> {
+    let (prefix, inner, suffix) = split_jsoup_not(selector)?;
+    if inner.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    let excluded: HashSet<_> = select(inner).into_iter().map(|el| el.id()).collect();
+    let prefix = if prefix.trim().is_empty() {
+        "*"
+    } else {
+        prefix
+    };
+    // Conditions immediately after :not still constrain the same subject.
+    let (condition, relation) = if suffix.starts_with([':', '.', '#', '[']) {
+        split_contains_sibling(suffix)
+    } else {
+        ("", suffix)
+    };
+    let candidate_rule = format!("{prefix}{condition}");
+    Some(
+        select(&candidate_rule)
+            .into_iter()
+            .filter(|el| !excluded.contains(&el.id()))
+            .flat_map(|el| select_css_suffix(el, relation))
+            .collect(),
+    )
+}
+
 fn has_condition_matches(el: ElementRef<'_>, inner: &str) -> bool {
     let sub_selectors = split_top_level(inner, &[","]);
     for sub in sub_selectors.parts {
@@ -908,45 +1030,54 @@ fn select_css_with_has<'a>(
         .into_iter()
         .filter(|el| has_condition_matches(*el, inner))
         .collect::<Vec<_>>();
+    Some(
+        matched_candidates
+            .into_iter()
+            .flat_map(|el| select_css_suffix(el, suffix))
+            .collect(),
+    )
+}
+
+fn select_css_suffix<'a>(el: ElementRef<'a>, suffix: &str) -> Vec<ElementRef<'a>> {
     let suffix = suffix.trim();
     if suffix.is_empty() {
-        return Some(matched_candidates);
+        return vec![el];
     }
     let mut results = Vec::new();
-    for el in matched_candidates {
-        if let Some(rest) = suffix.strip_prefix(['+', '~']) {
-            let adjacent = suffix.starts_with('+');
-            let (sibling, descendant) = split_contains_sibling(rest);
-            let Some(sel) = parse_css_selector(sibling) else {
-                continue;
-            };
-            let matches: Vec<_> = if adjacent {
-                el.next_siblings()
-                    .find_map(ElementRef::wrap)
-                    .filter(|next| sel.matches(next))
-                    .into_iter()
-                    .collect()
-            } else {
-                el.next_siblings()
-                    .filter_map(ElementRef::wrap)
-                    .filter(|next| sel.matches(next))
-                    .collect()
-            };
-            if descendant.is_empty() {
-                results.extend(matches);
-            } else {
-                for next in matches {
-                    results.extend(select_css_from_element(next, descendant));
-                }
-            }
+    if let Some(rest) = suffix.strip_prefix(['+', '~']) {
+        let adjacent = suffix.starts_with('+');
+        let (sibling, descendant) = split_contains_sibling(rest);
+        let Some(sel) = parse_css_selector(sibling) else {
+            return Vec::new();
+        };
+        let matches: Vec<_> = if adjacent {
+            el.next_siblings()
+                .find_map(ElementRef::wrap)
+                .filter(|next| sel.matches(next))
+                .into_iter()
+                .collect()
         } else {
-            results.extend(select_css_from_element(el, suffix));
+            el.next_siblings()
+                .filter_map(ElementRef::wrap)
+                .filter(|next| sel.matches(next))
+                .collect()
+        };
+        if descendant.is_empty() {
+            results.extend(matches);
+        } else {
+            for next in matches {
+                results.extend(select_css_from_element(next, descendant));
+            }
         }
+    } else {
+        results.extend(select_css_from_element(el, suffix));
     }
-    Some(results)
+    results
 }
 
 fn select_css<'a>(doc: &'a Html, css_selector: &str) -> Vec<ElementRef<'a>> {
+    #[cfg(test)]
+    SELECTOR_VISITS.with(|visits| visits.borrow_mut().push(css_selector.to_owned()));
     let groups = split_top_level(css_selector, &[","]);
     if groups.parts.len() > 1 {
         let matches = groups
@@ -954,6 +1085,10 @@ fn select_css<'a>(doc: &'a Html, css_selector: &str) -> Vec<ElementRef<'a>> {
             .iter()
             .flat_map(|part| select_css(doc, part))
             .collect();
+        let all = Selector::parse("*").expect("valid universal selector");
+        return unique_in_document_order(matches, doc.select(&all));
+    }
+    if let Some(matches) = select_css_with_not(css_selector, |part| select_css(doc, part)) {
         let all = Selector::parse("*").expect("valid universal selector");
         return unique_in_document_order(matches, doc.select(&all));
     }
@@ -991,6 +1126,12 @@ fn select_css_from_element<'a>(el: ElementRef<'a>, css_selector: &str) -> Vec<El
             .iter()
             .flat_map(|part| select_css_from_element(el, part))
             .collect();
+        let all = Selector::parse("*").expect("valid universal selector");
+        return unique_in_document_order(matches, el.select(&all));
+    }
+    if let Some(matches) =
+        select_css_with_not(css_selector, |part| select_css_from_element(el, part))
+    {
         let all = Selector::parse("*").expect("valid universal selector");
         return unique_in_document_order(matches, el.select(&all));
     }
@@ -1244,6 +1385,9 @@ fn select_with_combination<'a>(doc: &'a Html, rule: &str) -> Vec<ElementRef<'a>>
 
     let mut result = select_chain(doc, &rules[0]);
     for next_rule in rules.iter().skip(1) {
+        if operator == "||" && !result.is_empty() {
+            break;
+        }
         let next_results = select_chain(doc, next_rule);
         match operator {
             "&&" => result.extend(next_results),
@@ -1463,6 +1607,12 @@ pub fn select_all_text(doc: &Html, rule: &str) -> Option<String> {
         let sub_rule = parts[1..].join("@");
 
         for root in roots {
+            let extracted = select_text_list_from_element(&root, &sub_rule);
+            if !extracted.is_empty() {
+                all_texts.extend(extracted);
+                continue;
+            }
+
             let last_part = sub_rule.trim();
             if let Some(text) = extract_text(&root, last_part) {
                 if !text.is_empty() {
@@ -1521,6 +1671,9 @@ pub fn select_text_list(doc: &Html, rule: &str) -> Vec<String> {
         let mut result =
             select_text_list(doc, combo.parts.first().map(String::as_str).unwrap_or(""));
         for part in combo.parts.iter().skip(1) {
+            if operator == "||" && !result.is_empty() {
+                break;
+            }
             let next = select_text_list(doc, part);
             match operator {
                 "&&" => result.extend(next),
@@ -2884,6 +3037,157 @@ pub fn clean_html(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "manual XPath stage measurement; no timing assertions"]
+    fn xpath_stage_cost_measurement() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const SAMPLES: usize = 30;
+        const ITERATIONS: usize = 100;
+        const ROOT_QUERY: &str = "//div[@class='book']/h2/text()";
+        const FIELD_QUERY: &str = "h2/text()";
+
+        fn measure(label: &str, books: usize, mut work: impl FnMut()) {
+            for _ in 0..10 {
+                work();
+            }
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let started = Instant::now();
+                for _ in 0..ITERATIONS {
+                    work();
+                }
+                samples.push(started.elapsed().as_nanos() / ITERATIONS as u128);
+            }
+            samples.sort_unstable();
+            eprintln!(
+                "xpath-stage books={books} stage={label} samples={SAMPLES} iterations={ITERATIONS} ns_per_call median={} min={} max={}",
+                samples[SAMPLES / 2], samples[0], samples[SAMPLES - 1]
+            );
+        }
+
+        eprintln!("xpath-stage debug_assertions={} synthetic_only=true; stages overlap and must not be added", cfg!(debug_assertions));
+        for books in [2, 32, 128] {
+            let mut body = String::from("<html><body>");
+            for index in 1..=books {
+                body.push_str(&format!(
+                    "<div class='book'><h2>Book {index}</h2><a href='/b{index}'>作者</a></div>"
+                ));
+            }
+            body.push_str("</body></html>");
+            let (package, html_mode) = parse_xpath_package_with_mode(&body).unwrap();
+            assert!(html_mode);
+            let root = package.as_document().root().into();
+            let expected: Vec<String> = (1..=books).map(|index| format!("Book {index}")).collect();
+            assert_eq!(
+                xpath_eval_strings_in_mode(root, ROOT_QUERY, html_mode),
+                expected
+            );
+            let nodes = xpath_select_nodes(root, "//div[@class='book']");
+            assert_eq!(nodes.len(), books);
+            let field_node = nodes[0];
+            assert_eq!(
+                xpath_eval_strings_in_mode(field_node, FIELD_QUERY, html_mode),
+                vec!["Book 1"]
+            );
+            let context = new_xpath_context(field_node, FIELD_QUERY).unwrap();
+            let expression = sxd_xpath::Factory::new()
+                .build(FIELD_QUERY)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                expression.evaluate(&context, field_node).unwrap().string(),
+                "Book 1"
+            );
+
+            // Construction/compilation include destruction; setup is outside evaluate timing.
+            measure("html_package", books, || {
+                black_box(parse_xpath_package_with_mode(black_box(&body)).unwrap());
+            });
+            measure("factory_field", books, || {
+                black_box(
+                    sxd_xpath::Factory::new()
+                        .build(black_box(FIELD_QUERY))
+                        .unwrap()
+                        .unwrap(),
+                );
+            });
+            measure("evaluate_field", books, || {
+                black_box(
+                    expression
+                        .evaluate(black_box(&context), black_box(field_node))
+                        .unwrap(),
+                );
+            });
+            measure("field_adapter", books, || {
+                black_box(xpath_eval_strings_in_mode(
+                    black_box(field_node),
+                    black_box(FIELD_QUERY),
+                    html_mode,
+                ));
+            });
+            // Root query visits all books; it is not comparable to one relative field call.
+            measure("root_adapter", books, || {
+                black_box(xpath_eval_strings_in_mode(
+                    black_box(root),
+                    black_box(ROOT_QUERY),
+                    html_mode,
+                ));
+            });
+        }
+    }
+
+    #[test]
+    fn css_fragment_validation_rejects_bad_tails_but_keeps_custom_tags() {
+        for rule in [
+            "li:not(.ad)[id] text.",
+            "li:has(a)???",
+            "li:not(.ad):has(a)???",
+        ] {
+            assert!(!css_rule_is_valid(rule), "{rule}");
+        }
+        for rule in [
+            "li:not(.ad)[id] children",
+            "li:not(.ad)[id] text.foo",
+            "li:not(.ad) > a",
+            "li:not(.ad):has(a) > a",
+            "li:not(.ad):has(a) + li > a",
+        ] {
+            assert!(css_rule_is_valid(rule), "{rule}");
+        }
+    }
+
+    #[test]
+    fn html_fallback_skips_unneeded_selector_evaluation() {
+        let doc = parse_document("<h1>first</h1><p>fallback</p>");
+        SELECTOR_VISITS.with(|visits| visits.borrow_mut().clear());
+        assert_eq!(select_list(&doc, "h1||p").len(), 1);
+        assert_eq!(
+            SELECTOR_VISITS.with(|visits| visits.borrow().clone()),
+            vec!["h1"]
+        );
+        SELECTOR_VISITS.with(|visits| visits.borrow_mut().clear());
+        assert_eq!(select_text_list(&doc, "h1@text||p@text"), vec!["first"]);
+        assert_eq!(
+            SELECTOR_VISITS.with(|visits| visits.borrow().clone()),
+            vec!["h1"]
+        );
+        SELECTOR_VISITS.with(|visits| visits.borrow_mut().clear());
+        assert_eq!(
+            select_text_list(&doc, ".missing@text||p@text"),
+            vec!["fallback"]
+        );
+        assert_eq!(
+            SELECTOR_VISITS.with(|visits| visits.borrow().clone()),
+            vec![".missing", "p"]
+        );
+        assert_eq!(
+            select_text_list(&doc, "h1@text&&p@text"),
+            vec!["first", "fallback"]
+        );
+    }
 
     #[test]
     fn xml_node_context_snapshot_preserves_namespace_resets_and_attribute_aliases() {

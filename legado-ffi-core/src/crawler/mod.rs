@@ -136,7 +136,7 @@ pub struct RequestSpec {
     pub retry: usize,
     pub proxy: Option<String>,
     pub response_type: Option<String>,
-    pub(crate) render_with_rakers: bool,
+    pub render_with_rakers: bool,
     pub(crate) body_js: Option<BodyJs>,
 }
 

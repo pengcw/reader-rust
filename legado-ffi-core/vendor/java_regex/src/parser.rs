@@ -20,7 +20,9 @@ fn pattern_max_length(p: &Pattern) -> Option<usize> {
         for node in branch {
             total = total.checked_add(node_max_length(node)?)?;
         }
-        if total > max { max = total; }
+        if total > max {
+            max = total;
+        }
     }
     Some(max)
 }
@@ -30,11 +32,14 @@ fn node_max_length(n: &Node) -> Option<usize> {
         Node::Literal(_) | Node::Dot | Node::CharClass(_) => Some(1),
         // \R matches \r\n (2 chars) or a single line-break char (1 char).
         Node::LinebreakMatcher => Some(2),
-        Node::Anchor(_) | Node::SetFlags(_) | Node::RestoreFlags(_)
-        | Node::Lookahead { .. } | Node::Lookbehind { .. } => Some(0),
-        Node::Group { inner, .. }
-        | Node::FlagGroup { inner, .. }
-        | Node::AtomicGroup { inner } => pattern_max_length(inner),
+        Node::Anchor(_)
+        | Node::SetFlags(_)
+        | Node::RestoreFlags(_)
+        | Node::Lookahead { .. }
+        | Node::Lookbehind { .. } => Some(0),
+        Node::Group { inner, .. } | Node::FlagGroup { inner, .. } | Node::AtomicGroup { inner } => {
+            pattern_max_length(inner)
+        }
         Node::Quantified { inner, max, .. } => {
             // Mirrors OpenJDK's Curly.study/GroupCurly.study overflow check.
             // For an unbounded count, the body's max length must be at most 1
@@ -44,7 +49,11 @@ fn node_max_length(n: &Node) -> Option<usize> {
             // we use 1 directly as the rule for clarity and compatibility.
             let inner_max = node_max_length(inner)?;
             if *max == u32::MAX {
-                if inner_max <= 1 { Some(inner_max) } else { None }
+                if inner_max <= 1 {
+                    Some(inner_max)
+                } else {
+                    None
+                }
             } else {
                 inner_max.checked_mul(*max as usize)
             }
@@ -91,10 +100,15 @@ impl Parser {
         }
     }
 
-    pub fn parse(mut self) -> Result<(Pattern, usize, BTreeMap<String, usize>), PatternSyntaxError> {
+    pub fn parse(
+        mut self,
+    ) -> Result<(Pattern, usize, BTreeMap<String, usize>), PatternSyntaxError> {
         let pattern = self.parse_pattern()?;
         if self.pos < self.chars.len() {
-            return Err(self.error(format!("Unexpected character '{}' at position {}", self.chars[self.pos], self.pos)));
+            return Err(self.error(format!(
+                "Unexpected character '{}' at position {}",
+                self.chars[self.pos], self.pos
+            )));
         }
         for name in &self.all_named_backrefs {
             if !self.named_groups.contains_key(name) {
@@ -110,11 +124,7 @@ impl Parser {
     /// position. The Display impl formats this Java-style:
     ///     `<message> near index <N>\n<pattern>\n      ^`
     fn error(&self, message: String) -> PatternSyntaxError {
-        PatternSyntaxError::with_context(
-            message,
-            self.chars.iter().collect(),
-            self.pos,
-        )
+        PatternSyntaxError::with_context(message, self.chars.iter().collect(), self.pos)
     }
 
     fn peek(&self) -> Option<char> {
@@ -123,7 +133,9 @@ impl Parser {
 
     fn advance(&mut self) -> Option<char> {
         let c = self.chars.get(self.pos).copied();
-        if c.is_some() { self.pos += 1; }
+        if c.is_some() {
+            self.pos += 1;
+        }
         c
     }
 
@@ -151,7 +163,9 @@ impl Parser {
             let mut branch = self.parse_branch()?;
             branch.insert(0, Node::SetFlags(branch_start_flags));
             branches.push(branch);
-            if self.peek() != Some('|') { break; }
+            if self.peek() != Some('|') {
+                break;
+            }
             self.advance();
         }
         Ok(Pattern { branches })
@@ -170,12 +184,20 @@ impl Parser {
             }
             // Handle \Q...\E specially: emit all-but-last as literals,
             // let only the last go through quantifier parsing
-            if self.pos + 1 < self.chars.len() && self.chars[self.pos] == '\\' && self.chars[self.pos + 1] == 'Q' {
+            if self.pos + 1 < self.chars.len()
+                && self.chars[self.pos] == '\\'
+                && self.chars[self.pos + 1] == 'Q'
+            {
                 self.pos += 2;
                 let mut quoted_chars = Vec::new();
                 loop {
-                    if self.pos >= self.chars.len() { break; }
-                    if self.pos + 1 < self.chars.len() && self.chars[self.pos] == '\\' && self.chars[self.pos + 1] == 'E' {
+                    if self.pos >= self.chars.len() {
+                        break;
+                    }
+                    if self.pos + 1 < self.chars.len()
+                        && self.chars[self.pos] == '\\'
+                        && self.chars[self.pos + 1] == 'E'
+                    {
                         self.pos += 2;
                         break;
                     }
@@ -209,7 +231,10 @@ impl Parser {
                 Some('#') => {
                     self.advance();
                     while let Some(ch) = self.peek() {
-                        if ch == '\n' { self.advance(); break; }
+                        if ch == '\n' {
+                            self.advance();
+                            break;
+                        }
                         self.advance();
                     }
                 }
@@ -219,34 +244,56 @@ impl Parser {
     }
 
     fn parse_atom(&mut self) -> Result<Node, PatternSyntaxError> {
-        let c = self.peek().ok_or_else(|| self.error("Unexpected end of pattern".to_string()))?;
+        let c = self
+            .peek()
+            .ok_or_else(|| self.error("Unexpected end of pattern".to_string()))?;
 
         match c {
             '\\' => self.parse_escape(),
-            '.' => { self.advance(); Ok(Node::Dot) }
-            '^' => { self.advance(); Ok(Node::Anchor(AnchorKind::StartOfLine)) }
-            '$' => { self.advance(); Ok(Node::Anchor(AnchorKind::EndOfLine)) }
+            '.' => {
+                self.advance();
+                Ok(Node::Dot)
+            }
+            '^' => {
+                self.advance();
+                Ok(Node::Anchor(AnchorKind::StartOfLine))
+            }
+            '$' => {
+                self.advance();
+                Ok(Node::Anchor(AnchorKind::EndOfLine))
+            }
             '[' => self.parse_char_class_node(),
             '(' => self.parse_group(),
-            '*' | '+' | '?' => {
-                Err(self.error(format!("Dangling meta character '{}'", c)))
-            }
+            '*' | '+' | '?' => Err(self.error(format!("Dangling meta character '{}'", c))),
             '{' => {
                 let saved = self.pos;
                 self.advance();
                 match self.parse_quantifier_braces() {
                     Ok((min, max)) => {
                         let kind = match self.peek() {
-                            Some('?') => { self.advance(); QuantKind::Reluctant }
-                            Some('+') => { self.advance(); QuantKind::Possessive }
+                            Some('?') => {
+                                self.advance();
+                                QuantKind::Reluctant
+                            }
+                            Some('+') => {
+                                self.advance();
+                                QuantKind::Possessive
+                            }
                             _ => QuantKind::Greedy,
                         };
                         let empty = Node::Group {
                             index: None,
                             name: None,
-                            inner: Pattern { branches: vec![vec![]] },
+                            inner: Pattern {
+                                branches: vec![vec![]],
+                            },
                         };
-                        Ok(Node::Quantified { inner: Box::new(empty), min, max, kind })
+                        Ok(Node::Quantified {
+                            inner: Box::new(empty),
+                            min,
+                            max,
+                            kind,
+                        })
                     }
                     Err(_) => {
                         self.pos = saved;
@@ -254,13 +301,18 @@ impl Parser {
                     }
                 }
             }
-            _ => { self.advance(); Ok(Node::Literal(c)) }
+            _ => {
+                self.advance();
+                Ok(Node::Literal(c))
+            }
         }
     }
 
     fn parse_escape(&mut self) -> Result<Node, PatternSyntaxError> {
         self.advance(); // consume '\'
-        let c = self.advance().ok_or_else(|| self.error("Unexpected end of pattern after \\".to_string()))?;
+        let c = self
+            .advance()
+            .ok_or_else(|| self.error("Unexpected end of pattern after \\".to_string()))?;
 
         match c {
             // Predefined character classes
@@ -281,7 +333,9 @@ impl Parser {
             'Z' => Ok(Node::Anchor(AnchorKind::EndOfInputBeforeFinalNewline)),
             'b' => {
                 if self.peek() == Some('{') {
-                    return Err(self.error("\\b{g} grapheme cluster boundary is not supported".to_string()));
+                    return Err(
+                        self.error("\\b{g} grapheme cluster boundary is not supported".to_string())
+                    );
                 }
                 Ok(Node::Anchor(AnchorKind::WordBoundary))
             }
@@ -342,13 +396,14 @@ impl Parser {
             // matching OpenJDK behavior.
 
             // Escaped metacharacters
-            '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '-' | '!' | '=' | '<' | '>' | '/' | '#' | ' ' | '&' | '~' | '@' | '`' | '\'' | '"' | ',' | ';' | ':' => {
-                Ok(Node::Literal(c))
-            }
+            '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$'
+            | '-' | '!' | '=' | '<' | '>' | '/' | '#' | ' ' | '&' | '~' | '@' | '`' | '\''
+            | '"' | ',' | ';' | ':' => Ok(Node::Literal(c)),
 
-            'E' => {
-                Err(self.error(format!("Illegal/unsupported escape sequence near index {}", self.pos - 1)))
-            }
+            'E' => Err(self.error(format!(
+                "Illegal/unsupported escape sequence near index {}",
+                self.pos - 1
+            ))),
 
             _ => Ok(Node::Literal(c)),
         }
@@ -361,24 +416,33 @@ impl Parser {
             self.advance();
             let mut hex = String::new();
             while let Some(c) = self.peek() {
-                if c == '}' { self.advance(); break; }
+                if c == '}' {
+                    self.advance();
+                    break;
+                }
                 hex.push(c);
                 self.advance();
             }
-            let code = u32::from_str_radix(&hex, 16).map_err(|_| self.error(format!("Invalid hex escape: {}", hex)))?;
+            let code = u32::from_str_radix(&hex, 16)
+                .map_err(|_| self.error(format!("Invalid hex escape: {}", hex)))?;
             Ok(char::from_u32(code).unwrap_or('\0'))
         } else {
             let mut hex = String::new();
             for _ in 0..2 {
                 if let Some(c) = self.peek() {
-                    if c.is_ascii_hexdigit() { hex.push(c); self.advance(); }
-                    else { break; }
+                    if c.is_ascii_hexdigit() {
+                        hex.push(c);
+                        self.advance();
+                    } else {
+                        break;
+                    }
                 }
             }
             if hex.len() != 2 {
                 return Err(self.error("Invalid hex escape".to_string()));
             }
-            let code = u32::from_str_radix(&hex, 16).map_err(|_| self.error(format!("Invalid hex escape: {}", hex)))?;
+            let code = u32::from_str_radix(&hex, 16)
+                .map_err(|_| self.error(format!("Invalid hex escape: {}", hex)))?;
             Ok(char::from_u32(code).unwrap_or('\0'))
         }
     }
@@ -410,11 +474,16 @@ impl Parser {
         let mut hex = String::new();
         for _ in 0..4 {
             if let Some(c) = self.peek() {
-                if c.is_ascii_hexdigit() { hex.push(c); self.advance(); }
-                else { break; }
+                if c.is_ascii_hexdigit() {
+                    hex.push(c);
+                    self.advance();
+                } else {
+                    break;
+                }
             }
         }
-        u32::from_str_radix(&hex, 16).map_err(|_| self.error(format!("Invalid unicode escape: {}", hex)))
+        u32::from_str_radix(&hex, 16)
+            .map_err(|_| self.error(format!("Invalid unicode escape: {}", hex)))
     }
 
     fn parse_octal_char(&mut self) -> Result<char, PatternSyntaxError> {
@@ -422,9 +491,15 @@ impl Parser {
         // If first digit is 0-3, read up to 2 more (total value ≤ 0377).
         // If first digit is 4-7, read only 1 more (total value ≤ 077).
         let first = match self.peek() {
-            Some(c) if ('0'..='7').contains(&c) => { self.advance(); c }
+            Some(c) if ('0'..='7').contains(&c) => {
+                self.advance();
+                c
+            }
             _ => {
-                return Err(self.error(format!("Illegal octal escape sequence near index {}", self.pos)));
+                return Err(self.error(format!(
+                    "Illegal octal escape sequence near index {}",
+                    self.pos
+                )));
             }
         };
         let max_more = if ('0'..='3').contains(&first) { 2 } else { 1 };
@@ -432,8 +507,12 @@ impl Parser {
         oct.push(first);
         for _ in 0..max_more {
             if let Some(c) = self.peek() {
-                if ('0'..='7').contains(&c) { oct.push(c); self.advance(); }
-                else { break; }
+                if ('0'..='7').contains(&c) {
+                    oct.push(c);
+                    self.advance();
+                } else {
+                    break;
+                }
             }
         }
         let code = u32::from_str_radix(&oct, 8).unwrap_or(0);
@@ -441,7 +520,9 @@ impl Parser {
     }
 
     fn parse_control_char(&mut self) -> Result<char, PatternSyntaxError> {
-        let ctrl = self.advance().ok_or_else(|| self.error("Expected control character after \\c".to_string()))?;
+        let ctrl = self
+            .advance()
+            .ok_or_else(|| self.error("Expected control character after \\c".to_string()))?;
         let code = (ctrl as u32) ^ 0x40;
         Ok(char::from_u32(code).unwrap_or('\0'))
     }
@@ -468,7 +549,10 @@ impl Parser {
             self.advance();
             let mut name = String::new();
             while let Some(c) = self.peek() {
-                if c == '}' { self.advance(); break; }
+                if c == '}' {
+                    self.advance();
+                    break;
+                }
                 name.push(c);
                 self.advance();
             }
@@ -477,7 +561,9 @@ impl Parser {
             }
             Ok((name, negated))
         } else {
-            let c = self.advance().ok_or_else(|| self.error("Expected property name after \\p".to_string()))?;
+            let c = self
+                .advance()
+                .ok_or_else(|| self.error("Expected property name after \\p".to_string()))?;
             Ok((c.to_string(), negated))
         }
     }
@@ -496,7 +582,10 @@ impl Parser {
             return Err(self.error("Empty group name".to_string()));
         }
         if name.starts_with(|c: char| c.is_ascii_digit()) {
-            return Err(self.error(format!("Group name must start with a letter, not '{}'", name.chars().next().unwrap())));
+            return Err(self.error(format!(
+                "Group name must start with a letter, not '{}'",
+                name.chars().next().unwrap()
+            )));
         }
         Ok(name)
     }
@@ -517,7 +606,11 @@ impl Parser {
                     let inner = self.parse_pattern()?;
                     self.flags = saved;
                     self.expect(')')?;
-                    Ok(Node::Group { index: None, name: None, inner })
+                    Ok(Node::Group {
+                        index: None,
+                        name: None,
+                        inner,
+                    })
                 }
                 Some('<') => {
                     self.advance();
@@ -530,9 +623,14 @@ impl Parser {
                             self.expect(')')?;
                             if !is_lookbehind_bounded(&inner) {
                                 return Err(self.error(
-                                    "Look-behind group does not have an obvious maximum length".to_string()));
+                                    "Look-behind group does not have an obvious maximum length"
+                                        .to_string(),
+                                ));
                             }
-                            Ok(Node::Lookbehind { positive: true, inner })
+                            Ok(Node::Lookbehind {
+                                positive: true,
+                                inner,
+                            })
                         }
                         Some('!') => {
                             self.advance();
@@ -542,9 +640,14 @@ impl Parser {
                             self.expect(')')?;
                             if !is_lookbehind_bounded(&inner) {
                                 return Err(self.error(
-                                    "Look-behind group does not have an obvious maximum length".to_string()));
+                                    "Look-behind group does not have an obvious maximum length"
+                                        .to_string(),
+                                ));
                             }
-                            Ok(Node::Lookbehind { positive: false, inner })
+                            Ok(Node::Lookbehind {
+                                positive: false,
+                                inner,
+                            })
                         }
                         _ => {
                             let name = self.parse_group_name()?;
@@ -559,7 +662,11 @@ impl Parser {
                             let inner = self.parse_pattern()?;
                             self.flags = saved;
                             self.expect(')')?;
-                            Ok(Node::Group { index: Some(index), name: Some(name), inner })
+                            Ok(Node::Group {
+                                index: Some(index),
+                                name: Some(name),
+                                inner,
+                            })
                         }
                     }
                 }
@@ -569,7 +676,10 @@ impl Parser {
                     let inner = self.parse_pattern()?;
                     self.flags = saved;
                     self.expect(')')?;
-                    Ok(Node::Lookahead { positive: true, inner })
+                    Ok(Node::Lookahead {
+                        positive: true,
+                        inner,
+                    })
                 }
                 Some('!') => {
                     self.advance();
@@ -577,7 +687,10 @@ impl Parser {
                     let inner = self.parse_pattern()?;
                     self.flags = saved;
                     self.expect(')')?;
-                    Ok(Node::Lookahead { positive: false, inner })
+                    Ok(Node::Lookahead {
+                        positive: false,
+                        inner,
+                    })
                 }
                 Some('>') => {
                     self.advance();
@@ -596,7 +709,11 @@ impl Parser {
             let inner = self.parse_pattern()?;
             self.flags = saved;
             self.expect(')')?;
-            Ok(Node::Group { index: Some(index), name: None, inner })
+            Ok(Node::Group {
+                index: Some(index),
+                name: None,
+                inner,
+            })
         }
     }
 
@@ -609,7 +726,11 @@ impl Parser {
             match self.peek() {
                 Some(ch @ ('i' | 'm' | 's' | 'x' | 'U' | 'd' | 'u')) => {
                     self.advance();
-                    let target = if clearing { &mut clear_flags } else { &mut set_flags };
+                    let target = if clearing {
+                        &mut clear_flags
+                    } else {
+                        &mut set_flags
+                    };
                     match ch {
                         'i' => target.case_insensitive = true,
                         'm' => target.multiline = true,
@@ -629,7 +750,10 @@ impl Parser {
                         ),
                     }
                 }
-                Some('-') => { self.advance(); clearing = true; }
+                Some('-') => {
+                    self.advance();
+                    clearing = true;
+                }
                 Some(':') => {
                     self.advance();
                     let saved = self.flags;
@@ -638,7 +762,10 @@ impl Parser {
                     let inner = self.parse_pattern()?;
                     self.flags = saved;
                     self.expect(')')?;
-                    return Ok(Node::FlagGroup { flags: active_flags, inner });
+                    return Ok(Node::FlagGroup {
+                        flags: active_flags,
+                        inner,
+                    });
                 }
                 Some(')') => {
                     self.advance();
@@ -653,20 +780,48 @@ impl Parser {
     }
 
     fn apply_flags(&mut self, set: Flags, clear: Flags) {
-        if set.case_insensitive { self.flags.case_insensitive = true; }
-        if set.multiline { self.flags.multiline = true; }
-        if set.dotall { self.flags.dotall = true; }
-        if set.comments { self.flags.comments = true; }
-        if set.unicode_class { self.flags.unicode_class = true; }
-        if set.unix_lines { self.flags.unix_lines = true; }
-        if set.unicode_case { self.flags.unicode_case = true; }
-        if clear.case_insensitive { self.flags.case_insensitive = false; }
-        if clear.multiline { self.flags.multiline = false; }
-        if clear.dotall { self.flags.dotall = false; }
-        if clear.comments { self.flags.comments = false; }
-        if clear.unicode_class { self.flags.unicode_class = false; }
-        if clear.unix_lines { self.flags.unix_lines = false; }
-        if clear.unicode_case { self.flags.unicode_case = false; }
+        if set.case_insensitive {
+            self.flags.case_insensitive = true;
+        }
+        if set.multiline {
+            self.flags.multiline = true;
+        }
+        if set.dotall {
+            self.flags.dotall = true;
+        }
+        if set.comments {
+            self.flags.comments = true;
+        }
+        if set.unicode_class {
+            self.flags.unicode_class = true;
+        }
+        if set.unix_lines {
+            self.flags.unix_lines = true;
+        }
+        if set.unicode_case {
+            self.flags.unicode_case = true;
+        }
+        if clear.case_insensitive {
+            self.flags.case_insensitive = false;
+        }
+        if clear.multiline {
+            self.flags.multiline = false;
+        }
+        if clear.dotall {
+            self.flags.dotall = false;
+        }
+        if clear.comments {
+            self.flags.comments = false;
+        }
+        if clear.unicode_class {
+            self.flags.unicode_class = false;
+        }
+        if clear.unix_lines {
+            self.flags.unix_lines = false;
+        }
+        if clear.unicode_case {
+            self.flags.unicode_case = false;
+        }
     }
 
     fn maybe_parse_quantifier(&mut self, node: Node) -> Result<Node, PatternSyntaxError> {
@@ -674,15 +829,26 @@ impl Parser {
             self.skip_comments_whitespace();
         }
         let (min, max) = match self.peek() {
-            Some('*') => { self.advance(); (0, u32::MAX) }
-            Some('+') => { self.advance(); (1, u32::MAX) }
-            Some('?') => { self.advance(); (0, 1) }
+            Some('*') => {
+                self.advance();
+                (0, u32::MAX)
+            }
+            Some('+') => {
+                self.advance();
+                (1, u32::MAX)
+            }
+            Some('?') => {
+                self.advance();
+                (0, 1)
+            }
             Some('{') => {
                 self.advance();
                 match self.parse_quantifier_braces() {
                     Ok((min, max)) => (min, max),
                     Err(_) => {
-                        return Err(self.error(format!("Illegal repetition near index {}", self.pos)));
+                        return Err(
+                            self.error(format!("Illegal repetition near index {}", self.pos))
+                        );
                     }
                 }
             }
@@ -690,27 +856,47 @@ impl Parser {
         };
 
         let kind = match self.peek() {
-            Some('?') => { self.advance(); QuantKind::Reluctant }
-            Some('+') => { self.advance(); QuantKind::Possessive }
+            Some('?') => {
+                self.advance();
+                QuantKind::Reluctant
+            }
+            Some('+') => {
+                self.advance();
+                QuantKind::Possessive
+            }
             _ => QuantKind::Greedy,
         };
 
-        Ok(Node::Quantified { inner: Box::new(node), min, max, kind })
+        Ok(Node::Quantified {
+            inner: Box::new(node),
+            min,
+            max,
+            kind,
+        })
     }
 
     fn parse_quantifier_braces(&mut self) -> Result<(u32, u32), PatternSyntaxError> {
         let mut min_str = String::new();
         while let Some(c) = self.peek() {
-            if c.is_ascii_digit() { min_str.push(c); self.advance(); }
-            else { break; }
+            if c.is_ascii_digit() {
+                min_str.push(c);
+                self.advance();
+            } else {
+                break;
+            }
         }
         if min_str.is_empty() {
             return Err(self.error("Invalid quantifier".to_string()));
         }
-        let min: u32 = min_str.parse().map_err(|_| self.error("Invalid quantifier number".to_string()))?;
+        let min: u32 = min_str
+            .parse()
+            .map_err(|_| self.error("Invalid quantifier number".to_string()))?;
 
         match self.peek() {
-            Some('}') => { self.advance(); Ok((min, min)) }
+            Some('}') => {
+                self.advance();
+                Ok((min, min))
+            }
             Some(',') => {
                 self.advance();
                 if self.peek() == Some('}') {
@@ -719,13 +905,21 @@ impl Parser {
                 } else {
                     let mut max_str = String::new();
                     while let Some(c) = self.peek() {
-                        if c.is_ascii_digit() { max_str.push(c); self.advance(); }
-                        else { break; }
+                        if c.is_ascii_digit() {
+                            max_str.push(c);
+                            self.advance();
+                        } else {
+                            break;
+                        }
                     }
                     self.expect('}')?;
-                    let max: u32 = max_str.parse().map_err(|_| self.error("Invalid quantifier number".to_string()))?;
+                    let max: u32 = max_str
+                        .parse()
+                        .map_err(|_| self.error("Invalid quantifier number".to_string()))?;
                     if min > max {
-                        return Err(self.error(format!("Illegal repetition range near index {}", self.pos)));
+                        return Err(
+                            self.error(format!("Illegal repetition range near index {}", self.pos))
+                        );
                     }
                     Ok((min, max))
                 }
@@ -743,7 +937,12 @@ impl Parser {
 
     fn parse_char_class(&mut self) -> Result<CharClass, PatternSyntaxError> {
         self.expect('[')?;
-        let negated = if self.peek() == Some('^') { self.advance(); true } else { false };
+        let negated = if self.peek() == Some('^') {
+            self.advance();
+            true
+        } else {
+            false
+        };
         let items = self.parse_char_class_body(true)?;
         Ok(CharClass { negated, items })
     }
@@ -757,9 +956,10 @@ impl Parser {
     /// at the outer level — the literal `x` triggers a recursive sub-class scope
     /// that absorbs `x && C`, and the resulting (B-with-nested-intersection)
     /// becomes a single right operand of the outer `&&`.
-    fn parse_char_class_body(&mut self, consume_closing: bool)
-        -> Result<Vec<CharClassItem>, PatternSyntaxError>
-    {
+    fn parse_char_class_body(
+        &mut self,
+        consume_closing: bool,
+    ) -> Result<Vec<CharClassItem>, PatternSyntaxError> {
         let mut items = Vec::new();
         let mut at_start = true;
 
@@ -776,7 +976,9 @@ impl Parser {
                     continue;
                 }
                 Some(']') => {
-                    if consume_closing { self.advance(); }
+                    if consume_closing {
+                        self.advance();
+                    }
                     return Ok(items);
                 }
                 Some('[') => {
@@ -785,9 +987,7 @@ impl Parser {
                     at_start = false;
                     continue;
                 }
-                Some('&') if self.pos + 1 < self.chars.len()
-                    && self.chars[self.pos + 1] == '&' =>
-                {
+                Some('&') if self.pos + 1 < self.chars.len() && self.chars[self.pos + 1] == '&' => {
                     self.advance();
                     self.advance();
                     let right_items = self.parse_intersection_rhs()?;
@@ -810,7 +1010,9 @@ impl Parser {
                             let end_item = self.parse_char_class_item()?;
                             if let CharClassItem::Single(end) = end_item {
                                 if start > end {
-                                    return Err(self.error(format!("Invalid range: {}-{}", start, end)));
+                                    return Err(
+                                        self.error(format!("Invalid range: {}-{}", start, end))
+                                    );
                                 }
                                 items.push(CharClassItem::Range(start, end));
                                 continue;
@@ -838,8 +1040,9 @@ impl Parser {
             match self.peek() {
                 None => return Err(self.error("Unclosed character class".to_string())),
                 Some(']') => break,
-                Some('&') if self.pos + 1 < self.chars.len()
-                    && self.chars[self.pos + 1] == '&' => break,
+                Some('&') if self.pos + 1 < self.chars.len() && self.chars[self.pos + 1] == '&' => {
+                    break
+                }
                 Some('[') => {
                     let nested = self.parse_char_class()?;
                     items.push(CharClassItem::Nested(nested));
@@ -864,7 +1067,9 @@ impl Parser {
         match self.peek() {
             Some('\\') => {
                 self.advance();
-                let c = self.advance().ok_or_else(|| self.error("Unexpected end in character class".to_string()))?;
+                let c = self
+                    .advance()
+                    .ok_or_else(|| self.error("Unexpected end in character class".to_string()))?;
                 match c {
                     'd' => Ok(CharClassItem::Predefined(PredefinedClass::Digit)),
                     'D' => Ok(CharClassItem::Predefined(PredefinedClass::NonDigit)),
@@ -873,9 +1078,13 @@ impl Parser {
                     's' => Ok(CharClassItem::Predefined(PredefinedClass::Whitespace)),
                     'S' => Ok(CharClassItem::Predefined(PredefinedClass::NonWhitespace)),
                     'h' => Ok(CharClassItem::Predefined(PredefinedClass::HorizWhitespace)),
-                    'H' => Ok(CharClassItem::Predefined(PredefinedClass::NonHorizWhitespace)),
+                    'H' => Ok(CharClassItem::Predefined(
+                        PredefinedClass::NonHorizWhitespace,
+                    )),
                     'v' => Ok(CharClassItem::Predefined(PredefinedClass::VertWhitespace)),
-                    'V' => Ok(CharClassItem::Predefined(PredefinedClass::NonVertWhitespace)),
+                    'V' => Ok(CharClassItem::Predefined(
+                        PredefinedClass::NonVertWhitespace,
+                    )),
                     'p' => {
                         let (name, negated) = self.parse_property_name(false)?;
                         Ok(CharClassItem::UnicodeProperty { name, negated })
@@ -897,18 +1106,31 @@ impl Parser {
                     'Q' => {
                         let mut items = Vec::new();
                         loop {
-                            if self.pos >= self.chars.len() { break; }
-                            if self.pos + 1 < self.chars.len() && self.chars[self.pos] == '\\' && self.chars[self.pos + 1] == 'E' {
+                            if self.pos >= self.chars.len() {
+                                break;
+                            }
+                            if self.pos + 1 < self.chars.len()
+                                && self.chars[self.pos] == '\\'
+                                && self.chars[self.pos + 1] == 'E'
+                            {
                                 self.pos += 2;
                                 break;
                             }
                             items.push(CharClassItem::Single(self.chars[self.pos]));
                             self.pos += 1;
                         }
-                        if items.len() == 1 { return Ok(items.into_iter().next().unwrap()); }
-                        Ok(CharClassItem::Nested(CharClass { negated: false, items }))
+                        if items.len() == 1 {
+                            return Ok(items.into_iter().next().unwrap());
+                        }
+                        Ok(CharClassItem::Nested(CharClass {
+                            negated: false,
+                            items,
+                        }))
                     }
-                    '1'..='9' => Err(self.error(format!("Illegal backreference in character class near index {}", self.pos - 1))),
+                    '1'..='9' => Err(self.error(format!(
+                        "Illegal backreference in character class near index {}",
+                        self.pos - 1
+                    ))),
                     _ => Ok(CharClassItem::Single(c)),
                 }
             }
@@ -916,7 +1138,10 @@ impl Parser {
                 let nested = self.parse_char_class()?;
                 Ok(CharClassItem::Nested(nested))
             }
-            Some(c) => { self.advance(); Ok(CharClassItem::Single(c)) }
+            Some(c) => {
+                self.advance();
+                Ok(CharClassItem::Single(c))
+            }
             None => Err(self.error("Unexpected end in character class".to_string())),
         }
     }

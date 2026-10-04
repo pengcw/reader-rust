@@ -11,10 +11,10 @@ extern crate alloc;
 #[cfg(feature = "fuzz-gen")]
 extern crate std;
 
+mod engine;
+mod parser;
 mod types;
 mod unicode;
-mod parser;
-mod engine;
 
 #[doc(hidden)]
 pub mod gen;
@@ -46,14 +46,14 @@ pub mod fuzzing {}
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
-use alloc::vec::Vec;
 use alloc::vec;
+use alloc::vec::Vec;
 use core::fmt;
 
-pub use types::{PatternSyntaxError, MatchInfo};
-use types::*;
 use engine::{Engine, State};
 use parser::Parser;
+use types::*;
+pub use types::{MatchInfo, PatternSyntaxError};
 
 /// A compiled Java-compatible regular expression.
 ///
@@ -125,7 +125,9 @@ impl Regex {
         if flags.literal {
             // LITERAL mode: treat the entire pattern as literal text
             let nodes: Vec<Node> = pattern.chars().map(Node::Literal).collect();
-            parsed_pattern = Pattern { branches: vec![nodes] };
+            parsed_pattern = Pattern {
+                branches: vec![nodes],
+            };
             group_count = 0;
             named_groups = BTreeMap::new();
         } else {
@@ -160,7 +162,12 @@ impl Regex {
     /// Returns true if the pattern matches the entire input.
     pub fn matches(&self, input: &str) -> bool {
         let input_chars: Vec<char> = input.chars().collect();
-        let mut engine = Engine::new(&input_chars, self.flags, self.group_count, &self.named_groups);
+        let mut engine = Engine::new(
+            &input_chars,
+            self.flags,
+            self.group_count,
+            &self.named_groups,
+        );
         let mut state = State::new(self.group_count);
         let end_anchor = vec![Node::Anchor(AnchorKind::EndOfInput)];
         engine.match_pattern(&self.pattern, &end_anchor, 0, &mut state)
@@ -170,7 +177,12 @@ impl Regex {
     /// Unlike `matches()`, the pattern does not need to match the entire input.
     pub fn looking_at(&self, input: &str) -> Option<MatchInfo> {
         let input_chars: Vec<char> = input.chars().collect();
-        let mut engine = Engine::new(&input_chars, self.flags, self.group_count, &self.named_groups);
+        let mut engine = Engine::new(
+            &input_chars,
+            self.flags,
+            self.group_count,
+            &self.named_groups,
+        );
         if let Some((end_pos, captures)) = engine.try_match_at(&self.pattern, 0) {
             Some(self.build_match_info(&input_chars, 0, end_pos, &captures))
         } else {
@@ -241,12 +253,24 @@ impl Regex {
         // attempts leak into the eventually-successful one (matching Java's
         // `Matcher.find(start)` which uses the same Start.match iteration
         // that find() does, with the same per-search groups[] persistence).
-        let mut engine = Engine::new(&input_chars, self.flags, self.group_count, &self.named_groups);
+        let mut engine = Engine::new(
+            &input_chars,
+            self.flags,
+            self.group_count,
+            &self.named_groups,
+        );
         engine.search_start = start;
         let mut state = State::new(self.group_count);
         while search_pos <= input_len {
-            if let Some(end_pos) = engine.try_match_at_persistent(&self.pattern, search_pos, &mut state) {
-                return Some(self.build_match_info(&input_chars, search_pos, end_pos, &state.captures));
+            if let Some(end_pos) =
+                engine.try_match_at_persistent(&self.pattern, search_pos, &mut state)
+            {
+                return Some(self.build_match_info(
+                    &input_chars,
+                    search_pos,
+                    end_pos,
+                    &state.captures,
+                ));
             }
             search_pos += 1;
         }
@@ -256,12 +280,22 @@ impl Regex {
     /// Like `find_iter_impl` but only matches in the half-open range
     /// `[start, end)`. The full input is available to the engine for
     /// context-dependent lookups; bounds only gate where matching starts/ends.
-    fn find_iter_impl_bounded(&self, input_chars: &[char], start: usize, end: usize) -> Vec<MatchInfo> {
+    fn find_iter_impl_bounded(
+        &self,
+        input_chars: &[char],
+        start: usize,
+        end: usize,
+    ) -> Vec<MatchInfo> {
         let mut results = Vec::new();
         let mut search_pos = start;
         let mut prev_match_end = start;
 
-        let mut engine = Engine::new(input_chars, self.flags, self.group_count, &self.named_groups);
+        let mut engine = Engine::new(
+            input_chars,
+            self.flags,
+            self.group_count,
+            &self.named_groups,
+        );
         engine.text_start = start;
         engine.text_end = end;
         let mut state = State::new(self.group_count);
@@ -269,8 +303,15 @@ impl Regex {
         while search_pos <= end {
             engine.search_start = prev_match_end;
 
-            if let Some(end_pos) = engine.try_match_at_persistent(&self.pattern, search_pos, &mut state) {
-                results.push(self.build_match_info(input_chars, search_pos, end_pos, &state.captures));
+            if let Some(end_pos) =
+                engine.try_match_at_persistent(&self.pattern, search_pos, &mut state)
+            {
+                results.push(self.build_match_info(
+                    input_chars,
+                    search_pos,
+                    end_pos,
+                    &state.captures,
+                ));
 
                 prev_match_end = end_pos;
                 if end_pos == search_pos {
@@ -287,8 +328,13 @@ impl Regex {
         results
     }
 
-    fn build_match_info(&self, input_chars: &[char], start: usize, end: usize,
-                        captures: &[Option<(usize, usize)>]) -> MatchInfo {
+    fn build_match_info(
+        &self,
+        input_chars: &[char],
+        start: usize,
+        end: usize,
+        captures: &[Option<(usize, usize)>],
+    ) -> MatchInfo {
         let matched_text: String = input_chars[start..end].iter().collect();
 
         let mut groups = Vec::new();
@@ -334,12 +380,17 @@ impl Regex {
     /// ```
     pub fn replace_all<R: Replacer>(&self, input: &str, replacer: R) -> String {
         let input_chars: Vec<char> = input.chars().collect();
-        self.replace_internal(&input_chars, replacer, false).unwrap_or_else(|_| input.to_string())
+        self.replace_internal(&input_chars, replacer, false)
+            .unwrap_or_else(|_| input.to_string())
     }
 
     /// Report step-budget exhaustion without returning partial output.
     /// Side effects of a custom Replacer are not rolled back.
-    pub fn try_replace_all<R: Replacer>(&self, input: &str, replacer: R) -> Result<String, MatchError> {
+    pub fn try_replace_all<R: Replacer>(
+        &self,
+        input: &str,
+        replacer: R,
+    ) -> Result<String, MatchError> {
         self.replace_internal(&input.chars().collect::<Vec<_>>(), replacer, false)
     }
 
@@ -347,15 +398,25 @@ impl Regex {
     /// [`replace_all`](Regex::replace_all).
     pub fn replace_first<R: Replacer>(&self, input: &str, replacer: R) -> String {
         let input_chars: Vec<char> = input.chars().collect();
-        self.replace_internal(&input_chars, replacer, true).unwrap_or_else(|_| input.to_string())
+        self.replace_internal(&input_chars, replacer, true)
+            .unwrap_or_else(|_| input.to_string())
     }
 
     /// Like `try_replace_all`, stopping after the first complete match.
-    pub fn try_replace_first<R: Replacer>(&self, input: &str, replacer: R) -> Result<String, MatchError> {
+    pub fn try_replace_first<R: Replacer>(
+        &self,
+        input: &str,
+        replacer: R,
+    ) -> Result<String, MatchError> {
         self.replace_internal(&input.chars().collect::<Vec<_>>(), replacer, true)
     }
 
-    fn replace_internal<R: Replacer>(&self, input_chars: &[char], mut replacer: R, first_only: bool) -> Result<String, MatchError> {
+    fn replace_internal<R: Replacer>(
+        &self,
+        input_chars: &[char],
+        mut replacer: R,
+        first_only: bool,
+    ) -> Result<String, MatchError> {
         let input_len = input_chars.len();
         let mut result = String::new();
         let mut last_end = 0;
@@ -365,7 +426,12 @@ impl Regex {
         // the eventual successful match, matching Java's `appendReplacement`
         // which uses the same find() semantics. State is reset after each
         // successful replacement (Java's per-search groups[] reset).
-        let mut engine = Engine::new(input_chars, self.flags, self.group_count, &self.named_groups);
+        let mut engine = Engine::new(
+            input_chars,
+            self.flags,
+            self.group_count,
+            &self.named_groups,
+        );
         let mut state = State::new(self.group_count);
 
         let mut prev_match_end = 0;
@@ -399,7 +465,9 @@ impl Regex {
                 }
 
                 state = State::new(self.group_count);
-                if first_only { break; }
+                if first_only {
+                    break;
+                }
             } else {
                 search_pos += 1;
             }
@@ -408,7 +476,6 @@ impl Regex {
         result.extend(&input_chars[last_end..]);
         Ok(result)
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -442,7 +509,9 @@ pub struct Matches<'r, 'h> {
 
 impl Matches<'_, '_> {
     /// A partial scan must be discarded when this is true.
-    pub fn budget_exhausted(&self) -> bool { self.exhausted }
+    pub fn budget_exhausted(&self) -> bool {
+        self.exhausted
+    }
 }
 
 impl<'r, 'h> Iterator for Matches<'r, 'h> {
@@ -451,23 +520,30 @@ impl<'r, 'h> Iterator for Matches<'r, 'h> {
     fn next(&mut self) -> Option<MatchInfo> {
         while !self.exhausted && self.search_pos <= self.end {
             let mut engine = Engine::new(
-                &self.input_chars, self.re.flags,
-                self.re.group_count, &self.re.named_groups,
+                &self.input_chars,
+                self.re.flags,
+                self.re.group_count,
+                &self.re.named_groups,
             );
             engine.text_start = 0;
             engine.text_end = self.end;
             engine.search_start = self.prev_match_end;
             engine.steps = self.steps;
 
-            let matched = engine.try_match_at_persistent(
-                &self.re.pattern, self.search_pos, &mut self.state,
-            );
+            let matched =
+                engine.try_match_at_persistent(&self.re.pattern, self.search_pos, &mut self.state);
             self.steps = engine.steps;
             self.exhausted = engine.budget_exhausted();
-            if self.exhausted { return None; }
+            if self.exhausted {
+                return None;
+            }
             if let Some(end_pos) = matched {
                 let m = self.re.build_match_info(
-                    &self.input_chars, self.search_pos, end_pos, &self.state.captures);
+                    &self.input_chars,
+                    self.search_pos,
+                    end_pos,
+                    &self.state.captures,
+                );
                 self.prev_match_end = end_pos;
                 if end_pos == self.search_pos {
                     self.search_pos += 1;
@@ -518,7 +594,9 @@ fn expand_java_replacement(replacement: &str, m: &MatchInfo, dst: &mut String) {
                     name.push(rep_chars[i]);
                     i += 1;
                 }
-                if i < rep_chars.len() { i += 1; }
+                if i < rep_chars.len() {
+                    i += 1;
+                }
                 if let Some(val) = m.named_groups.get(&name) {
                     dst.push_str(val);
                 }
@@ -569,7 +647,8 @@ impl Replacer for &String {
 }
 
 impl<F> Replacer for F
-where F: FnMut(&MatchInfo) -> String
+where
+    F: FnMut(&MatchInfo) -> String,
 {
     fn replace_append(&mut self, m: &MatchInfo, dst: &mut String) {
         dst.push_str(&self(m));
@@ -577,7 +656,6 @@ where F: FnMut(&MatchInfo) -> String
 }
 
 impl Regex {
-
     /// Split the input by pattern matches (Java String.split semantics, limit=0).
     pub fn split(&self, input: &str) -> Vec<String> {
         self.split_with_limit(input, 0)
@@ -597,7 +675,12 @@ impl Regex {
         // Persistent State across position attempts — relevant when the
         // pattern uses backreferences that the capture leak across positions
         // could change the result of (rare for split, but matches Java).
-        let mut engine = Engine::new(&input_chars, self.flags, self.group_count, &self.named_groups);
+        let mut engine = Engine::new(
+            &input_chars,
+            self.flags,
+            self.group_count,
+            &self.named_groups,
+        );
         let mut state = State::new(self.group_count);
 
         let mut prev_match_end = 0;
@@ -608,7 +691,9 @@ impl Regex {
 
             engine.search_start = prev_match_end;
 
-            if let Some(end_pos) = engine.try_match_at_persistent(&self.pattern, search_pos, &mut state) {
+            if let Some(end_pos) =
+                engine.try_match_at_persistent(&self.pattern, search_pos, &mut state)
+            {
                 // Java quirk: a zero-width match at position 0 produces NO leading
                 // empty substring. OpenJDK's Pattern.split has the explicit check:
                 //     if (index == 0 && index == m.start() && m.start() == m.end()) continue;
@@ -694,7 +779,14 @@ mod tests {
         let regex = Regex::new("(a)(b)(c)").unwrap();
         let matches = regex.find("abc");
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].groups, vec![Some("a".to_string()), Some("b".to_string()), Some("c".to_string())]);
+        assert_eq!(
+            matches[0].groups,
+            vec![
+                Some("a".to_string()),
+                Some("b".to_string()),
+                Some("c".to_string())
+            ]
+        );
     }
 
     #[test]
@@ -1002,7 +1094,10 @@ mod tests {
         let regex = Regex::new(",").unwrap();
         assert_eq!(regex.split_with_limit("a,b,c,d", 2), vec!["a", "b,c,d"]);
         assert_eq!(regex.split_with_limit("a,b,c,d", 3), vec!["a", "b", "c,d"]);
-        assert_eq!(regex.split_with_limit("a,b,c,d", -1), vec!["a", "b", "c", "d"]);
+        assert_eq!(
+            regex.split_with_limit("a,b,c,d", -1),
+            vec!["a", "b", "c", "d"]
+        );
     }
 
     #[test]
@@ -1078,9 +1173,8 @@ mod tests {
     #[test]
     fn test_replace_first_closure() {
         let regex = Regex::new("\\w+").unwrap();
-        let result = regex.replace_first("hello world", |m: &MatchInfo| {
-            m.matched_text.to_uppercase()
-        });
+        let result =
+            regex.replace_first("hello world", |m: &MatchInfo| m.matched_text.to_uppercase());
         assert_eq!(result, "HELLO world");
     }
 
@@ -1134,7 +1228,10 @@ mod tests {
         let r = Regex::with_flags("^", "m").unwrap();
         let ms = r.find("\r\ré\n");
         assert_eq!(ms.len(), 3, "expected matches at positions 0, 1, 2 only");
-        assert_eq!(ms.iter().map(|m| m.start).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(
+            ms.iter().map(|m| m.start).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
     }
 
     #[test]
@@ -1154,8 +1251,10 @@ mod tests {
             r"(?i:\R){2}",
             r"(?im:\R){2}",
         ] {
-            assert!(!Regex::new(pat).unwrap().matches("\r\n"),
-                "expected no match for {pat:?}");
+            assert!(
+                !Regex::new(pat).unwrap().matches("\r\n"),
+                "expected no match for {pat:?}"
+            );
         }
     }
 
@@ -1193,11 +1292,11 @@ mod tests {
         // executed — `g_i` stays null. Mirrors GroupCurly's `locals[i] = -1`
         // sentinel that tells GroupTail to skip the capture write.
         let cases = [
-            (r"(\Q\E)*", true),   // empty body + * → g1 should be null
-            (r"()*",     true),   // truly empty body + *
-            (r"(\Q\E)",  false),  // no quantifier → g1 should be ""
-            (r"()",      false),  // no quantifier
-            (r"()+",     false),  // + (cmin=1) → body actually runs once → g1=""
+            (r"(\Q\E)*", true), // empty body + * → g1 should be null
+            (r"()*", true),     // truly empty body + *
+            (r"(\Q\E)", false), // no quantifier → g1 should be ""
+            (r"()", false),     // no quantifier
+            (r"()+", false),    // + (cmin=1) → body actually runs once → g1=""
         ];
         for (pat, expect_null) in cases {
             let r = Regex::new(pat).unwrap();
@@ -1206,15 +1305,24 @@ mod tests {
             if expect_null {
                 assert_eq!(got, None, "{pat}: expected null capture, got {got:?}");
             } else {
-                assert_eq!(got.as_deref(), Some(""),
-                    "{pat}: expected empty-string capture, got {got:?}");
+                assert_eq!(
+                    got.as_deref(),
+                    Some(""),
+                    "{pat}: expected empty-string capture, got {got:?}"
+                );
             }
         }
         // And: a group whose body CAN match (e.g. `a*` or `a?`) still gets ""
         // even with `*` — the body did run, just matched zero chars by choice.
         assert_eq!(
-            Regex::new(r"(a*)*").unwrap().find("ab")[0].groups.first().cloned().flatten().as_deref(),
-            Some(""));
+            Regex::new(r"(a*)*").unwrap().find("ab")[0]
+                .groups
+                .first()
+                .cloned()
+                .flatten()
+                .as_deref(),
+            Some("")
+        );
     }
 
     #[test]
@@ -1242,8 +1350,11 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].start, 1);
         assert_eq!(matches[0].end, 2);
-        assert_eq!(matches[0].groups.first().cloned().flatten(),
-            Some("a".to_string()), "group 1 should leak from failed pos 0 attempt");
+        assert_eq!(
+            matches[0].groups.first().cloned().flatten(),
+            Some("a".to_string()),
+            "group 1 should leak from failed pos 0 attempt"
+        );
     }
 
     #[test]
@@ -1261,8 +1372,11 @@ mod tests {
         // Second match at pos 2: lookbehind succeeded *here*, but the failed
         // pos 1 attempt's inner (a|bb) had matched `a` at pos 0, leaking g1.
         assert_eq!(matches[1].start, 2);
-        assert_eq!(matches[1].groups.first().cloned().flatten(),
-            Some("a".to_string()), "group 1 should leak from failed pos 1 lookbehind attempt");
+        assert_eq!(
+            matches[1].groups.first().cloned().flatten(),
+            Some("a".to_string()),
+            "group 1 should leak from failed pos 1 lookbehind attempt"
+        );
     }
 
     #[test]
@@ -1277,8 +1391,11 @@ mod tests {
         assert_eq!(matches.len(), 2);
         assert_eq!(matches[1].start, 1);
         assert_eq!(matches[1].end, 1);
-        assert_eq!(matches[1].groups.first().cloned().flatten(), None,
-            "g1 must be null when outer succeeds via the zero-width alt");
+        assert_eq!(
+            matches[1].groups.first().cloned().flatten(),
+            None,
+            "g1 must be null when outer succeeds via the zero-width alt"
+        );
     }
 
     #[test]
@@ -1295,9 +1412,11 @@ mod tests {
         assert_eq!(matches.len(), 4);
         assert_eq!(matches[1].start, 1);
         assert_eq!(matches[1].end, 1);
-        assert_eq!(matches[1].groups.first().cloned().flatten(),
+        assert_eq!(
+            matches[1].groups.first().cloned().flatten(),
             Some("\n".to_string()),
-            "g1 should leak from the failed iter-2 attempt at pos 1");
+            "g1 should leak from the failed iter-2 attempt at pos 1"
+        );
     }
 
     #[test]
@@ -1315,8 +1434,10 @@ mod tests {
         // zero-width body fails the cmin requirement on non-deterministic
         // bodies, mirroring Java's chain-unwind GroupTail restoration.
         let re = Regex::new(r"(?:((\1[^\w])*?)){2,3}?").unwrap();
-        assert!(!re.matches("\t"),
-            "outer reluctant {{2,3}}? with non-det zero-width body must not match");
+        assert!(
+            !re.matches("\t"),
+            "outer reluctant {{2,3}}? with non-det zero-width body must not match"
+        );
     }
 
     #[test]
@@ -1351,8 +1472,11 @@ mod tests {
         // unbounded part broke this case. The fix is to honor Java's
         // `Math.max` across alternation atoms in `pattern_java_max`.
         let re = Regex::new(r"(?<!|\n\t(?:.{4,})(?:))").unwrap();
-        assert_eq!(re.find("").len(), 0,
-            "alt 1 (empty) matches → neg lookbehind fails at every position");
+        assert_eq!(
+            re.find("").len(),
+            0,
+            "alt 1 (empty) matches → neg lookbehind fails at every position"
+        );
     }
 
     #[test]
@@ -1397,9 +1521,12 @@ mod tests {
         let ms = re.find("\t\t\r");
         assert_eq!(ms.len(), 1);
         assert_eq!(ms[0].group(0), Some("\t\t\r"));
-        assert_eq!(ms[0].group(1), Some("\t"),
+        assert_eq!(
+            ms[0].group(1),
+            Some("\t"),
             "Java's outer GroupCurly backoff overrides group 1 to its own \
-             iter's slice (1,2) after the recursive Loop iter 2 had set (2,3)");
+             iter's slice (1,2) after the recursive Loop iter 2 had set (2,3)"
+        );
     }
 
     #[test]
@@ -1420,10 +1547,12 @@ mod tests {
         // (the cmin-equivalent body match) — apply the same to the generic and
         // FlagGroup arms.
         let re = Regex::new(r"(?:(?<=())*?)(?msu:\1)").unwrap();
-        assert!(!re.matches(""),
+        assert!(
+            !re.matches(""),
             "reluctant Lookbehind body (zero-width) must abort like Java's \
              match1; the lookbehind's leaked group 1 capture should not enable \
-             \\1 to succeed");
+             \\1 to succeed"
+        );
     }
 
     #[test]
@@ -1442,9 +1571,12 @@ mod tests {
         // body match — Java's `next.match` was already tried at the top of
         // `match_reluctant`.
         let re = Regex::new(r"(?:(?iu)(\B))*?\1\R").unwrap();
-        assert_eq!(re.find("\r").len(), 0,
+        assert_eq!(
+            re.find("\r").len(),
+            0,
             "Java's reluctant Curly aborts on zero-width body, not re-trying \
-             rest with the body's leaked capture");
+             rest with the body's leaked capture"
+        );
     }
 
     #[test]
@@ -1461,9 +1593,11 @@ mod tests {
         // after a single zero-width iter, missing iter 2 where state had
         // changed via the leaked capture.
         let re = Regex::new(r"(?<y2>(?:\z|(?:.)\2|(?!(\G{3,}?))||\Q\E)++)").unwrap();
-        assert!(re.matches("\t"),
+        assert!(
+            re.matches("\t"),
             "possessive ++ should iterate again after a zero-width iter because \
-             leaked captures from inner alt 3 enable alt 2 to advance in iter 2");
+             leaked captures from inner alt 3 enable alt 2 to advance in iter 2"
+        );
     }
 
     #[test]
@@ -1482,8 +1616,11 @@ mod tests {
         // First match at pos 0.
         assert_eq!(matches[0].start, 0);
         assert_eq!(matches[0].end, 0);
-        assert_eq!(matches[0].groups.first().cloned().flatten(), None,
-            "g1 must be null when zero-width inner capture's continuation failed");
+        assert_eq!(
+            matches[0].groups.first().cloned().flatten(),
+            None,
+            "g1 must be null when zero-width inner capture's continuation failed"
+        );
     }
 
     #[test]
@@ -1519,14 +1656,22 @@ mod tests {
         // Scoped-wrap NEGATIVE cases (from QUIRKS.md): wrapping `(?s)` in any
         // group at all stops the propagation — non-capturing, capturing, atomic,
         // and lookaround groups all close the scope.
-        assert!(!Regex::new(r"(?:(?s))|.").unwrap().matches("\n"),
-            "non-cap wrap should scope the (?s)");
-        assert!(!Regex::new(r"((?s))|.").unwrap().matches("\n"),
-            "capturing wrap should scope the (?s)");
-        assert!(!Regex::new(r"(?>(?s))|.").unwrap().matches("\n"),
-            "atomic wrap should scope the (?s)");
-        assert!(!Regex::new(r"(?=(?s))|.").unwrap().matches("\n"),
-            "lookahead wrap should scope the (?s)");
+        assert!(
+            !Regex::new(r"(?:(?s))|.").unwrap().matches("\n"),
+            "non-cap wrap should scope the (?s)"
+        );
+        assert!(
+            !Regex::new(r"((?s))|.").unwrap().matches("\n"),
+            "capturing wrap should scope the (?s)"
+        );
+        assert!(
+            !Regex::new(r"(?>(?s))|.").unwrap().matches("\n"),
+            "atomic wrap should scope the (?s)"
+        );
+        assert!(
+            !Regex::new(r"(?=(?s))|.").unwrap().matches("\n"),
+            "lookahead wrap should scope the (?s)"
+        );
         // And the same with a non-matching branch-1 still leaves branch-2 with
         // default (no DOTALL) flags:
         assert!(!Regex::new(r"(?:(?s)xx)|.").unwrap().matches("\n"));
@@ -1542,7 +1687,11 @@ mod tests {
         // the result is `{a,b,c}` (not empty, as a straightforward 3-way
         // intersection would give). Mirroring OpenJDK is intentional.
         let r = Regex::new(r"[abc&&[\w]a&&z]").unwrap();
-        let texts: Vec<_> = r.find("abcxz").into_iter().map(|m| m.matched_text).collect();
+        let texts: Vec<_> = r
+            .find("abcxz")
+            .into_iter()
+            .map(|m| m.matched_text)
+            .collect();
         assert_eq!(texts, vec!["a", "b", "c"]);
         // Sanity: when no literal sits between the nested class and the next &&,
         // the chain IS preserved (proper 3-way intersection, result is empty).
@@ -1731,9 +1880,9 @@ mod tests {
 
         let r = Regex::new(r"[\V]").unwrap();
         assert!(r.matches("a"));
-        assert!(r.matches(" "));      // space is horizontal, not vertical → \V includes
-        assert!(r.matches("\t"));     // tab is horizontal too
-        assert!(!r.matches("\n"));    // newline IS vertical → \V rejects
+        assert!(r.matches(" ")); // space is horizontal, not vertical → \V includes
+        assert!(r.matches("\t")); // tab is horizontal too
+        assert!(!r.matches("\n")); // newline IS vertical → \V rejects
         assert!(!r.matches("\u{2028}")); // line separator is vertical → \V rejects
     }
 
@@ -1745,7 +1894,11 @@ mod tests {
         // 👨‍👩‍👦 = U+1F468 U+200D U+1F469 U+200D U+1F466 is one cluster.
         let r = Regex::new(r"\X").unwrap();
         let ms = r.find("👨‍👩‍👦");
-        assert_eq!(ms.len(), 1, "expected the whole ZWJ sequence as one cluster");
+        assert_eq!(
+            ms.len(),
+            1,
+            "expected the whole ZWJ sequence as one cluster"
+        );
         // Combining marks attach to base: "é" with combining acute
         // (a + combining acute) is one cluster.
         let ms = r.find("a\u{0301}");
@@ -1824,20 +1977,23 @@ mod tests {
         // symbol whose Bidi_Mirrored=Yes per Unicode data.
         let r = Regex::new(r"\p{javaMirrored}").unwrap();
         for ch in &[
-            '\u{2224}',  // ∤
-            '\u{2239}',  // ∹
-            '\u{225F}',  // ≟
-            '\u{2264}',  // ≤
-            '\u{228F}',  // ⊏
-            '\u{22BE}',  // ⊾
-            '\u{22D0}',  // ⋐
-            '\u{22F0}',  // ⋰
-            '\u{2320}',  // ⌠
-            '\u{27D5}',  // ⟕
-            '\u{27E2}',  // ⟢
+            '\u{2224}', // ∤
+            '\u{2239}', // ∹
+            '\u{225F}', // ≟
+            '\u{2264}', // ≤
+            '\u{228F}', // ⊏
+            '\u{22BE}', // ⊾
+            '\u{22D0}', // ⋐
+            '\u{22F0}', // ⋰
+            '\u{2320}', // ⌠
+            '\u{27D5}', // ⟕
+            '\u{27E2}', // ⟢
         ] {
-            assert!(r.matches(&ch.to_string()),
-                "U+{:04X} should be javaMirrored (Bidi_Mirrored math symbol)", *ch as u32);
+            assert!(
+                r.matches(&ch.to_string()),
+                "U+{:04X} should be javaMirrored (Bidi_Mirrored math symbol)",
+                *ch as u32
+            );
         }
     }
 
@@ -1868,7 +2024,10 @@ mod tests {
         let s_owned: String = "Y".to_string();
         let s_ref: &String = &s_owned;
         // Closure impl (FnMut)
-        assert_eq!(r.replace_all("axb", |_m: &MatchInfo| "Y".to_string()), "aYb");
+        assert_eq!(
+            r.replace_all("axb", |_m: &MatchInfo| "Y".to_string()),
+            "aYb"
+        );
         // String impl
         assert_eq!(r.replace_all("axb", s_owned.clone()), "aYb");
         // &String impl
@@ -1938,7 +2097,10 @@ mod tests {
         use crate::unicode::match_unicode_property;
         // Pass a name that goes through to match_ugc_category but isn't in
         // the giant match arm — falls through to false.
-        assert!(!match_unicode_property("definitely_not_a_real_category", 'a'));
+        assert!(!match_unicode_property(
+            "definitely_not_a_real_category",
+            'a'
+        ));
     }
 
     #[test]
@@ -1947,7 +2109,8 @@ mod tests {
         // `while (m.find()) { ... }` loop. Equivalent to find() but yields
         // matches lazily.
         let re = Regex::new(r"\w+").unwrap();
-        let collected: Vec<_> = re.find_iter("hello   world\tfoo")
+        let collected: Vec<_> = re
+            .find_iter("hello   world\tfoo")
             .map(|m| m.matched_text)
             .collect();
         assert_eq!(collected, vec!["hello", "world", "foo"]);

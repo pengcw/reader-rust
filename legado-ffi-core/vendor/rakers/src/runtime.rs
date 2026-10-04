@@ -124,10 +124,13 @@ fn perform_http_request(
         Ok(response) => {
             let mut response_headers = serde_json::Map::new();
             for (name, value) in response.headers {
-                if name.eq_ignore_ascii_case("set-cookie") || name.eq_ignore_ascii_case("set-cookie2") {
+                if name.eq_ignore_ascii_case("set-cookie")
+                    || name.eq_ignore_ascii_case("set-cookie2")
+                {
                     continue;
                 }
-                response_headers.insert(name.to_ascii_lowercase(), serde_json::Value::String(value));
+                response_headers
+                    .insert(name.to_ascii_lowercase(), serde_json::Value::String(value));
             }
             let status_text = ureq::http::StatusCode::from_u16(response.status)
                 .ok()
@@ -222,7 +225,6 @@ mod boa_rt {
             let bootstrap = super::make_bootstrap(page_url, cfg.user_agent.as_deref());
             ctx.eval(Source::from_bytes(bootstrap.as_bytes()))
                 .map_err(|e| anyhow!("bootstrap error: {:?}", e))?;
-
 
             for script in scripts {
                 if let Err(e) = ctx.eval(Source::from_bytes(script.as_bytes())) {
@@ -465,7 +467,10 @@ mod quickjs_rt {
         }
     }
 
-    fn bounded_deadline(timeout: Option<Duration>, render_deadline: Option<Instant>) -> Option<Instant> {
+    fn bounded_deadline(
+        timeout: Option<Duration>,
+        render_deadline: Option<Instant>,
+    ) -> Option<Instant> {
         let local = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
         match (local, render_deadline) {
             (Some(local), Some(render)) => Some(local.min(render)),

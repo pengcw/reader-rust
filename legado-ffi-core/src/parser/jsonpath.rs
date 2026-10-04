@@ -46,6 +46,218 @@ fn has_unsupported_filter_selector(rule: &str) -> bool {
     false
 }
 
+// A deliberately narrow Jayway extension: one current-item dotted-path =~ predicate.
+// All ordinary JSONPath evaluation remains with jsonpath_lib.
+fn regex_filter_query(value: &Value, rule: &str) -> Option<Vec<Value>> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut start = None;
+    for (index, ch) in rule.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+        } else if rule[index..].starts_with("[?(") {
+            start = Some(index);
+            break;
+        }
+    }
+    let start = start?;
+    let expression = &rule[start + 3..];
+    let mut quote = None;
+    let mut escaped = false;
+    let mut operator = None;
+    for (index, ch) in expression.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+        } else if ch == ')' {
+            break;
+        } else if expression[index..].starts_with("=~") {
+            operator = Some(index);
+            break;
+        }
+    }
+    let operator = operator?;
+    let (left, literal) = (&expression[..operator], &expression[operator + 2..]);
+    static CURRENT_PATH: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"^@(?:\.[\p{L}_$][\p{L}\p{N}_$]*)*$").unwrap()
+    });
+    if !CURRENT_PATH.is_match(left.trim()) {
+        return Some(vec![]);
+    }
+    let literal = literal.trim_start();
+    let Some(pattern_start) = literal.strip_prefix('/') else {
+        return Some(vec![]);
+    };
+    let mut escaped = false;
+    let mut end = None;
+    for (index, ch) in pattern_start.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+        } else if ch == '/' {
+            end = Some(index);
+            break;
+        }
+    }
+    let Some(end) = end else {
+        return Some(vec![]);
+    };
+    let tail = &pattern_start[end + 1..];
+    let flags_end = tail
+        .find(|ch: char| !ch.is_ascii_alphabetic())
+        .unwrap_or(tail.len());
+    // Jayway ignores unknown literal flags; use the supported Java flag set.
+    let flags: String = tail[..flags_end]
+        .chars()
+        .filter(|ch| "dixmsuU".contains(*ch))
+        .collect();
+    let Some(suffix) = tail[flags_end..]
+        .trim_start()
+        .strip_prefix(')')
+        .and_then(|tail| tail.trim_start().strip_prefix(']'))
+    else {
+        return Some(vec![]);
+    };
+    let prefix = &rule[..start];
+    if prefix.contains("[?(") || suffix.contains("[?(") {
+        return Some(vec![]);
+    }
+    let pattern = pattern_start[..end].replace(r"\/", "/");
+    let pattern = if flags.is_empty() {
+        pattern
+    } else {
+        format!("(?{flags}){pattern}")
+    };
+    if !super::source_regex::is_valid(&pattern) {
+        return Some(vec![]);
+    }
+    let prefix = normalize_negative_indices(prefix);
+    let Ok(parents) = jsonpath_lib::select(value, &prefix) else {
+        return Some(vec![]);
+    };
+    let path = format!("${}", &left.trim()[1..]);
+    let matches = |item: &Value| {
+        let values = jsonpath_lib::select(item, &path).unwrap_or_default();
+        // A missing definite path becomes Jayway's UNDEFINED node, whose regex input is empty.
+        if values.is_empty() {
+            return super::source_regex::is_full_match(&pattern, "");
+        }
+        let scalar_matches = |value: &Value| {
+            let input = match value {
+                Value::String(text) => text.clone(),
+                Value::Number(_) | Value::Bool(_) => value.to_string(),
+                // Jayway RegexpEvaluator.getInput uses an empty string otherwise.
+                _ => String::new(),
+            };
+            super::source_regex::is_full_match(&pattern, &input)
+        };
+        values.into_iter().any(|value| match value {
+            Value::Array(items) => items.iter().any(scalar_matches),
+            other => scalar_matches(other),
+        })
+    };
+    let mut output = Vec::new();
+    for parent in parents {
+        let candidates: &[Value] = match parent {
+            Value::Array(items) => items,
+            other => std::slice::from_ref(other),
+        };
+        for item in candidates.iter().filter(|item| matches(item)) {
+            if suffix.is_empty() {
+                output.push(item.clone());
+            } else {
+                output.extend(jsonpath_query(item, &format!("${suffix}")));
+            }
+        }
+    }
+    Some(output)
+}
+
+// jsonpath_lib clamps underflowing negative indexes to zero. A one-item slice
+// uses the same bounds but becomes empty on underflow, without replacing its evaluator.
+fn normalize_negative_indices(rule: &str) -> std::borrow::Cow<'_, str> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut parentheses = 0usize;
+    let mut output = String::new();
+    let mut copied = 0;
+    for (index, ch) in rule.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' => parentheses += 1,
+            ')' => parentheses = parentheses.saturating_sub(1),
+            '[' if parentheses == 0 => {
+                let Some(end) = rule[index..].find(']').map(|end| index + end) else {
+                    continue;
+                };
+                let Ok(position) = rule[index + 1..end].trim().parse::<isize>() else {
+                    continue;
+                };
+                if position >= 0 {
+                    continue;
+                }
+                output.push_str(&rule[copied..index]);
+                if position == -1 {
+                    output.push_str("[-1:]");
+                } else {
+                    output.push_str(&format!("[{position}:{}]", position + 1));
+                }
+                copied = end + 1;
+            }
+            _ => {}
+        }
+    }
+    if copied == 0 {
+        return std::borrow::Cow::Borrowed(rule);
+    }
+    output.push_str(&rule[copied..]);
+    std::borrow::Cow::Owned(output)
+}
+
 pub fn jsonpath_query(value: &Value, rule: &str) -> Vec<Value> {
     if let Some(rendered) = render_embedded_paths(value, rule) {
         return vec![Value::String(rendered)];
@@ -64,12 +276,16 @@ pub fn jsonpath_query(value: &Value, rule: &str) -> Vec<Value> {
         normalized = format!("$.{rule}");
         &normalized
     };
+    if let Some(result) = regex_filter_query(value, rule) {
+        return result;
+    }
     // jsonpath_lib 0.3 panics on range, union, and named-key selectors inside filters.
     // Reject those unsupported expressions before calling it; release builds abort on panic.
     if has_unsupported_filter_selector(rule) {
         return vec![];
     }
-    if let Ok(res) = jsonpath_lib::select(value, rule) {
+    let rule = normalize_negative_indices(rule);
+    if let Ok(res) = jsonpath_lib::select(value, &rule) {
         let mut out = Vec::new();
         for item in res {
             match item {
@@ -251,9 +467,12 @@ mod tests {
             vec![json!("ok")]
         );
 
-        // UNSUPPORTED: regex, membership, size, and reverse slices are parse errors.
+        assert_eq!(
+            jsonpath_query(&value, "$.books[?(@.name =~ /A|B/)].name"),
+            vec![json!("A"), json!("B")]
+        );
+        // UNSUPPORTED: membership, size, and reverse slices are parse errors.
         for rule in [
-            "$.books[?(@.name =~ /A|B/)].name",
             "$.books[?(@.name in ['A','C'])].name",
             "$.books[?(@.name nin ['A','C'])].name",
             "$.books[?(@.tags size 0)].name",

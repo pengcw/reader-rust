@@ -28,13 +28,21 @@ impl PatternSyntaxError {
     /// Construct an error with only a message — no source context attached.
     /// Used when the error surfaces outside the parser (e.g., from `Matcher`).
     pub fn new(message: String) -> Self {
-        Self { message, pattern: String::new(), index: 0 }
+        Self {
+            message,
+            pattern: String::new(),
+            index: 0,
+        }
     }
 
     /// Construct an error with full source context (message + pattern + index).
     /// The `Display` impl formats this in OpenJDK's `PatternSyntaxException` style.
     pub fn with_context(message: String, pattern: String, index: usize) -> Self {
-        Self { message, pattern, index }
+        Self {
+            message,
+            pattern,
+            index,
+        }
     }
 }
 
@@ -47,8 +55,14 @@ impl fmt::Display for PatternSyntaxError {
             // the chars before `index`. ASCII = 1 col each; non-ASCII chars
             // in source patterns are rare and treated as 1 col here (matches
             // OpenJDK, which also uses column count rather than visual width).
-            write!(f, "{} near index {}\n{}\n", self.message, self.index, self.pattern)?;
-            for _ in 0..self.index { f.write_str(" ")?; }
+            write!(
+                f,
+                "{} near index {}\n{}\n",
+                self.message, self.index, self.pattern
+            )?;
+            for _ in 0..self.index {
+                f.write_str(" ")?;
+            }
             f.write_str("^")
         }
     }
@@ -106,7 +120,8 @@ pub enum Node {
     LinebreakMatcher, // \R
     GraphemeCluster,  // \X
     SetFlags(Flags),  // inline flag change (?i) etc.
-    FlagGroup {        // (?i:...) scoped flag group
+    FlagGroup {
+        // (?i:...) scoped flag group
         flags: Flags,
         inner: Pattern,
     },
@@ -116,10 +131,11 @@ pub enum Node {
         index: usize,
         start: usize,
     },
-    RestoreFlags(Flags),  // engine-internal: restore flags after FlagGroup
+    RestoreFlags(Flags), // engine-internal: restore flags after FlagGroup
     #[allow(dead_code)]
     PositionCheck(usize), // engine-internal: assert current pos == target
-    GreedyCont {           // engine-internal: continue greedy quantifier loop
+    GreedyCont {
+        // engine-internal: continue greedy quantifier loop
         atom: Box<Node>,
         min: u32,
         max: u32,
@@ -127,7 +143,8 @@ pub enum Node {
         rest: Vec<Node>,
         prev_pos: usize,
     },
-    ReluctantCont {        // engine-internal: continue reluctant quantifier loop
+    ReluctantCont {
+        // engine-internal: continue reluctant quantifier loop
         atom: Box<Node>,
         min: u32,
         max: u32,
@@ -139,14 +156,14 @@ pub enum Node {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AnchorKind {
-    StartOfLine,                    // ^
-    EndOfLine,                      // $
-    StartOfInput,                   // \A
-    EndOfInput,                     // \z
-    EndOfInputBeforeFinalNewline,   // \Z
-    WordBoundary,                   // \b
-    NonWordBoundary,                // \B
-    PreviousMatchEnd,               // \G
+    StartOfLine,                  // ^
+    EndOfLine,                    // $
+    StartOfInput,                 // \A
+    EndOfInput,                   // \z
+    EndOfInputBeforeFinalNewline, // \Z
+    WordBoundary,                 // \b
+    NonWordBoundary,              // \B
+    PreviousMatchEnd,             // \G
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -167,26 +184,23 @@ pub enum CharClassItem {
     Single(char),
     Range(char, char),
     Predefined(PredefinedClass),
-    UnicodeProperty {
-        name: String,
-        negated: bool,
-    },
+    UnicodeProperty { name: String, negated: bool },
     Nested(CharClass),
     Intersection(Vec<CharClassItem>, Vec<CharClassItem>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PredefinedClass {
-    Digit,        // \d
-    NonDigit,     // \D
-    Word,         // \w
-    NonWord,      // \W
-    Whitespace,   // \s
-    NonWhitespace,// \S
-    HorizWhitespace,  // \h
-    NonHorizWhitespace,// \H
-    VertWhitespace,    // \v
-    NonVertWhitespace, // \V
+    Digit,              // \d
+    NonDigit,           // \D
+    Word,               // \w
+    NonWord,            // \W
+    Whitespace,         // \s
+    NonWhitespace,      // \S
+    HorizWhitespace,    // \h
+    NonHorizWhitespace, // \H
+    VertWhitespace,     // \v
+    NonVertWhitespace,  // \V
 }
 
 /// Information about a single regex match, including captured groups.

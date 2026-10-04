@@ -10,11 +10,15 @@ pub fn get_ugc(ch: char) -> UGC {
 }
 
 pub fn chars_eq_ci(a: char, b: char, unicode_case: bool) -> bool {
-    if a == b { return true; }
+    if a == b {
+        return true;
+    }
     if unicode_case {
         let a_lower = a.to_lowercase().next().unwrap_or(a);
         let b_lower = b.to_lowercase().next().unwrap_or(b);
-        if a_lower == b_lower { return true; }
+        if a_lower == b_lower {
+            return true;
+        }
         let a_upper = a.to_uppercase().next().unwrap_or(a);
         let b_upper = b.to_uppercase().next().unwrap_or(b);
         a_upper == b_upper
@@ -31,16 +35,24 @@ pub fn is_word_char(c: char, unicode: bool) -> bool {
     if unicode {
         // Java's Unicode \w: [\p{Alpha}\p{gc=Mn}\p{gc=Me}\p{gc=Mc}\p{Digit}\p{gc=Pc}]
         c.is_alphabetic()
-            || matches!(get_ugc(c),
-                UGC::DecimalNumber | UGC::NonspacingMark | UGC::SpacingMark |
-                UGC::EnclosingMark | UGC::ConnectorPunctuation)
+            || matches!(
+                get_ugc(c),
+                UGC::DecimalNumber
+                    | UGC::NonspacingMark
+                    | UGC::SpacingMark
+                    | UGC::EnclosingMark
+                    | UGC::ConnectorPunctuation
+            )
     } else {
         c.is_ascii_alphanumeric() || c == '_'
     }
 }
 
 pub fn is_linebreak(c: char) -> bool {
-    matches!(c, '\n' | '\x0B' | '\x0C' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}')
+    matches!(
+        c,
+        '\n' | '\x0B' | '\x0C' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}'
+    )
 }
 
 /// Approximation of Unicode Bidi_Mirrored property for Java's Character.isMirrored().
@@ -48,9 +60,13 @@ pub fn is_linebreak(c: char) -> bool {
 /// and a subset of Sm (math) symbols that have mirrored counterparts.
 fn is_bidi_mirrored(ch: char) -> bool {
     let cat = get_ugc(ch);
-    matches!(cat, UGC::OpenPunctuation | UGC::ClosePunctuation |
-        UGC::InitialPunctuation | UGC::FinalPunctuation)
-        || (cat == UGC::MathSymbol && is_mirrored_math(ch))
+    matches!(
+        cat,
+        UGC::OpenPunctuation
+            | UGC::ClosePunctuation
+            | UGC::InitialPunctuation
+            | UGC::FinalPunctuation
+    ) || (cat == UGC::MathSymbol && is_mirrored_math(ch))
         || matches!(ch, '<' | '>')
 }
 
@@ -72,35 +88,66 @@ fn is_mirrored_math(ch: char) -> bool {
 }
 
 fn is_unicode_punct(ch: char) -> bool {
-    matches!(get_ugc(ch),
-        UGC::ConnectorPunctuation | UGC::DashPunctuation | UGC::OpenPunctuation |
-        UGC::ClosePunctuation | UGC::InitialPunctuation | UGC::FinalPunctuation |
-        UGC::OtherPunctuation)
+    matches!(
+        get_ugc(ch),
+        UGC::ConnectorPunctuation
+            | UGC::DashPunctuation
+            | UGC::OpenPunctuation
+            | UGC::ClosePunctuation
+            | UGC::InitialPunctuation
+            | UGC::FinalPunctuation
+            | UGC::OtherPunctuation
+    )
 }
 
 fn is_unicode_graph(ch: char) -> bool {
     let cat = get_ugc(ch);
-    !matches!(cat, UGC::SpaceSeparator | UGC::LineSeparator | UGC::ParagraphSeparator |
-        UGC::Control | UGC::Surrogate | UGC::Unassigned)
-        && !ch.is_whitespace()
+    !matches!(
+        cat,
+        UGC::SpaceSeparator
+            | UGC::LineSeparator
+            | UGC::ParagraphSeparator
+            | UGC::Control
+            | UGC::Surrogate
+            | UGC::Unassigned
+    ) && !ch.is_whitespace()
 }
 
 fn is_unicode_print(ch: char) -> bool {
     let cat = get_ugc(ch);
     !matches!(cat, UGC::Control | UGC::Surrogate | UGC::Unassigned)
-        || matches!(cat, UGC::SpaceSeparator | UGC::LineSeparator | UGC::ParagraphSeparator)
+        || matches!(
+            cat,
+            UGC::SpaceSeparator | UGC::LineSeparator | UGC::ParagraphSeparator
+        )
 }
 
 pub fn is_posix_class(name: &str) -> bool {
-    matches!(name.to_lowercase().as_str(),
-        "alpha" | "alnum" | "ascii" | "blank" | "cntrl" | "digit" |
-        "graph" | "lower" | "print" | "punct" | "space" | "upper" |
-        "xdigit" | "white_space")
+    matches!(
+        name.to_lowercase().as_str(),
+        "alpha"
+            | "alnum"
+            | "ascii"
+            | "blank"
+            | "cntrl"
+            | "digit"
+            | "graph"
+            | "lower"
+            | "print"
+            | "punct"
+            | "space"
+            | "upper"
+            | "xdigit"
+            | "white_space"
+    )
 }
 
 pub fn is_combining_mark(c: char) -> bool {
     let cat = get_ugc(c);
-    matches!(cat, UGC::NonspacingMark | UGC::SpacingMark | UGC::EnclosingMark)
+    matches!(
+        cat,
+        UGC::NonspacingMark | UGC::SpacingMark | UGC::EnclosingMark
+    )
 }
 
 pub fn is_regional_indicator(c: char) -> bool {
@@ -118,46 +165,79 @@ pub fn is_emoji_modifier(c: char) -> bool {
 pub fn match_predefined_class(pc: PredefinedClass, ch: char, unicode: bool) -> bool {
     match pc {
         PredefinedClass::Digit => {
-            if unicode { matches!(get_ugc(ch), UGC::DecimalNumber) } else { ch.is_ascii_digit() }
+            if unicode {
+                matches!(get_ugc(ch), UGC::DecimalNumber)
+            } else {
+                ch.is_ascii_digit()
+            }
         }
         PredefinedClass::NonDigit => {
-            if unicode { !matches!(get_ugc(ch), UGC::DecimalNumber) } else { !ch.is_ascii_digit() }
+            if unicode {
+                !matches!(get_ugc(ch), UGC::DecimalNumber)
+            } else {
+                !ch.is_ascii_digit()
+            }
         }
         PredefinedClass::Word => is_word_char(ch, unicode),
         PredefinedClass::NonWord => !is_word_char(ch, unicode),
         PredefinedClass::Whitespace => {
-            if unicode { ch.is_whitespace() }
-            else { matches!(ch, ' ' | '\t' | '\n' | '\r' | '\x0C' | '\x0B') }
+            if unicode {
+                ch.is_whitespace()
+            } else {
+                matches!(ch, ' ' | '\t' | '\n' | '\r' | '\x0C' | '\x0B')
+            }
         }
         PredefinedClass::NonWhitespace => {
-            if unicode { !ch.is_whitespace() }
-            else { !matches!(ch, ' ' | '\t' | '\n' | '\r' | '\x0C' | '\x0B') }
+            if unicode {
+                !ch.is_whitespace()
+            } else {
+                !matches!(ch, ' ' | '\t' | '\n' | '\r' | '\x0C' | '\x0B')
+            }
         }
         PredefinedClass::HorizWhitespace => {
-            matches!(ch, '\t' | ' ' | '\u{00A0}' | '\u{1680}' | '\u{180E}' |
-                '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}')
+            matches!(
+                ch,
+                '\t' | ' ' | '\u{00A0}' | '\u{1680}' | '\u{180E}' | '\u{2000}'
+                    ..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
+            )
         }
-        PredefinedClass::NonHorizWhitespace => {
-            !matches!(ch, '\t' | ' ' | '\u{00A0}' | '\u{1680}' | '\u{180E}' |
-                '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}')
-        }
+        PredefinedClass::NonHorizWhitespace => !matches!(
+            ch,
+            '\t' | ' ' | '\u{00A0}' | '\u{1680}' | '\u{180E}' | '\u{2000}'
+                ..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
+        ),
         PredefinedClass::VertWhitespace => {
-            matches!(ch, '\n' | '\x0B' | '\x0C' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}')
+            matches!(
+                ch,
+                '\n' | '\x0B' | '\x0C' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}'
+            )
         }
-        PredefinedClass::NonVertWhitespace => {
-            !matches!(ch, '\n' | '\x0B' | '\x0C' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}')
-        }
+        PredefinedClass::NonVertWhitespace => !matches!(
+            ch,
+            '\n' | '\x0B' | '\x0C' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}'
+        ),
     }
 }
 
 pub fn is_valid_unicode_property(name: &str) -> bool {
     if name.starts_with("java") {
-        return matches!(name,
-            "javaLowerCase" | "javaUpperCase" | "javaTitleCase" |
-            "javaDigit" | "javaLetter" | "javaLetterOrDigit" |
-            "javaAlphabetic" | "javaWhitespace" | "javaSpaceChar" |
-            "javaMirrored" | "javaDefined" | "javaIdentifierIgnorable" |
-            "javaISOControl" | "javaUnicodeIdentifierStart" | "javaUnicodeIdentifierPart"
+        return matches!(
+            name,
+            "javaLowerCase"
+                | "javaUpperCase"
+                | "javaTitleCase"
+                | "javaDigit"
+                | "javaLetter"
+                | "javaLetterOrDigit"
+                | "javaAlphabetic"
+                | "javaWhitespace"
+                | "javaSpaceChar"
+                | "javaMirrored"
+                | "javaDefined"
+                | "javaIdentifierIgnorable"
+                | "javaISOControl"
+                | "javaUnicodeIdentifierStart"
+                | "javaUnicodeIdentifierPart"
         );
     }
     // Script names require "Is" prefix in Java (e.g. \p{IsLatin})
@@ -174,21 +254,97 @@ pub fn is_valid_unicode_property(name: &str) -> bool {
     }
     let name = name.strip_prefix("Is").unwrap_or(name);
     let name_lower = name.to_lowercase();
-    matches!(name_lower.as_str(),
-        "l" | "letter" | "lu" | "uppercase_letter" | "upper" | "ll" | "lowercase_letter" | "lower" |
-        "lc" | "cased_letter" |
-        "lt" | "titlecase_letter" | "lm" | "modifier_letter" | "lo" | "other_letter" |
-        "m" | "mark" | "mn" | "nonspacing_mark" | "mc" | "spacing_mark" | "me" | "enclosing_mark" |
-        "n" | "number" | "nd" | "decimal_digit_number" | "digit" | "nl" | "letter_number" | "no" | "other_number" |
-        "p" | "punctuation" | "punct" |
-        "pc" | "connector_punctuation" | "pd" | "dash_punctuation" |
-        "ps" | "open_punctuation" | "pe" | "close_punctuation" |
-        "pi" | "initial_punctuation" | "pf" | "final_punctuation" | "po" | "other_punctuation" |
-        "s" | "symbol" | "sm" | "math_symbol" | "sc" | "currency_symbol" | "sk" | "modifier_symbol" | "so" | "other_symbol" |
-        "z" | "separator" | "zs" | "space_separator" | "zl" | "line_separator" | "zp" | "paragraph_separator" |
-        "c" | "control" | "other" | "cc" | "cntrl" | "cf" | "format" | "co" | "private_use" | "cn" | "unassigned" |
-        "alpha" | "alnum" | "ascii" | "blank" | "graph" | "print" | "space" | "white_space" | "xdigit" |
-        "l1" | "latin1"
+    matches!(
+        name_lower.as_str(),
+        "l" | "letter"
+            | "lu"
+            | "uppercase_letter"
+            | "upper"
+            | "ll"
+            | "lowercase_letter"
+            | "lower"
+            | "lc"
+            | "cased_letter"
+            | "lt"
+            | "titlecase_letter"
+            | "lm"
+            | "modifier_letter"
+            | "lo"
+            | "other_letter"
+            | "m"
+            | "mark"
+            | "mn"
+            | "nonspacing_mark"
+            | "mc"
+            | "spacing_mark"
+            | "me"
+            | "enclosing_mark"
+            | "n"
+            | "number"
+            | "nd"
+            | "decimal_digit_number"
+            | "digit"
+            | "nl"
+            | "letter_number"
+            | "no"
+            | "other_number"
+            | "p"
+            | "punctuation"
+            | "punct"
+            | "pc"
+            | "connector_punctuation"
+            | "pd"
+            | "dash_punctuation"
+            | "ps"
+            | "open_punctuation"
+            | "pe"
+            | "close_punctuation"
+            | "pi"
+            | "initial_punctuation"
+            | "pf"
+            | "final_punctuation"
+            | "po"
+            | "other_punctuation"
+            | "s"
+            | "symbol"
+            | "sm"
+            | "math_symbol"
+            | "sc"
+            | "currency_symbol"
+            | "sk"
+            | "modifier_symbol"
+            | "so"
+            | "other_symbol"
+            | "z"
+            | "separator"
+            | "zs"
+            | "space_separator"
+            | "zl"
+            | "line_separator"
+            | "zp"
+            | "paragraph_separator"
+            | "c"
+            | "control"
+            | "other"
+            | "cc"
+            | "cntrl"
+            | "cf"
+            | "format"
+            | "co"
+            | "private_use"
+            | "cn"
+            | "unassigned"
+            | "alpha"
+            | "alnum"
+            | "ascii"
+            | "blank"
+            | "graph"
+            | "print"
+            | "space"
+            | "white_space"
+            | "xdigit"
+            | "l1"
+            | "latin1"
     )
 }
 
@@ -213,22 +369,30 @@ pub fn match_unicode_property_ext(name: &str, ch: char, unicode_class: bool) -> 
         "javaWhitespace" => {
             // Java's Character.isWhitespace: Zs/Zl/Zp except non-breaking spaces, plus control whitespace
             return match ch {
-                '\t' | '\n' | '\u{000B}' | '\u{000C}' | '\r' |
-                '\u{001C}' | '\u{001D}' | '\u{001E}' | '\u{001F}' => true,
+                '\t' | '\n' | '\u{000B}' | '\u{000C}' | '\r' | '\u{001C}' | '\u{001D}'
+                | '\u{001E}' | '\u{001F}' => true,
                 _ => {
                     let cat = get_ugc(ch);
-                    (matches!(cat, UGC::SpaceSeparator | UGC::LineSeparator | UGC::ParagraphSeparator))
-                        && ch != '\u{00A0}' && ch != '\u{2007}' && ch != '\u{202F}'
+                    (matches!(
+                        cat,
+                        UGC::SpaceSeparator | UGC::LineSeparator | UGC::ParagraphSeparator
+                    )) && ch != '\u{00A0}'
+                        && ch != '\u{2007}'
+                        && ch != '\u{202F}'
                 }
             };
         }
-        "javaSpaceChar" => return matches!(get_ugc(ch), UGC::SpaceSeparator | UGC::LineSeparator | UGC::ParagraphSeparator),
+        "javaSpaceChar" => {
+            return matches!(
+                get_ugc(ch),
+                UGC::SpaceSeparator | UGC::LineSeparator | UGC::ParagraphSeparator
+            )
+        }
         "javaISOControl" => return ch.is_control(),
         "javaDefined" => return !matches!(get_ugc(ch), UGC::Unassigned),
         "javaMirrored" => return is_bidi_mirrored(ch),
         "javaIdentifierIgnorable" => {
-            return (ch.is_control() && !ch.is_whitespace())
-                || matches!(get_ugc(ch), UGC::Format)
+            return (ch.is_control() && !ch.is_whitespace()) || matches!(get_ugc(ch), UGC::Format)
         }
         "javaUnicodeIdentifierStart" => return ch.is_alphabetic(),
         "javaUnicodeIdentifierPart" => return ch.is_alphanumeric() || ch == '_',
@@ -259,20 +423,84 @@ pub fn match_unicode_property_ext(name: &str, ch: char, unicode_class: bool) -> 
     // The `u` (bool) parameter below is `unicode_class`.
     let u = unicode_class;
     match name_lower.as_str() {
-        "upper" => return if u { ch.is_uppercase() } else { ch.is_ascii_uppercase() },
-        "lower" => return if u { ch.is_lowercase() } else { ch.is_ascii_lowercase() },
-        "alpha" => return if u { ch.is_alphabetic() } else { ch.is_ascii_alphabetic() },
-        "digit" => return if u { matches!(get_ugc(ch), UGC::DecimalNumber) } else { ch.is_ascii_digit() },
-        "alnum" => return if u { ch.is_alphabetic() || matches!(get_ugc(ch), UGC::DecimalNumber) } else { ch.is_ascii_alphanumeric() },
+        "upper" => {
+            return if u {
+                ch.is_uppercase()
+            } else {
+                ch.is_ascii_uppercase()
+            }
+        }
+        "lower" => {
+            return if u {
+                ch.is_lowercase()
+            } else {
+                ch.is_ascii_lowercase()
+            }
+        }
+        "alpha" => {
+            return if u {
+                ch.is_alphabetic()
+            } else {
+                ch.is_ascii_alphabetic()
+            }
+        }
+        "digit" => {
+            return if u {
+                matches!(get_ugc(ch), UGC::DecimalNumber)
+            } else {
+                ch.is_ascii_digit()
+            }
+        }
+        "alnum" => {
+            return if u {
+                ch.is_alphabetic() || matches!(get_ugc(ch), UGC::DecimalNumber)
+            } else {
+                ch.is_ascii_alphanumeric()
+            }
+        }
         "ascii" => return ch.is_ascii(),
-        "blank" => return if u { ch == '\t' || matches!(get_ugc(ch), UGC::SpaceSeparator) }
-                          else { ch == ' ' || ch == '\t' },
-        "punct" => return if u { is_unicode_punct(ch) }
-                          else { matches!(ch, '!'..='/' | ':'..='@' | '['..='`' | '{'..='~') },
-        "graph" => return if u { is_unicode_graph(ch) } else { ch.is_ascii_graphic() },
-        "print" => return if u { is_unicode_print(ch) } else { ch.is_ascii_graphic() || ch == ' ' },
-        "cntrl" => return if u { matches!(get_ugc(ch), UGC::Control) } else { ch.is_ascii_control() },
-        "space" | "white_space" => return if u { ch.is_whitespace() } else { ch.is_ascii_whitespace() },
+        "blank" => {
+            return if u {
+                ch == '\t' || matches!(get_ugc(ch), UGC::SpaceSeparator)
+            } else {
+                ch == ' ' || ch == '\t'
+            }
+        }
+        "punct" => {
+            return if u {
+                is_unicode_punct(ch)
+            } else {
+                matches!(ch, '!'..='/' | ':'..='@' | '['..='`' | '{'..='~')
+            }
+        }
+        "graph" => {
+            return if u {
+                is_unicode_graph(ch)
+            } else {
+                ch.is_ascii_graphic()
+            }
+        }
+        "print" => {
+            return if u {
+                is_unicode_print(ch)
+            } else {
+                ch.is_ascii_graphic() || ch == ' '
+            }
+        }
+        "cntrl" => {
+            return if u {
+                matches!(get_ugc(ch), UGC::Control)
+            } else {
+                ch.is_ascii_control()
+            }
+        }
+        "space" | "white_space" => {
+            return if u {
+                ch.is_whitespace()
+            } else {
+                ch.is_ascii_whitespace()
+            }
+        }
         "xdigit" => return ch.is_ascii_hexdigit(),
         "l1" | "latin1" => return (ch as u32) <= 0xFF,
         _ => {}
@@ -285,26 +513,47 @@ pub fn match_unicode_property_ext(name: &str, ch: char, unicode_class: bool) -> 
 
 fn match_ugc_category(name: &str, cat: UGC) -> bool {
     match name {
-        "l" | "letter" => matches!(cat,
-            UGC::UppercaseLetter | UGC::LowercaseLetter | UGC::TitlecaseLetter |
-            UGC::ModifierLetter | UGC::OtherLetter),
+        "l" | "letter" => matches!(
+            cat,
+            UGC::UppercaseLetter
+                | UGC::LowercaseLetter
+                | UGC::TitlecaseLetter
+                | UGC::ModifierLetter
+                | UGC::OtherLetter
+        ),
         "lu" | "uppercase_letter" => matches!(cat, UGC::UppercaseLetter),
         "ll" | "lowercase_letter" => matches!(cat, UGC::LowercaseLetter),
-        "lc" | "cased_letter" => matches!(cat, UGC::UppercaseLetter | UGC::LowercaseLetter | UGC::TitlecaseLetter),
+        "lc" | "cased_letter" => matches!(
+            cat,
+            UGC::UppercaseLetter | UGC::LowercaseLetter | UGC::TitlecaseLetter
+        ),
         "lt" | "titlecase_letter" => matches!(cat, UGC::TitlecaseLetter),
         "lm" | "modifier_letter" => matches!(cat, UGC::ModifierLetter),
         "lo" | "other_letter" => matches!(cat, UGC::OtherLetter),
-        "m" | "mark" => matches!(cat, UGC::NonspacingMark | UGC::SpacingMark | UGC::EnclosingMark),
+        "m" | "mark" => matches!(
+            cat,
+            UGC::NonspacingMark | UGC::SpacingMark | UGC::EnclosingMark
+        ),
         "mn" | "nonspacing_mark" => matches!(cat, UGC::NonspacingMark),
         "mc" | "spacing_mark" => matches!(cat, UGC::SpacingMark),
         "me" | "enclosing_mark" => matches!(cat, UGC::EnclosingMark),
-        "n" | "number" => matches!(cat, UGC::DecimalNumber | UGC::LetterNumber | UGC::OtherNumber),
+        "n" | "number" => matches!(
+            cat,
+            UGC::DecimalNumber | UGC::LetterNumber | UGC::OtherNumber
+        ),
         "nd" | "decimal_digit_number" => matches!(cat, UGC::DecimalNumber),
         "nl" | "letter_number" => matches!(cat, UGC::LetterNumber),
         "no" | "other_number" => matches!(cat, UGC::OtherNumber),
-        "p" | "punctuation" => matches!(cat,
-            UGC::ConnectorPunctuation | UGC::DashPunctuation | UGC::OpenPunctuation |
-            UGC::ClosePunctuation | UGC::InitialPunctuation | UGC::FinalPunctuation | UGC::OtherPunctuation),
+        "p" | "punctuation" => matches!(
+            cat,
+            UGC::ConnectorPunctuation
+                | UGC::DashPunctuation
+                | UGC::OpenPunctuation
+                | UGC::ClosePunctuation
+                | UGC::InitialPunctuation
+                | UGC::FinalPunctuation
+                | UGC::OtherPunctuation
+        ),
         "pc" | "connector_punctuation" => matches!(cat, UGC::ConnectorPunctuation),
         "pd" | "dash_punctuation" => matches!(cat, UGC::DashPunctuation),
         "ps" | "open_punctuation" => matches!(cat, UGC::OpenPunctuation),
@@ -312,16 +561,25 @@ fn match_ugc_category(name: &str, cat: UGC) -> bool {
         "pi" | "initial_punctuation" => matches!(cat, UGC::InitialPunctuation),
         "pf" | "final_punctuation" => matches!(cat, UGC::FinalPunctuation),
         "po" | "other_punctuation" => matches!(cat, UGC::OtherPunctuation),
-        "s" | "symbol" => matches!(cat, UGC::MathSymbol | UGC::CurrencySymbol | UGC::ModifierSymbol | UGC::OtherSymbol),
+        "s" | "symbol" => matches!(
+            cat,
+            UGC::MathSymbol | UGC::CurrencySymbol | UGC::ModifierSymbol | UGC::OtherSymbol
+        ),
         "sm" | "math_symbol" => matches!(cat, UGC::MathSymbol),
         "sc" | "currency_symbol" => matches!(cat, UGC::CurrencySymbol),
         "sk" | "modifier_symbol" => matches!(cat, UGC::ModifierSymbol),
         "so" | "other_symbol" => matches!(cat, UGC::OtherSymbol),
-        "z" | "separator" => matches!(cat, UGC::SpaceSeparator | UGC::LineSeparator | UGC::ParagraphSeparator),
+        "z" | "separator" => matches!(
+            cat,
+            UGC::SpaceSeparator | UGC::LineSeparator | UGC::ParagraphSeparator
+        ),
         "zs" | "space_separator" => matches!(cat, UGC::SpaceSeparator),
         "zl" | "line_separator" => matches!(cat, UGC::LineSeparator),
         "zp" | "paragraph_separator" => matches!(cat, UGC::ParagraphSeparator),
-        "c" | "control" | "other" => matches!(cat, UGC::Control | UGC::Format | UGC::PrivateUse | UGC::Unassigned),
+        "c" | "control" | "other" => matches!(
+            cat,
+            UGC::Control | UGC::Format | UGC::PrivateUse | UGC::Unassigned
+        ),
         "cc" => matches!(cat, UGC::Control),
         "cf" | "format" => matches!(cat, UGC::Format),
         "co" | "private_use" => matches!(cat, UGC::PrivateUse),
@@ -356,7 +614,10 @@ fn resolve_block_name(name: &str) -> Option<unicode_blocks::UnicodeBlock> {
     // Iterate all known blocks and compare normalized names
     // unicode_blocks doesn't provide a from_name lookup, so we check the char range
     // by finding a block whose normalized name matches
-    BLOCK_LIST.iter().find(|(norm, _)| *norm == normalized).map(|(_, block)| *block)
+    BLOCK_LIST
+        .iter()
+        .find(|(norm, _)| *norm == normalized)
+        .map(|(_, block)| *block)
 }
 
 /// Normalize block name for comparison: lowercase, remove spaces, underscores, hyphens.
@@ -375,8 +636,14 @@ const BLOCK_LIST: &[(&str, unicode_blocks::UnicodeBlock)] = &[
     ("latinextendeda", unicode_blocks::LATIN_EXTENDED_A),
     ("latinextendedb", unicode_blocks::LATIN_EXTENDED_B),
     ("ipaextensions", unicode_blocks::IPA_EXTENSIONS),
-    ("spacingmodifierletters", unicode_blocks::SPACING_MODIFIER_LETTERS),
-    ("combiningdiacriticalmarks", unicode_blocks::COMBINING_DIACRITICAL_MARKS),
+    (
+        "spacingmodifierletters",
+        unicode_blocks::SPACING_MODIFIER_LETTERS,
+    ),
+    (
+        "combiningdiacriticalmarks",
+        unicode_blocks::COMBINING_DIACRITICAL_MARKS,
+    ),
     ("greekandcoptic", unicode_blocks::GREEK_AND_COPTIC),
     ("greek", unicode_blocks::GREEK_AND_COPTIC),
     ("cyrillic", unicode_blocks::CYRILLIC),
@@ -391,28 +658,61 @@ const BLOCK_LIST: &[(&str, unicode_blocks::UnicodeBlock)] = &[
     ("telugu", unicode_blocks::TELUGU),
     ("thai", unicode_blocks::THAI),
     ("georgian", unicode_blocks::GEORGIAN),
-    ("hanguljamoextendeda", unicode_blocks::HANGUL_JAMO_EXTENDED_A),
-    ("hanguljamoextendedb", unicode_blocks::HANGUL_JAMO_EXTENDED_B),
+    (
+        "hanguljamoextendeda",
+        unicode_blocks::HANGUL_JAMO_EXTENDED_A,
+    ),
+    (
+        "hanguljamoextendedb",
+        unicode_blocks::HANGUL_JAMO_EXTENDED_B,
+    ),
     ("generalpunctuation", unicode_blocks::GENERAL_PUNCTUATION),
-    ("superscriptsandsubscripts", unicode_blocks::SUPERSCRIPTS_AND_SUBSCRIPTS),
+    (
+        "superscriptsandsubscripts",
+        unicode_blocks::SUPERSCRIPTS_AND_SUBSCRIPTS,
+    ),
     ("currencysymbols", unicode_blocks::CURRENCY_SYMBOLS),
     ("letterlikesymbols", unicode_blocks::LETTERLIKE_SYMBOLS),
     ("numberforms", unicode_blocks::NUMBER_FORMS),
     ("arrows", unicode_blocks::ARROWS),
-    ("mathematicaloperators", unicode_blocks::MATHEMATICAL_OPERATORS),
+    (
+        "mathematicaloperators",
+        unicode_blocks::MATHEMATICAL_OPERATORS,
+    ),
     ("boxdrawing", unicode_blocks::BOX_DRAWING),
     ("geometricshapes", unicode_blocks::GEOMETRIC_SHAPES),
-    ("miscellaneoussymbols", unicode_blocks::MISCELLANEOUS_SYMBOLS),
-    ("cjkunifiedideographs", unicode_blocks::CJK_UNIFIED_IDEOGRAPHS),
+    (
+        "miscellaneoussymbols",
+        unicode_blocks::MISCELLANEOUS_SYMBOLS,
+    ),
+    (
+        "cjkunifiedideographs",
+        unicode_blocks::CJK_UNIFIED_IDEOGRAPHS,
+    ),
     ("hiragana", unicode_blocks::HIRAGANA),
     ("katakana", unicode_blocks::KATAKANA),
     ("hangulsyllables", unicode_blocks::HANGUL_SYLLABLES),
     ("privateusearea", unicode_blocks::PRIVATE_USE_AREA),
-    ("alphabeticpresentationforms", unicode_blocks::ALPHABETIC_PRESENTATION_FORMS),
-    ("arabicpresentationformsa", unicode_blocks::ARABIC_PRESENTATION_FORMS_A),
-    ("arabicpresentationformsb", unicode_blocks::ARABIC_PRESENTATION_FORMS_B),
-    ("latinextendedadditional", unicode_blocks::LATIN_EXTENDED_ADDITIONAL),
-    ("halfwidthandfullwidthforms", unicode_blocks::HALFWIDTH_AND_FULLWIDTH_FORMS),
+    (
+        "alphabeticpresentationforms",
+        unicode_blocks::ALPHABETIC_PRESENTATION_FORMS,
+    ),
+    (
+        "arabicpresentationformsa",
+        unicode_blocks::ARABIC_PRESENTATION_FORMS_A,
+    ),
+    (
+        "arabicpresentationformsb",
+        unicode_blocks::ARABIC_PRESENTATION_FORMS_B,
+    ),
+    (
+        "latinextendedadditional",
+        unicode_blocks::LATIN_EXTENDED_ADDITIONAL,
+    ),
+    (
+        "halfwidthandfullwidthforms",
+        unicode_blocks::HALFWIDTH_AND_FULLWIDTH_FORMS,
+    ),
     ("specials", unicode_blocks::SPECIALS),
     ("deseret", unicode_blocks::DESERET),
     ("olditalic", unicode_blocks::OLD_ITALIC),

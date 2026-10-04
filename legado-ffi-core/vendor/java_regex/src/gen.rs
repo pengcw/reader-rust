@@ -20,17 +20,30 @@ pub enum RegexNode {
     Dot,
     Anchor(Anchor),
     Escape(EscClass),
-    LineBreak,                                  // \R
+    LineBreak, // \R
     Class(CharClass),
     Concat(Vec<RegexNode>),
     Alt(Vec<RegexNode>),
-    Group { kind: GroupKind, body: Box<RegexNode> },
-    Quantified { body: Box<RegexNode>, quant: Quantifier },
-    Lookaround { ahead: bool, neg: bool, body: Box<RegexNode> },
+    Group {
+        kind: GroupKind,
+        body: Box<RegexNode>,
+    },
+    Quantified {
+        body: Box<RegexNode>,
+        quant: Quantifier,
+    },
+    Lookaround {
+        ahead: bool,
+        neg: bool,
+        body: Box<RegexNode>,
+    },
     Backref(BackrefIdx),
-    Quote(Vec<LitChar>),                        // \Q...\E
-    InlineFlags(FlagSet),                       // (?i-m) etc.
-    FlagGroup { flags: FlagSet, body: Box<RegexNode> },  // (?i:...)
+    Quote(Vec<LitChar>),  // \Q...\E
+    InlineFlags(FlagSet), // (?i-m) etc.
+    FlagGroup {
+        flags: FlagSet,
+        body: Box<RegexNode>,
+    }, // (?i:...)
 }
 
 /// A character intended as a literal. Restricted to a tractable subset for
@@ -50,10 +63,30 @@ pub enum LitChar {
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "fuzz-gen", derive(arbitrary::Arbitrary))]
 pub enum AsciiPrintable {
-    A, B, C, D, E, F, G, H,
-    Zero, One, Two, Three,
-    Space, Comma, Colon, Underscore, Slash, Hyphen, At,
-    OpenAngle, CloseAngle, Equals, Plus, Tilde,
+    A,
+    B,
+    C,
+    D,
+    E,
+    F,
+    G,
+    H,
+    Zero,
+    One,
+    Two,
+    Three,
+    Space,
+    Comma,
+    Colon,
+    Underscore,
+    Slash,
+    Hyphen,
+    At,
+    OpenAngle,
+    CloseAngle,
+    Equals,
+    Plus,
+    Tilde,
 }
 
 /// A handful of non-ASCII code points spanning interesting Unicode behaviors
@@ -61,47 +94,52 @@ pub enum AsciiPrintable {
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "fuzz-gen", derive(arbitrary::Arbitrary))]
 pub enum UnicodeChar {
-    LatinEAcute,    // é U+00E9
-    LatinSsharp,    // ß U+00DF (folds to "ss")
-    GreekAlpha,     // α U+03B1
-    GreekCapAlpha,  // Α U+0391
-    CyrillicYa,     // я U+044F
-    Cjk,            // 中 U+4E2D
-    Snowman,        // ☃ U+2603
-    EmojiGrin,      // 😀 U+1F600 (supplementary plane)
+    LatinEAcute,   // é U+00E9
+    LatinSsharp,   // ß U+00DF (folds to "ss")
+    GreekAlpha,    // α U+03B1
+    GreekCapAlpha, // Α U+0391
+    CyrillicYa,    // я U+044F
+    Cjk,           // 中 U+4E2D
+    Snowman,       // ☃ U+2603
+    EmojiGrin,     // 😀 U+1F600 (supplementary plane)
 }
 
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "fuzz-gen", derive(arbitrary::Arbitrary))]
 pub enum Anchor {
-    StartLine,      // ^
-    EndLine,        // $
-    StartInput,     // \A
-    EndInputZ,      // \z
-    EndInputBigZ,   // \Z
-    WordBoundary,   // \b
-    NonWordBoundary,// \B
-    PrevMatchEnd,   // \G
+    StartLine,       // ^
+    EndLine,         // $
+    StartInput,      // \A
+    EndInputZ,       // \z
+    EndInputBigZ,    // \Z
+    WordBoundary,    // \b
+    NonWordBoundary, // \B
+    PrevMatchEnd,    // \G
 }
 
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "fuzz-gen", derive(arbitrary::Arbitrary))]
 pub enum EscClass {
-    Digit, NonDigit,
-    Word, NonWord,
-    Space, NonSpace,
-    HSpace, NonHSpace,
-    VSpace, NonVSpace,
-    UnicodeLetter,     // \p{L}
-    UnicodeNotLetter,  // \P{L}
-    UnicodeDigit,      // \p{Nd}
-    UnicodePunct,      // \p{P}
+    Digit,
+    NonDigit,
+    Word,
+    NonWord,
+    Space,
+    NonSpace,
+    HSpace,
+    NonHSpace,
+    VSpace,
+    NonVSpace,
+    UnicodeLetter,    // \p{L}
+    UnicodeNotLetter, // \P{L}
+    UnicodeDigit,     // \p{Nd}
+    UnicodePunct,     // \p{P}
     // Java-specific property aliases — sample a few to exercise the parser's
     // alias-resolution path. All of these should be accepted by both engines.
-    JavaUpperCase,     // \p{javaUpperCase}
-    JavaWhitespace,    // \p{javaWhitespace}
-    InGreek,           // \p{InGreek}     — block alias form
-    IsLatin,           // \p{IsLatin}     — script alias form
+    JavaUpperCase,  // \p{javaUpperCase}
+    JavaWhitespace, // \p{javaWhitespace}
+    InGreek,        // \p{InGreek}     — block alias form
+    IsLatin,        // \p{IsLatin}     — script alias form
 }
 
 #[derive(Debug, Clone)]
@@ -115,7 +153,7 @@ pub struct CharClass {
 #[cfg_attr(feature = "fuzz-gen", derive(arbitrary::Arbitrary))]
 pub enum ClassItem {
     Single(LitChar),
-    Range(AsciiPrintable, AsciiPrintable),  // ordered before render
+    Range(AsciiPrintable, AsciiPrintable), // ordered before render
     Esc(EscClass),
     Nested(Box<CharClass>),
     Intersect(Box<CharClass>, Box<CharClass>),
@@ -133,7 +171,13 @@ pub enum GroupKind {
 /// A small set of valid group names (must match Java's `[A-Za-z][A-Za-z0-9]*`).
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "fuzz-gen", derive(arbitrary::Arbitrary))]
-pub enum GroupName { Foo, Bar, Baz, X1, Y2 }
+pub enum GroupName {
+    Foo,
+    Bar,
+    Baz,
+    X1,
+    Y2,
+}
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "fuzz-gen", derive(arbitrary::Arbitrary))]
@@ -156,24 +200,43 @@ pub enum QuantKind {
 /// Bounded small counts — keeps generated patterns from blowing up.
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "fuzz-gen", derive(arbitrary::Arbitrary))]
-pub enum SmallCount { Zero, One, Two, Three, Four, Five }
+pub enum SmallCount {
+    Zero,
+    One,
+    Two,
+    Three,
+    Four,
+    Five,
+}
 
 impl SmallCount {
     fn val(self) -> u32 {
         match self {
-            SmallCount::Zero => 0, SmallCount::One => 1, SmallCount::Two => 2,
-            SmallCount::Three => 3, SmallCount::Four => 4, SmallCount::Five => 5,
+            SmallCount::Zero => 0,
+            SmallCount::One => 1,
+            SmallCount::Two => 2,
+            SmallCount::Three => 3,
+            SmallCount::Four => 4,
+            SmallCount::Five => 5,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "fuzz-gen", derive(arbitrary::Arbitrary))]
-pub enum QuantMode { Greedy, Reluctant, Possessive }
+pub enum QuantMode {
+    Greedy,
+    Reluctant,
+    Possessive,
+}
 
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "fuzz-gen", derive(arbitrary::Arbitrary))]
-pub enum BackrefIdx { B1, B2, B3 }
+pub enum BackrefIdx {
+    B1,
+    B2,
+    B3,
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 #[cfg_attr(feature = "fuzz-gen", derive(arbitrary::Arbitrary))]
@@ -199,17 +262,29 @@ impl LitChar {
 impl AsciiPrintable {
     pub fn to_char(self) -> char {
         match self {
-            AsciiPrintable::A => 'a', AsciiPrintable::B => 'b', AsciiPrintable::C => 'c',
-            AsciiPrintable::D => 'd', AsciiPrintable::E => 'e', AsciiPrintable::F => 'f',
-            AsciiPrintable::G => 'g', AsciiPrintable::H => 'h',
-            AsciiPrintable::Zero => '0', AsciiPrintable::One => '1',
-            AsciiPrintable::Two => '2', AsciiPrintable::Three => '3',
-            AsciiPrintable::Space => ' ', AsciiPrintable::Comma => ',',
-            AsciiPrintable::Colon => ':', AsciiPrintable::Underscore => '_',
-            AsciiPrintable::Slash => '/', AsciiPrintable::Hyphen => '-',
+            AsciiPrintable::A => 'a',
+            AsciiPrintable::B => 'b',
+            AsciiPrintable::C => 'c',
+            AsciiPrintable::D => 'd',
+            AsciiPrintable::E => 'e',
+            AsciiPrintable::F => 'f',
+            AsciiPrintable::G => 'g',
+            AsciiPrintable::H => 'h',
+            AsciiPrintable::Zero => '0',
+            AsciiPrintable::One => '1',
+            AsciiPrintable::Two => '2',
+            AsciiPrintable::Three => '3',
+            AsciiPrintable::Space => ' ',
+            AsciiPrintable::Comma => ',',
+            AsciiPrintable::Colon => ':',
+            AsciiPrintable::Underscore => '_',
+            AsciiPrintable::Slash => '/',
+            AsciiPrintable::Hyphen => '-',
             AsciiPrintable::At => '@',
-            AsciiPrintable::OpenAngle => '<', AsciiPrintable::CloseAngle => '>',
-            AsciiPrintable::Equals => '=', AsciiPrintable::Plus => '+',
+            AsciiPrintable::OpenAngle => '<',
+            AsciiPrintable::CloseAngle => '>',
+            AsciiPrintable::Equals => '=',
+            AsciiPrintable::Plus => '+',
             AsciiPrintable::Tilde => '~',
         }
     }
@@ -233,8 +308,11 @@ impl UnicodeChar {
 impl GroupName {
     pub fn name(self) -> &'static str {
         match self {
-            GroupName::Foo => "foo", GroupName::Bar => "bar", GroupName::Baz => "baz",
-            GroupName::X1 => "x1", GroupName::Y2 => "y2",
+            GroupName::Foo => "foo",
+            GroupName::Bar => "bar",
+            GroupName::Baz => "baz",
+            GroupName::X1 => "x1",
+            GroupName::Y2 => "y2",
         }
     }
 }
@@ -243,13 +321,23 @@ impl FlagSet {
     /// Render as `iXX` chars for inline flag groups.
     fn to_chars(self) -> String {
         let mut s = String::new();
-        if self.i { s.push('i'); }
-        if self.m { s.push('m'); }
-        if self.s { s.push('s'); }
-        if self.u { s.push('u'); }
+        if self.i {
+            s.push('i');
+        }
+        if self.m {
+            s.push('m');
+        }
+        if self.s {
+            s.push('s');
+        }
+        if self.u {
+            s.push('u');
+        }
         s
     }
-    pub fn to_flags_str(self) -> String { self.to_chars() }
+    pub fn to_flags_str(self) -> String {
+        self.to_chars()
+    }
 }
 
 /// Render an AST node to a regex pattern string. Always produces UTF-8 output
@@ -269,7 +357,9 @@ fn render_into(node: &RegexNode, out: &mut String) {
         RegexNode::LineBreak => out.push_str("\\R"),
         RegexNode::Class(c) => render_class(c, out),
         RegexNode::Concat(items) => {
-            for n in items { render_atom(n, out); }
+            for n in items {
+                render_atom(n, out);
+            }
         }
         RegexNode::Alt(branches) => {
             if branches.is_empty() {
@@ -278,7 +368,9 @@ fn render_into(node: &RegexNode, out: &mut String) {
                 return;
             }
             for (i, b) in branches.iter().enumerate() {
-                if i > 0 { out.push('|'); }
+                if i > 0 {
+                    out.push('|');
+                }
                 render_branch(b, out);
             }
         }
@@ -313,7 +405,11 @@ fn render_into(node: &RegexNode, out: &mut String) {
             out.push(')');
         }
         RegexNode::Backref(b) => {
-            let n = match b { BackrefIdx::B1 => 1, BackrefIdx::B2 => 2, BackrefIdx::B3 => 3 };
+            let n = match b {
+                BackrefIdx::B1 => 1,
+                BackrefIdx::B2 => 2,
+                BackrefIdx::B3 => 3,
+            };
             write!(out, "\\{}", n).unwrap();
         }
         RegexNode::Quote(chars) => {
@@ -380,21 +476,29 @@ fn render_atom(node: &RegexNode, out: &mut String) {
 
 fn anchor_str(a: Anchor) -> &'static str {
     match a {
-        Anchor::StartLine => "^", Anchor::EndLine => "$",
-        Anchor::StartInput => "\\A", Anchor::EndInputZ => "\\z",
+        Anchor::StartLine => "^",
+        Anchor::EndLine => "$",
+        Anchor::StartInput => "\\A",
+        Anchor::EndInputZ => "\\z",
         Anchor::EndInputBigZ => "\\Z",
-        Anchor::WordBoundary => "\\b", Anchor::NonWordBoundary => "\\B",
+        Anchor::WordBoundary => "\\b",
+        Anchor::NonWordBoundary => "\\B",
         Anchor::PrevMatchEnd => "\\G",
     }
 }
 
 fn esc_str(e: EscClass) -> &'static str {
     match e {
-        EscClass::Digit => "\\d", EscClass::NonDigit => "\\D",
-        EscClass::Word => "\\w", EscClass::NonWord => "\\W",
-        EscClass::Space => "\\s", EscClass::NonSpace => "\\S",
-        EscClass::HSpace => "\\h", EscClass::NonHSpace => "\\H",
-        EscClass::VSpace => "\\v", EscClass::NonVSpace => "\\V",
+        EscClass::Digit => "\\d",
+        EscClass::NonDigit => "\\D",
+        EscClass::Word => "\\w",
+        EscClass::NonWord => "\\W",
+        EscClass::Space => "\\s",
+        EscClass::NonSpace => "\\S",
+        EscClass::HSpace => "\\h",
+        EscClass::NonHSpace => "\\H",
+        EscClass::VSpace => "\\v",
+        EscClass::NonVSpace => "\\V",
         EscClass::UnicodeLetter => "\\p{L}",
         EscClass::UnicodeNotLetter => "\\P{L}",
         EscClass::UnicodeDigit => "\\p{Nd}",
@@ -414,7 +518,11 @@ fn quant_str(q: &Quantifier, out: &mut String) {
         QuantKind::Exact(n) => write!(out, "{{{}}}", n.val()).unwrap(),
         QuantKind::AtLeast(n) => write!(out, "{{{},}}", n.val()).unwrap(),
         QuantKind::Range(lo, hi) => {
-            let (a, b) = if lo.val() <= hi.val() { (lo.val(), hi.val()) } else { (hi.val(), lo.val()) };
+            let (a, b) = if lo.val() <= hi.val() {
+                (lo.val(), hi.val())
+            } else {
+                (hi.val(), lo.val())
+            };
             write!(out, "{{{},{}}}", a, b).unwrap();
         }
     }
@@ -428,9 +536,9 @@ fn quant_str(q: &Quantifier, out: &mut String) {
 /// Escape a literal character for use *outside* a character class.
 fn write_literal(c: char, out: &mut String) {
     match c {
-        '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' |
-        '\\' | '|' | '^' | '$' => {
-            out.push('\\'); out.push(c);
+        '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '\\' | '|' | '^' | '$' => {
+            out.push('\\');
+            out.push(c);
         }
         '\n' => out.push_str("\\n"),
         '\r' => out.push_str("\\r"),
@@ -444,7 +552,8 @@ fn write_literal(c: char, out: &mut String) {
 fn write_class_char(c: char, out: &mut String) {
     match c {
         '\\' | ']' | '[' | '^' | '-' | '&' => {
-            out.push('\\'); out.push(c);
+            out.push('\\');
+            out.push(c);
         }
         '\n' => out.push_str("\\n"),
         '\r' => out.push_str("\\r"),
@@ -455,7 +564,9 @@ fn write_class_char(c: char, out: &mut String) {
 
 fn render_class(c: &CharClass, out: &mut String) {
     out.push('[');
-    if c.negated { out.push('^'); }
+    if c.negated {
+        out.push('^');
+    }
     if c.items.is_empty() {
         // empty class is invalid; emit a harmless placeholder
         out.push_str("\\w");
@@ -472,7 +583,11 @@ fn render_class_item(it: &ClassItem, out: &mut String) {
         ClassItem::Single(c) => write_class_char(c.to_char(), out),
         ClassItem::Range(lo, hi) => {
             let (a, b) = (lo.to_char(), hi.to_char());
-            let (lo_c, hi_c) = if (a as u32) <= (b as u32) { (a, b) } else { (b, a) };
+            let (lo_c, hi_c) = if (a as u32) <= (b as u32) {
+                (a, b)
+            } else {
+                (b, a)
+            };
             write_class_char(lo_c, out);
             out.push('-');
             write_class_char(hi_c, out);
@@ -492,8 +607,8 @@ fn render_class_item(it: &ClassItem, out: &mut String) {
 #[cfg(all(test, feature = "fuzz-gen"))]
 mod tests {
     use super::*;
-    use arbitrary::{Arbitrary, Unstructured};
     use alloc::vec;
+    use arbitrary::{Arbitrary, Unstructured};
 
     /// Deterministic SplitMix64 — same PRNG used by diff_fuzz.
     fn fill(state: &mut u64, buf: &mut [u8]) {
@@ -503,7 +618,9 @@ mod tests {
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
             z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
             let bytes = (z ^ (z >> 31)).to_le_bytes();
-            for (i, b) in chunk.iter_mut().enumerate() { *b = bytes[i]; }
+            for (i, b) in chunk.iter_mut().enumerate() {
+                *b = bytes[i];
+            }
         }
     }
 
@@ -526,14 +643,22 @@ mod tests {
                 produced += 1;
             }
         }
-        assert!(produced > 1000, "expected >1k successful renders, got {produced}");
+        assert!(
+            produced > 1000,
+            "expected >1k successful renders, got {produced}"
+        );
     }
 
     #[test]
     fn flag_set_to_flags_str_alias() {
         // `to_flags_str` is a public alias of the private `to_chars`. Direct
         // call covers the alias method.
-        let f = FlagSet { i: true, m: false, s: true, u: false };
+        let f = FlagSet {
+            i: true,
+            m: false,
+            s: true,
+            u: false,
+        };
         assert_eq!(f.to_flags_str(), "is");
     }
 
@@ -569,26 +694,51 @@ mod tests {
             },
             RegexNode::Quantified {
                 body: Box::new(RegexNode::Dot),
-                quant: Quantifier { kind: QuantKind::Star, mode: QuantMode::Greedy },
+                quant: Quantifier {
+                    kind: QuantKind::Star,
+                    mode: QuantMode::Greedy,
+                },
             },
             RegexNode::Lookaround {
-                ahead: true, neg: false,
+                ahead: true,
+                neg: false,
                 body: Box::new(RegexNode::Dot),
             },
             RegexNode::Lookaround {
-                ahead: false, neg: true,
+                ahead: false,
+                neg: true,
                 body: Box::new(RegexNode::Dot),
             },
             RegexNode::Backref(BackrefIdx::B1),
             RegexNode::Quote(vec![LitChar::Cr]),
-            RegexNode::InlineFlags(FlagSet { i: true, m: false, s: true, u: false }),
-            RegexNode::InlineFlags(FlagSet { i: false, m: false, s: false, u: false }),
+            RegexNode::InlineFlags(FlagSet {
+                i: true,
+                m: false,
+                s: true,
+                u: false,
+            }),
+            RegexNode::InlineFlags(FlagSet {
+                i: false,
+                m: false,
+                s: false,
+                u: false,
+            }),
             RegexNode::FlagGroup {
-                flags: FlagSet { i: true, m: false, s: false, u: false },
+                flags: FlagSet {
+                    i: true,
+                    m: false,
+                    s: false,
+                    u: false,
+                },
                 body: Box::new(RegexNode::Dot),
             },
             RegexNode::FlagGroup {
-                flags: FlagSet { i: false, m: false, s: false, u: false },
+                flags: FlagSet {
+                    i: false,
+                    m: false,
+                    s: false,
+                    u: false,
+                },
                 body: Box::new(RegexNode::Dot),
             },
         ];

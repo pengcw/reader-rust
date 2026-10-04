@@ -1,3 +1,4 @@
+pub(crate) mod chacha20;
 pub(crate) mod compression;
 pub(crate) mod crypto;
 pub mod html;
@@ -6,4 +7,5 @@ pub mod js;
 pub mod jsonpath;
 pub mod rule_analyzer;
 pub mod rule_engine;
+pub(crate) mod secure_random;
 pub(crate) mod source_regex;

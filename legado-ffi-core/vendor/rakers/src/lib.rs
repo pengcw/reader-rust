@@ -108,7 +108,9 @@ impl RequestBudget {
             requests: Arc::new(AtomicUsize::new(0)),
             max_requests: cfg.max_requests.unwrap_or(32).max(1),
             max_response_bytes: cfg.max_response_bytes.unwrap_or(8 * 1024 * 1024).max(1),
-            deadline: cfg.render_timeout.and_then(|timeout| Instant::now().checked_add(timeout)),
+            deadline: cfg
+                .render_timeout
+                .and_then(|timeout| Instant::now().checked_add(timeout)),
         }
     }
 
@@ -117,12 +119,18 @@ impl RequestBudget {
     }
 
     fn before_request(&self) -> Result<(), String> {
-        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
             return Err("Rakers render deadline exceeded".to_string());
         }
         let request = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
         if request > self.max_requests {
-            return Err(format!("Rakers network request limit exceeded ({})", self.max_requests));
+            return Err(format!(
+                "Rakers network request limit exceeded ({})",
+                self.max_requests
+            ));
         }
         Ok(())
     }
@@ -134,7 +142,10 @@ impl RequestBudget {
                 self.max_response_bytes
             ));
         }
-        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
             return Err("Rakers render deadline exceeded".to_string());
         }
         Ok(())
@@ -206,7 +217,9 @@ impl HttpConfig {
     ) -> Vec<(String, String)> {
         let mut out = Vec::new();
         if let Some(ua) = &self.user_agent
-            && !headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+            && !headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
         {
             out.push(("User-Agent".to_string(), ua.clone()));
         }
@@ -227,7 +240,10 @@ impl HttpConfig {
         include_config_headers: bool,
     ) -> Result<HttpResponse, String> {
         let method = method.trim().to_ascii_uppercase();
-        if !matches!(method.as_str(), "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS") {
+        if !matches!(
+            method.as_str(),
+            "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS"
+        ) {
             return Err(format!("unsupported Rakers HTTP method: {method}"));
         }
         let parsed = url::Url::parse(url).map_err(|error| format!("invalid URL: {error}"))?;
@@ -236,7 +252,9 @@ impl HttpConfig {
             || !parsed.username().is_empty()
             || parsed.password().is_some()
         {
-            return Err("Rakers requests require an absolute http(s) URL without credentials".to_string());
+            return Err(
+                "Rakers requests require an absolute http(s) URL without credentials".to_string(),
+            );
         }
         budget.before_request()?;
         let headers = self.request_headers(headers, include_config_headers);
@@ -256,8 +274,11 @@ impl HttpConfig {
                 builder = builder.header(name.as_str(), value.as_str());
             }
             let mut response = if let Some(body) = body {
-                self.build_agent(false)
-                    .run(builder.body(body.to_string()).map_err(|error| error.to_string())?)
+                self.build_agent(false).run(
+                    builder
+                        .body(body.to_string())
+                        .map_err(|error| error.to_string())?,
+                )
             } else {
                 self.build_agent(false)
                     .run(builder.body(()).map_err(|error| error.to_string())?)
@@ -759,7 +780,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(out.contains("<p>fetched</p>"), "dynamic script must use host transport");
+        assert!(
+            out.contains("<p>fetched</p>"),
+            "dynamic script must use host transport"
+        );
     }
 
     #[test]
@@ -1123,7 +1147,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(out.contains("<p>payload</p>"), "real fetch body must hydrate, got: {out}");
+        assert!(
+            out.contains("<p>payload</p>"),
+            "real fetch body must hydrate, got: {out}"
+        );
     }
 
     #[test]
@@ -1144,7 +1171,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(out.contains("<p>json-ok</p>"), "fetch.json() must use response body, got: {out}");
+        assert!(
+            out.contains("<p>json-ok</p>"),
+            "fetch.json() must use response body, got: {out}"
+        );
     }
 
     #[test]
@@ -1165,7 +1195,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(out.contains("<p>rejected</p>"), "transport failures must reject fetch, got: {out}");
+        assert!(
+            out.contains("<p>rejected</p>"),
+            "transport failures must reject fetch, got: {out}"
+        );
         assert!(!out.contains("<p>unexpected</p>"));
     }
 
@@ -1187,7 +1220,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(out.contains("<p>404:false</p>"), "HTTP errors must resolve as responses, got: {out}");
+        assert!(
+            out.contains("<p>404:false</p>"),
+            "HTTP errors must resolve as responses, got: {out}"
+        );
         assert!(!out.contains("<p>rejected</p>"));
     }
 
@@ -1209,7 +1245,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(out.contains("<p>limited</p>"), "request budget must reject excess fetches, got: {out}");
+        assert!(
+            out.contains("<p>limited</p>"),
+            "request budget must reject excess fetches, got: {out}"
+        );
     }
 
     #[test]
@@ -1231,7 +1270,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(out.contains("<p>too-large</p>"), "response limit must reject fetch, got: {out}");
+        assert!(
+            out.contains("<p>too-large</p>"),
+            "response limit must reject fetch, got: {out}"
+        );
         assert!(!out.contains("<p>unexpected</p>"));
     }
 
@@ -1248,7 +1290,10 @@ mod tests {
         };
         let started = Instant::now();
         let out = render(js, true, None, &cfg, false, None, None).unwrap();
-        assert!(started.elapsed() < Duration::from_secs(2), "microtask loop escaped render budget");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "microtask loop escaped render budget"
+        );
         assert!(out.contains("<p>started</p>"));
     }
 
@@ -1296,7 +1341,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(out.contains("<p>xhr-addev-ok</p>"), "XHR load listener must fire, got: {out}");
+        assert!(
+            out.contains("<p>xhr-addev-ok</p>"),
+            "XHR load listener must fire, got: {out}"
+        );
     }
 
     #[test]

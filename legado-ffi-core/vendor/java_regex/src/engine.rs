@@ -13,7 +13,10 @@ use crate::unicode::*;
 /// chain-based bodies (Path 2), and whether to try `rest` after a zero-width
 /// Path-1 body match.
 #[derive(Copy, Clone, PartialEq, Eq)]
-enum Mode { Greedy, Reluctant }
+enum Mode {
+    Greedy,
+    Reluctant,
+}
 
 /// Whether a `Pattern` is "deterministic" in OpenJDK's sense — i.e., would be
 /// compiled with `GroupCurly` (atomic) rather than `Loop` (with backtracking)
@@ -34,18 +37,25 @@ fn is_deterministic_body(p: &Pattern) -> bool {
 /// Minimum match length of a Pattern. Walks the AST recursively; conservative
 /// (returns 0 for things it can't statically size, like backrefs).
 fn pattern_min_length(p: &Pattern) -> usize {
-    p.branches.iter().map(|b| b.iter().map(node_min_length).sum::<usize>()).min().unwrap_or(0)
+    p.branches
+        .iter()
+        .map(|b| b.iter().map(node_min_length).sum::<usize>())
+        .min()
+        .unwrap_or(0)
 }
 
 fn node_min_length(n: &Node) -> usize {
     match n {
         Node::Literal(_) | Node::Dot | Node::CharClass(_) => 1,
-        Node::LinebreakMatcher => 1,  // \R minimum is 1 (single char)
-        Node::Anchor(_) | Node::SetFlags(_) | Node::RestoreFlags(_)
-        | Node::Lookahead { .. } | Node::Lookbehind { .. } => 0,
-        Node::Group { inner, .. }
-        | Node::FlagGroup { inner, .. }
-        | Node::AtomicGroup { inner } => pattern_min_length(inner),
+        Node::LinebreakMatcher => 1, // \R minimum is 1 (single char)
+        Node::Anchor(_)
+        | Node::SetFlags(_)
+        | Node::RestoreFlags(_)
+        | Node::Lookahead { .. }
+        | Node::Lookbehind { .. } => 0,
+        Node::Group { inner, .. } | Node::FlagGroup { inner, .. } | Node::AtomicGroup { inner } => {
+            pattern_min_length(inner)
+        }
         Node::Quantified { inner, min, .. } => node_min_length(inner) * (*min as usize),
         // Only call site is `check_lookbehind` (via `pattern_min_length`).
         // The lookbehind body is a parsed pattern, which the parser has
@@ -69,7 +79,9 @@ fn pattern_max_length(p: &Pattern) -> Option<usize> {
         for node in branch {
             total = total.checked_add(node_max_length(node)?)?;
         }
-        if total > max { max = total; }
+        if total > max {
+            max = total;
+        }
     }
     Some(max)
 }
@@ -102,13 +114,18 @@ fn node_java_max(n: &Node) -> i32 {
     match n {
         Node::Literal(_) | Node::Dot | Node::CharClass(_) => 1,
         Node::LinebreakMatcher => 2,
-        Node::Anchor(_) | Node::SetFlags(_) | Node::RestoreFlags(_)
-        | Node::Lookahead { .. } | Node::Lookbehind { .. } => 0,
-        Node::Group { inner, .. }
-        | Node::FlagGroup { inner, .. }
-        | Node::AtomicGroup { inner } => pattern_java_max(inner),
+        Node::Anchor(_)
+        | Node::SetFlags(_)
+        | Node::RestoreFlags(_)
+        | Node::Lookahead { .. }
+        | Node::Lookbehind { .. } => 0,
+        Node::Group { inner, .. } | Node::FlagGroup { inner, .. } | Node::AtomicGroup { inner } => {
+            pattern_java_max(inner)
+        }
         Node::Quantified { inner, max, .. } => {
-            if *max == 0 { return 0; }
+            if *max == 0 {
+                return 0;
+            }
             let inner_max = node_java_max(inner);
             if *max == 1 {
                 // Java's Ques greedy/lazy is wrapped in `Branch[head, null]`
@@ -135,16 +152,18 @@ fn node_java_max(n: &Node) -> i32 {
     }
 }
 
-
 fn node_max_length(n: &Node) -> Option<usize> {
     match n {
         Node::Literal(_) | Node::Dot | Node::CharClass(_) => Some(1),
         Node::LinebreakMatcher => Some(2),
-        Node::Anchor(_) | Node::SetFlags(_) | Node::RestoreFlags(_)
-        | Node::Lookahead { .. } | Node::Lookbehind { .. } => Some(0),
-        Node::Group { inner, .. }
-        | Node::FlagGroup { inner, .. }
-        | Node::AtomicGroup { inner } => pattern_max_length(inner),
+        Node::Anchor(_)
+        | Node::SetFlags(_)
+        | Node::RestoreFlags(_)
+        | Node::Lookahead { .. }
+        | Node::Lookbehind { .. } => Some(0),
+        Node::Group { inner, .. } | Node::FlagGroup { inner, .. } | Node::AtomicGroup { inner } => {
+            pattern_max_length(inner)
+        }
         Node::Quantified { inner, max, .. } => {
             if *max == 0 {
                 // `X{0}` matches zero times regardless of `X` — even if X's
@@ -180,20 +199,20 @@ fn node_is_deterministic(n: &Node) -> bool {
         // Alternation (multi-branch Pattern) is the canonical non-deterministic
         // construct — Group/FlagGroup with a multi-branch body falls through to
         // is_deterministic_body returning false.
-        Node::Group { inner, .. }
-        | Node::FlagGroup { inner, .. }
-        | Node::AtomicGroup { inner } => is_deterministic_body(inner),
+        Node::Group { inner, .. } | Node::FlagGroup { inner, .. } | Node::AtomicGroup { inner } => {
+            is_deterministic_body(inner)
+        }
         // Java's `study()` marks Lookbehind/Lookahead as deterministic
         // regardless of internal alternation — lookarounds don't consume, so
         // their internal structure doesn't affect the outer quantifier's
         // backtracking model. Mirror that: a lookaround atom is deterministic
         // from the perspective of any enclosing quantifier.
-        Node::Lookahead { .. }
-        | Node::Lookbehind { .. } => true,
+        Node::Lookahead { .. } | Node::Lookbehind { .. } => true,
         // Java's `Curly.study` keeps `deterministic` only when min == max AND
         // the atom is deterministic.
-        Node::Quantified { inner, min, max, .. } =>
-            min == max && node_is_deterministic(inner),
+        Node::Quantified {
+            inner, min, max, ..
+        } => min == max && node_is_deterministic(inner),
         _ => true,
     }
 }
@@ -201,13 +220,21 @@ fn node_is_deterministic(n: &Node) -> bool {
 fn single_char_lowercase(c: char) -> Option<char> {
     let mut iter = c.to_lowercase();
     let first = iter.next()?;
-    if iter.next().is_some() { None } else { Some(first) }
+    if iter.next().is_some() {
+        None
+    } else {
+        Some(first)
+    }
 }
 
 fn single_char_uppercase(c: char) -> Option<char> {
     let mut iter = c.to_uppercase();
     let first = iter.next()?;
-    if iter.next().is_some() { None } else { Some(first) }
+    if iter.next().is_some() {
+        None
+    } else {
+        Some(first)
+    }
 }
 
 pub struct Engine<'a> {
@@ -247,7 +274,12 @@ impl State {
 }
 
 impl<'a> Engine<'a> {
-    pub fn new(input: &'a [char], flags: Flags, group_count: usize, named_groups: &'a BTreeMap<String, usize>) -> Self {
+    pub fn new(
+        input: &'a [char],
+        flags: Flags,
+        group_count: usize,
+        named_groups: &'a BTreeMap<String, usize>,
+    ) -> Self {
         Engine {
             input,
             flags,
@@ -265,7 +297,9 @@ impl<'a> Engine<'a> {
 
     /// Effective end-of-text for matching: `text_end`, mirroring `Matcher.to`.
     #[inline]
-    pub fn text_len(&self) -> usize { self.text_end }
+    pub fn text_len(&self) -> usize {
+        self.text_end
+    }
 
     pub(crate) fn budget_exhausted(&self) -> bool {
         self.steps >= self.max_steps
@@ -277,7 +311,11 @@ impl<'a> Engine<'a> {
     }
 
     #[allow(clippy::type_complexity)]
-    pub fn try_match_at(&mut self, pattern: &Pattern, pos: usize) -> Option<(usize, Vec<Option<(usize, usize)>>)> {
+    pub fn try_match_at(
+        &mut self,
+        pattern: &Pattern,
+        pos: usize,
+    ) -> Option<(usize, Vec<Option<(usize, usize)>>)> {
         let mut state = State::new(self.group_count);
         if self.match_pattern(pattern, &[], pos, &mut state) {
             Some((state.match_end, state.captures))
@@ -295,7 +333,12 @@ impl<'a> Engine<'a> {
     ///
     /// Returns `Some(end_pos)` on success and `None` on failure. State is
     /// mutated either way.
-    pub fn try_match_at_persistent(&mut self, pattern: &Pattern, pos: usize, state: &mut State) -> Option<usize> {
+    pub fn try_match_at_persistent(
+        &mut self,
+        pattern: &Pattern,
+        pos: usize,
+        state: &mut State,
+    ) -> Option<usize> {
         for branch in &pattern.branches {
             let combined = branch.clone();
             if self.match_nodes(&combined, pos, state) {
@@ -308,7 +351,13 @@ impl<'a> Engine<'a> {
         None
     }
 
-    pub fn match_pattern(&mut self, pattern: &Pattern, rest: &[Node], pos: usize, state: &mut State) -> bool {
+    pub fn match_pattern(
+        &mut self,
+        pattern: &Pattern,
+        rest: &[Node],
+        pos: usize,
+        state: &mut State,
+    ) -> bool {
         for branch in &pattern.branches {
             let mut combined = branch.clone();
             combined.extend_from_slice(rest);
@@ -326,7 +375,9 @@ impl<'a> Engine<'a> {
     }
 
     fn match_nodes(&mut self, nodes: &[Node], pos: usize, state: &mut State) -> bool {
-        if !self.step() { return false; }
+        if !self.step() {
+            return false;
+        }
         self.depth += 1;
         if self.depth > self.max_depth {
             self.depth -= 1;
@@ -338,7 +389,6 @@ impl<'a> Engine<'a> {
     }
 
     fn match_nodes_inner(&mut self, nodes: &[Node], pos: usize, state: &mut State) -> bool {
-
         if nodes.is_empty() {
             state.match_end = pos;
             return true;
@@ -423,12 +473,23 @@ impl<'a> Engine<'a> {
                 false
             }
 
-            Node::Quantified { inner, min, max, kind } => {
+            Node::Quantified {
+                inner,
+                min,
+                max,
+                kind,
+            } => {
                 let rest = &nodes[1..];
                 match kind {
-                    QuantKind::Greedy => self.match_greedy(inner, *min, *max, 0, rest, pos, pos, state),
-                    QuantKind::Reluctant => self.match_reluctant(inner, *min, *max, 0, rest, pos, pos, state),
-                    QuantKind::Possessive => self.match_possessive(inner, *min, *max, rest, pos, state),
+                    QuantKind::Greedy => {
+                        self.match_greedy(inner, *min, *max, 0, rest, pos, pos, state)
+                    }
+                    QuantKind::Reluctant => {
+                        self.match_reluctant(inner, *min, *max, 0, rest, pos, pos, state)
+                    }
+                    QuantKind::Possessive => {
+                        self.match_possessive(inner, *min, *max, rest, pos, state)
+                    }
                 }
             }
 
@@ -480,9 +541,7 @@ impl<'a> Engine<'a> {
                 }
             }
 
-            Node::Backreference(idx) => {
-                self.match_backref_by_index(*idx, &nodes[1..], pos, state)
-            }
+            Node::Backreference(idx) => self.match_backref_by_index(*idx, &nodes[1..], pos, state),
 
             Node::NamedBackreference(name) => {
                 if let Some(&idx) = self.named_groups.get(name) {
@@ -500,7 +559,10 @@ impl<'a> Engine<'a> {
                 // back to the single-char alternative when the \r\n branch
                 // fails downstream.
                 if pos < self.text_len() {
-                    if self.input[pos] == '\r' && pos + 1 < self.text_len() && self.input[pos + 1] == '\n' {
+                    if self.input[pos] == '\r'
+                        && pos + 1 < self.text_len()
+                        && self.input[pos + 1] == '\n'
+                    {
                         if self.match_nodes(&nodes[1..], pos + 2, state) {
                             return true;
                         }
@@ -568,7 +630,9 @@ impl<'a> Engine<'a> {
                 // - regional indicator pairs (flag emoji)
                 // - emoji ZWJ sequences (emoji + ZWJ + emoji + ...)
                 // - emoji with variation selectors and skin tone modifiers
-                if pos >= self.text_len() { return false; }
+                if pos >= self.text_len() {
+                    return false;
+                }
                 let mut p = pos;
                 if self.input[p] == '\r' && p + 1 < self.text_len() && self.input[p + 1] == '\n' {
                     p += 2;
@@ -608,7 +672,14 @@ impl<'a> Engine<'a> {
                 }
             }
 
-            Node::GreedyCont { atom, min, max, count, rest, prev_pos } => {
+            Node::GreedyCont {
+                atom,
+                min,
+                max,
+                count,
+                rest,
+                prev_pos,
+            } => {
                 if pos == *prev_pos {
                     // No progress made — atom matched zero-width. Since it can
                     // match empty forever, treat as having reached min, try rest.
@@ -618,7 +689,14 @@ impl<'a> Engine<'a> {
                 }
             }
 
-            Node::ReluctantCont { atom, min, max, count, rest, prev_pos } => {
+            Node::ReluctantCont {
+                atom,
+                min,
+                max,
+                count,
+                rest,
+                prev_pos,
+            } => {
                 if pos == *prev_pos {
                     // No progress made — atom matched zero-width. Since it can
                     // match empty forever, treat as having reached min, try rest.
@@ -631,14 +709,24 @@ impl<'a> Engine<'a> {
     }
 
     /// Shared backreference matching for both numbered and named backrefs.
-    fn match_backref_by_index(&mut self, idx: usize, rest: &[Node], pos: usize, state: &mut State) -> bool {
+    fn match_backref_by_index(
+        &mut self,
+        idx: usize,
+        rest: &[Node],
+        pos: usize,
+        state: &mut State,
+    ) -> bool {
         if let Some(Some((start, end))) = state.captures.get(idx) {
             let captured: Vec<char> = self.input[*start..*end].to_vec();
             let mut p = pos;
             for &ch in &captured {
-                if p >= self.text_len() { return false; }
+                if p >= self.text_len() {
+                    return false;
+                }
                 if self.flags.case_insensitive {
-                    if !chars_eq_ci(self.input[p], ch, self.flags.unicode_case) { return false; }
+                    if !chars_eq_ci(self.input[p], ch, self.flags.unicode_case) {
+                        return false;
+                    }
                 } else if self.input[p] != ch {
                     return false;
                 }
@@ -652,10 +740,19 @@ impl<'a> Engine<'a> {
 
     #[allow(clippy::too_many_arguments)]
     fn match_greedy(
-        &mut self, atom: &Node, min: u32, max: u32, count: u32,
-        rest: &[Node], pos: usize, iter_start: usize, state: &mut State,
+        &mut self,
+        atom: &Node,
+        min: u32,
+        max: u32,
+        count: u32,
+        rest: &[Node],
+        pos: usize,
+        iter_start: usize,
+        state: &mut State,
     ) -> bool {
-        if !self.step() { return false; }
+        if !self.step() {
+            return false;
+        }
 
         if count < max {
             // No save/restore — captures from failed quantifier-atom attempts
@@ -680,7 +777,12 @@ impl<'a> Engine<'a> {
             // GroupCurly conversion). For Path 2 (Ques `Branch[head, null]`
             // or non-det `Prolog(Loop)`), Java has no such override.
             if count > 0 {
-                if let Node::Group { index: Some(idx), inner, .. } = atom {
+                if let Node::Group {
+                    index: Some(idx),
+                    inner,
+                    ..
+                } = atom
+                {
                     let is_ques = min == 0 && max == 1;
                     let chain_based = is_ques || !is_deterministic_body(inner);
                     if !chain_based {
@@ -700,12 +802,22 @@ impl<'a> Engine<'a> {
     /// helper just dispatches.
     #[allow(clippy::too_many_arguments)]
     fn match_quant(
-        &mut self, mode: Mode, atom: &Node, min: u32, max: u32, count: u32,
-        rest: &[Node], pos: usize, iter_start: usize, state: &mut State,
+        &mut self,
+        mode: Mode,
+        atom: &Node,
+        min: u32,
+        max: u32,
+        count: u32,
+        rest: &[Node],
+        pos: usize,
+        iter_start: usize,
+        state: &mut State,
     ) -> bool {
         match mode {
             Mode::Greedy => self.match_greedy(atom, min, max, count, rest, pos, iter_start, state),
-            Mode::Reluctant => self.match_reluctant(atom, min, max, count, rest, pos, iter_start, state),
+            Mode::Reluctant => {
+                self.match_reluctant(atom, min, max, count, rest, pos, iter_start, state)
+            }
         }
     }
 
@@ -722,8 +834,15 @@ impl<'a> Engine<'a> {
     ///    abort `if (i == matcher.last) return false;` applies otherwise).
     #[allow(clippy::too_many_arguments)]
     fn try_match_atom_mode(
-        &mut self, mode: Mode, atom: &Node, min: u32, max: u32, count: u32,
-        rest: &[Node], pos: usize, state: &mut State,
+        &mut self,
+        mode: Mode,
+        atom: &Node,
+        min: u32,
+        max: u32,
+        count: u32,
+        rest: &[Node],
+        pos: usize,
+        state: &mut State,
     ) -> bool {
         let try_rest_zw = |count: u32| -> bool {
             match mode {
@@ -735,8 +854,22 @@ impl<'a> Engine<'a> {
             let atom = Box::new(atom.clone());
             let rest = rest.to_vec();
             match mode {
-                Mode::Greedy => Node::GreedyCont { atom, min, max, count, rest, prev_pos },
-                Mode::Reluctant => Node::ReluctantCont { atom, min, max, count, rest, prev_pos },
+                Mode::Greedy => Node::GreedyCont {
+                    atom,
+                    min,
+                    max,
+                    count,
+                    rest,
+                    prev_pos,
+                },
+                Mode::Reluctant => Node::ReluctantCont {
+                    atom,
+                    min,
+                    max,
+                    count,
+                    rest,
+                    prev_pos,
+                },
             }
         };
 
@@ -749,7 +882,17 @@ impl<'a> Engine<'a> {
                         self.input[pos] == *ch
                     };
                     if matched {
-                        return self.match_quant(mode, atom, min, max, count + 1, rest, pos + 1, pos, state);
+                        return self.match_quant(
+                            mode,
+                            atom,
+                            min,
+                            max,
+                            count + 1,
+                            rest,
+                            pos + 1,
+                            pos,
+                            state,
+                        );
                     }
                 }
                 false
@@ -816,7 +959,17 @@ impl<'a> Engine<'a> {
                         if branch_ok {
                             let new_pos = branch_state.match_end;
                             if new_pos > pos {
-                                if self.match_quant(mode, atom, min, max, count + 1, rest, new_pos, pos, state) {
+                                if self.match_quant(
+                                    mode,
+                                    atom,
+                                    min,
+                                    max,
+                                    count + 1,
+                                    rest,
+                                    new_pos,
+                                    pos,
+                                    state,
+                                ) {
                                     return true;
                                 }
                                 // GroupCurly restores its OWN slot on overall
@@ -830,7 +983,9 @@ impl<'a> Engine<'a> {
                                 // restores its own slot when body is provably
                                 // zero-width-only (pattern_max_length == 0) and
                                 // `max > 1` (excludes Ques, now chain-based).
-                                if count == 0 && min == 0 && max > 1
+                                if count == 0
+                                    && min == 0
+                                    && max > 1
                                     && pattern_max_length(inner) == Some(0)
                                 {
                                     if let Some(idx) = index {
@@ -838,7 +993,17 @@ impl<'a> Engine<'a> {
                                     }
                                 }
                                 if (count + 1) < min {
-                                    if self.match_quant(mode, atom, min, max, count + 1, rest, pos, pos, state) {
+                                    if self.match_quant(
+                                        mode,
+                                        atom,
+                                        min,
+                                        max,
+                                        count + 1,
+                                        rest,
+                                        pos,
+                                        pos,
+                                        state,
+                                    ) {
                                         return true;
                                     }
                                     if let Some(idx) = index {
@@ -890,11 +1055,31 @@ impl<'a> Engine<'a> {
                             let new_pos = branch_state.match_end;
                             self.flags = old_flags;
                             if new_pos > pos {
-                                if self.match_quant(mode, atom, min, max, count + 1, rest, new_pos, pos, state) {
+                                if self.match_quant(
+                                    mode,
+                                    atom,
+                                    min,
+                                    max,
+                                    count + 1,
+                                    rest,
+                                    new_pos,
+                                    pos,
+                                    state,
+                                ) {
                                     return true;
                                 }
                             } else if (count + 1) < min {
-                                if self.match_quant(mode, atom, min, max, count + 1, rest, pos, pos, state) {
+                                if self.match_quant(
+                                    mode,
+                                    atom,
+                                    min,
+                                    max,
+                                    count + 1,
+                                    rest,
+                                    pos,
+                                    pos,
+                                    state,
+                                ) {
                                     return true;
                                 }
                             } else if try_rest_zw(count) && self.match_nodes(rest, pos, state) {
@@ -914,11 +1099,34 @@ impl<'a> Engine<'a> {
                 // \R if a later iteration fails. So we match atomically here.
                 // (Sequential `\R\R` still backtracks via the match_nodes arm.)
                 if pos < self.text_len() {
-                    if self.input[pos] == '\r' && pos + 1 < self.text_len() && self.input[pos + 1] == '\n' {
-                        return self.match_quant(mode, atom, min, max, count + 1, rest, pos + 2, pos, state);
+                    if self.input[pos] == '\r'
+                        && pos + 1 < self.text_len()
+                        && self.input[pos + 1] == '\n'
+                    {
+                        return self.match_quant(
+                            mode,
+                            atom,
+                            min,
+                            max,
+                            count + 1,
+                            rest,
+                            pos + 2,
+                            pos,
+                            state,
+                        );
                     }
                     if is_linebreak(self.input[pos]) {
-                        return self.match_quant(mode, atom, min, max, count + 1, rest, pos + 1, pos, state);
+                        return self.match_quant(
+                            mode,
+                            atom,
+                            min,
+                            max,
+                            count + 1,
+                            rest,
+                            pos + 1,
+                            pos,
+                            state,
+                        );
                     }
                 }
                 false
@@ -933,9 +1141,13 @@ impl<'a> Engine<'a> {
                     let captured: Vec<char> = self.input[start..end].to_vec();
                     let mut p = pos;
                     for &ch in &captured {
-                        if p >= self.text_len() { return false; }
+                        if p >= self.text_len() {
+                            return false;
+                        }
                         if self.flags.case_insensitive {
-                            if !chars_eq_ci(self.input[p], ch, self.flags.unicode_case) { return false; }
+                            if !chars_eq_ci(self.input[p], ch, self.flags.unicode_case) {
+                                return false;
+                            }
                         } else if self.input[p] != ch {
                             return false;
                         }
@@ -989,10 +1201,19 @@ impl<'a> Engine<'a> {
 
     #[allow(clippy::too_many_arguments)]
     fn match_reluctant(
-        &mut self, atom: &Node, min: u32, max: u32, count: u32,
-        rest: &[Node], pos: usize, iter_start: usize, state: &mut State,
+        &mut self,
+        atom: &Node,
+        min: u32,
+        max: u32,
+        count: u32,
+        rest: &[Node],
+        pos: usize,
+        iter_start: usize,
+        state: &mut State,
     ) -> bool {
-        if !self.step() { return false; }
+        if !self.step() {
+            return false;
+        }
 
         if count >= min {
             // No save/restore — see comment on match_greedy.
@@ -1008,7 +1229,12 @@ impl<'a> Engine<'a> {
                 // GroupCurly). For Path 2 (Ques or non-det Loop) Java has no
                 // such override.
                 if count > 0 {
-                    if let Node::Group { index: Some(idx), inner, .. } = atom {
+                    if let Node::Group {
+                        index: Some(idx),
+                        inner,
+                        ..
+                    } = atom
+                    {
                         let is_ques = min == 0 && max == 1;
                         let chain_based = is_ques || !is_deterministic_body(inner);
                         if !chain_based {
@@ -1028,8 +1254,13 @@ impl<'a> Engine<'a> {
     }
 
     fn match_possessive(
-        &mut self, atom: &Node, min: u32, max: u32,
-        rest: &[Node], pos: usize, state: &mut State,
+        &mut self,
+        atom: &Node,
+        min: u32,
+        max: u32,
+        rest: &[Node],
+        pos: usize,
+        state: &mut State,
     ) -> bool {
         // Mirrors OpenJDK Curly POSSESSIVE: a cmin loop that iterates `min`
         // times unconditionally (without zero-width check), followed by
@@ -1065,15 +1296,23 @@ impl<'a> Engine<'a> {
     }
 
     fn is_lt(&self, c: char) -> bool {
-        if self.flags.unix_lines { c == '\n' } else { is_line_terminator(c) }
+        if self.flags.unix_lines {
+            c == '\n'
+        } else {
+            is_line_terminator(c)
+        }
     }
 
     fn is_after_line_terminator(&self, pos: usize) -> bool {
         // With anchoring bounds (default), positions at/before text_start
         // have no "preceding char" for line-terminator purposes.
-        if pos <= self.text_start { return false; }
+        if pos <= self.text_start {
+            return false;
+        }
         let prev = self.input[pos - 1];
-        if self.flags.unix_lines { return prev == '\n'; }
+        if self.flags.unix_lines {
+            return prev == '\n';
+        }
         if prev == '\n' {
             true
         } else if prev == '\r' {
@@ -1090,7 +1329,9 @@ impl<'a> Engine<'a> {
                     // Java/Perl quirk: in multiline mode, ^ never matches at end of input
                     // (even after a trailing line terminator). OpenJDK's Caret has an
                     // explicit `if (i == endIndex) return false;` for the same reason.
-                    if pos == self.text_len() { return false; }
+                    if pos == self.text_len() {
+                        return false;
+                    }
                     pos == self.text_start || self.is_after_line_terminator(pos)
                 } else {
                     pos == self.text_start
@@ -1098,9 +1339,15 @@ impl<'a> Engine<'a> {
             }
             AnchorKind::EndOfLine => {
                 if self.flags.multiline {
-                    if pos == self.text_len() { return true; }
+                    if pos == self.text_len() {
+                        return true;
+                    }
                     if pos < self.text_len() && self.is_lt(self.input[pos]) {
-                        if !self.flags.unix_lines && self.input[pos] == '\n' && pos > 0 && self.input[pos - 1] == '\r' {
+                        if !self.flags.unix_lines
+                            && self.input[pos] == '\n'
+                            && pos > 0
+                            && self.input[pos - 1] == '\r'
+                        {
                             return false;
                         }
                         return true;
@@ -1113,7 +1360,9 @@ impl<'a> Engine<'a> {
             AnchorKind::StartOfInput => pos == self.text_start,
             AnchorKind::EndOfInput => pos == self.text_len(),
             AnchorKind::EndOfInputBeforeFinalNewline => {
-                if pos == self.text_len() { return true; }
+                if pos == self.text_len() {
+                    return true;
+                }
                 self.check_before_final_newline(pos)
             }
             AnchorKind::WordBoundary => {
@@ -1133,7 +1382,9 @@ impl<'a> Engine<'a> {
     /// Check non-multiline $ and \Z: before final newline or at end.
     fn check_before_final_newline(&self, pos: usize) -> bool {
         let len = self.text_len();
-        if len == 0 { return false; }
+        if len == 0 {
+            return false;
+        }
         if self.flags.unix_lines {
             return pos == len - 1 && self.input[pos] == '\n';
         }
@@ -1142,7 +1393,11 @@ impl<'a> Engine<'a> {
             return true;
         }
         // Single line terminator at end (pos == len-1), but not the \n of a \r\n pair
-        pos + 1 == len && matches!(self.input[pos], '\n' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}')
+        pos + 1 == len
+            && matches!(
+                self.input[pos],
+                '\n' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}'
+            )
             && !(self.input[pos] == '\n' && pos > 0 && self.input[pos - 1] == '\r')
     }
 
@@ -1151,7 +1406,9 @@ impl<'a> Engine<'a> {
     fn word_char_before(&self, pos: usize) -> bool {
         // With anchoring bounds (default), positions at/before text_start
         // have no preceding word char.
-        if pos <= self.text_start { return false; }
+        if pos <= self.text_start {
+            return false;
+        }
         let mut i = pos - 1;
         // Skip back over combining marks to find the base character
         while i > 0 && is_combining_mark(self.input[i]) {
@@ -1163,7 +1420,9 @@ impl<'a> Engine<'a> {
     /// Check if the character at pos is a word character,
     /// treating combining marks as inheriting word-status from preceding char.
     fn word_char_after(&self, pos: usize) -> bool {
-        if pos >= self.text_len() { return false; }
+        if pos >= self.text_len() {
+            return false;
+        }
         if is_combining_mark(self.input[pos]) {
             // Combining mark inherits from preceding char
             return self.word_char_before(pos);
@@ -1172,7 +1431,9 @@ impl<'a> Engine<'a> {
     }
 
     fn check_end_of_line(&self, pos: usize) -> bool {
-        if pos == self.text_len() { return true; }
+        if pos == self.text_len() {
+            return true;
+        }
         self.check_before_final_newline(pos)
     }
 
@@ -1184,7 +1445,9 @@ impl<'a> Engine<'a> {
         // from the inner success that flipped the outer to fail.
         let rest = [Node::PositionCheck(pos)];
         let body_min = pattern_min_length(inner);
-        if body_min > pos { return false; }
+        if body_min > pos {
+            return false;
+        }
         let start_high = pos - body_min;
         // Compute `rmax` using Java's i32 wrapping arithmetic so we replicate
         // `Behind.match`/`NotBehind.match`'s iteration range exactly:
@@ -1205,7 +1468,9 @@ impl<'a> Engine<'a> {
         } else {
             (from_i32 as usize).max(self.text_start)
         };
-        if start_low > start_high { return false; }
+        if start_low > start_high {
+            return false;
+        }
         for start in (start_low..=start_high).rev() {
             if self.match_pattern(inner, &rest, start, state) {
                 return true;
@@ -1216,7 +1481,11 @@ impl<'a> Engine<'a> {
 
     pub fn match_char_class(&self, cc: &CharClass, ch: char) -> bool {
         let matched = self.match_char_class_items(&cc.items, ch);
-        if cc.negated { !matched } else { matched }
+        if cc.negated {
+            !matched
+        } else {
+            matched
+        }
     }
 
     fn match_char_class_items(&self, items: &[CharClassItem], ch: char) -> bool {
@@ -1224,16 +1493,22 @@ impl<'a> Engine<'a> {
             match item {
                 CharClassItem::Single(c) => {
                     if self.flags.case_insensitive {
-                        if chars_eq_ci(ch, *c, self.flags.unicode_case) { return true; }
+                        if chars_eq_ci(ch, *c, self.flags.unicode_case) {
+                            return true;
+                        }
                     } else if ch == *c {
                         return true;
                     }
                 }
                 CharClassItem::Range(start, end) => {
-                    if self.match_char_range(ch, *start, *end) { return true; }
+                    if self.match_char_range(ch, *start, *end) {
+                        return true;
+                    }
                 }
                 CharClassItem::Predefined(pc) => {
-                    if match_predefined_class(*pc, ch, self.flags.unicode_class) { return true; }
+                    if match_predefined_class(*pc, ch, self.flags.unicode_class) {
+                        return true;
+                    }
                 }
                 CharClassItem::UnicodeProperty { name, negated } => {
                     let uc = self.flags.unicode_class;
@@ -1241,30 +1516,54 @@ impl<'a> Engine<'a> {
                     if !matched && self.flags.case_insensitive && !is_posix_class(name) {
                         // For Lu/Ll/Lt, case-insensitive matching treats them as LC (cased letter)
                         let name_lower = name.to_lowercase();
-                        if matches!(name_lower.as_str(), "lu" | "uppercase_letter" | "ll" | "lowercase_letter" | "lt" | "titlecase_letter") {
+                        if matches!(
+                            name_lower.as_str(),
+                            "lu" | "uppercase_letter"
+                                | "ll"
+                                | "lowercase_letter"
+                                | "lt"
+                                | "titlecase_letter"
+                        ) {
                             matched = match_unicode_property_ext("lc", ch, uc);
                         } else if self.flags.unicode_case || name.starts_with("java") {
                             // Unicode case folding for unicode_case mode and java* properties
                             let upper = ch.to_uppercase().next().unwrap_or(ch);
                             let lower = ch.to_lowercase().next().unwrap_or(ch);
-                            if upper != ch { matched = match_unicode_property_ext(name, upper, uc); }
-                            if !matched && lower != ch { matched = match_unicode_property_ext(name, lower, uc); }
+                            if upper != ch {
+                                matched = match_unicode_property_ext(name, upper, uc);
+                            }
+                            if !matched && lower != ch {
+                                matched = match_unicode_property_ext(name, lower, uc);
+                            }
                         } else {
                             // ASCII case folding
                             let upper = ch.to_ascii_uppercase();
                             let lower = ch.to_ascii_lowercase();
-                            if upper != ch { matched = match_unicode_property_ext(name, upper, uc); }
-                            if !matched && lower != ch { matched = match_unicode_property_ext(name, lower, uc); }
+                            if upper != ch {
+                                matched = match_unicode_property_ext(name, upper, uc);
+                            }
+                            if !matched && lower != ch {
+                                matched = match_unicode_property_ext(name, lower, uc);
+                            }
                         }
                     }
-                    if *negated { if !matched { return true; } }
-                    else if matched { return true; }
+                    if *negated {
+                        if !matched {
+                            return true;
+                        }
+                    } else if matched {
+                        return true;
+                    }
                 }
                 CharClassItem::Nested(nested) => {
-                    if self.match_char_class(nested, ch) { return true; }
+                    if self.match_char_class(nested, ch) {
+                        return true;
+                    }
                 }
                 CharClassItem::Intersection(left, right) => {
-                    if self.match_char_class_items(left, ch) && self.match_char_class_items(right, ch) {
+                    if self.match_char_class_items(left, ch)
+                        && self.match_char_class_items(right, ch)
+                    {
                         return true;
                     }
                 }
@@ -1274,7 +1573,9 @@ impl<'a> Engine<'a> {
     }
 
     fn match_char_range(&self, ch: char, start: char, end: char) -> bool {
-        if ch >= start && ch <= end { return true; }
+        if ch >= start && ch <= end {
+            return true;
+        }
         if self.flags.case_insensitive {
             // Java treats `[start-end]` under CASE_INSENSITIVE as the set of input
             // characters whose own case variant lands inside the (unmodified) range.
@@ -1284,16 +1585,24 @@ impl<'a> Engine<'a> {
             // 'G' (0x47) is actually inside the original range 0x31..0x63.
             if self.flags.unicode_case {
                 if let Some(u) = single_char_uppercase(ch) {
-                    if u >= start && u <= end { return true; }
+                    if u >= start && u <= end {
+                        return true;
+                    }
                 }
                 if let Some(l) = single_char_lowercase(ch) {
-                    if l >= start && l <= end { return true; }
+                    if l >= start && l <= end {
+                        return true;
+                    }
                 }
             } else {
                 let u = ch.to_ascii_uppercase();
                 let l = ch.to_ascii_lowercase();
-                if u >= start && u <= end { return true; }
-                if l >= start && l <= end { return true; }
+                if u >= start && u <= end {
+                    return true;
+                }
+                if l >= start && l <= end {
+                    return true;
+                }
             }
             false
         } else {
