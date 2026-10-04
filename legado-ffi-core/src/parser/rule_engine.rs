@@ -1444,20 +1444,21 @@ impl RuleEngine {
         }
 
         let expanded = interpolate_common_templates(next_rule, body, base_url, ctx);
-        let mode = self.detect_mode(&expanded, body);
+        let (pure_rule, regex_part) = split_legado_regex(&expanded);
+        let mode = self.detect_mode(&pure_rule, body);
         let raw_urls = match mode {
             ParseMode::JsonPath => serde_json::from_str::<Value>(body)
                 .ok()
                 .map(|value| {
-                    jsonpath::jsonpath_query(&value, self.strip_mode_prefix(&expanded))
+                    jsonpath::jsonpath_query(&value, self.strip_mode_prefix(&pure_rule))
                         .iter()
                         .filter_map(jsonpath::value_to_string)
                         .collect()
                 })
                 .unwrap_or_default(),
-            ParseMode::XPath => html::select_xpath(body, self.strip_mode_prefix(&expanded)),
+            ParseMode::XPath => html::select_xpath(body, self.strip_mode_prefix(&pure_rule)),
             ParseMode::Js => eval_js_with_bindings(
-                self.strip_mode_prefix(&expanded),
+                self.strip_mode_prefix(&pure_rule),
                 body,
                 base_url,
                 &ctx.js_bindings(),
@@ -1469,7 +1470,7 @@ impl RuleEngine {
             })
             .unwrap_or_default(),
             ParseMode::Regex => regex_capture_all(
-                self.strip_mode_prefix(&expanded)
+                self.strip_mode_prefix(&pure_rule)
                     .trim_start_matches(':')
                     .trim(),
                 body,
@@ -1479,8 +1480,16 @@ impl RuleEngine {
             .collect(),
             ParseMode::Css => {
                 let doc = html::parse_document(body);
-                html::select_text_list(&doc, self.strip_mode_prefix(&expanded))
+                html::select_text_list(&doc, self.strip_mode_prefix(&pure_rule))
             }
+        };
+        let raw_urls = if let Some(reg) = regex_part {
+            raw_urls
+                .into_iter()
+                .map(|u| apply_legado_regex(&u, reg))
+                .collect()
+        } else {
+            raw_urls
         };
         normalize_toc_next_urls(base_url, raw_urls)
     }
@@ -2478,7 +2487,16 @@ fn parse_chapter_list_html(
 
     // Extract next_toc_url(s)
     let rule_str = rule.next_toc_url.as_deref().unwrap_or("");
-    let raw_urls: Vec<String> = html::select_text_list(&doc, rule_str);
+    let (pure_rule, regex_part) = split_legado_regex(rule_str);
+    let raw_urls: Vec<String> = html::select_text_list(&doc, &pure_rule);
+    let raw_urls = if let Some(reg) = regex_part {
+        raw_urls
+            .into_iter()
+            .map(|u| apply_legado_regex(&u, reg))
+            .collect()
+    } else {
+        raw_urls
+    };
     let next_urls = normalize_toc_next_urls(base_url, raw_urls);
 
     (out, next_urls)
@@ -3584,7 +3602,12 @@ fn eval_field_html_with_ctx(
         text = pure.to_string();
     }
     if let Some(script) = js {
-        if let Ok(result) = eval_js_with_bindings(script, &text, base_url, &ctx.js_bindings()) {
+        let js_input = if source_rule.mode == ParseMode::Js && text.is_empty() {
+            &input
+        } else {
+            &text
+        };
+        if let Ok(result) = eval_js_with_bindings(script, js_input, base_url, &ctx.js_bindings()) {
             text = result;
         }
     }
@@ -3663,7 +3686,12 @@ fn eval_field_html_doc_with_ctx(
         text = pure.to_string();
     }
     if let Some(script) = js {
-        if let Ok(result) = eval_js_with_bindings(script, &text, base_url, &ctx.js_bindings()) {
+        let js_input = if source_rule.mode == ParseMode::Js && text.is_empty() {
+            &input
+        } else {
+            &text
+        };
+        if let Ok(result) = eval_js_with_bindings(script, js_input, base_url, &ctx.js_bindings()) {
             text = result;
         }
     }
@@ -3819,8 +3847,32 @@ fn eval_field_json_with_ctx(
     if v.get("__readerHtmlElement").and_then(Value::as_bool) == Some(true)
         && v.get("__readerXPathNode").is_none()
     {
-        let document = scraper::Html::parse_fragment(v.get("outerHtml")?.as_str()?);
-        let element = document.root_element().child_elements().next()?;
+        let outer_html = v.get("outerHtml")?.as_str()?;
+        let tag = outer_html
+            .strip_prefix('<')?
+            .split(|c: char| c == '>' || c.is_ascii_whitespace())
+            .next()?;
+        // HTML fragment parsing uses a body context, which discards bare table
+        // rows/cells. Supply only their required container; keep the item root.
+        let (prefix, suffix) = match tag {
+            "td" | "th" => ("<table><tbody><tr>", "</tr></tbody></table>"),
+            "tr" => ("<table><tbody>", "</tbody></table>"),
+            "col" => ("<table><colgroup>", "</colgroup></table>"),
+            "tbody" | "thead" | "tfoot" | "caption" | "colgroup" => ("<table>", "</table>"),
+            _ => ("", ""),
+        };
+        let document = if prefix.is_empty() {
+            scraper::Html::parse_fragment(outer_html)
+        } else {
+            scraper::Html::parse_fragment(&format!("{prefix}{outer_html}{suffix}"))
+        };
+        let element = if prefix.is_empty() {
+            document.root_element().child_elements().next()?
+        } else {
+            document
+                .select(&scraper::Selector::parse(tag).ok()?)
+                .next()?
+        };
         return eval_field_html_with_ctx(rule, &element, base_url, ctx);
     }
     if let Some((script, remainder)) =
