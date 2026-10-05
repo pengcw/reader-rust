@@ -14,6 +14,8 @@ use url::Url;
 
 pub(crate) const DEFAULT_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+pub(crate) const DEFAULT_WEBVIEW_USER_AGENT: &str =
+    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/120.0.0.0 Mobile Safari/537.36";
 const MAX_REDIRECTS: usize = 5;
 
 #[derive(Debug, Clone, Default)]

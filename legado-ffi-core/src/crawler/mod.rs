@@ -17,6 +17,7 @@ mod http;
 pub mod session;
 pub(crate) use http::{
     HttpClient, HttpClientError, RawHttpResponse, SharedCookieStore, DEFAULT_USER_AGENT,
+    DEFAULT_WEBVIEW_USER_AGENT,
 };
 pub use session::{current_active_session, with_active_session, ActiveSession, ExecuteSession};
 
@@ -455,6 +456,80 @@ pub(crate) fn rakers_http_transport(
     })
 }
 
+fn render_rakers_page(
+    client: &HttpClient,
+    page_url: Option<&str>,
+    html: &str,
+    final_script: Option<&str>,
+    user_agent: Option<String>,
+    proxy: Option<String>,
+    clean: bool,
+    max_response_bytes: usize,
+) -> Result<rakers::RenderOutput, FetchError> {
+    let limit = max_response_bytes.max(1);
+    // Do not copy raw source credentials into page-controlled requests. Cookies
+    // flow through the shared WebView-style jar with normal domain/path rules.
+    let config = rakers::HttpConfig {
+        user_agent,
+        headers: Vec::new(),
+        proxy,
+        forward_headers: false,
+        transport: Some(rakers_http_transport(client, max_response_bytes)),
+        max_requests: Some(RAKERS_MAX_REQUESTS),
+        max_response_bytes: Some(max_response_bytes.max(1)),
+        render_timeout: Some(RAKERS_RENDER_TIMEOUT),
+    };
+    let rendered = rakers::render_detailed(
+        html,
+        false,
+        page_url,
+        &config,
+        clean,
+        Some(RAKERS_MAX_REMOTE_SCRIPTS),
+        Some(RAKERS_SCRIPT_TIMEOUT),
+        final_script,
+    )
+    .map_err(|error| FetchError::Rule(format!("Rakers render failed: {error}")))?;
+    if rendered.html.len() > limit
+        || rendered
+            .script_result
+            .as_ref()
+            .is_some_and(|result| result.len() > limit)
+    {
+        return Err(FetchError::ResponseTooLarge {
+            url: page_url.unwrap_or_default().to_string(),
+            limit,
+        });
+    }
+    Ok(rendered)
+}
+
+pub(crate) fn render_webview_with_rakers(
+    client: &HttpClient,
+    page_url: Option<&str>,
+    html: &str,
+    final_script: Option<&str>,
+    max_response_bytes: usize,
+) -> Result<rakers::RenderOutput, FetchError> {
+    let limit = max_response_bytes.max(1);
+    if html.len() > limit {
+        return Err(FetchError::ResponseTooLarge {
+            url: page_url.unwrap_or_default().to_string(),
+            limit,
+        });
+    }
+    render_rakers_page(
+        client,
+        page_url,
+        html,
+        final_script,
+        Some(DEFAULT_WEBVIEW_USER_AGENT.to_string()),
+        None,
+        false,
+        max_response_bytes,
+    )
+}
+
 fn render_with_rakers(
     client: &HttpClient,
     spec: &RequestSpec,
@@ -468,36 +543,17 @@ fn render_with_rakers(
         .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
         .map(|(_, value)| value.clone())
         .or_else(|| Some(DEFAULT_USER_AGENT.to_string()));
-    // Do not copy raw source credentials into page-controlled requests. Cookies
-    // flow through the shared WebView-style jar with normal domain/path rules.
-    let config = rakers::HttpConfig {
-        user_agent,
-        headers: Vec::new(),
-        proxy: spec.proxy.clone(),
-        forward_headers: false,
-        transport: Some(rakers_http_transport(client, max_response_bytes)),
-        max_requests: Some(RAKERS_MAX_REQUESTS),
-        max_response_bytes: Some(max_response_bytes.max(1)),
-        render_timeout: Some(RAKERS_RENDER_TIMEOUT),
-    };
-    let rendered = rakers::render(
-        html,
-        false,
+    Ok(render_rakers_page(
+        client,
         Some(page_url),
-        &config,
+        html,
+        None,
+        user_agent,
+        spec.proxy.clone(),
         true,
-        Some(RAKERS_MAX_REMOTE_SCRIPTS),
-        Some(RAKERS_SCRIPT_TIMEOUT),
-    )
-    .map_err(|error| FetchError::Rule(format!("Rakers render failed: {error}")))?;
-    let limit = max_response_bytes.max(1);
-    if rendered.len() > limit {
-        return Err(FetchError::ResponseTooLarge {
-            url: page_url.to_string(),
-            limit,
-        });
-    }
-    Ok(rendered)
+        max_response_bytes,
+    )?
+    .html)
 }
 
 /// Typed data URIs carry bytes locally; type-less data requests remain unsupported.

@@ -1,6 +1,6 @@
 use crate::crawler::{
     analyze_url_with_headers, decode_body, execute_request_spec, execute_request_spec_limited,
-    format_analyzed_body, HttpClient,
+    format_analyzed_body, render_webview_with_rakers, HttpClient,
 };
 use crate::model::book_source::BookSource;
 use crate::parser::html;
@@ -1080,6 +1080,12 @@ fn eval_js_inner_with_source(
                 }),
             )?;
             java_obj.set(
+                "__nativeWebView",
+                Func::new(|html: String, url: String, js: String| -> Option<String> {
+                    java_web_view(&html, &url, &js)
+                }),
+            )?;
+            java_obj.set(
                 "md5Encode",
                 Func::new(|input: String| -> String { md5_hex(&input) }),
             )?;
@@ -1188,7 +1194,7 @@ fn eval_js_inner_with_source(
             java_obj.set(
                 "getWebViewUA",
                 Func::new(|| -> String {
-                    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/120.0.0.0 Mobile Safari/537.36".to_string()
+                    crate::crawler::DEFAULT_WEBVIEW_USER_AGENT.to_string()
                 }),
             )?;
             java_obj.set(
@@ -1935,6 +1941,11 @@ fn eval_js_inner_with_source(
                         }
                         return value;
                     };
+                    java.webView = (html, url, js) => java.__nativeWebView(
+                        String(html == null ? '' : html),
+                        String(url == null ? '' : url),
+                        String(js == null ? '' : js)
+                    );
                     java.get = function(url, headers) {
                         const target = String(url == null ? '' : url);
                         if (arguments.length < 2 && !/^https?:\/\//i.test(target)) {
@@ -4808,6 +4819,54 @@ fn js_cache_delete(key: &str) -> bool {
         .is_some()
 }
 
+fn java_web_view(html: &str, url: &str, js: &str) -> Option<String> {
+    let client = active_js_webview_client();
+    let limit = crate::executor::DEFAULT_MAX_RESPONSE_BYTES;
+    let url = url.trim();
+
+    let (page_html, page_url) = if !html.trim().is_empty() {
+        (
+            html.to_string(),
+            (!url.is_empty()).then(|| url.to_string()),
+        )
+    } else {
+        if url.is_empty() {
+            return None;
+        }
+        let headers = [(
+            "User-Agent".to_string(),
+            crate::crawler::DEFAULT_WEBVIEW_USER_AGENT.to_string(),
+        )];
+        let response = client
+            .execute(Method::GET, url, &headers, None, Some(limit))
+            .ok()?;
+        let content_type = response
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        (
+            decode_body(&response.body, None, content_type.as_deref()),
+            Some(response.url),
+        )
+    };
+
+    let final_script = (!js.trim().is_empty()).then_some(js);
+    let output = render_webview_with_rakers(
+        &client,
+        page_url.as_deref(),
+        &page_html,
+        final_script,
+        limit,
+    )
+    .ok()?;
+    if final_script.is_some() {
+        output.script_result
+    } else {
+        Some(output.html)
+    }
+}
+
 fn java_request_simple(
     method: &str,
     url: &str,
@@ -6775,6 +6834,100 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
             eval_js(script, "", "https://example.com").unwrap(),
             "第123章|第123章|第123章|第102章|第12章|第20章|第1200章|前言|第-1章"
         );
+    }
+
+    #[test]
+    fn webview_renders_supplied_html_and_runs_final_script_after_load() {
+        let source = BookSource {
+            book_source_url: "https://example.test/".into(),
+            ..Default::default()
+        };
+        let client = HttpClient::standalone();
+        let result = with_js_http_context(&client, &source, || {
+            eval_js(
+                r#"java.webView(
+                    '<!doctype html><html><body><script>document.body.innerHTML="<p>page</p>"</script></body></html>',
+                    'https://example.test/page',
+                    'document.readyState + "|" + document.body.innerHTML'
+                )"#,
+                "",
+                &source.book_source_url,
+            )
+            .unwrap()
+        });
+        assert_eq!(result, "complete|<p>page</p>");
+
+        let rendered = with_js_http_context(&client, &source, || {
+            eval_js(
+                r#"java.webView(
+                    '<!doctype html><html><body><script>window.marker=1</script><p>static</p></body></html>',
+                    'https://example.test/page',
+                    null
+                )"#,
+                "",
+                &source.book_source_url,
+            )
+            .unwrap()
+        });
+        assert!(rendered.contains("<script>window.marker=1</script>"));
+        assert!(rendered.contains("<p>static</p>"));
+    }
+
+    #[test]
+    fn webview_url_fetch_uses_browser_client_cookie_jar() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("http://{address}/page");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = accept_with_timeout(&listener);
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut saw_cookie = false;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if line.to_ascii_lowercase().starts_with("cookie:") && line.contains("wv=1") {
+                    saw_cookie = true;
+                }
+            }
+            let body = "<!doctype html><html><body><script>document.body.innerHTML='<p>fetched</p>'</script></body></html>";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            saw_cookie
+        });
+
+        let source = BookSource {
+            book_source_url: format!("http://{address}/"),
+            enabled_cookie_jar: Some(false),
+            ..Default::default()
+        };
+        let session = crate::crawler::HttpSession::new(&source, 15_000).unwrap();
+        let parsed_url = url::Url::parse(&url).unwrap();
+        assert!(session
+            .webview_client()
+            .seed_cookie_header("wv=1", &parsed_url));
+        let result = with_js_http_clients(
+            session.client(),
+            session.webview_client(),
+            &source,
+            || {
+                eval_js(
+                    &format!("java.webView('', {url:?}, 'document.body.innerHTML')"),
+                    "",
+                    &source.book_source_url,
+                )
+                .unwrap()
+            },
+        );
+        assert_eq!(result, "<p>fetched</p>");
+        assert!(server.join().unwrap());
     }
 
     #[test]
