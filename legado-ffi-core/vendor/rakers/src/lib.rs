@@ -478,6 +478,12 @@ fn build_meta_script(meta: &std::collections::HashMap<String, String>) -> String
     out
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderOutput {
+    pub html: String,
+    pub script_result: Option<String>,
+}
+
 /// Parse `input`, execute its scripts, and return the rendered HTML.
 ///
 /// `is_js` — when `true`, `input` is treated as a bare JS snippet and wrapped in a
@@ -503,6 +509,31 @@ pub fn render(
     max_scripts: Option<usize>,
     script_timeout: Option<Duration>,
 ) -> anyhow::Result<String> {
+    Ok(render_detailed(
+        input,
+        is_js,
+        page_url,
+        cfg,
+        clean,
+        max_scripts,
+        script_timeout,
+        None,
+    )?
+    .html)
+}
+
+/// Render a page while optionally evaluating one caller-provided script after
+/// page lifecycle/timer work has settled. Existing `render` callers remain unchanged.
+pub fn render_detailed(
+    input: &str,
+    is_js: bool,
+    page_url: Option<&str>,
+    cfg: &HttpConfig,
+    clean: bool,
+    max_scripts: Option<usize>,
+    script_timeout: Option<Duration>,
+    final_script: Option<&str>,
+) -> anyhow::Result<RenderOutput> {
     let html = if is_js {
         format!("<!DOCTYPE html><html><head></head><body><script>{input}</script></body></html>")
     } else {
@@ -521,7 +552,8 @@ pub fn render(
         Some(t) => runtime::JsRuntime::with_timeout(t),
         None => runtime::JsRuntime::without_timeout(),
     };
-    rt.execute(&scripts, page_url, cfg, &budget)?;
+    let script_result =
+        rt.execute_with_final_script(&scripts, page_url, cfg, &budget, final_script)?;
 
     for msg in runtime::JsRuntime::logged_messages() {
         if is_verbose() {
@@ -545,7 +577,10 @@ pub fn render(
 
     let out =
         doc.serialize_with_body_and_injection(effective_body, &runtime::JsRuntime::written_html())?;
-    Ok(if clean { clean_document(out) } else { out })
+    Ok(RenderOutput {
+        html: if clean { clean_document(out) } else { out },
+        script_result,
+    })
 }
 
 /// Strip scripts and unwrap `<noscript>` elements from rendered HTML.
@@ -796,6 +831,27 @@ mod tests {
         let msgs = runtime::JsRuntime::logged_messages();
         assert_eq!(msgs[0], "hello world");
         assert_eq!(msgs[1], "oops");
+    }
+
+    #[test]
+    fn detailed_render_runs_final_script_after_page_lifecycle() {
+        let html = "<!DOCTYPE html><html><body><script>window.pageRan = true;</script></body></html>";
+        let output = render_detailed(
+            html,
+            false,
+            Some("https://example.test/page"),
+            &HttpConfig::default(),
+            false,
+            None,
+            None,
+            Some("document.body.innerHTML = '<p>' + document.readyState + '</p>'; 'final-ok'"),
+        )
+        .unwrap();
+        assert_eq!(output.script_result.as_deref(), Some("final-ok"));
+        assert!(
+            output.html.contains("<p>complete</p>"),
+            "final script must run after load lifecycle"
+        );
     }
 
     #[test]

@@ -42,6 +42,12 @@ struct JsCacheEntry {
     value: String,
     expires_at: Option<Instant>,
 }
+
+#[derive(Clone)]
+struct JsHttpContext {
+    request_client: HttpClient,
+    webview_client: HttpClient,
+}
 static JS_HTTP_CLIENT: Lazy<HttpClient> = Lazy::new(HttpClient::standalone);
 static JS_DEVICE_ID: Lazy<String> = Lazy::new(|| {
     let mut map = JS_KV.lock().unwrap_or_else(|e| e.into_inner());
@@ -104,9 +110,10 @@ impl InfoMapState {
 thread_local! {
     static ACTIVE_JS_INFO_MAP: RefCell<Option<InfoMapState>> = const { RefCell::new(None) };
     static ACTIVE_JS_LIB: RefCell<Option<String>> = const { RefCell::new(None) };
-    // reader_execute installs its source-bound HTTP session here so JavaScript
-    // java.ajax/get/post shares the same cookies and request policy as Rust HTTP.
-    static ACTIVE_JS_HTTP_CLIENT: RefCell<Option<HttpClient>> = const { RefCell::new(None) };
+    // reader_execute installs both sides of its source-bound HTTP session here:
+    // ordinary JsExtensions calls keep native request policy, while future WebView
+    // calls use the browser-style client without collapsing their cookie semantics.
+    static ACTIVE_JS_HTTP_CONTEXT: RefCell<Option<JsHttpContext>> = const { RefCell::new(None) };
     static ACTIVE_JS_BOOK_SOURCE: RefCell<Option<BookSource>> = const { RefCell::new(None) };
     // Native JS callbacks may need AnalyzeUrl to evaluate nested header/URL JavaScript.
     // Reuse the currently borrowed QuickJS context instead of entering Context::with again.
@@ -163,12 +170,35 @@ fn update_active_info_map(state: InfoMapState) {
     ACTIVE_JS_INFO_MAP.with(|cell| *cell.borrow_mut() = Some(state));
 }
 
-/// Bind a source-specific synchronous HTTP client for the duration of a rule
-/// execution. Nested calls restore the prior client, so reader_eval keeps its
-/// legacy fallback client.
+/// Bind one synchronous HTTP client for both request and WebView paths.
+/// Kept for reader_eval/tests that do not have a full HttpSession.
 pub(crate) fn with_js_http_client<T>(client: &HttpClient, f: impl FnOnce() -> T) -> T {
-    ACTIVE_JS_HTTP_CLIENT
-        .with(|cell| crate::util::scoped::with_scoped_value(cell, Some(client.clone()), f))
+    let context = JsHttpContext {
+        request_client: client.clone(),
+        webview_client: client.clone(),
+    };
+    ACTIVE_JS_HTTP_CONTEXT
+        .with(|cell| crate::util::scoped::with_scoped_value(cell, Some(context), f))
+}
+
+/// Bind the distinct native-request and browser-style clients used by reader_execute.
+pub(crate) fn with_js_http_clients<T>(
+    request_client: &HttpClient,
+    webview_client: &HttpClient,
+    source: &BookSource,
+    f: impl FnOnce() -> T,
+) -> T {
+    let context = JsHttpContext {
+        request_client: request_client.clone(),
+        webview_client: webview_client.clone(),
+    };
+    ACTIVE_JS_BOOK_SOURCE.with(|source_cell| {
+        crate::util::scoped::with_scoped_value(source_cell, Some(source.clone()), || {
+            ACTIVE_JS_HTTP_CONTEXT.with(|http_cell| {
+                crate::util::scoped::with_scoped_value(http_cell, Some(context), f)
+            })
+        })
+    })
 }
 
 pub(crate) fn with_js_http_context<T>(
@@ -176,16 +206,26 @@ pub(crate) fn with_js_http_context<T>(
     source: &BookSource,
     f: impl FnOnce() -> T,
 ) -> T {
-    ACTIVE_JS_BOOK_SOURCE.with(|cell| {
-        crate::util::scoped::with_scoped_value(cell, Some(source.clone()), || {
-            with_js_http_client(client, f)
-        })
-    })
+    with_js_http_clients(client, client, source, f)
 }
 
 fn active_js_http_client() -> HttpClient {
-    ACTIVE_JS_HTTP_CLIENT
-        .with(|cell| cell.borrow().clone())
+    ACTIVE_JS_HTTP_CONTEXT
+        .with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .map(|context| context.request_client.clone())
+        })
+        .unwrap_or_else(|| JS_HTTP_CLIENT.clone())
+}
+
+pub(crate) fn active_js_webview_client() -> HttpClient {
+    ACTIVE_JS_HTTP_CONTEXT
+        .with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .map(|context| context.webview_client.clone())
+        })
         .unwrap_or_else(|| JS_HTTP_CLIENT.clone())
 }
 
@@ -5149,7 +5189,7 @@ mod tests {
             with_js_http_context(&client, &outer, || {
                 assert!(catch_unwind(AssertUnwindSafe(|| {
                     with_js_http_context(&client, &inner, || {
-                        assert!(ACTIVE_JS_HTTP_CLIENT.with(|cell| cell.borrow().is_some()));
+                        assert!(ACTIVE_JS_HTTP_CONTEXT.with(|cell| cell.borrow().is_some()));
                         panic!("expected");
                     });
                 }))
@@ -5163,12 +5203,12 @@ mod tests {
                         .clone()),
                     outer.book_source_url
                 );
-                assert!(ACTIVE_JS_HTTP_CLIENT.with(|cell| cell.borrow().is_some()));
+                assert!(ACTIVE_JS_HTTP_CONTEXT.with(|cell| cell.borrow().is_some()));
                 panic!("expected");
             });
         }))
         .is_err());
-        assert!(ACTIVE_JS_HTTP_CLIENT.with(|cell| cell.borrow().is_none()));
+        assert!(ACTIVE_JS_HTTP_CONTEXT.with(|cell| cell.borrow().is_none()));
         assert!(ACTIVE_JS_BOOK_SOURCE.with(|cell| cell.borrow().is_none()));
 
         let runtime = Runtime::new().unwrap();

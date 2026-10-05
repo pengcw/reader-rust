@@ -254,6 +254,10 @@ impl HttpSession {
         &self.client
     }
 
+    pub(crate) fn webview_client(&self) -> &HttpClient {
+        &self.webview_client
+    }
+
     pub fn fetch(
         &self,
         spec: &RequestSpec,

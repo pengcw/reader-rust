@@ -212,6 +212,20 @@ mod boa_rt {
             cfg: &crate::HttpConfig,
             budget: &crate::RequestBudget,
         ) -> anyhow::Result<()> {
+            self.execute_with_final_script(scripts, page_url, cfg, budget, None)
+                .map(|_| ())
+        }
+
+        /// Execute a page and optionally evaluate one caller-provided script after
+        /// lifecycle/timer work has settled. The script result is coerced to a string.
+        pub fn execute_with_final_script(
+            &self,
+            scripts: &[String],
+            page_url: Option<&str>,
+            cfg: &crate::HttpConfig,
+            budget: &crate::RequestBudget,
+            final_script: Option<&str>,
+        ) -> anyhow::Result<Option<String>> {
             HTTP_CONFIG.with(|slot| *slot.borrow_mut() = Some(cfg.clone()));
             HTTP_BUDGET.with(|slot| *slot.borrow_mut() = Some(budget.clone()));
             let _http_guard = HttpContextGuard;
@@ -259,6 +273,22 @@ mod boa_rt {
                 }
             }
 
+            let final_result = final_script.and_then(|script| {
+                match ctx.eval(Source::from_bytes(script.as_bytes())) {
+                    Ok(value) => {
+                        let _ = ctx.run_jobs();
+                        value
+                            .to_string(&mut ctx)
+                            .ok()
+                            .map(|value| value.to_std_string_escaped())
+                    }
+                    Err(error) => {
+                        eprintln!("[js error] {error:?}");
+                        None
+                    }
+                }
+            });
+
             let body_result = ctx.eval(Source::from_bytes(super::READBACK_JS.as_bytes()));
             let body_html = body_result
                 .ok()
@@ -272,7 +302,7 @@ mod boa_rt {
             };
             BODY_INNER_HTML.with(|b| *b.borrow_mut() = body_html);
 
-            Ok(())
+            Ok(final_result)
         }
 
         /// Return the accumulated output of all `document.write` / `document.writeln` calls.
@@ -510,6 +540,9 @@ mod quickjs_rt {
         had_jobs
     }
 
+    const RUNTIME_MEMORY_LIMIT: usize = 32 * 1024 * 1024;
+    const RUNTIME_STACK_LIMIT: usize = 512 * 1024;
+
     /// A sandboxed JavaScript execution context.
     pub struct JsRuntime {
         timeout: Option<Duration>,
@@ -547,11 +580,27 @@ mod quickjs_rt {
             cfg: &crate::HttpConfig,
             budget: &crate::RequestBudget,
         ) -> anyhow::Result<()> {
+            self.execute_with_final_script(scripts, page_url, cfg, budget, None)
+                .map(|_| ())
+        }
+
+        /// Execute a page and optionally evaluate one caller-provided script after
+        /// lifecycle/timer work has settled. The script result is coerced to a string.
+        pub fn execute_with_final_script(
+            &self,
+            scripts: &[String],
+            page_url: Option<&str>,
+            cfg: &crate::HttpConfig,
+            budget: &crate::RequestBudget,
+            final_script: Option<&str>,
+        ) -> anyhow::Result<Option<String>> {
             HTTP_CONFIG.with(|slot| *slot.borrow_mut() = Some(cfg.clone()));
             HTTP_BUDGET.with(|slot| *slot.borrow_mut() = Some(budget.clone()));
             let _http_guard = HttpContextGuard;
 
             let rt = Runtime::new().map_err(|e| anyhow!("quickjs runtime: {e:?}"))?;
+            rt.set_memory_limit(RUNTIME_MEMORY_LIMIT);
+            rt.set_max_stack_size(RUNTIME_STACK_LIMIT);
             rt.set_loader(StubModuleSystem, StubModuleSystem);
 
             // Check the per-script deadline every 10 000 opcodes to keep overhead near zero.
@@ -568,7 +617,7 @@ mod quickjs_rt {
 
             let ctx = Context::full(&rt).map_err(|e| anyhow!("quickjs context: {e:?}"))?;
 
-            ctx.with(|ctx| -> anyhow::Result<()> {
+            let final_result = ctx.with(|ctx| -> anyhow::Result<Option<String>> {
                 setup_document(&ctx)?;
                 setup_console(&ctx)?;
                 setup_http_bridge(&ctx)?;
@@ -644,6 +693,31 @@ mod quickjs_rt {
                     }
                 }
 
+                let final_result = if let Some(script) = final_script {
+                    let task_deadline = bounded_deadline(self.timeout, render_deadline);
+                    set_deadline(task_deadline);
+                    let result = match ctx
+                        .eval_with_options::<rquickjs::Coerced<String>, _>(script, sloppy())
+                    {
+                        Ok(value) => Some(value.0),
+                        Err(_) => {
+                            let exc = ctx.catch();
+                            if let Some(error) = exc.as_exception() {
+                                let message = error
+                                    .message()
+                                    .unwrap_or_else(|| "unknown exception".into());
+                                eprintln!("[js error] {message}");
+                            }
+                            None
+                        }
+                    };
+                    clear_deadline();
+                    drain_pending_jobs(&ctx, task_deadline);
+                    result
+                } else {
+                    None
+                };
+
                 set_deadline(bounded_deadline(self.timeout, render_deadline));
                 let body_html: String = ctx
                     .eval_with_options::<Value, _>(super::READBACK_JS, sloppy())
@@ -658,10 +732,10 @@ mod quickjs_rt {
                 };
                 BODY_INNER_HTML.with(|b| *b.borrow_mut() = body_html);
 
-                Ok(())
+                Ok(final_result)
             })?;
 
-            Ok(())
+            Ok(final_result)
         }
 
         /// Return the accumulated output of all `document.write` / `document.writeln` calls.
