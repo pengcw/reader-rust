@@ -259,6 +259,16 @@ fn normalize_negative_indices(rule: &str) -> std::borrow::Cow<'_, str> {
 }
 
 pub fn jsonpath_query(value: &Value, rule: &str) -> Vec<Value> {
+    jsonpath_query_with_arrays(value, rule, true)
+}
+
+pub(crate) fn jsonpath_first_value(value: &Value, rule: &str) -> Option<Value> {
+    jsonpath_query_with_arrays(value, rule, false)
+        .into_iter()
+        .next()
+}
+
+fn jsonpath_query_with_arrays(value: &Value, rule: &str, flatten_arrays: bool) -> Vec<Value> {
     if let Some(rendered) = render_embedded_paths(value, rule) {
         return vec![Value::String(rendered)];
     }
@@ -289,7 +299,7 @@ pub fn jsonpath_query(value: &Value, rule: &str) -> Vec<Value> {
         let mut out = Vec::new();
         for item in res {
             match item {
-                Value::Array(items) => {
+                Value::Array(items) if flatten_arrays => {
                     out.extend(items.iter().cloned());
                 }
                 other => out.push(other.clone()),

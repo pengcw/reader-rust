@@ -3,11 +3,11 @@ use crate::crawler::{
     format_analyzed_body, render_webview_with_rakers, HttpClient,
 };
 use crate::model::book_source::BookSource;
-use crate::parser::html;
 use crate::parser::jsonpath;
 use crate::parser::rule_analyzer;
 use crate::parser::rule_engine;
 use crate::parser::source_regex;
+use crate::parser::{dom, html};
 use crate::util::hash::md5_hex;
 use crate::util::text::strip_whitespace;
 use aes::Aes128;
@@ -655,8 +655,7 @@ fn eval_js_inner_with_source(
             .as_secs();
         start_time.store(now, Ordering::Relaxed);
         let _guard = TimerGuard(start_time.clone());
-
-        ctx.with(|ctx| {
+        let eval_result = ctx.with(|ctx| {
             let globals = ctx.globals();
             let input_value = input.unwrap_or("");
             let content_state = Arc::new(Mutex::new(input_value.to_string()));
@@ -699,6 +698,11 @@ fn eval_js_inner_with_source(
             source_obj.set("getKey", Func::new(move || sk_clone.clone()))?;
             if let Some(active_source) = ACTIVE_JS_BOOK_SOURCE.with(|cell| cell.borrow().clone()) {
                 source_obj.set("bookSourceUrl", active_source.book_source_url)?;
+                source_obj.set("bookSourceName", active_source.book_source_name)?;
+                source_obj.set("bookSourceComment", ctx.json_parse(
+                    serde_json::to_string(&active_source.book_source_comment)?,
+                )?)?;
+                source_obj.set("lastUpdateTime", active_source.last_update_time.unwrap_or(0))?;
                 source_obj.set("header", active_source.header.unwrap_or_default())?;
                 source_obj.set("loginUi", active_source.login_ui.unwrap_or_default())?;
                 source_obj.set("loginUrl", active_source.login_url.unwrap_or_default())?;
@@ -1199,13 +1203,26 @@ fn eval_js_inner_with_source(
             )?;
             java_obj.set(
                 "timeFormat",
-                Func::new(|timestamp: i64| -> String { java_time_format(timestamp) }),
+                Func::new(
+                    |ctx: rquickjs::Ctx<'_>,
+                     timestamp: rquickjs::Coerced<f64>|
+                     -> rquickjs::Result<String> {
+                        Ok(java_time_format(java_timestamp_long(&ctx, timestamp.0)?))
+                    },
+                ),
             )?;
             java_obj.set(
                 "timeFormatUTC",
-                Func::new(|timestamp: i64, format: String, offset_ms: i64| -> String {
-                    java_time_format_utc(timestamp, &format, offset_ms)
-                }),
+                Func::new(
+                    |ctx: rquickjs::Ctx<'_>,
+                     timestamp: rquickjs::Coerced<f64>,
+                     format: String,
+                     offset_ms: i64|
+                     -> rquickjs::Result<String> {
+                        let timestamp = java_timestamp_long(&ctx, timestamp.0)?;
+                        Ok(java_time_format_utc(timestamp, &format, offset_ms))
+                    },
+                ),
             )?;
             java_obj.set(
                 "androidId",
@@ -1676,23 +1693,23 @@ fn eval_js_inner_with_source(
                 ),
             )?;
             let content_for_element = content_state.clone();
-            let base_url_for_element = base_url_state.clone();
             java_obj.set(
                 "getElement",
-                Func::new(move |rule: String, content: Option<String>| -> String {
+                Func::new(move |rule: String, content: Option<String>| -> Option<String> {
                     let default_content = content_for_element
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .clone();
-                    let base_url = base_url_for_element
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone();
-                    java_get_elements_json(
-                        &rule,
+                    let value: JsonValue = serde_json::from_str(
                         content.as_deref().unwrap_or(&default_content),
-                        &base_url,
-                    )
+                    ).ok()?;
+                    let path = if rule.get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case("@json:")) {
+                        &rule[6..]
+                    } else {
+                        &rule
+                    };
+                    let found = jsonpath::jsonpath_first_value(&value, path)?;
+                    serde_json::to_string(&found).ok()
                 }),
             )?;
 
@@ -1767,7 +1784,7 @@ fn eval_js_inner_with_source(
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .clone();
-                    crate::parser::html::format_keep_img(&html, &base_url)
+                    crate::parser::html::format_js_html(&html, &base_url)
                 }),
             )?;
 
@@ -1992,7 +2009,9 @@ fn eval_js_inner_with_source(
                             value.close = () => {};
                             return value;
                         };
+                        const rawRequest = { url: () => url };
                         const rawResponse = {
+                            request: () => rawRequest,
                             body: rawResponseBody,
                             url: () => url,
                             code: () => code,
@@ -2200,7 +2219,8 @@ fn eval_js_inner_with_source(
             }
             eval_script(
                 ctx.clone(),
-                r#"source.getLoginInfo = function() {
+                r#"(function(NativeMap) {
+                source.getLoginInfo = function() {
                     if (globalThis.loginInfo == null) return source.__getLoginInfo() ?? null;
                     return typeof globalThis.loginInfo === 'string'
                         ? globalThis.loginInfo : JSON.stringify(globalThis.loginInfo);
@@ -2233,7 +2253,7 @@ fn eval_js_inner_with_source(
                                 };
                                 const script = inlineJs(rule);
                                 if (script !== null) {
-                                    globalThis.result = new Map();
+                                    globalThis.result = new NativeMap();
                                     globalThis.book = null;
                                     globalThis.chapter = null;
                                     const login = inlineJs(source.loginUrl) ?? String(source.loginUrl || '').trim();
@@ -2241,7 +2261,7 @@ fn eval_js_inner_with_source(
                                     try { ui = JSON.parse(output == null ? '' : String(output)); } catch (_) { ui = null; }
                                 }
                                 if (Array.isArray(ui)) {
-                                    const defaults = new Map();
+                                    const defaults = new NativeMap();
                                     for (const row of ui) {
                                         if (!row || typeof row !== 'object') {
                                             defaults.clear(); break;
@@ -2257,7 +2277,7 @@ fn eval_js_inner_with_source(
                             }
                         }
                     }
-                    const map = new Map(Object.entries(value).map(([key, item]) => [key, String(item)]));
+                    const map = new NativeMap(Object.entries(value).map(([key, item]) => [key, String(item)]));
                     // Config keys supplement, never shadow, native Map members.
                     for (const key of map.keys()) {
                         if (key in map) continue;
@@ -2269,7 +2289,8 @@ fn eval_js_inner_with_source(
                     return map;
                 };
                 java.reGetBook = function() { if (globalThis.__allowTocRefresh !== true) throw new Error('java.reGetBook is only available in preUpdateJs'); throw new Error('java.reGetBook is not supported by this host'); };
-                java.refreshTocUrl = function() { if (globalThis.__allowTocRefresh !== true) throw new Error('java.refreshTocUrl is only available in preUpdateJs'); throw new Error('java.refreshTocUrl is not supported by this host'); };"#,
+                java.refreshTocUrl = function() { if (globalThis.__allowTocRefresh !== true) throw new Error('java.refreshTocUrl is only available in preUpdateJs'); throw new Error('java.refreshTocUrl is not supported by this host'); };
+                })(globalThis.Map);"#,
             )?;
 
             eval_script(
@@ -2325,7 +2346,17 @@ fn eval_js_inner_with_source(
                         }
                         const r = String(rule);
                         const c = (content !== undefined && content !== null) ? String(content) : undefined;
-                        return _orig_getStringList(r, c, isUrl);
+                        const values = _orig_getStringList(r, c, isUrl);
+                        Object.defineProperties(values, {
+                            size: { value() { return this.length; } },
+                            get: { value(index) {
+                                if (!Number.isInteger(index) || index < 0 || index >= this.length) {
+                                    throw new RangeError('string list index out of bounds');
+                                }
+                                return this[index];
+                            } }
+                        });
+                        return values;
                     };
                     const _nativeSetContent = globalThis.java.__setContent;
                     globalThis.java.setContent = function(content, newBaseUrl) {
@@ -2344,6 +2375,7 @@ fn eval_js_inner_with_source(
                         return globalThis.java;
                     };
                     const _nativeGetElements = globalThis.java.getElements;
+                    const _nativeGetElement = globalThis.java.getElement;
                     const _decorateItems = (values, rawCss = false) => {
                         if (!Array.isArray(values)) values = [];
                         const carrier = values.find(item => item && item.__readerXPathNode
@@ -2416,6 +2448,8 @@ fn eval_js_inner_with_source(
                     _attachVariableMap(globalThis.chapter);
                     globalThis.java.getElements = _wrapElements;
                     globalThis.java.getElement = function(rule, content) {
+                        const jsonValue = _nativeGetElement(rule, _readerNodeContent(rule, content, false));
+                        if (jsonValue != null) return JSON.parse(jsonValue);
                         const items = _wrapElements(rule, content);
                         return items.length > 0 ? items[0] : null;
                     };
@@ -3187,9 +3221,13 @@ fn eval_js_inner_with_source(
                             return {
                                 init(mode, key, iv) { this.mode = mode; this.key = key; this.iv = iv; },
                                 doFinal(data) {
+                                    const bytes = toBytes(data);
+                                    if (bytes.length % 16 !== 0) {
+                                        throw new TypeError('AES ciphertext must contain complete blocks');
+                                    }
                                     return JSON.parse(java.__aesDecryptByteArray(JSON.stringify({
                                         algorithm, mode: this.mode, key: this.key.key,
-                                        iv: this.iv.iv, data: toBytes(data)
+                                        iv: this.iv.iv, data: bytes
                                     })));
                                 }
                             };
@@ -3293,6 +3331,7 @@ fn eval_js_inner_with_source(
                         markClass('GCMParameterSpec', GCMParameterSpec);
                     // Rhino-style aliases used by the real decrypt script; java remains the host helper.
                     java.lang = Packages.java.lang;
+                    java.security = Packages.java.security;
                     globalThis.javax = Packages.javax;
                     Packages.javax.xml.bind.DatatypeConverter =
                         markClass('DatatypeConverter', DatatypeConverter);
@@ -3383,13 +3422,7 @@ fn eval_js_inner_with_source(
             let java_string_result: rquickjs::Function<'_> = globals
                 .get::<_, Object<'_>>("java")?
                 .get("__javaStringResult")?;
-            let java_string_value = |value| -> rquickjs::Result<Option<String>> {
-                let unwrapped: Value<'_> = java_string_result.call((value,))?;
-                unwrapped
-                    .into_string()
-                    .map(|string| string.to_string())
-                    .transpose()
-            };
+            let dom_string_result = dom::install(&ctx)?;
             eval_script(ctx.clone(), include_str!("js_security.js"))?;
             eval_script(ctx.clone(), include_str!("js_des.js"))?;
 
@@ -3429,7 +3462,7 @@ fn eval_js_inner_with_source(
                                 s.to_string()
                                     .map(|value| value.to_string())
                                     .unwrap_or_default()
-                            } else if let Some(value) = java_string_value(res_val.clone())? {
+                            } else if let Some(value) = wrapped_string_value(res_val.clone(), &java_string_result, &dom_string_result)? {
                                 value
                             } else {
                                 match ctx.json_stringify(res_val) {
@@ -3455,7 +3488,7 @@ fn eval_js_inner_with_source(
                 s.to_string()
                     .map(|value| value.to_string())
                     .unwrap_or_default()
-            } else if let Some(value) = java_string_value(v.clone())? {
+            } else if let Some(value) = wrapped_string_value(v.clone(), &java_string_result, &dom_string_result)? {
                 value
             } else {
                 match ctx.json_stringify(v) {
@@ -3474,8 +3507,29 @@ fn eval_js_inner_with_source(
                 update_active_info_map(state);
             }
             Ok(result)
-        }) // closes ctx.with
-    }) // closes JS_ENV.with
+        });
+        drop(ctx);
+        runtime.run_gc();
+        eval_result
+    })
+}
+
+fn wrapped_string_value<'js>(
+    value: Value<'js>,
+    java: &rquickjs::Function<'js>,
+    dom: &Option<rquickjs::Function<'js>>,
+) -> rquickjs::Result<Option<String>> {
+    if let Some(extract) = dom {
+        let unwrapped: Value<'js> = extract.call((value.clone(),))?;
+        if let Some(string) = unwrapped.into_string() {
+            return string.to_string().map(Some);
+        }
+    }
+    let unwrapped: Value<'js> = java.call((value,))?;
+    unwrapped
+        .into_string()
+        .map(|string| string.to_string())
+        .transpose()
 }
 
 fn snapshot_object_properties<'js>(
@@ -3569,6 +3623,20 @@ fn eval_js_reentrant<'js>(
             }
         }
 
+        let dom_string_result = dom::install(&ctx)?;
+        let dom_string = |value: Value<'js>| -> rquickjs::Result<Option<String>> {
+            match &dom_string_result {
+                Some(extract) => {
+                    let value: Value<'js> = extract.call((value,))?;
+                    value
+                        .into_string()
+                        .map(|string| string.to_string())
+                        .transpose()
+                }
+                None => Ok(None),
+            }
+        };
+
         // Direct eval inside a temporary function keeps nested AnalyzeUrl
         // var/function declarations local while preserving eval's completion value.
         // Explicit globalThis/java mutations are restored by the snapshots below.
@@ -3589,6 +3657,9 @@ fn eval_js_reentrant<'js>(
             if let Some(string) = result_value.clone().into_string() {
                 return Ok(string.to_string().unwrap_or_default());
             }
+            if let Some(string) = dom_string(result_value.clone())? {
+                return Ok(string);
+            }
             return Ok(ctx
                 .json_stringify(result_value)?
                 .and_then(|json| json.to_string().ok())
@@ -3600,6 +3671,9 @@ fn eval_js_reentrant<'js>(
         }
         if let Some(string) = value.clone().into_string() {
             return Ok(string.to_string().unwrap_or_default());
+        }
+        if let Some(string) = dom_string(value.clone())? {
+            return Ok(string);
         }
         Ok(ctx
             .json_stringify(value)?
@@ -3959,10 +4033,6 @@ fn jsoup_remove_elements(source: &str, selector: &str) -> Option<String> {
         }
     }
     Some(document.html())
-}
-
-fn java_get_elements_json(rule: &str, content: &str, base_url: &str) -> String {
-    java_get_elements_json_with_mode(rule, content, base_url, false)
 }
 
 fn java_get_elements_json_with_mode(
@@ -4480,6 +4550,18 @@ fn legado_chinese_num_to_int(input: &str) -> i32 {
     }
 }
 
+fn java_timestamp_long(ctx: &rquickjs::Ctx<'_>, timestamp: f64) -> rquickjs::Result<i64> {
+    if !timestamp.is_finite()
+        || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&timestamp)
+    {
+        return Err(rquickjs::Exception::throw_type(
+            ctx,
+            "time format requires a finite Java long timestamp",
+        ));
+    }
+    Ok(timestamp as i64)
+}
+
 fn java_time_format(timestamp_ms: i64) -> String {
     match Local.timestamp_millis_opt(timestamp_ms).single() {
         Some(dt) => dt.format("%Y/%m/%d %H:%M").to_string(),
@@ -4825,10 +4907,7 @@ fn java_web_view(html: &str, url: &str, js: &str) -> Option<String> {
     let url = url.trim();
 
     let (page_html, page_url) = if !html.trim().is_empty() {
-        (
-            html.to_string(),
-            (!url.is_empty()).then(|| url.to_string()),
-        )
+        (html.to_string(), (!url.is_empty()).then(|| url.to_string()))
     } else {
         if url.is_empty() {
             return None;
@@ -6913,19 +6992,15 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
         assert!(session
             .webview_client()
             .seed_cookie_header("wv=1", &parsed_url));
-        let result = with_js_http_clients(
-            session.client(),
-            session.webview_client(),
-            &source,
-            || {
+        let result =
+            with_js_http_clients(session.client(), session.webview_client(), &source, || {
                 eval_js(
                     &format!("java.webView('', {url:?}, 'document.body.innerHTML')"),
                     "",
                     &source.book_source_url,
                 )
                 .unwrap()
-            },
-        );
+            });
         assert_eq!(result, "<p>fetched</p>");
         assert!(server.join().unwrap());
     }

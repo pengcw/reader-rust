@@ -1253,6 +1253,7 @@ dependencies = [
  "chardetng",
  "chrono",
  "cookie_store",
+ "ego-tree",
  "encoding_rs",
  "flate2",
  "hex",

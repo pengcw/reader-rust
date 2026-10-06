@@ -236,13 +236,9 @@ fn execute_inner(source_json: &str, request_json: &str) -> ExecuteResult<Value> 
                     &source,
                     || {
                         match operation.as_str() {
-                            "search" => execute_search(
-                                &source,
-                                &engine,
-                                &http_session,
-                                &params,
-                                &options,
-                            ),
+                            "search" => {
+                                execute_search(&source, &engine, &http_session, &params, &options)
+                            }
                             "explore" => execute_explore(
                                 &source,
                                 &engine,

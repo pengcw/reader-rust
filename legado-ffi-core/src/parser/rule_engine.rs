@@ -4,7 +4,7 @@ use crate::model::{
     book::Book, book_chapter::BookChapter, book_source::BookSource, search::SearchBook,
 };
 use crate::parser::{
-    html,
+    dom, html,
     js::{eval_js_template_with_bindings, eval_js_with_bindings, with_js_lib},
     jsonpath, rule_analyzer, source_regex,
 };
@@ -40,8 +40,18 @@ enum ParseMode {
     Js,
 }
 
+#[derive(Debug)]
+struct HtmlCarrierScope {
+    outer_html: String,
+    document: scraper::Html,
+    root: ego_tree::NodeId,
+    shared: dom::SharedDocument,
+}
+
 #[derive(Debug, Clone, Default)]
 struct RuleVariableContext {
+    html_document: dom::SharedDocument,
+    html_carrier: Option<std::rc::Rc<HtmlCarrierScope>>,
     rule_data: Option<HashMap<String, String>>,
     book: Option<HashMap<String, String>>,
     book_fields: HashMap<String, String>,
@@ -87,6 +97,8 @@ impl RuleVariableContext {
     fn for_chapter(&self, variable: Option<&str>, title: &str) -> Self {
         Self {
             rule_data: self.rule_data.clone(),
+            html_document: self.html_document.clone(),
+            html_carrier: None,
             book: self.book.clone(),
             book_fields: self.book_fields.clone(),
             chapter: Some(parse_variable_map(variable)),
@@ -417,6 +429,8 @@ fn classify_rule_mode_with_css_regex_fallback(
     let (mode, rule) = classify_rule_mode(raw_rule, fallback, content_is_json);
     if mode == ParseMode::Css
         && !explicit_css
+        // Keep bare hyphens as attribute extractors; missing attributes stay empty.
+        && rule != "-"
         && !html::css_rule_is_valid(&rule)
         && source_regex::is_valid(&rule)
     {
@@ -1054,17 +1068,28 @@ impl RuleEngine {
         let mut content = match mode {
             ParseMode::JsonPath => {
                 if let Ok(v) = serde_json::from_str::<Value>(&content_body) {
-                    jsonpath::jsonpath_first_string(&v, self.strip_mode_prefix(content_rule))
-                        .unwrap_or_default()
+                    if content_js_boundary(content_rule).is_some() {
+                        eval_json_content_stages(content_rule, &content_body, base_url, context)
+                    } else {
+                        let selection = self.strip_mode_prefix(content_rule);
+                        if let Some((index, _)) =
+                            rule_analyzer::find_next_delimiter(selection, &["##"], 0)
+                        {
+                            let extracted =
+                                jsonpath::jsonpath_first_string(&v, &selection[..index])
+                                    .unwrap_or_default();
+                            apply_legado_regex(&extracted, &selection[index..])
+                        } else {
+                            jsonpath::jsonpath_first_string(&v, selection).unwrap_or_default()
+                        }
+                    }
                 } else {
                     String::new()
                 }
             }
             ParseMode::XPath => {
                 html::select_xpath_content(&content_body, self.strip_mode_prefix(content_rule))
-                    .first()
-                    .cloned()
-                    .unwrap_or_default()
+                    .join("\n")
             }
             ParseMode::Regex => regex_capture_first(
                 self.strip_mode_prefix(content_rule)
@@ -1261,8 +1286,10 @@ impl RuleEngine {
             Err(_) => return vec![],
         };
         let mut out = Vec::new();
+        let html_document = dom::SharedDocument::default();
         for el in doc.select(&sel) {
             let mut context = RuleVariableContext::for_search_item();
+            context.html_document = html_document.clone();
             let name = rule
                 .name
                 .as_ref()
@@ -1530,6 +1557,7 @@ impl RuleEngine {
             Err(_) => return (vec![], vec![]),
         };
         let mut out = Vec::new();
+        ctx.html_document = dom::SharedDocument::default();
         for el in doc.select(&sel) {
             let mut chapter_ctx = ctx.for_chapter(None, "");
             let title = rule
@@ -1689,6 +1717,7 @@ impl RuleEngine {
 
         for el in items {
             let mut context = RuleVariableContext::for_search_item();
+            context.html_document = list_context.html_document.clone();
             let name = rule
                 .name
                 .as_ref()
@@ -2417,6 +2446,7 @@ fn parse_chapter_list_html(
         return (vec![], vec![]);
     }
     let doc = html::parse_document(body);
+    ctx.html_document = dom::SharedDocument::default();
 
     // Execute init rule if present
     if let Some(init) = &rule.init {
@@ -3069,7 +3099,8 @@ fn evaluate_template_expression(
             };
             value
         };
-        return pick_json_field(value, Some(expression)).unwrap_or_default();
+        return eval_field_json_with_ctx(expression, value, base_url, &mut ctx.clone())
+            .unwrap_or_default();
     }
     if let Some(xpath) = html::xpath_rule(expression) {
         return html::select_xpath(input, xpath)
@@ -3093,7 +3124,8 @@ fn evaluate_template_expression(
             };
             value
         };
-        return pick_json_field(value, Some(path)).unwrap_or_default();
+        return eval_field_json_with_ctx(path, value, base_url, &mut ctx.clone())
+            .unwrap_or_default();
     }
     if let Some(script) = strip_prefix_ascii_case(expression, "@js:") {
         return eval_js_template_with_bindings(script, input, base_url, &ctx.js_bindings())
@@ -3442,10 +3474,18 @@ impl FieldInput<'_> {
                         .collect()
                 }
                 ParseMode::Js => {
-                    eval_js_with_bindings(strip_js_rule(pure), &input, base_url, &ctx.js_bindings())
-                        .ok()
-                        .into_iter()
-                        .collect()
+                    let result = match self {
+                        Self::Html(element) => {
+                            eval_html_node_js(strip_js_rule(&source.rule), element, base_url, ctx)
+                        }
+                        _ => eval_js_with_bindings(
+                            strip_js_rule(pure),
+                            &input,
+                            base_url,
+                            &ctx.js_bindings(),
+                        ),
+                    };
+                    result.ok().into_iter().collect()
                 }
             }
         };
@@ -3456,7 +3496,9 @@ impl FieldInput<'_> {
         values
             .into_iter()
             .filter_map(|mut text| {
-                if let Some(script) = js {
+                if let Some(script) =
+                    js.filter(|_| !(matches!(self, Self::Html(_)) && source.mode == ParseMode::Js))
+                {
                     if let Ok(result) =
                         eval_js_with_bindings(script, &text, base_url, &ctx.js_bindings())
                     {
@@ -3551,6 +3593,24 @@ fn evaluate_put_entries(
     }
 }
 
+fn eval_html_node_js(
+    script: &str,
+    element: scraper::ElementRef<'_>,
+    base_url: &str,
+    context: &RuleVariableContext,
+) -> anyhow::Result<String> {
+    dom::evaluate(element, &context.html_document, |descriptor| {
+        let mut bindings = context.js_bindings();
+        bindings.insert("result".to_string(), descriptor);
+        eval_js_with_bindings(
+            script,
+            &html::get_descendant_text_nodes(&element),
+            base_url,
+            &bindings,
+        )
+    })
+}
+
 fn eval_field_html_with_ctx(
     rule: &str,
     el: &scraper::ElementRef,
@@ -3588,16 +3648,14 @@ fn eval_field_html_with_ctx(
         ParseMode::Regex => regex_capture_first(pure.trim_start_matches(':').trim(), &input)
             .and_then(|row| row.get(1).or_else(|| row.first()).and_then(Clone::clone))
             .unwrap_or_default(),
-        ParseMode::Js => {
-            eval_js_with_bindings(strip_js_rule(pure), &input, base_url, &ctx.js_bindings())
-                .unwrap_or_default()
-        }
+        ParseMode::Js => eval_html_node_js(strip_js_rule(&source_rule.rule), *el, base_url, ctx)
+            .unwrap_or_default(),
         ParseMode::JsonPath => String::new(),
     };
     if text.is_empty() && had_templates && source_rule.mode == ParseMode::Css && !pure.is_empty() {
         text = pure.to_string();
     }
-    if let Some(script) = js {
+    if let Some(script) = js.filter(|_| source_rule.mode != ParseMode::Js) {
         let js_input = if source_rule.mode == ParseMode::Js && text.is_empty() {
             &input
         } else {
@@ -3704,6 +3762,8 @@ fn xpath_default_extractor(node: sxd_xpath::nodeset::Node<'_>, rule: &str) -> bo
         rule,
         "text" | "textNodes" | "ownText" | "html" | "all" | "href" | "src"
     ) || (rule.starts_with("attr[") && rule.ends_with(']'))
+        // Explicit legacy CSS selectors can follow an HTML XPath list rule.
+        || ["tag.", "class.", "id."].iter().any(|prefix| rule.starts_with(prefix))
         || element
             .attributes()
             .iter()
@@ -3857,19 +3917,48 @@ fn eval_field_json_with_ctx(
             "tbody" | "thead" | "tfoot" | "caption" | "colgroup" => ("<table>", "</table>"),
             _ => ("", ""),
         };
-        let document = if prefix.is_empty() {
-            scraper::Html::parse_fragment(outer_html)
-        } else {
-            scraper::Html::parse_fragment(&format!("{prefix}{outer_html}{suffix}"))
+        if ctx
+            .html_carrier
+            .as_ref()
+            .is_none_or(|scope| scope.outer_html != outer_html)
+        {
+            let document = if prefix.is_empty() {
+                scraper::Html::parse_fragment(outer_html)
+            } else {
+                scraper::Html::parse_fragment(&format!("{prefix}{outer_html}{suffix}"))
+            };
+            let root = if prefix.is_empty() {
+                document.root_element().child_elements().next()?.id()
+            } else {
+                document
+                    .select(&scraper::Selector::parse(tag).ok()?)
+                    .next()?
+                    .id()
+            };
+            ctx.html_carrier = Some(std::rc::Rc::new(HtmlCarrierScope {
+                outer_html: outer_html.to_string(),
+                document,
+                root,
+                shared: dom::SharedDocument::default(),
+            }));
+        }
+        let scope = ctx.html_carrier.as_ref()?.clone();
+        let element = scraper::ElementRef::wrap(scope.document.tree.get(scope.root)?)?;
+        struct RestoreDocument<'a> {
+            context: &'a mut RuleVariableContext,
+            previous: dom::SharedDocument,
+        }
+        impl Drop for RestoreDocument<'_> {
+            fn drop(&mut self) {
+                self.context.html_document = self.previous.clone();
+            }
+        }
+        let previous = std::mem::replace(&mut ctx.html_document, scope.shared.clone());
+        let guard = RestoreDocument {
+            context: ctx,
+            previous,
         };
-        let element = if prefix.is_empty() {
-            document.root_element().child_elements().next()?
-        } else {
-            document
-                .select(&scraper::Selector::parse(tag).ok()?)
-                .next()?
-        };
-        return eval_field_html_with_ctx(rule, &element, base_url, ctx);
+        return eval_field_html_with_ctx(rule, &element, base_url, &mut *guard.context);
     }
     if let Some((script, remainder)) =
         split_leading_js_transform(rule).filter(|(_, remainder)| !remainder.starts_with("##"))
@@ -4035,6 +4124,61 @@ pub(crate) fn normalize_list_rule(rule: &str) -> (&str, bool) {
         return (rest.trim(), false);
     }
     (rule, false)
+}
+
+// Stage markers are located outside selector quotes/brackets. Never scan a JS
+// body for selector combinators; @js consumes the entire remaining script.
+fn content_js_boundary(rule: &str) -> Option<usize> {
+    rule_analyzer::find_next_delimiter(
+        rule,
+        &[
+            "<js>", "<Js>", "<jS>", "<JS>", "@js:", "@Js:", "@jS:", "@JS:",
+        ],
+        0,
+    )
+    .map(|(index, _)| index)
+}
+
+fn eval_json_content_stages(
+    rule: &str,
+    body: &str,
+    base_url: &str,
+    context: &mut RuleVariableContext,
+) -> String {
+    let mut remaining = rule.trim();
+    let mut current = body.to_string();
+    while !remaining.is_empty() {
+        if let Some(script) = strip_prefix_ascii_case(remaining, "@js:") {
+            return eval_js_with_bindings(script, &current, base_url, &context.js_bindings())
+                .unwrap_or_default();
+        }
+        if let Some(rest) = strip_prefix_ascii_case(remaining, "<js>") {
+            let Some(end) = find_ascii_case(rest, "</js>") else {
+                return String::new();
+            };
+            let Ok(output) =
+                eval_js_with_bindings(&rest[..end], &current, base_url, &context.js_bindings())
+            else {
+                return String::new();
+            };
+            current = output;
+            remaining = rest[end + "</js>".len()..].trim();
+            continue;
+        }
+        if remaining.starts_with("##") {
+            return apply_legado_regex(&current, remaining);
+        }
+        let boundary = content_js_boundary(remaining).unwrap_or(remaining.len());
+        let selection = remaining[..boundary].trim();
+        let value =
+            serde_json::from_str(&current).unwrap_or_else(|_| Value::String(current.clone()));
+        let Some(selected) = eval_field_json_with_ctx(selection, &value, base_url, context) else {
+            return String::new();
+        };
+        current = selected;
+        remaining = remaining[boundary..].trim();
+    }
+    current
 }
 
 fn split_leading_js_transform(rule: &str) -> Option<(&str, &str)> {
@@ -4411,11 +4555,20 @@ fn capture_rule_values(rule: Option<&str>, captures: &[Option<String>]) -> Optio
     if rule.is_empty() {
         return None;
     }
-    let replaced = substitute_capture_values(rule, captures);
-    let (pure, regex_part) = split_legado_regex(&replaced);
+    // Replacement groups belong to the field regex, not the list captures.
+    let (selector, regex_part) = split_legado_regex(rule);
+    let input = if selector.is_empty() && regex_part.is_some() {
+        captures
+            .first()
+            .and_then(Option::as_deref)
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        substitute_capture_values(&selector, captures)
+    };
     let output = regex_part
-        .map(|replacement| apply_legado_regex(&pure, replacement))
-        .unwrap_or(pure);
+        .map(|replacement| apply_legado_regex(&input, replacement))
+        .unwrap_or(input);
     (!output.is_empty()).then_some(output)
 }
 
@@ -6558,6 +6711,49 @@ chapter_id='{{$.chapter_id}}'
         assert_eq!(chapters[0].url, "https://books.example/ch1");
         assert_eq!(chapters[1].title, "第二章 斗之气三段");
         assert_eq!(chapters[1].url, "https://books.example/ch2");
+    }
+
+    #[test]
+    fn carrier_fields_restore_outer_document_after_success_and_js_error() {
+        let mut context = RuleVariableContext::for_search_item();
+        let outer_slot = context.html_document.clone();
+        let outer = scraper::Html::parse_fragment("<p>Outer</p>");
+        let outer_element = outer
+            .select(&scraper::Selector::parse("p").unwrap())
+            .next()
+            .unwrap();
+        assert_eq!(
+            eval_field_html_with_ctx(
+                "@js:result.text()",
+                &outer_element,
+                "https://scope.invalid",
+                &mut context
+            )
+            .as_deref(),
+            Some("Outer")
+        );
+        let carrier = json!({"__readerHtmlElement":true,"outerHtml":"<a href='/one'>Inner</a>"});
+        for (rule, expected) in [
+            ("@js:result.text()", Some("Inner")),
+            ("@js:throw new Error('carrier failure')", None),
+        ] {
+            assert_eq!(
+                eval_field_json_with_ctx(rule, &carrier, "https://scope.invalid", &mut context)
+                    .as_deref(),
+                expected
+            );
+            assert!(std::rc::Rc::ptr_eq(&context.html_document, &outer_slot));
+            assert_eq!(
+                eval_field_html_with_ctx(
+                    "@js:result.text()",
+                    &outer_element,
+                    "https://scope.invalid",
+                    &mut context
+                )
+                .as_deref(),
+                Some("Outer")
+            );
+        }
     }
 
     #[test]

@@ -1131,9 +1131,7 @@ fn replace_legacy_placeholders(rule: &str, key: &str, page: i32) -> String {
     let encoded_key = urlencoding::encode(key);
     let page = page.max(1).to_string();
     rule.replace("{key}", &encoded_key)
-        .replace("searchKey", &encoded_key)
         .replace("{page}", &page)
-        .replace("searchPage", &page)
 }
 
 fn replace_page_choices_before_options(rule: &str, page: i32) -> String {
@@ -1152,7 +1150,6 @@ fn replace_page_choices(rule: &str, page: i32) -> String {
         let choices = captures[1]
             .split(',')
             .map(str::trim)
-            .filter(|value| !value.is_empty())
             .collect::<Vec<_>>();
         choices
             .get(page.saturating_sub(1) as usize)

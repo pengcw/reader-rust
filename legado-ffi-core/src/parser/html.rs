@@ -2871,15 +2871,31 @@ pub fn html_unescape(input: &str) -> String {
 /// 按照阅读 3.0 规范第 16 节实现 HtmlFormatter.formatKeepImg：
 /// 保留图片并补全 URL，将 <p>/<br> 等块级标签清洗为换行符，剔除其他无意义 HTML 标签。
 pub fn format_keep_img(content: &str, redirect_url: &str) -> String {
+    format_keep_img_with_script_text(content, redirect_url, false)
+}
+
+/// JS htmlFormat strips tags but retains their text, unlike reader content cleaning.
+pub(crate) fn format_js_html(content: &str, redirect_url: &str) -> String {
+    format_keep_img_with_script_text(content, redirect_url, true)
+}
+
+fn format_keep_img_with_script_text(
+    content: &str,
+    redirect_url: &str,
+    keep_script_text: bool,
+) -> String {
     if content.trim().is_empty() {
         return String::new();
     }
 
-    // 1. 移除 script、style 与注释
+    // Reader cleaning drops script/style bodies; the JS facade only strips tags below.
     let mut text = content.to_string();
-    if let Ok(re) =
-        regex::Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<!--.*?-->")
-    {
+    let removed = if keep_script_text {
+        r"(?s)<!--.*?-->"
+    } else {
+        r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<!--.*?-->"
+    };
+    if let Ok(re) = regex::Regex::new(removed) {
         text = re.replace_all(&text, "").into_owned();
     }
 

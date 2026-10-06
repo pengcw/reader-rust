@@ -49,7 +49,7 @@ pub fn interleave_result_groups<T>(groups: Vec<Vec<T>>) -> Vec<T> {
     result
 }
 
-fn find_next_delimiter<'a>(
+pub(crate) fn find_next_delimiter<'a>(
     rule: &'a str,
     delimiters: &[&'a str],
     from: usize,
