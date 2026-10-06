@@ -1708,7 +1708,7 @@ fn eval_js_inner_with_source(
                     } else {
                         &rule
                     };
-                    let found = jsonpath::jsonpath_first_value(&value, path)?;
+                    let found = jsonpath::jsonpath_object_value(&value, path)?;
                     serde_json::to_string(&found).ok()
                 }),
             )?;
@@ -6714,15 +6714,16 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
         let script = r#"
             java.setContent(JSON.stringify({data:{list:[{name:'first'},{name:'last'}]}}));
             const list = java.getElements('$.data.list[*]').toArray();
+            const all = java.getElement('$.data.list[*]');
             const last = java.getElement('$.data.list[-1]');
             const firstName = java.getString('$.data.list[0].name');
             java.setContent('<div><p id="p1"><b>one</b></p><p id="p2">two</p></div>');
             const paragraphs = java.getElements('@@tag.p').toArray();
-            [list[0].name, last.name, firstName, paragraphs[0].attr('id'),
-             paragraphs[0].html(), paragraphs[0].text()].join('|')
+            [list[0].name, all.length, all[1].name, last.name, firstName,
+             paragraphs[0].attr('id'), paragraphs[0].html(), paragraphs[0].text()].join('|')
         "#;
         let result = eval_js(script, "", "https://example.com").unwrap();
-        assert_eq!(result, "first|last|first|p1|<b>one</b>|one");
+        assert_eq!(result, "first|2|last|last|first|p1|<b>one</b>|one");
     }
 
     #[test]

@@ -262,10 +262,52 @@ pub fn jsonpath_query(value: &Value, rule: &str) -> Vec<Value> {
     jsonpath_query_with_arrays(value, rule, true)
 }
 
-pub(crate) fn jsonpath_first_value(value: &Value, rule: &str) -> Option<Value> {
-    jsonpath_query_with_arrays(value, rule, false)
-        .into_iter()
-        .next()
+pub(crate) fn jsonpath_object_value(value: &Value, rule: &str) -> Option<Value> {
+    let indefinite = jsonpath_is_indefinite(rule);
+    let mut values = jsonpath_query_with_arrays(value, rule, false);
+    if values.is_empty() {
+        return None;
+    }
+    if indefinite || values.len() > 1 {
+        Some(Value::Array(values))
+    } else {
+        values.pop()
+    }
+}
+
+fn jsonpath_is_indefinite(rule: &str) -> bool {
+    let chars: Vec<char> = rule.chars().collect();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut bracket_depth = 0usize;
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        let ch = chars[index];
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '.' if bracket_depth == 0 && chars.get(index + 1) == Some(&'.') => return true,
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '*' => return true,
+            '?' | ':' | ',' if bracket_depth > 0 => return true,
+            _ => {}
+        }
+        index += 1;
+    }
+    false
 }
 
 fn jsonpath_query_with_arrays(value: &Value, rule: &str, flatten_arrays: bool) -> Vec<Value> {
@@ -379,6 +421,27 @@ mod tests {
         assert_eq!(
             jsonpath_first_string(&value, "作者：{$.data.author}"),
             Some("作者：作者".into())
+        );
+    }
+
+    #[test]
+    fn object_value_preserves_definite_arrays_and_indefinite_results() {
+        let value = json!({"data":[{"name":"one"}]});
+        assert_eq!(
+            jsonpath_object_value(&value, "$.data"),
+            Some(json!([{"name":"one"}]))
+        );
+        assert_eq!(
+            jsonpath_object_value(&value, "$.data[0].name"),
+            Some(json!("one"))
+        );
+        assert_eq!(
+            jsonpath_object_value(&value, "$.data[*]"),
+            Some(json!([{"name":"one"}]))
+        );
+        assert_eq!(
+            jsonpath_object_value(&value, "$.data[*].name"),
+            Some(json!(["one"]))
         );
     }
 

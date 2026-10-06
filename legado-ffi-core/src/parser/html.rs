@@ -1116,7 +1116,10 @@ pub(crate) fn select_css_list<'a>(doc: &'a Html, css_selector: &str) -> Vec<Elem
     select_css(doc, css_selector)
 }
 
-fn select_css_from_element<'a>(el: ElementRef<'a>, css_selector: &str) -> Vec<ElementRef<'a>> {
+pub(crate) fn select_css_from_element<'a>(
+    el: ElementRef<'a>,
+    css_selector: &str,
+) -> Vec<ElementRef<'a>> {
     let scoped = scope_child_selector(css_selector);
     let css_selector = scoped.as_ref();
     let groups = split_top_level(css_selector, &[","]);

@@ -1,7 +1,10 @@
 //! Read-only HTML nodes sharing one owned tree per parsing scope.
+use crate::parser::html;
 use ego_tree::NodeId;
 use rquickjs::{function::Func, Ctx, Function, Value};
-use scraper::{ElementRef, Html, Selector};
+use scraper::{ElementRef, Html};
+#[cfg(test)]
+use scraper::Selector;
 use serde_json::{json, Value as JsonValue};
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
@@ -83,7 +86,18 @@ impl NodeContext {
         let value = match operation {
             "attr" => json!(element.value().attr(argument).unwrap_or("")),
             "hasAttr" => json!(element.value().attr(argument).is_some()),
-            "text" => json!(element.text().collect::<Vec<_>>().join(" ").trim()),
+            "text" => json!(html::normalize_jsoup_text_node(
+                &element.text().collect::<Vec<_>>().join(" ")
+            )),
+            "ownText" => {
+                let text = element
+                    .children()
+                    .filter_map(|node| node.value().as_text())
+                    .map(|text| text.text.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                json!(html::normalize_jsoup_text_node(&text))
+            }
             "html" => json!(element.inner_html()),
             "outerHtml" => json!(element.html()),
             "parent" => element
@@ -108,15 +122,23 @@ impl NodeContext {
                     .collect::<anyhow::Result<Vec<_>>>()?)
             }
             "select" => {
-                let selector = Selector::parse(argument)
-                    .map_err(|_| anyhow::anyhow!("Invalid DOM selector"))?;
-                let nodes: Vec<_> = std::iter::once(element)
-                    .filter(|element| selector.matches(element))
-                    .chain(element.select(&selector))
-                    .take(4097)
-                    .collect();
-                if nodes.len() > 4096 {
-                    anyhow::bail!("DOM query node budget exceeded");
+                if !html::css_rule_is_valid(argument) {
+                    anyhow::bail!("Invalid DOM selector");
+                }
+                let mut nodes = Vec::new();
+                if html::select_css_list(&self.document.html, argument)
+                    .iter()
+                    .any(|candidate| candidate.id() == element.id())
+                {
+                    nodes.push(element);
+                }
+                for candidate in html::select_css_from_element(element, argument) {
+                    if nodes.iter().all(|node| node.id() != candidate.id()) {
+                        nodes.push(candidate);
+                    }
+                    if nodes.len() > 4096 {
+                        anyhow::bail!("DOM query node budget exceeded");
+                    }
                 }
                 json!(nodes
                     .into_iter()

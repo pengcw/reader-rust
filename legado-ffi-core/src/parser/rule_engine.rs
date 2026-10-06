@@ -6714,6 +6714,38 @@ chapter_id='{{$.chapter_id}}'
     }
 
     #[test]
+    fn html_js_nodes_keep_jsoup_selection_text_and_collection_semantics() {
+        let mut context = RuleVariableContext::for_search_item();
+        let document = scraper::Html::parse_fragment(
+            "<div class='item'> A \n <span>B</span> C <a>A1</a><a>A2</a></div>",
+        );
+        let element = document
+            .select(&scraper::Selector::parse("div.item").unwrap())
+            .next()
+            .unwrap();
+        let value = eval_field_html_with_ctx(
+            "@js:[result.select('div.item').size(), result.select('a:eq(2)').first().text(), result.text(), result.ownText(), result.hasClass('ITEM'), result.selectFirst('span').text(), String(result.select('a'))].join('|')",
+            &element,
+            "https://scope.invalid",
+            &mut context,
+        );
+        assert_eq!(
+            value.as_deref(),
+            Some("1|A2|A B C A1 A2|A C|true|B|<a>A1</a><a>A2</a>")
+        );
+        assert_eq!(
+            eval_field_html_with_ctx(
+                "@js:result.select('a')",
+                &element,
+                "https://scope.invalid",
+                &mut context,
+            )
+            .as_deref(),
+            Some("<a>A1</a><a>A2</a>")
+        );
+    }
+
+    #[test]
     fn carrier_fields_restore_outer_document_after_success_and_js_error() {
         let mut context = RuleVariableContext::for_search_item();
         let outer_slot = context.html_document.clone();
