@@ -6746,6 +6746,26 @@ chapter_id='{{$.chapter_id}}'
     }
 
     #[test]
+    fn html_js_own_text_and_scope_work_through_field_rules() {
+        let mut context = RuleVariableContext::for_search_item();
+        let document = scraper::Html::parse_fragment("<div>A<span>B</span>C<a>D</a></div>");
+        let element = document
+            .select(&scraper::Selector::parse("div").unwrap())
+            .next()
+            .unwrap();
+        assert_eq!(
+            eval_field_html_with_ctx(
+                "@js:[result.ownText(), result.select(':scope').size(), result.selectFirst(':scope').ownText(), result.select(':scope > a').first().text()].join('|')",
+                &element,
+                "https://scope.invalid",
+                &mut context,
+            )
+            .as_deref(),
+            Some("AC|1|AC|D")
+        );
+    }
+
+    #[test]
     fn carrier_fields_restore_outer_document_after_success_and_js_error() {
         let mut context = RuleVariableContext::for_search_item();
         let outer_slot = context.html_document.clone();

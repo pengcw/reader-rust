@@ -2,9 +2,7 @@
 use crate::parser::html;
 use ego_tree::NodeId;
 use rquickjs::{function::Func, Ctx, Function, Value};
-use scraper::{ElementRef, Html};
-#[cfg(test)]
-use scraper::Selector;
+use scraper::{ElementRef, Html, Selector};
 use serde_json::{json, Value as JsonValue};
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
@@ -90,13 +88,31 @@ impl NodeContext {
                 &element.text().collect::<Vec<_>>().join(" ")
             )),
             "ownText" => {
-                let text = element
-                    .children()
-                    .filter_map(|node| node.value().as_text())
-                    .map(|text| text.text.to_string())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                json!(html::normalize_jsoup_text_node(&text))
+                let preserve_whitespace = std::iter::once(element)
+                    .chain(element.ancestors().filter_map(ElementRef::wrap))
+                    .take(6)
+                    .any(|node| {
+                        matches!(
+                            node.value().name(),
+                            "pre" | "plaintext" | "title" | "textarea"
+                        )
+                    });
+                let mut text = String::new();
+                for child in element.children() {
+                    if let Some(node) = child.value().as_text() {
+                        text.push_str(&node.text);
+                    } else if ElementRef::wrap(child)
+                        .is_some_and(|node| node.value().name() == "br")
+                        && !text.ends_with(' ')
+                    {
+                        text.push(' ');
+                    }
+                }
+                if preserve_whitespace {
+                    json!(text.trim_matches(|ch| ch <= '\u{0020}'))
+                } else {
+                    json!(html::normalize_jsoup_text_node(&text))
+                }
             }
             "html" => json!(element.inner_html()),
             "outerHtml" => json!(element.html()),
@@ -126,10 +142,13 @@ impl NodeContext {
                     anyhow::bail!("Invalid DOM selector");
                 }
                 let mut nodes = Vec::new();
-                if html::select_css_list(&self.document.html, argument)
-                    .iter()
-                    .any(|candidate| candidate.id() == element.id())
-                {
+                let matches_self = match Selector::parse(argument) {
+                    Ok(selector) => selector.matches_with_scope(&element, Some(element)),
+                    Err(_) => html::select_css_list(&self.document.html, argument)
+                        .iter()
+                        .any(|candidate| candidate.id() == element.id()),
+                };
+                if matches_self {
                     nodes.push(element);
                 }
                 for candidate in html::select_css_from_element(element, argument) {
@@ -299,6 +318,38 @@ mod tests {
         .unwrap();
         assert!(Rc::ptr_eq(&first, shared.borrow().as_ref().unwrap()));
         assert!(ACTIVE.with(|active| active.borrow().is_none()));
+    }
+
+    #[test]
+    fn own_text_and_self_selection_follow_node_scope() {
+        for (body, expected) in [
+            ("<div>A<span>B</span>C</div>", "AC"),
+            ("<div>A <span>B</span> C</div>", "A C"),
+            ("<div>A<br>C</div>", "A C"),
+            ("<pre>A  <span>B</span>\nC</pre>", "A  \nC"),
+            ("<pre>A <br>C</pre>", "A C"),
+        ] {
+            let document = Html::parse_fragment(body);
+            let selector = Selector::parse("div, pre").unwrap();
+            let element = document.select(&selector).next().unwrap();
+            evaluate(element, &SharedDocument::default(), |_| {
+                ACTIVE.with(|active| {
+                    let active = active.borrow();
+                    let node = active.as_ref().unwrap();
+                    assert_eq!(
+                        node.query("ownText", &node.path, "").unwrap(),
+                        json!(expected)
+                    );
+                    for selector in [":scope", element.value().name()] {
+                        let selected = node.query("select", &node.path, selector).unwrap();
+                        assert_eq!(selected.as_array().unwrap().len(), 1);
+                        assert_eq!(selected[0]["__readerDomNode"], json!(node.path));
+                    }
+                });
+                Ok(())
+            })
+            .unwrap();
+        }
     }
 
     #[test]

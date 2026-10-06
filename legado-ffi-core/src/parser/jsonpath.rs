@@ -48,7 +48,7 @@ fn has_unsupported_filter_selector(rule: &str) -> bool {
 
 // A deliberately narrow Jayway extension: one current-item dotted-path =~ predicate.
 // All ordinary JSONPath evaluation remains with jsonpath_lib.
-fn regex_filter_query(value: &Value, rule: &str) -> Option<Vec<Value>> {
+fn regex_filter_query(value: &Value, rule: &str) -> Option<Option<Vec<Value>>> {
     let mut quote = None;
     let mut escaped = false;
     let mut start = None;
@@ -109,11 +109,11 @@ fn regex_filter_query(value: &Value, rule: &str) -> Option<Vec<Value>> {
         regex::Regex::new(r"^@(?:\.[\p{L}_$][\p{L}\p{N}_$]*)*$").unwrap()
     });
     if !CURRENT_PATH.is_match(left.trim()) {
-        return Some(vec![]);
+        return Some(None);
     }
     let literal = literal.trim_start();
     let Some(pattern_start) = literal.strip_prefix('/') else {
-        return Some(vec![]);
+        return Some(None);
     };
     let mut escaped = false;
     let mut end = None;
@@ -130,7 +130,7 @@ fn regex_filter_query(value: &Value, rule: &str) -> Option<Vec<Value>> {
         }
     }
     let Some(end) = end else {
-        return Some(vec![]);
+        return Some(None);
     };
     let tail = &pattern_start[end + 1..];
     let flags_end = tail
@@ -146,11 +146,11 @@ fn regex_filter_query(value: &Value, rule: &str) -> Option<Vec<Value>> {
         .strip_prefix(')')
         .and_then(|tail| tail.trim_start().strip_prefix(']'))
     else {
-        return Some(vec![]);
+        return Some(None);
     };
     let prefix = &rule[..start];
     if prefix.contains("[?(") || suffix.contains("[?(") {
-        return Some(vec![]);
+        return Some(None);
     }
     let pattern = pattern_start[..end].replace(r"\/", "/");
     let pattern = if flags.is_empty() {
@@ -159,11 +159,11 @@ fn regex_filter_query(value: &Value, rule: &str) -> Option<Vec<Value>> {
         format!("(?{flags}){pattern}")
     };
     if !super::source_regex::is_valid(&pattern) {
-        return Some(vec![]);
+        return Some(None);
     }
     let prefix = normalize_negative_indices(prefix);
     let Ok(parents) = jsonpath_lib::select(value, &prefix) else {
-        return Some(vec![]);
+        return Some(None);
     };
     let path = format!("${}", &left.trim()[1..]);
     let matches = |item: &Value| {
@@ -200,7 +200,7 @@ fn regex_filter_query(value: &Value, rule: &str) -> Option<Vec<Value>> {
             }
         }
     }
-    Some(output)
+    Some(Some(output))
 }
 
 // jsonpath_lib clamps underflowing negative indexes to zero. A one-item slice
@@ -264,8 +264,8 @@ pub fn jsonpath_query(value: &Value, rule: &str) -> Vec<Value> {
 
 pub(crate) fn jsonpath_object_value(value: &Value, rule: &str) -> Option<Value> {
     let indefinite = jsonpath_is_indefinite(rule);
-    let mut values = jsonpath_query_with_arrays(value, rule, false);
-    if values.is_empty() {
+    let mut values = jsonpath_query_checked(value, rule, false)?;
+    if values.is_empty() && !indefinite {
         return None;
     }
     if indefinite || values.len() > 1 {
@@ -311,12 +311,16 @@ fn jsonpath_is_indefinite(rule: &str) -> bool {
 }
 
 fn jsonpath_query_with_arrays(value: &Value, rule: &str, flatten_arrays: bool) -> Vec<Value> {
+    jsonpath_query_checked(value, rule, flatten_arrays).unwrap_or_default()
+}
+
+fn jsonpath_query_checked(value: &Value, rule: &str, flatten_arrays: bool) -> Option<Vec<Value>> {
     if let Some(rendered) = render_embedded_paths(value, rule) {
-        return vec![Value::String(rendered)];
+        return Some(vec![Value::String(rendered)]);
     }
     let rule = rule.trim();
     if rule.is_empty() {
-        return vec![];
+        return None;
     }
     let normalized;
     let rule = if rule.starts_with('$') {
@@ -334,7 +338,7 @@ fn jsonpath_query_with_arrays(value: &Value, rule: &str, flatten_arrays: bool) -
     // jsonpath_lib 0.3 panics on range, union, and named-key selectors inside filters.
     // Reject those unsupported expressions before calling it; release builds abort on panic.
     if has_unsupported_filter_selector(rule) {
-        return vec![];
+        return None;
     }
     let rule = normalize_negative_indices(rule);
     if let Ok(res) = jsonpath_lib::select(value, &rule) {
@@ -347,9 +351,9 @@ fn jsonpath_query_with_arrays(value: &Value, rule: &str, flatten_arrays: bool) -
                 other => out.push(other.clone()),
             }
         }
-        out
+        Some(out)
     } else {
-        vec![]
+        None
     }
 }
 
@@ -421,6 +425,26 @@ mod tests {
         assert_eq!(
             jsonpath_first_string(&value, "作者：{$.data.author}"),
             Some("作者：作者".into())
+        );
+    }
+
+    #[test]
+    fn object_value_distinguishes_empty_queries_from_errors() {
+        let value = json!({"items": []});
+        assert_eq!(jsonpath_object_value(&value, "$.items[*]"), Some(json!([])));
+        assert_eq!(
+            jsonpath_object_value(&value, "$.items[?(@.id == 1)]"),
+            Some(json!([]))
+        );
+        assert_eq!(jsonpath_object_value(&value, "$.missing"), None);
+        assert_eq!(jsonpath_object_value(&value, "$.items["), None);
+        assert_eq!(
+            jsonpath_object_value(&value, "$.items[?(@.id =~ /[/)]"),
+            None
+        );
+        assert_eq!(
+            jsonpath_object_value(&value, "$.items[?(@.id =~ /x/)]"),
+            Some(json!([]))
         );
     }
 

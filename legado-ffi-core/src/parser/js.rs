@@ -6727,6 +6727,20 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
     }
 
     #[test]
+    fn java_get_element_empty_indefinite_queries_are_arrays() {
+        let result = eval_js(
+            r#"java.setContent('{"items":[]}');
+               const all = java.getElement('$.items[*]');
+               const filtered = java.getElement('$.items[?(@.id == 1)]');
+               [Array.isArray(all), all.length, filtered.map(x => x.id).length].join('|')"#,
+            "",
+            "https://example.com",
+        )
+        .unwrap();
+        assert_eq!(result, "true|0|0");
+    }
+
+    #[test]
     fn real_source_get_string_json_fallback_values_and_blank_url() {
         let body = r#"{"data":{"list":[{"publish_sn":"first"},{"publish_sn":"last"}]},"fallback":"备用","path":"/next","count":0,"enabled":false,"blank":""}"#;
         let result = eval_js(
