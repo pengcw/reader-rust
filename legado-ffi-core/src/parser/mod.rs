@@ -8,6 +8,7 @@ pub mod js;
 pub(crate) mod js_compat;
 pub(crate) mod js_http;
 pub(crate) mod js_state;
+pub(crate) mod js_url;
 pub mod jsonpath;
 pub mod rule_analyzer;
 pub mod rule_engine;

@@ -17,6 +17,10 @@ use crate::parser::source_regex;
 use crate::runtime::session::current_active_session;
 use crate::parser::{dom, html};
 pub use crate::parser::js_state::with_js_lib;
+pub use crate::parser::js_url::{
+    eval_js_url, eval_js_url_template, eval_js_url_template_with_bindings,
+    eval_js_url_template_with_headers, eval_js_url_with_bindings, eval_js_url_with_headers,
+};
 pub(crate) use crate::parser::js_http::{
     with_js_http_client, with_js_http_clients, with_js_http_context,
 };
@@ -150,136 +154,6 @@ pub fn eval_js_search_with_source(
         Some(source_key),
         None,
         false,
-        None,
-    )
-}
-
-pub fn eval_js_url(
-    script: &str,
-    result: &str,
-    key: &str,
-    page: i32,
-    source_key: &str,
-    base_url: &str,
-) -> anyhow::Result<String> {
-    eval_js_url_with_bindings(script, result, key, page, source_key, base_url, None)
-}
-
-pub fn eval_js_url_with_bindings(
-    script: &str,
-    result: &str,
-    key: &str,
-    page: i32,
-    source_key: &str,
-    base_url: &str,
-    bindings: Option<&HashMap<String, JsonValue>>,
-) -> anyhow::Result<String> {
-    eval_js_inner_with_source(
-        script,
-        Some(result),
-        Some(base_url),
-        Some(key),
-        Some(page),
-        Some(source_key),
-        bindings,
-        false,
-        None,
-    )
-}
-
-/// Evaluate an AnalyzeUrl option script with its mutable, request-local headerMap.
-pub fn eval_js_url_with_headers(
-    script: &str,
-    result: &str,
-    key: &str,
-    page: i32,
-    source_key: &str,
-    base_url: &str,
-    bindings: Option<&HashMap<String, JsonValue>>,
-    headers: &mut Vec<(String, String)>,
-) -> anyhow::Result<String> {
-    eval_js_url_with_headers_inner(
-        script, result, key, page, source_key, base_url, bindings, headers, false,
-    )
-}
-
-pub fn eval_js_url_template_with_headers(
-    script: &str,
-    result: &str,
-    key: &str,
-    page: i32,
-    source_key: &str,
-    base_url: &str,
-    bindings: Option<&HashMap<String, JsonValue>>,
-    headers: &mut Vec<(String, String)>,
-) -> anyhow::Result<String> {
-    eval_js_url_with_headers_inner(
-        script, result, key, page, source_key, base_url, bindings, headers, true,
-    )
-}
-
-fn eval_js_url_with_headers_inner(
-    script: &str,
-    result: &str,
-    key: &str,
-    page: i32,
-    source_key: &str,
-    base_url: &str,
-    bindings: Option<&HashMap<String, JsonValue>>,
-    headers: &mut Vec<(String, String)>,
-    template_result: bool,
-) -> anyhow::Result<String> {
-    let initial: serde_json::Map<String, JsonValue> = headers
-        .iter()
-        .map(|(name, value)| (name.clone(), JsonValue::String(value.clone())))
-        .collect();
-    let updated = std::cell::RefCell::new(None);
-    let result = eval_js_inner_with_source(
-        script,
-        Some(result),
-        Some(base_url),
-        Some(key),
-        Some(page),
-        Some(source_key),
-        bindings,
-        template_result,
-        Some((&initial, &updated)),
-    )?;
-    if let Some(values) = updated.into_inner() {
-        *headers = values;
-    }
-    Ok(result)
-}
-
-pub fn eval_js_url_template(
-    script: &str,
-    result: &str,
-    key: &str,
-    page: i32,
-    source_key: &str,
-    base_url: &str,
-) -> anyhow::Result<String> {
-    eval_js_url_template_with_bindings(script, result, key, page, source_key, base_url, None)
-}
-
-pub fn eval_js_url_template_with_bindings(
-    script: &str,
-    result: &str,
-    key: &str,
-    page: i32,
-    source_key: &str,
-    base_url: &str,
-    bindings: Option<&HashMap<String, JsonValue>>,
-) -> anyhow::Result<String> {
-    eval_js_inner_with_source(
-        script,
-        Some(result),
-        Some(base_url),
-        Some(key),
-        Some(page),
-        Some(source_key),
-        bindings,
-        true,
         None,
     )
 }
@@ -461,7 +335,7 @@ fn collect_header_map(ctx: &rquickjs::Ctx<'_>) -> anyhow::Result<Vec<(String, St
         .collect())
 }
 
-fn eval_js_inner_with_source(
+pub(super) fn eval_js_inner_with_source(
     script: &str,
     input: Option<&str>,
     base_url: Option<&str>,

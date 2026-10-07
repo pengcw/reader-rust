@@ -4,7 +4,7 @@
 //! 执行引擎需要的同步路径，避免为 `cdylib` 引入异步 runtime。
 
 use crate::model::book_source::BookSource;
-use crate::parser::js::{
+use crate::parser::js_url::{
     eval_js_url_template_with_headers, eval_js_url_with_bindings, eval_js_url_with_headers,
     with_js_lib,
 };
