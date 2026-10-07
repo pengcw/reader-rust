@@ -9,27 +9,28 @@ thread_local! {
         RefCell::new(HashMap::with_capacity(SOURCE_REGEX_CACHE_CAPACITY));
 }
 
-fn compile_android_pattern(pattern: &str) -> Option<Regex> {
-    // Android's java.util.regex.Pattern is ICU-backed and always uses Unicode
-    // character classes/case handling. java_regex targets OpenJDK, so enable
-    // the equivalent Java U/u flags by default at this compatibility boundary.
-    Regex::with_flags(pattern, "uU").ok()
-}
-
-fn get_cached_regex(pattern: &str) -> Option<Regex> {
+fn get_cached_regex_with_flags(pattern: &str, flags: &str) -> Option<Regex> {
+    let key = format!("{flags}\0{pattern}");
     SOURCE_REGEX_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if let Some(regex) = cache.get(pattern) {
+        if let Some(regex) = cache.get(&key) {
             return Some(regex.clone());
         }
 
-        let regex = compile_android_pattern(pattern)?;
+        let regex = Regex::with_flags(pattern, flags).ok()?;
         if cache.len() >= SOURCE_REGEX_CACHE_CAPACITY {
             cache.clear();
         }
-        cache.insert(pattern.to_string(), regex.clone());
+        cache.insert(key, regex.clone());
         Some(regex)
     })
+}
+
+fn get_cached_regex(pattern: &str) -> Option<Regex> {
+    // Android's java.util.regex.Pattern is ICU-backed and always uses Unicode
+    // character classes/case handling. java_regex targets OpenJDK, so enable
+    // the equivalent Java U/u flags by default at this compatibility boundary.
+    get_cached_regex_with_flags(pattern, "uU")
 }
 
 fn match_captures(info: MatchInfo) -> Vec<Option<String>> {
@@ -227,7 +228,17 @@ pub(crate) fn replace_all(
     pattern: &str,
     replacement: &str,
 ) -> Result<String, RegexError> {
-    let regex = get_cached_regex(pattern).ok_or(RegexError::InvalidPattern)?;
+    replace_all_with_flags(input, pattern, replacement, "uU")
+}
+
+pub(crate) fn replace_all_with_flags(
+    input: &str,
+    pattern: &str,
+    replacement: &str,
+    flags: &str,
+) -> Result<String, RegexError> {
+    let regex =
+        get_cached_regex_with_flags(pattern, flags).ok_or(RegexError::InvalidPattern)?;
     checked_replace(&regex, input, replacement, false)
 }
 
@@ -253,6 +264,18 @@ pub(crate) fn replace_first_match(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_separates_android_and_qread_flags() {
+        assert_eq!(
+            replace_all("a\nb", "^b", "x"),
+            Ok("a\nb".into())
+        );
+        assert_eq!(
+            replace_all_with_flags("a\nb", "^b", "x", "uUm"),
+            Ok("a\nx".into())
+        );
+    }
 
     #[test]
     fn replacement_metadata_includes_nonparticipating_named_groups() {

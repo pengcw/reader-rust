@@ -69,8 +69,8 @@ fn ffi_eval_content_extraction_html_and_xpath_returns_json_arrays() {
 #[test]
 fn ffi_eval_jsonpath_missing_in_eval_defect() {
     // DEFECT DISCOVERY IN reader_eval:
-    // reader_eval handles directives (@...), regex (##...), replace ([...), JS (@js:),
-    // and XPath (//...). But for JSON inputs with `$.field` rules, reader_eval lacks a
+    // reader_eval handles directives (@...), regex (##...), JS (@js:), and XPath (//...).
+    // But for JSON inputs with `$.field` rules, reader_eval lacks a
     // JsonPath dispatch branch! It falls through to parse_document (HTML parser),
     // treating "$.title" as a CSS selector, which produces an empty array "[]".
     let json_data = r#"{"title":"Rust Deep Dive","author":"Ferris"}"#;

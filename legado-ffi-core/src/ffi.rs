@@ -1,6 +1,5 @@
 use crate::executor;
 use crate::model::book_source::book_source_from_value;
-use crate::model::replace_rule::ReplaceRule;
 use crate::model::search::SearchBook;
 use crate::parser::js::eval_js;
 use crate::parser::rule_engine::{apply_legado_regex, RuleEngine};
@@ -42,7 +41,7 @@ pub fn reader_free_string(value: Option<char_p::Box>) {
     drop(value);
 }
 
-/// 通用规则/求值/清洗/微指令入口。该函数保持 ABI v1 已有语义，但不承担书源抓取。
+/// 通用规则/求值/清洗/微指令入口；不承担书源抓取。
 #[ffi_export]
 pub fn reader_eval(input: char_p::Ref<'_>, rule: char_p::Ref<'_>) -> char_p::Box {
     let input = input.to_str();
@@ -152,9 +151,6 @@ pub fn reader_eval(input: char_p::Ref<'_>, rule: char_p::Ref<'_>) -> char_p::Box
 
     if rule.starts_with("##") {
         return ffi_string(apply_legado_regex(input, rule));
-    }
-    if rule.starts_with('[') {
-        return ffi_string(apply_replace_rules(input, rule));
     }
     if let Some(script) = strip_js_prefix(rule) {
         return ffi_string(
@@ -678,34 +674,6 @@ fn strip_js_prefix(rule: &str) -> Option<&str> {
     rule.strip_prefix("@js:")
         .or_else(|| rule.strip_prefix("js:"))
         .or_else(|| rule.strip_prefix("<js>"))
-}
-
-fn apply_replace_rules(content: &str, raw_rules: &str) -> String {
-    let Ok(rules) = serde_json::from_str::<Vec<ReplaceRule>>(raw_rules) else {
-        return content.to_string();
-    };
-    apply_replace_rule_list(content, &rules)
-}
-
-fn apply_replace_rule_list(content: &str, rules: &[ReplaceRule]) -> String {
-    let mut output = content.to_string();
-    for rule in rules.iter().filter(|rule| rule.is_enabled) {
-        if rule.is_regex {
-            let expression = if rule.pattern.starts_with("##") {
-                if rule.pattern.contains(&format!("##{}", rule.replacement)) {
-                    rule.pattern.clone()
-                } else {
-                    format!("{}##{}", rule.pattern, rule.replacement)
-                }
-            } else {
-                format!("##{}##{}", rule.pattern, rule.replacement)
-            };
-            output = apply_legado_regex(&output, &expression);
-        } else {
-            output = output.replace(&rule.pattern, &rule.replacement);
-        }
-    }
-    output
 }
 
 fn merge_search_results(raw_books: &str) -> String {

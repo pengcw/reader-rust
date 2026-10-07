@@ -111,7 +111,7 @@ fn pages_with_sub_content() -> Vec<Value> {
 }
 
 #[test]
-fn pipeline_appends_sub_content_before_source_and_host_replacements() {
+fn pipeline_appends_sub_content_before_source_and_user_transforms() {
     for (rule, source_output) in [
         ("##^A\\nB\\nC$##source", "source"),
         ("@js: '[' + result + ']'", "[A\nB\nC]"),
@@ -122,7 +122,8 @@ fn pipeline_appends_sub_content_before_source_and_host_replacements() {
             pages_with_sub_content(),
             source,
             json!({
-                "replaceRules": [{"pattern": source_output, "replacement": "host-final", "isEnabled": true, "isRegex": false}]
+                "textTransformDialect": "legado",
+                "textTransformRules": [{"pattern": source_output, "replacement": "host-final", "isRegex": false}]
             }),
         );
         assert_eq!(result["data"]["content"], "host-final", "{rule}");
@@ -130,16 +131,16 @@ fn pipeline_appends_sub_content_before_source_and_host_replacements() {
 }
 
 #[test]
-fn failing_source_js_keeps_sub_content_for_later_host_replacement() {
+fn failing_source_js_keeps_sub_content_for_later_user_transform() {
     let mut source = source("", "@js: throw new Error('synthetic failure')", "$.content");
     source["ruleContent"]["subContent"] = json!("$.extra");
     let result = run_with_config(
         pages_with_sub_content(),
         source,
         json!({
-            "replaceRules": [
-                {"pattern": "^A\\nB\\nC$", "replacement": "host-result", "isEnabled": true, "isRegex": true},
-                {"pattern": "host-result", "replacement": "must-not-apply", "isEnabled": false, "isRegex": false}
+            "textTransformDialect": "legado",
+            "textTransformRules": [
+                {"pattern": "^A\\nB\\nC$", "replacement": "host-result", "isRegex": true}
             ]
         }),
     );
@@ -158,6 +159,23 @@ fn sub_content_keeps_the_existing_book_type_gate() {
         );
         assert_eq!(result["data"]["content"], expected);
     }
+}
+
+#[test]
+fn legacy_replace_rules_param_is_ignored() {
+    let result = run_with_config(
+        vec![json!({"content":"raw","next":""})],
+        source("", "", "$.content"),
+        json!({
+            "replaceRules": [{
+                "pattern": "raw",
+                "replacement": "legacy",
+                "isEnabled": true,
+                "isRegex": false
+            }]
+        }),
+    );
+    assert_eq!(result["data"]["content"], "raw");
 }
 
 #[test]

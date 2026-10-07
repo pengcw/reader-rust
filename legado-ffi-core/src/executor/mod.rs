@@ -8,17 +8,18 @@ use crate::crawler::{
     HttpResponse, HttpSession, UrlRuleContext,
 };
 use crate::model::book_source::{book_source_from_value, BookSource};
-use crate::model::replace_rule::ReplaceRule;
 use crate::parser::js::{
     eval_js, eval_js_with_bindings, with_js_http_clients, with_js_info_map, with_js_lib,
     InfoMapState,
 };
 use crate::parser::rule_engine::{
-    apply_legado_regex, dedupe_chapters_last_wins, normalize_list_rule, RuleEngine,
+    dedupe_chapters_last_wins, normalize_list_rule, RuleEngine,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
+
+mod text_transform;
 
 const DEFAULT_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_MAX_PAGES: usize = 100;
@@ -1002,6 +1003,14 @@ fn execute_toc(
         Some(&book_info.name),
         Some(&book_fields),
     );
+    let mut titles = chapters
+        .iter()
+        .map(|chapter| chapter.title.clone())
+        .collect::<Vec<_>>();
+    text_transform::apply_from_params(&mut titles, params);
+    for (chapter, title) in chapters.iter_mut().zip(titles) {
+        chapter.title = title;
+    }
     let mut data =
         json!({"chapters": chapters, "pages": visited_pages.len(), "truncated": truncated});
     if let Some(variable) = book_variable {
@@ -1152,7 +1161,6 @@ fn execute_content(
     }
     let (mut chapter_variable, mut chapter_title) = input_chapter_state(params);
     let is_volume = input_chapter_is_volume(params);
-    let replace_rules = parse_replace_rules(params.get("replaceRules"))?;
 
     let self_fetch = uses_js_ajax_content_rule(source)
         && !strip_url_options(&initial_url).trim().starts_with("data:");
@@ -1331,13 +1339,13 @@ fn execute_content(
         chapter_title.as_deref(),
         Some(&book_fields),
     );
-    let content = engine.replace_content_with_context(
+    let mut content = engine.replace_content_with_context(
         source,
         &fragments.join("\n"),
         &final_url,
         &replacement_context,
     );
-    let content = apply_replace_rules(&content, &replace_rules);
+    text_transform::apply_from_params(std::slice::from_mut(&mut content), params);
     if content.is_empty() && !is_volume {
         return Err(ExecuteError::parse("content is empty"));
     }
@@ -1800,36 +1808,6 @@ fn optional_page(params: &Value) -> ExecuteResult<i32> {
     Ok(page as i32)
 }
 
-fn parse_replace_rules(value: Option<&Value>) -> ExecuteResult<Vec<ReplaceRule>> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    serde_json::from_value(value.clone()).map_err(|error| {
-        ExecuteError::invalid_request(format!("invalid params.replaceRules: {error}"))
-    })
-}
-
-fn apply_replace_rules(content: &str, rules: &[ReplaceRule]) -> String {
-    let mut content = content.to_string();
-    for rule in rules.iter().filter(|rule| rule.is_enabled) {
-        if rule.is_regex {
-            let expression = if rule.pattern.starts_with("##") {
-                if rule.pattern.contains(&format!("##{}", rule.replacement)) {
-                    rule.pattern.clone()
-                } else {
-                    format!("{}##{}", rule.pattern, rule.replacement)
-                }
-            } else {
-                format!("##{}##{}", rule.pattern, rule.replacement)
-            };
-            content = apply_legado_regex(&content, &expression);
-        } else {
-            content = content.replace(&rule.pattern, &rule.replacement);
-        }
-    }
-    content
-}
-
 fn success(
     data: Value,
     pages: usize,
@@ -2081,6 +2059,39 @@ mod tests {
         .unwrap();
         assert_eq!(result["ok"], true, "{result}");
         assert_eq!(result["data"]["content"], "");
+    }
+
+    #[test]
+    fn execute_toc_text_transform_runs_after_format_js() {
+        let base_url = serve_once(r#"{"chapters":[{"title":"old","url":"/chapter/1"}]}"#);
+        let source = serde_json::json!({
+            "bookSourceName": "TOC text transform fixture",
+            "bookSourceUrl": base_url,
+            "ruleToc": {
+                "chapterList": "$.chapters[*]",
+                "chapterName": "$.title",
+                "chapterUrl": "$.url",
+                "formatJs": "'fmt-' + title"
+            }
+        });
+        let request = serde_json::json!({
+            "api": 2,
+            "op": "toc",
+            "params": {
+                "url": source["bookSourceUrl"],
+                "textTransformDialect": "legado",
+                "textTransformRules": [{
+                    "pattern": "fmt-",
+                    "replacement": "final-",
+                    "isRegex": false
+                }]
+            }
+        });
+
+        let result: Value =
+            serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["chapters"][0]["title"], "final-old");
     }
 
     #[test]
