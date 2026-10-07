@@ -5,6 +5,8 @@ pub(crate) mod dom;
 pub mod html;
 pub(crate) mod http_url;
 pub mod js;
+pub(crate) mod js_compat;
+pub(crate) mod js_state;
 pub mod jsonpath;
 pub mod rule_analyzer;
 pub mod rule_engine;

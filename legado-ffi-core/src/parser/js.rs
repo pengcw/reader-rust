@@ -3,26 +3,41 @@ use crate::crawler::{
     format_analyzed_body, render_webview_with_rakers, HttpClient,
 };
 use crate::model::book_source::BookSource;
+use crate::parser::js_compat::{
+    java_base64_decode, java_base64_decode_bytes, java_base64_encode_bytes, java_bytes_to_str,
+    java_digest_bytes, java_encode_uri, java_hmac_bytes, java_hmac_string_bytes,
+    java_str_to_bytes, java_time_format, java_time_format_utc, java_to_num_chapter,
+    java_to_url_json,
+};
 use crate::parser::jsonpath;
 use crate::parser::rule_analyzer;
 use crate::parser::rule_engine;
 use crate::parser::source_regex;
+use crate::runtime::session::current_active_session;
 use crate::parser::{dom, html};
+pub use crate::parser::js_state::with_js_lib;
+pub(crate) use crate::parser::js_state::{
+    active_js_webview_client, with_click_browser, with_js_http_client, with_js_http_clients,
+    with_js_http_context, with_js_info_map, with_login_messages, InfoMapState,
+};
+use crate::parser::js_state::{
+    active_info_map_state, active_js_http_client, capture_login_message, update_active_info_map,
+    ACTIVE_JS_BOOK_SOURCE, ACTIVE_JS_LIB, CLICK_BROWSER, LOGIN_MESSAGES, LOGIN_PREVIEW,
+};
+#[cfg(test)]
+use crate::parser::js_state::ACTIVE_JS_HTTP_CONTEXT;
 use crate::util::hash::md5_hex;
 use crate::util::text::strip_whitespace;
 use aes::Aes128;
 use base64::Engine;
 use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
-use chrono::{FixedOffset, Local, TimeZone};
 use once_cell::sync::Lazy;
-use ring::{digest, hmac};
 use rquickjs::context::EvalOptions;
 use rquickjs::function::Func;
 use rquickjs::{Context, Object, Runtime, Value};
-use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -30,49 +45,6 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 use ureq::http::Method;
 use uuid::Uuid;
-
-thread_local! {
-    static LOGIN_MESSAGES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
-    static LOGIN_PREVIEW: RefCell<Option<JsonValue>> = const { RefCell::new(None) };
-    static CLICK_BROWSER: RefCell<Option<Option<JsonValue>>> = const { RefCell::new(None) };
-}
-
-// Capture only during a source click; restore the outer scope even on unwind.
-pub(crate) fn with_click_browser<T>(run: impl FnOnce() -> T) -> (T, Option<JsonValue>) {
-    CLICK_BROWSER.with(|cell| crate::util::scoped::with_scoped_value(cell, Some(None), || {
-        let result = run();
-        (result, cell.borrow().as_ref().and_then(Clone::clone))
-    }))
-}
-
-pub(crate) fn with_login_messages<T>(run: impl FnOnce() -> T) -> (T, Vec<String>, Option<JsonValue>) {
-    struct Restore(Option<Vec<String>>, Option<JsonValue>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            LOGIN_MESSAGES.with(|slot| *slot.borrow_mut() = self.0.take());
-            LOGIN_PREVIEW.with(|slot| *slot.borrow_mut() = self.1.take());
-        }
-    }
-    let restore = Restore(LOGIN_MESSAGES.with(|slot| slot.replace(Some(Vec::new()))),
-        LOGIN_PREVIEW.with(|slot| slot.replace(None)));
-    let result = run();
-    let messages = LOGIN_MESSAGES.with(|slot| slot.borrow_mut().take().unwrap_or_default());
-    let preview = LOGIN_PREVIEW.with(|slot| slot.borrow_mut().take());
-    drop(restore);
-    (result, messages, preview)
-}
-
-fn capture_login_message(message: Option<rquickjs::Coerced<String>>) {
-    if let Some(message) = message {
-        LOGIN_MESSAGES.with(|slot| {
-            if let Some(messages) = slot.borrow_mut().as_mut() {
-                if messages.len() < 8 && !message.0.trim().is_empty() {
-                    messages.push(message.0.chars().take(1024).collect());
-                }
-            }
-        });
-    }
-}
 
 static JS_KV: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static JS_CACHE: Lazy<Mutex<HashMap<String, JsCacheEntry>>> =
@@ -86,12 +58,6 @@ struct JsCacheEntry {
     expires_at: Option<Instant>,
 }
 
-#[derive(Clone)]
-struct JsHttpContext {
-    request_client: HttpClient,
-    webview_client: HttpClient,
-}
-static JS_HTTP_CLIENT: Lazy<HttpClient> = Lazy::new(HttpClient::standalone);
 static JS_DEVICE_ID: Lazy<String> = Lazy::new(|| {
     let mut map = JS_KV.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(existing) = map.get("__device_id") {
@@ -111,53 +77,7 @@ impl Drop for TimerGuard {
     }
 }
 
-const MAX_INFO_MAP_BYTES: usize = 256 * 1024;
-const MAX_INFO_MAP_ENTRIES: usize = 64;
-const MAX_INFO_MAP_KEY_BYTES: usize = 1024;
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct InfoMapState {
-    pub(crate) values: BTreeMap<String, String>,
-    pub(crate) need_save: bool,
-    pub(crate) save_time: i32,
-}
-
-impl InfoMapState {
-    pub(crate) fn from_value(value: JsonValue) -> anyhow::Result<Self> {
-        let encoded = serde_json::to_vec(&value)?;
-        anyhow::ensure!(
-            encoded.len() <= MAX_INFO_MAP_BYTES,
-            "infoMap state is too large"
-        );
-        let state: Self = serde_json::from_value(value)?;
-        anyhow::ensure!(
-            state.save_time >= 0,
-            "infoMap saveTime must not be negative"
-        );
-        anyhow::ensure!(
-            state.values.len() <= MAX_INFO_MAP_ENTRIES,
-            "infoMap has too many entries"
-        );
-        anyhow::ensure!(
-            state
-                .values
-                .keys()
-                .all(|key| key.len() <= MAX_INFO_MAP_KEY_BYTES),
-            "infoMap key is too large"
-        );
-        Ok(state)
-    }
-}
-
 thread_local! {
-    static ACTIVE_JS_INFO_MAP: RefCell<Option<InfoMapState>> = const { RefCell::new(None) };
-    static ACTIVE_JS_LIB: RefCell<Option<String>> = const { RefCell::new(None) };
-    // reader_execute installs both sides of its source-bound HTTP session here:
-    // ordinary JsExtensions calls keep native request policy, while future WebView
-    // calls use the browser-style client without collapsing their cookie semantics.
-    static ACTIVE_JS_HTTP_CONTEXT: RefCell<Option<JsHttpContext>> = const { RefCell::new(None) };
-    static ACTIVE_JS_BOOK_SOURCE: RefCell<Option<BookSource>> = const { RefCell::new(None) };
     // Native JS callbacks may need AnalyzeUrl to evaluate nested header/URL JavaScript.
     // Reuse the currently borrowed QuickJS context instead of entering Context::with again.
     static ACTIVE_JS_REENTRANT_CTX: RefCell<Option<NonNull<rquickjs::qjs::JSContext>>> =
@@ -186,90 +106,6 @@ thread_local! {
 
         (rt, start_time)
     };
-}
-
-pub fn with_js_lib<T>(js_lib: Option<&str>, f: impl FnOnce() -> T) -> T {
-    ACTIVE_JS_LIB
-        .with(|cell| crate::util::scoped::with_scoped_value(cell, js_lib.map(str::to_string), f))
-}
-
-pub(crate) fn with_js_info_map<T>(state: InfoMapState, f: impl FnOnce() -> T) -> (T, InfoMapState) {
-    ACTIVE_JS_INFO_MAP.with(|cell| {
-        crate::util::scoped::with_scoped_value(cell, Some(state), || {
-            let result = f();
-            (
-                result,
-                cell.borrow().as_ref().expect("scoped infoMap").clone(),
-            )
-        })
-    })
-}
-
-fn active_info_map_state() -> Option<InfoMapState> {
-    ACTIVE_JS_INFO_MAP.with(|cell| cell.borrow().clone())
-}
-
-fn update_active_info_map(state: InfoMapState) {
-    ACTIVE_JS_INFO_MAP.with(|cell| *cell.borrow_mut() = Some(state));
-}
-
-/// Bind one synchronous HTTP client for both request and WebView paths.
-/// Kept for reader_eval/tests that do not have a full HttpSession.
-pub(crate) fn with_js_http_client<T>(client: &HttpClient, f: impl FnOnce() -> T) -> T {
-    let context = JsHttpContext {
-        request_client: client.clone(),
-        webview_client: client.clone(),
-    };
-    ACTIVE_JS_HTTP_CONTEXT
-        .with(|cell| crate::util::scoped::with_scoped_value(cell, Some(context), f))
-}
-
-/// Bind the distinct native-request and browser-style clients used by reader_execute.
-pub(crate) fn with_js_http_clients<T>(
-    request_client: &HttpClient,
-    webview_client: &HttpClient,
-    source: &BookSource,
-    f: impl FnOnce() -> T,
-) -> T {
-    let context = JsHttpContext {
-        request_client: request_client.clone(),
-        webview_client: webview_client.clone(),
-    };
-    ACTIVE_JS_BOOK_SOURCE.with(|source_cell| {
-        crate::util::scoped::with_scoped_value(source_cell, Some(source.clone()), || {
-            ACTIVE_JS_HTTP_CONTEXT.with(|http_cell| {
-                crate::util::scoped::with_scoped_value(http_cell, Some(context), f)
-            })
-        })
-    })
-}
-
-pub(crate) fn with_js_http_context<T>(
-    client: &HttpClient,
-    source: &BookSource,
-    f: impl FnOnce() -> T,
-) -> T {
-    with_js_http_clients(client, client, source, f)
-}
-
-fn active_js_http_client() -> HttpClient {
-    ACTIVE_JS_HTTP_CONTEXT
-        .with(|cell| {
-            cell.borrow()
-                .as_ref()
-                .map(|context| context.request_client.clone())
-        })
-        .unwrap_or_else(|| JS_HTTP_CLIENT.clone())
-}
-
-pub(crate) fn active_js_webview_client() -> HttpClient {
-    ACTIVE_JS_HTTP_CONTEXT
-        .with(|cell| {
-            cell.borrow()
-                .as_ref()
-                .map(|context| context.webview_client.clone())
-        })
-        .unwrap_or_else(|| JS_HTTP_CLIENT.clone())
 }
 
 fn with_js_reentrant_ctx<T>(ctx: &rquickjs::Ctx<'_>, f: impl FnOnce() -> T) -> T {
@@ -756,7 +592,7 @@ fn eval_js_inner_with_source(
                 "get",
                 Func::new(move |key: String| -> String {
                     let storage_key = format!("v_{}_{}", source_key_for_get, key);
-                    if let Some(active) = crate::crawler::session::current_active_session() {
+                    if let Some(active) = current_active_session() {
                         return active
                             .get_variable(&storage_key)
                             .map(|value| match value {
@@ -780,7 +616,7 @@ fn eval_js_inner_with_source(
                 "put",
                 Func::new(move |key: String, value: String| -> String {
                     let storage_key = format!("v_{}_{}", source_key_for_put, key);
-                    if let Some(active) = crate::crawler::session::current_active_session() {
+                    if let Some(active) = current_active_session() {
                         active.set_variable_exact(
                             &storage_key,
                             serde_json::Value::String(value.clone()),
@@ -798,7 +634,7 @@ fn eval_js_inner_with_source(
             let login_storage_key = format!("userInfo_{source_key_val}");
             let login_storage_key_for_get = login_storage_key.clone();
             source_obj.set("__getLoginInfo", Func::new(move || -> Option<String> {
-                if let Some(active) = crate::crawler::session::current_active_session() {
+                if let Some(active) = current_active_session() {
                     return active.get_variable(&login_storage_key_for_get).map(|value| match value {
                         JsonValue::String(value) => value,
                         other => other.to_string(),
@@ -808,7 +644,7 @@ fn eval_js_inner_with_source(
                     .get(&login_storage_key_for_get).cloned()
             }))?;
             source_obj.set("__putLoginInfo", Func::new(move |value: String| -> bool {
-                if let Some(active) = crate::crawler::session::current_active_session() {
+                if let Some(active) = current_active_session() {
                     active.set_variable_exact(&login_storage_key, JsonValue::String(value));
                 } else {
                     JS_KV.lock().unwrap_or_else(|error| error.into_inner())
@@ -821,7 +657,7 @@ fn eval_js_inner_with_source(
                 "__removeLoginInfo",
                 Func::new(move || {
                     let storage_key = format!("userInfo_{}", source_key_for_login_info);
-                    if let Some(active) = crate::crawler::session::current_active_session() {
+                    if let Some(active) = current_active_session() {
                         active.remove_variable(&storage_key);
                     } else {
                         JS_KV
@@ -837,7 +673,7 @@ fn eval_js_inner_with_source(
             source_obj.set(
                 "getVariable",
                 Func::new(move |key: rquickjs::function::Opt<String>| -> String {
-                    if let Some(active) = crate::crawler::session::current_active_session() {
+                    if let Some(active) = current_active_session() {
                         let value = match key.0.as_deref() {
                             Some(key) => active.get_variable(key),
                             None => active.get_variable(""),
@@ -867,7 +703,7 @@ fn eval_js_inner_with_source(
                 "setVariable",
                 Func::new(
                     move |first: String, second: rquickjs::function::Opt<String>| {
-                        if let Some(active) = crate::crawler::session::current_active_session() {
+                        if let Some(active) = current_active_session() {
                             match second.0 {
                                 Some(value) => active.set_variable_exact(
                                     &first,
@@ -895,7 +731,7 @@ fn eval_js_inner_with_source(
             source_obj.set(
                 "__removeVariable",
                 Func::new(move || {
-                    if let Some(active) = crate::crawler::session::current_active_session() {
+                    if let Some(active) = current_active_session() {
                         active.remove_variable("");
                     } else {
                         JS_KV
@@ -909,7 +745,7 @@ fn eval_js_inner_with_source(
             source_obj.set(
                 "getLoginHeader",
                 Func::new(|| -> Option<String> {
-                    crate::crawler::session::current_active_session()
+                    current_active_session()
                         .and_then(|active| active.get_login_header())
                         .map(|value| match value {
                             serde_json::Value::String(s) => s,
@@ -921,7 +757,7 @@ fn eval_js_inner_with_source(
             source_obj.set(
                 "putLoginHeader",
                 Func::new(|ctx: rquickjs::Ctx<'_>, val: String| -> rquickjs::Result<()> {
-                    if let Some(active) = crate::crawler::session::current_active_session() {
+                    if let Some(active) = current_active_session() {
                         active.put_login_header(serde_json::Value::String(val))
                             .map_err(|message| rquickjs::Exception::throw_type(&ctx, &message))?;
                     }
@@ -932,7 +768,7 @@ fn eval_js_inner_with_source(
             source_obj.set(
                 "removeLoginHeader",
                 Func::new(|| {
-                    if let Some(active) = crate::crawler::session::current_active_session() {
+                    if let Some(active) = current_active_session() {
                         active.remove_login_header();
                     }
                 }),
@@ -944,7 +780,7 @@ fn eval_js_inner_with_source(
             cookie_obj.set(
                 "getCookie",
                 Func::new(|url: String| -> String {
-                    if let Some(active) = crate::crawler::session::current_active_session() {
+                    if let Some(active) = current_active_session() {
                         active.get_cookie(&url).unwrap_or_default()
                     } else {
                         "".to_string()
@@ -954,7 +790,7 @@ fn eval_js_inner_with_source(
             cookie_obj.set(
                 "getKey",
                 Func::new(|url: String, key: String| -> String {
-                    crate::crawler::session::current_active_session()
+                    current_active_session()
                         .and_then(|active| active.get_cookie_key(&url, &key))
                         .unwrap_or_default()
                 }),
@@ -962,7 +798,7 @@ fn eval_js_inner_with_source(
             cookie_obj.set(
                 "get",
                 Func::new(|url: String| -> String {
-                    if let Some(active) = crate::crawler::session::current_active_session() {
+                    if let Some(active) = current_active_session() {
                         active.get_cookie(&url).unwrap_or_default()
                     } else {
                         "".to_string()
@@ -972,7 +808,7 @@ fn eval_js_inner_with_source(
             cookie_obj.set(
                 "setCookie",
                 Func::new(|url: String, cookie: String| {
-                    if let Some(active) = crate::crawler::session::current_active_session() {
+                    if let Some(active) = current_active_session() {
                         active.set_cookie(&url, &cookie);
                     }
                 }),
@@ -980,7 +816,7 @@ fn eval_js_inner_with_source(
             cookie_obj.set(
                 "replaceCookie",
                 Func::new(|url: String, cookie: String| {
-                    if let Some(active) = crate::crawler::session::current_active_session() {
+                    if let Some(active) = current_active_session() {
                         let mut merged = parse_cookie_pairs(
                             &active.get_cookie(&url).unwrap_or_default(),
                         );
@@ -996,7 +832,7 @@ fn eval_js_inner_with_source(
             cookie_obj.set(
                 "set",
                 Func::new(|url: String, cookie: String| {
-                    if let Some(active) = crate::crawler::session::current_active_session() {
+                    if let Some(active) = current_active_session() {
                         active.set_cookie(&url, &cookie);
                     }
                 }),
@@ -1004,7 +840,7 @@ fn eval_js_inner_with_source(
             cookie_obj.set(
                 "removeCookie",
                 Func::new(|url: String| {
-                    if let Some(active) = crate::crawler::session::current_active_session() {
+                    if let Some(active) = current_active_session() {
                         active.remove_cookie(&url);
                     }
                 }),
@@ -1012,7 +848,7 @@ fn eval_js_inner_with_source(
             cookie_obj.set(
                 "remove",
                 Func::new(|url: String| {
-                    if let Some(active) = crate::crawler::session::current_active_session() {
+                    if let Some(active) = current_active_session() {
                         active.remove_cookie(&url);
                     }
                 }),
@@ -1041,7 +877,7 @@ fn eval_js_inner_with_source(
             cache_obj.set(
                 "__memoryGet",
                 Func::new(|key: String| -> Option<String> {
-                    crate::crawler::session::current_active_session()
+                    current_active_session()
                         .and_then(|session| session.memory_cache_get(&key))
                         .and_then(|value| serde_json::to_string(&value).ok())
                 }),
@@ -1050,7 +886,7 @@ fn eval_js_inner_with_source(
                 "__memoryPut",
                 Func::new(|key: String, value: String| {
                     if let (Some(session), Ok(value)) = (
-                        crate::crawler::session::current_active_session(),
+                        current_active_session(),
                         serde_json::from_str(&value),
                     ) {
                         session.memory_cache_put(key, value);
@@ -1060,7 +896,7 @@ fn eval_js_inner_with_source(
             cache_obj.set(
                 "__memoryDelete",
                 Func::new(|key: String| {
-                    if let Some(session) = crate::crawler::session::current_active_session() {
+                    if let Some(session) = current_active_session() {
                         session.memory_cache_delete(&key);
                     }
                 }),
@@ -1772,7 +1608,7 @@ fn eval_js_inner_with_source(
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(key.clone(), val.clone());
-                    if let Some(active) = crate::crawler::session::current_active_session() {
+                    if let Some(active) = current_active_session() {
                         active.set_variable_exact(&key, serde_json::Value::String(val.clone()));
                     } else {
                         JS_KV
@@ -1795,7 +1631,7 @@ fn eval_js_inner_with_source(
                         .cloned()
                         .or_else(|| scoped_java_variable(&rule_bindings, &key))
                         .or_else(|| {
-                            crate::crawler::session::current_active_session()
+                            current_active_session()
                                 .and_then(|session| session.get_variable(&key))
                                 .map(|value| json_value_to_string(&value))
                                 .filter(|value| !value.is_empty())
@@ -2255,7 +2091,7 @@ fn eval_js_inner_with_source(
             globals.set(
                 "kv_get",
                 Func::new(|key: String| -> Option<String> {
-                    if let Some(active) = crate::crawler::session::current_active_session() {
+                    if let Some(active) = current_active_session() {
                         return active.js_cache_get(&format!("__kv:{key}"));
                     }
                     let map = JS_KV.lock().unwrap_or_else(|e| e.into_inner());
@@ -2265,7 +2101,7 @@ fn eval_js_inner_with_source(
             globals.set(
                 "kv_put",
                 Func::new(|key: String, val: String| -> bool {
-                    if let Some(active) = crate::crawler::session::current_active_session() {
+                    if let Some(active) = current_active_session() {
                         return active.js_cache_put(&format!("__kv:{key}"), val, None);
                     }
                     let mut map = JS_KV.lock().unwrap_or_else(|e| e.into_inner());
@@ -4386,7 +4222,7 @@ fn active_js_lib_script() -> anyhow::Result<String> {
                 .any(is_absolute_http_url)
         });
     if remote {
-        let active = crate::crawler::session::current_active_session();
+        let active = current_active_session();
         if let Some(cached) = active
             .as_ref()
             .and_then(|session| session.script_cache_get(&cache_key))
@@ -4456,7 +4292,7 @@ fn java_import_script(path: &str) -> Option<String> {
     }
 
     let cache_key = format!("import_script:{}", md5_hex(path));
-    let active = crate::crawler::session::current_active_session();
+    let active = current_active_session();
     if let Some(cached) = active
         .as_ref()
         .and_then(|session| session.script_cache_get(&cache_key))
@@ -4473,171 +4309,6 @@ fn java_import_script(path: &str) -> Option<String> {
     Some(body)
 }
 
-fn java_to_num_chapter(input: &str) -> String {
-    static TITLE_NUM_RE: Lazy<regex::Regex> =
-        Lazy::new(|| regex::Regex::new(r"(第)(.+?)(章)").expect("valid title number regex"));
-
-    let Some(captures) = TITLE_NUM_RE.captures(input) else {
-        return input.to_string();
-    };
-    let Some(number) = captures.get(2) else {
-        return input.to_string();
-    };
-
-    let value = legado_string_to_int(number.as_str());
-    let whole = captures.get(0).expect("full regex match");
-    let mut output = String::with_capacity(input.len());
-    output.push_str(&input[..whole.start()]);
-    output.push('第');
-    output.push_str(&value.to_string());
-    output.push('章');
-    output.push_str(&input[whole.end()..]);
-    output
-}
-
-fn legado_string_to_int(input: &str) -> i32 {
-    let normalized = input
-        .chars()
-        .map(fullwidth_to_halfwidth)
-        .filter(|ch| !ch.is_whitespace())
-        .collect::<String>();
-    normalized
-        .parse::<i32>()
-        .unwrap_or_else(|_| legado_chinese_num_to_int(&normalized))
-}
-
-fn fullwidth_to_halfwidth(ch: char) -> char {
-    match ch {
-        '　' => ' ',
-        '！'..='～' => char::from_u32(ch as u32 - 0xFEE0).unwrap_or(ch),
-        _ => ch,
-    }
-}
-
-fn chinese_digit_value(ch: char) -> Option<i32> {
-    match ch {
-        '零' | '〇' => Some(0),
-        '一' | '壹' => Some(1),
-        '二' | '贰' | '两' => Some(2),
-        '三' | '叁' => Some(3),
-        '四' | '肆' => Some(4),
-        '五' | '伍' => Some(5),
-        '六' | '陆' => Some(6),
-        '七' | '柒' => Some(7),
-        '八' | '捌' => Some(8),
-        '九' | '玖' => Some(9),
-        '十' | '拾' => Some(10),
-        '百' | '佰' => Some(100),
-        '千' | '仟' => Some(1000),
-        '万' => Some(10_000),
-        '亿' => Some(100_000_000),
-        _ => None,
-    }
-}
-
-fn is_plain_chinese_digits(input: &str) -> bool {
-    !input.is_empty()
-        && input.chars().all(|ch| {
-            matches!(
-                ch,
-                '〇' | '零'
-                    | '一'
-                    | '二'
-                    | '三'
-                    | '四'
-                    | '五'
-                    | '六'
-                    | '七'
-                    | '八'
-                    | '九'
-                    | '壹'
-                    | '贰'
-                    | '叁'
-                    | '肆'
-                    | '伍'
-                    | '陆'
-                    | '柒'
-                    | '捌'
-                    | '玖'
-            )
-        })
-}
-
-fn legado_chinese_num_to_int(input: &str) -> i32 {
-    if input.is_empty() {
-        return -1;
-    }
-
-    if is_plain_chinese_digits(input) {
-        let mut value: i64 = 0;
-        for ch in input.chars() {
-            let Some(digit) = chinese_digit_value(ch) else {
-                return -1;
-            };
-            value = value.saturating_mul(10).saturating_add(digit as i64);
-            if value > i32::MAX as i64 {
-                return -1;
-            }
-        }
-        return value as i32;
-    }
-
-    let chars = input.chars().collect::<Vec<_>>();
-    let mut result: i64 = 0;
-    let mut tmp: i64 = 0;
-    let mut billion: i64 = 0;
-
-    for (index, ch) in chars.iter().copied().enumerate() {
-        let Some(value) = chinese_digit_value(ch).map(i64::from) else {
-            return -1;
-        };
-
-        match value {
-            100_000_000 => {
-                result = result.saturating_add(tmp);
-                result = result.saturating_mul(value);
-                billion = billion.saturating_add(result);
-                result = 0;
-                tmp = 0;
-            }
-            10_000 => {
-                result = result.saturating_add(tmp);
-                result = result.saturating_mul(value);
-                tmp = 0;
-            }
-            10.. => {
-                if tmp == 0 {
-                    tmp = 1;
-                }
-                result = result.saturating_add(value.saturating_mul(tmp));
-                tmp = 0;
-            }
-            digit => {
-                if index + 1 == chars.len() && index > 0 {
-                    if let Some(previous) = chinese_digit_value(chars[index - 1]).map(i64::from) {
-                        if previous >= 10 {
-                            tmp = digit.saturating_mul(previous / 10);
-                            continue;
-                        }
-                    }
-                }
-                tmp = tmp.saturating_mul(10).saturating_add(digit);
-            }
-        }
-
-        if result > i32::MAX as i64 || tmp > i32::MAX as i64 || billion > i32::MAX as i64 {
-            return -1;
-        }
-    }
-
-    let total = result.saturating_add(tmp).saturating_add(billion);
-    if total > i32::MAX as i64 {
-        -1
-    } else {
-        total as i32
-    }
-}
-
 fn java_timestamp_long(ctx: &rquickjs::Ctx<'_>, timestamp: f64) -> rquickjs::Result<i64> {
     if !timestamp.is_finite()
         || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&timestamp)
@@ -4648,282 +4319,6 @@ fn java_timestamp_long(ctx: &rquickjs::Ctx<'_>, timestamp: f64) -> rquickjs::Res
         ));
     }
     Ok(timestamp as i64)
-}
-
-fn java_time_format(timestamp_ms: i64) -> String {
-    match Local.timestamp_millis_opt(timestamp_ms).single() {
-        Some(dt) => dt.format("%Y/%m/%d %H:%M").to_string(),
-        None => String::new(),
-    }
-}
-
-fn java_time_format_utc(timestamp_ms: i64, format: &str, offset_ms: i64) -> String {
-    let Ok(offset_seconds) = i32::try_from(offset_ms / 1000) else {
-        return String::new();
-    };
-    let Some(offset) = FixedOffset::east_opt(offset_seconds) else {
-        return String::new();
-    };
-    let Some(utc) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_ms) else {
-        return String::new();
-    };
-    let datetime = utc.with_timezone(&offset);
-    datetime
-        .format(&java_date_pattern_to_chrono(format))
-        .to_string()
-}
-
-fn java_date_pattern_to_chrono(pattern: &str) -> String {
-    let chars = pattern.chars().collect::<Vec<_>>();
-    let mut output = String::new();
-    let mut index = 0;
-    let mut quoted = false;
-
-    while index < chars.len() {
-        let ch = chars[index];
-        if ch == '\'' {
-            if chars.get(index + 1) == Some(&'\'') {
-                output.push('\'');
-                index += 2;
-                continue;
-            }
-            quoted = !quoted;
-            index += 1;
-            continue;
-        }
-        if quoted || !ch.is_ascii_alphabetic() {
-            if ch == '%' {
-                output.push_str("%%");
-            } else {
-                output.push(ch);
-            }
-            index += 1;
-            continue;
-        }
-
-        let mut end = index + 1;
-        while end < chars.len() && chars[end] == ch {
-            end += 1;
-        }
-        let width = end - index;
-        let directive = match ch {
-            'y' => Some(if width == 2 { "%y" } else { "%Y" }),
-            'M' => Some(match width {
-                1 => "%-m",
-                2 => "%m",
-                3 => "%b",
-                _ => "%B",
-            }),
-            'd' => Some(if width == 1 { "%-d" } else { "%d" }),
-            'H' => Some(if width == 1 { "%-H" } else { "%H" }),
-            'h' => Some(if width == 1 { "%-I" } else { "%I" }),
-            'm' => Some(if width == 1 { "%-M" } else { "%M" }),
-            's' => Some(if width == 1 { "%-S" } else { "%S" }),
-            'S' => Some(match width {
-                1 => "%1f",
-                2 => "%2f",
-                _ => "%3f",
-            }),
-            'a' => Some("%p"),
-            'E' => Some(if width <= 3 { "%a" } else { "%A" }),
-            'u' => Some("%u"),
-            'Z' => Some("%z"),
-            'X' => Some(if width >= 3 { "%:z" } else { "%z" }),
-            _ => None,
-        };
-        if let Some(directive) = directive {
-            output.push_str(directive);
-        } else {
-            for _ in 0..width {
-                output.push(ch);
-            }
-        }
-        index = end;
-    }
-
-    output
-}
-
-fn charset_encoding(charset: Option<&str>) -> &'static encoding_rs::Encoding {
-    charset
-        .and_then(|label| encoding_rs::Encoding::for_label(label.trim().as_bytes()))
-        .unwrap_or(encoding_rs::UTF_8)
-}
-
-fn java_str_to_bytes(input: &str, charset: Option<&str>) -> Vec<u8> {
-    charset_encoding(charset).encode(input).0.into_owned()
-}
-
-fn java_bytes_to_str(bytes: &[u8], charset: Option<&str>) -> String {
-    charset_encoding(charset).decode(bytes).0.into_owned()
-}
-
-fn java_base64_decode(input: &str, charset: Option<&str>) -> String {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(input.trim())
-        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(input.trim()));
-    bytes
-        .map(|bytes| java_bytes_to_str(&bytes, charset))
-        .unwrap_or_default()
-}
-
-fn json_byte_array(input: &str) -> Vec<u8> {
-    serde_json::from_str::<Vec<i64>>(input)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|byte| byte.rem_euclid(256) as u8)
-        .collect()
-}
-
-fn java_base64_encode_bytes(input_json: &str, flags: i32) -> String {
-    let bytes = json_byte_array(input_json);
-    let url_safe = flags & 8 != 0;
-    let no_padding = flags & 1 != 0;
-    let no_wrap = flags & 2 != 0;
-    let crlf = flags & 4 != 0;
-    let encoded = match (url_safe, no_padding) {
-        (true, true) => base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes),
-        (true, false) => base64::engine::general_purpose::URL_SAFE.encode(bytes),
-        (false, true) => base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes),
-        (false, false) => base64::engine::general_purpose::STANDARD.encode(bytes),
-    };
-    if no_wrap || encoded.is_empty() {
-        return encoded;
-    }
-
-    let separator = if crlf { "\r\n" } else { "\n" };
-    let mut wrapped = String::with_capacity(encoded.len() + encoded.len() / 76 + 2);
-    for (index, chunk) in encoded.as_bytes().chunks(76).enumerate() {
-        if index > 0 {
-            wrapped.push_str(separator);
-        }
-        wrapped.push_str(std::str::from_utf8(chunk).unwrap_or_default());
-    }
-    wrapped.push_str(separator);
-    wrapped
-}
-
-fn java_base64_decode_bytes(input: &str, flags: i32) -> String {
-    let input = input
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect::<String>();
-    let url_safe = flags & 8 != 0;
-    let decoded = if url_safe {
-        base64::engine::general_purpose::URL_SAFE
-            .decode(&input)
-            .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&input))
-    } else {
-        base64::engine::general_purpose::STANDARD
-            .decode(&input)
-            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&input))
-    }
-    .unwrap_or_default();
-    serde_json::to_string(&decoded).unwrap_or_else(|_| "[]".to_string())
-}
-
-fn normalize_crypto_algorithm(algorithm: &str) -> String {
-    algorithm
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .flat_map(|ch| ch.to_uppercase())
-        .collect()
-}
-
-fn java_digest_bytes(data: &[u8], algorithm: &str) -> Option<Vec<u8>> {
-    use md5::{Digest, Md5};
-
-    let normalized = normalize_crypto_algorithm(algorithm);
-    match normalized.as_str() {
-        "MD5" => Some(Md5::digest(data).to_vec()),
-        "SHA1" => Some(
-            digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, data)
-                .as_ref()
-                .to_vec(),
-        ),
-        "SHA256" => Some(digest::digest(&digest::SHA256, data).as_ref().to_vec()),
-        "SHA384" => Some(digest::digest(&digest::SHA384, data).as_ref().to_vec()),
-        "SHA512" => Some(digest::digest(&digest::SHA512, data).as_ref().to_vec()),
-        _ => None,
-    }
-}
-
-fn java_hmac_algorithm(algorithm: &str) -> Option<hmac::Algorithm> {
-    match normalize_crypto_algorithm(algorithm).as_str() {
-        "HMACSHA1" => Some(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY),
-        "HMACSHA256" => Some(hmac::HMAC_SHA256),
-        "HMACSHA384" => Some(hmac::HMAC_SHA384),
-        "HMACSHA512" => Some(hmac::HMAC_SHA512),
-        _ => None,
-    }
-}
-
-fn java_hmac_string_bytes(data: &str, algorithm: &str, key: &str) -> Option<Vec<u8>> {
-    let algorithm = java_hmac_algorithm(algorithm)?;
-    let key = hmac::Key::new(algorithm, key.as_bytes());
-    Some(hmac::sign(&key, data.as_bytes()).as_ref().to_vec())
-}
-
-fn java_hmac_bytes(algorithm: &str, key_json: &str, data_json: &str) -> String {
-    let Some(algorithm) = java_hmac_algorithm(algorithm) else {
-        return "[]".to_string();
-    };
-    let key = hmac::Key::new(algorithm, &json_byte_array(key_json));
-    let tag = hmac::sign(&key, &json_byte_array(data_json));
-    serde_json::to_string(tag.as_ref()).unwrap_or_else(|_| "[]".to_string())
-}
-
-fn java_to_url_json(raw_url: &str, base_url: Option<&str>) -> String {
-    let parsed = match base_url.filter(|base| !base.trim().is_empty()) {
-        Some(base_url) => url::Url::parse(base_url).and_then(|base| base.join(raw_url)),
-        None => url::Url::parse(raw_url),
-    };
-    let url = match parsed {
-        Ok(url) => url,
-        Err(error) => {
-            return serde_json::json!({
-                "error": error.to_string(),
-            })
-            .to_string();
-        }
-    };
-
-    let search_params = if let Some(query) = url.query() {
-        let mut values = serde_json::Map::new();
-        for item in query.split('&') {
-            let (key, value) = item.split_once('=').unwrap_or((item, ""));
-            let decoded = urlencoding::decode(&value.replace('+', " "))
-                .map(|value| value.into_owned())
-                .unwrap_or_else(|_| value.to_string());
-            values.insert(key.to_string(), JsonValue::String(decoded));
-        }
-        JsonValue::Object(values)
-    } else {
-        JsonValue::Null
-    };
-
-    serde_json::json!({
-        "searchParams": search_params,
-        "host": url.host_str().unwrap_or_default(),
-        "origin": url.origin().ascii_serialization(),
-        "pathname": url.path(),
-    })
-    .to_string()
-}
-
-fn java_encode_uri(input: &str, charset: Option<&str>) -> String {
-    let bytes = java_str_to_bytes(input, charset);
-    let mut encoded = String::with_capacity(bytes.len());
-    for byte in bytes {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'*' => {
-                encoded.push(byte as char)
-            }
-            b' ' => encoded.push('+'),
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    encoded
 }
 
 fn parse_cookie_pairs(input: &str) -> HashMap<String, String> {
@@ -4950,7 +4345,7 @@ fn cookie_pairs_to_string(pairs: &HashMap<String, String>) -> String {
 }
 
 fn js_cache_get(key: &str) -> Option<String> {
-    if let Some(active) = crate::crawler::session::current_active_session() {
+    if let Some(active) = current_active_session() {
         return active.js_cache_get(key);
     }
     let mut cache = JS_CACHE.lock().unwrap_or_else(|error| error.into_inner());
@@ -4967,7 +4362,7 @@ fn js_cache_get(key: &str) -> Option<String> {
 }
 
 fn js_cache_put(key: &str, value: String, save_time_secs: Option<i64>) -> bool {
-    if let Some(active) = crate::crawler::session::current_active_session() {
+    if let Some(active) = current_active_session() {
         return active.js_cache_put(key, value, save_time_secs);
     }
     let expires_at = save_time_secs
@@ -4979,7 +4374,7 @@ fn js_cache_put(key: &str, value: String, save_time_secs: Option<i64>) -> bool {
 }
 
 fn js_cache_delete(key: &str) -> bool {
-    if let Some(active) = crate::crawler::session::current_active_session() {
+    if let Some(active) = current_active_session() {
         return active.js_cache_delete(key);
     }
     JS_CACHE
