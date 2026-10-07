@@ -1,5 +1,5 @@
 use super::{validate_options, ExecuteError, ExecuteOptions, ExecuteResult, ValidatedOptions};
-use crate::crawler::ExecuteSession;
+use crate::runtime::session::ExecuteSession;
 use crate::parser::js::InfoMapState;
 use serde_json::{json, Value};
 

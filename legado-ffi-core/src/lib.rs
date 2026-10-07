@@ -4,6 +4,7 @@ pub mod ffi;
 pub mod host_services;
 pub mod model;
 pub mod parser;
+mod runtime;
 pub mod util;
 
 // ring's ARM/Linux detector imports getauxval, absent from Kindle's EGLIBC 2.12.

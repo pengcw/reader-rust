@@ -4,8 +4,8 @@
 //! `RuleEngine` 调用，并将所有业务失败转换成稳定的 JSON envelope。
 
 use crate::crawler::{
-    analyze_url_with_context, strip_url_options, with_active_session, FetchError,
-    HttpResponse, HttpSession, UrlRuleContext,
+    analyze_url_with_context, strip_url_options, FetchError, HttpResponse, HttpSession,
+    UrlRuleContext,
 };
 use crate::model::book_source::{book_source_from_value, BookSource};
 use crate::parser::js::{
@@ -15,6 +15,7 @@ use crate::parser::js::{
 use crate::parser::rule_engine::{
     dedupe_chapters_last_wins, normalize_list_rule, RuleEngine,
 };
+use crate::runtime::session::with_active_session;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
