@@ -10,7 +10,7 @@ use crate::crawler::{
 use crate::model::book_source::{book_source_from_value, BookSource};
 use crate::parser::js::{
     eval_js, eval_js_with_bindings, with_js_http_clients, with_js_info_map, with_js_lib,
-    with_login_messages, InfoMapState,
+    with_login_messages, with_click_browser, InfoMapState,
 };
 use crate::parser::rule_engine::{
     dedupe_chapters_last_wins, normalize_list_rule, RuleEngine,
@@ -271,6 +271,7 @@ fn execute_inner(source_json: &str, request_json: &str) -> ExecuteResult<Value> 
                             Operation::Content => {
                                 execute_content(&source, &engine, &http_session, &params, &options)
                             }
+                            Operation::Click => execute_click(&source, &params),
                             Operation::LoginUi => execute_login_ui(&source),
                             Operation::Login => {
                                 execute_login(&source, &http_session, &params, &options)
@@ -1427,6 +1428,33 @@ fn execute_login(
     Err(ExecuteError::invalid_request(
         "source.loginUrl or params.action is required",
     ))
+}
+
+fn execute_click(source: &BookSource, params: &Value) -> ExecuteResult<Value> {
+    let action = params.get("action").and_then(Value::as_str)
+        .filter(|action| !action.trim().is_empty() && action.len() <= 64 * 1024)
+        .ok_or_else(|| ExecuteError::invalid_request("click action must be a nonempty string up to 64 KiB"))?;
+    let mut bindings = HashMap::new();
+    for name in ["book", "chapter"] {
+        if let Some(value) = params.get(name) {
+            if !value.is_object() { return Err(ExecuteError::invalid_request(format!("{name} must be an object"))); }
+            bindings.insert(name.to_string(), value.clone());
+        }
+    }
+    let (output, browser) = with_click_browser(|| with_js_lib(source.js_lib.as_deref(), || {
+        eval_js_with_bindings(action, "", &source.book_source_url, &bindings)
+    }));
+    output.map_err(|error| ExecuteError::invalid_request(format!("click script failed: {error}")))?;
+    let browser = browser.ok_or_else(|| ExecuteError::invalid_request("click did not open a browser"))?;
+    let url = browser.get("url").and_then(Value::as_str).unwrap_or_default();
+    let html = browser.get("html").and_then(Value::as_str).unwrap_or_default();
+    if !url.is_empty() && !is_absolute_http_url(url) {
+        return Err(ExecuteError::invalid_request("click browser URL must be HTTP(S)"));
+    }
+    if url.is_empty() && html.is_empty() {
+        return Err(ExecuteError::invalid_request("click browser URL and HTML are empty"));
+    }
+    Ok(success_without_http(json!({"browser":browser})))
 }
 
 fn login_bindings(values: &Value) -> HashMap<String, Value> {

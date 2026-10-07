@@ -13,6 +13,7 @@ pub(super) enum Operation {
     Content,
     LoginUi,
     Login,
+    Click,
 }
 
 impl Operation {
@@ -26,6 +27,7 @@ impl Operation {
             "content" => Ok(Self::Content),
             "login_ui" => Ok(Self::LoginUi),
             "login" => Ok(Self::Login),
+            "click" => Ok(Self::Click),
             _ => Err(ExecuteError::invalid_request(format!(
                 "unsupported op: {value}"
             ))),
@@ -112,6 +114,7 @@ mod tests {
             ("content", Operation::Content),
             ("login_ui", Operation::LoginUi),
             ("login", Operation::Login),
+            ("click", Operation::Click),
         ];
 
         for (raw, expected) in cases {

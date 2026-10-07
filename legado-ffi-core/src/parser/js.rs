@@ -34,6 +34,15 @@ use uuid::Uuid;
 thread_local! {
     static LOGIN_MESSAGES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
     static LOGIN_PREVIEW: RefCell<Option<JsonValue>> = const { RefCell::new(None) };
+    static CLICK_BROWSER: RefCell<Option<Option<JsonValue>>> = const { RefCell::new(None) };
+}
+
+// Capture only during a source click; restore the outer scope even on unwind.
+pub(crate) fn with_click_browser<T>(run: impl FnOnce() -> T) -> (T, Option<JsonValue>) {
+    CLICK_BROWSER.with(|cell| crate::util::scoped::with_scoped_value(cell, Some(None), || {
+        let result = run();
+        (result, cell.borrow().as_ref().and_then(Clone::clone))
+    }))
 }
 
 pub(crate) fn with_login_messages<T>(run: impl FnOnce() -> T) -> (T, Vec<String>, Option<JsonValue>) {
@@ -1818,6 +1827,15 @@ fn eval_js_inner_with_source(
                 Func::new(|msg: rquickjs::function::Opt<rquickjs::Coerced<String>>| capture_login_message(msg.0)),
             )?;
             java_obj.set("__browserPreview", Func::new(|url: String, title: String, html: String| -> bool {
+                let captured = CLICK_BROWSER.with(|slot| {
+                    let mut slot = slot.borrow_mut();
+                    if let Some(browser) = slot.as_mut() {
+                        // Match the existing preview semantics: latest browser call wins.
+                        *browser = Some(serde_json::json!({"url":url,"title":title,"html":html}));
+                        true
+                    } else { false }
+                });
+                if captured { return true; }
                 if !LOGIN_MESSAGES.with(|slot| slot.borrow().is_some()) { return false; }
                 let Some(rendered) = java_web_view(&html, &url, "") else { return false; };
                 LOGIN_PREVIEW.with(|slot| *slot.borrow_mut() = Some(serde_json::json!({
@@ -1837,6 +1855,7 @@ fn eval_js_inner_with_source(
                 }),
             )?;
 
+            java_obj.set("__clickCaptureActive", CLICK_BROWSER.with(|slot| slot.borrow().is_some()))?;
             globals.set("java", java_obj)?;
             eval_script(
                 ctx.clone(),
@@ -1850,6 +1869,16 @@ fn eval_js_inner_with_source(
                     java.startBrowserAwait = function() {
                         throw new Error('当前仅支持网页只读预览，不支持等待网页交互验证');
                     };
+                    if (java.__clickCaptureActive) {
+                        java.showReadingBrowser = java.startBrowser;
+                        java.startBrowserDp = java.startBrowser;
+                        java.showBrowser = function(url, html, preloadJs) {
+                            if (preloadJs && String(preloadJs).trim() !== 'window.java=java;') {
+                                throw new Error('不支持自定义网页预加载脚本');
+                            }
+                            java.startBrowser(url, '评论', html);
+                        };
+                    }
                     java.hostCall = function(operation, arguments) {
                         const response = JSON.parse(java.__hostCall(
                             String(operation), JSON.stringify(arguments == null ? null : arguments)));

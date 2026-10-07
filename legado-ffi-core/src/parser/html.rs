@@ -2882,6 +2882,37 @@ pub(crate) fn format_js_html(content: &str, redirect_url: &str) -> String {
     format_keep_img_with_script_text(content, redirect_url, true)
 }
 
+// Move Legado's trailing image JSON out of its non-standard quoted src.
+// Keep it opaque: interpreting click actions belongs to the host.
+fn preserve_image_metadata(content: &str) -> String {
+    use base64::Engine;
+    static PREFIX: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(r#"(?i)<img\b[^>]*?\b(?:src|data-src|data-original)\s*=\s*["']([^"'\s>]+?),(\{)"#).unwrap()
+    });
+    let mut output = String::new();
+    let mut cursor = 0;
+    for caps in PREFIX.captures_iter(content) {
+        let whole = caps.get(0).unwrap();
+        if whole.start() < cursor { continue; }
+        let json_start = caps.get(2).unwrap().start();
+        let mut values = serde_json::Deserializer::from_str(&content[json_start..])
+            .into_iter::<serde_json::Value>();
+        if !matches!(values.next(), Some(Ok(serde_json::Value::Object(_)))) { continue; }
+        let json_end = json_start + values.byte_offset();
+        let quote = content.as_bytes()[caps.get(1).unwrap().start() - 1];
+        if content.as_bytes().get(json_end) != Some(&quote) { continue; }
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(&content.as_bytes()[json_start..json_end]);
+        output.push_str(&content[cursor..json_start - 1]);
+        output.push(quote as char);
+        output.push_str(&format!(r#" data-legado-image-meta="{}""#, encoded));
+        cursor = json_end + 1;
+    }
+    if cursor == 0 { return content.to_string(); }
+    output.push_str(&content[cursor..]);
+    output
+}
+
 fn format_keep_img_with_script_text(
     content: &str,
     redirect_url: &str,
@@ -2892,7 +2923,7 @@ fn format_keep_img_with_script_text(
     }
 
     // Reader cleaning drops script/style bodies; the JS facade only strips tags below.
-    let mut text = content.to_string();
+    let mut text = preserve_image_metadata(content);
     let removed = if keep_script_text {
         r"(?s)<!--.*?-->"
     } else {
@@ -2901,6 +2932,29 @@ fn format_keep_img_with_script_text(
     if let Ok(re) = regex::Regex::new(removed) {
         text = re.replace_all(&text, "").into_owned();
     }
+
+    // Preserve extension review attributes as opaque data at their original text position.
+    // The host decides presentation and action execution; no source-specific functions here.
+    let mut review_placeholders = Vec::new();
+    static REVIEW_RE: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(r#"(?is)<(?:comment|note)\b(?:[^"'<>]|"[^"]*"|'[^']*')*>"#).unwrap()
+    });
+    static REVIEW_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("comment, note").unwrap());
+    text = REVIEW_RE.replace_all(&text, |caps: &regex::Captures| {
+        let fragment = Html::parse_fragment(caps.get(0).unwrap().as_str());
+        let Some(node) = fragment.select(&REVIEW_SELECTOR).next() else { return String::new(); };
+        let mut attributes = serde_json::Map::new();
+        attributes.insert("tag".to_string(), serde_json::json!(node.value().name()));
+        for (name, value) in node.value().attrs() {
+            attributes.insert(name.to_string(), serde_json::json!(value));
+        }
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(
+            serde_json::to_vec(&attributes).unwrap());
+        let marker = format!("__READER_REVIEW_PLACEHOLDER_{}__", review_placeholders.len());
+        review_placeholders.push(format!(r#"<reader-review data-legado-review-meta="{}"></reader-review>"#, encoded));
+        marker
+    }).into_owned();
 
     // 2. 提取并保留 <img> 标签，补全相对 URL，使用占位符保护
     let mut img_placeholders: Vec<String> = Vec::new();
@@ -2911,7 +2965,7 @@ fn format_keep_img_with_script_text(
             text = img_re
                 .replace_all(&text, |caps: &regex::Captures| {
                     let img_tag = caps.get(0).unwrap().as_str();
-                    let full_img = if let Some(src_caps) = src_re.captures(img_tag) {
+                    let mut full_img = if let Some(src_caps) = src_re.captures(img_tag) {
                         let raw_src = src_caps.get(1).map(|m| m.as_str()).unwrap_or_default();
                         if !raw_src.is_empty() && !redirect_url.is_empty() {
                             let abs_src =
@@ -2923,6 +2977,14 @@ fn format_keep_img_with_script_text(
                     } else {
                         img_tag.to_string()
                     };
+                    if let Some(start) = img_tag.find(" data-legado-image-meta=\"") {
+                        let value_start = start + " data-legado-image-meta=\"".len();
+                        if let Some(end) = img_tag[value_start..].find('"') {
+                            full_img.pop();
+                            full_img.push_str(&img_tag[start..value_start + end + 1]);
+                            full_img.push('>');
+                        }
+                    }
                     let placeholder =
                         format!("__READER_IMG_PLACEHOLDER_{}__", img_placeholders.len());
                     img_placeholders.push(full_img);
@@ -2948,6 +3010,10 @@ fn format_keep_img_with_script_text(
     for (i, img_tag) in img_placeholders.into_iter().enumerate() {
         let placeholder = format!("__READER_IMG_PLACEHOLDER_{}__", i);
         text = text.replace(&placeholder, &img_tag);
+    }
+
+    for (i, tag) in review_placeholders.into_iter().enumerate() {
+        text = text.replace(&format!("__READER_REVIEW_PLACEHOLDER_{i}__"), &tag);
     }
 
     // 6. 若含 &，进行 HTML-unescape
@@ -3740,6 +3806,34 @@ mod tests {
         // 清洗 <li> 标签并正确分段换行
         let list_html = "<ul><li>第一条列表项</li><li>第二条列表项</li></ul>";
         assert_eq!(format_keep_img(list_html, ""), "第一条列表项\n第二条列表项");
+    }
+
+    #[test]
+    fn test_image_metadata_survives_content_cleaning() {
+        use base64::Engine;
+        let meta = r#"{"click":"showFanqieComment(\"https://example.com/review?a=1&b=2\",\"本章说 >\")","style":"FULL"}"#;
+        let input = format!(r#"<p>正文</p><img src="data:image/svg+xml;base64,PHN2Zz4=,{}">"#, meta);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(meta);
+        assert_eq!(format_keep_img(&input, ""), format!(
+            "正文\n<img src=\"data:image/svg+xml;base64,PHN2Zz4=\" data-legado-image-meta=\"{}\">", encoded));
+        assert_eq!(format_keep_img(r#"<img src="data:image/png;base64,YQ==">"#, ""),
+            r#"<img src="data:image/png;base64,YQ==">"#);
+    }
+
+    #[test]
+    fn review_extension_attributes_survive_without_source_specific_parsing() {
+        use base64::Engine;
+        let input = r#"<p>正文<comment count="12" onPress="customReview('https://example.com/?a=1&amp;b=2')"/></p><note ident="https://example.com/note" text="神评 &gt; 正文"/>"#;
+        let output = format_keep_img(input, "");
+        let regex = regex::Regex::new(r#"data-legado-review-meta="([^"]+)""#).unwrap();
+        let data: Vec<serde_json::Value> = regex.captures_iter(&output).map(|caps| {
+            serde_json::from_slice(&base64::engine::general_purpose::STANDARD.decode(&caps[1]).unwrap()).unwrap()
+        }).collect();
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0]["onpress"], "customReview('https://example.com/?a=1&b=2')");
+        assert_eq!(data[0]["count"], "12");
+        assert_eq!(data[1]["text"], "神评 > 正文");
+        assert!(!output.contains("customReview"));
     }
 
     #[test]
