@@ -1,4 +1,5 @@
-use crate::crawler::{current_active_session, UrlRuleContext};
+use crate::crawler::UrlRuleContext;
+use crate::runtime::session::current_active_session;
 use crate::model::rule::{BookInfoRule, SearchRule, TocRule};
 use crate::model::{
     book::Book, book_chapter::BookChapter, book_source::BookSource, search::SearchBook,

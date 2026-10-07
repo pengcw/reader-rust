@@ -4,8 +4,8 @@
 //! `RuleEngine` 调用，并将所有业务失败转换成稳定的 JSON envelope。
 
 use crate::crawler::{
-    analyze_url_with_context, strip_url_options, with_active_session, ExecuteSession, FetchError,
-    HttpResponse, HttpSession, UrlRuleContext,
+    analyze_url_with_context, strip_url_options, FetchError, HttpResponse, HttpSession,
+    UrlRuleContext,
 };
 use crate::model::book_source::{book_source_from_value, BookSource};
 use crate::parser::js::{
@@ -15,11 +15,15 @@ use crate::parser::js::{
 use crate::parser::rule_engine::{
     dedupe_chapters_last_wins, normalize_list_rule, RuleEngine,
 };
+use crate::runtime::session::with_active_session;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 
+mod protocol;
 mod text_transform;
+
+use protocol::{parse_request, ExecuteRequest, Operation};
 
 const DEFAULT_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_MAX_PAGES: usize = 100;
@@ -221,8 +225,13 @@ fn execute_inner(source_json: &str, request_json: &str) -> ExecuteResult<Value> 
         return Err(ExecuteError::unsupported("不支持远程本地书籍"));
     }
     let source = parse_source(source_json)?;
-    let (operation, params, options, request_session, request_info_map) =
-        parse_request(request_json)?;
+    let ExecuteRequest {
+        operation,
+        params,
+        options,
+        session: request_session,
+        info_map: request_info_map,
+    } = parse_request(request_json)?;
     let engine = RuleEngine::new().map_err(|error| ExecuteError::internal(error.to_string()))?;
 
     let (result, session_delta) = with_active_session(
@@ -236,11 +245,11 @@ fn execute_inner(source_json: &str, request_json: &str) -> ExecuteResult<Value> 
                     http_session.webview_client(),
                     &source,
                     || {
-                        match operation.as_str() {
-                            "search" => {
+                        match operation {
+                            Operation::Search => {
                                 execute_search(&source, &engine, &http_session, &params, &options)
                             }
-                            "explore" => execute_explore(
+                            Operation::Explore => execute_explore(
                                 &source,
                                 &engine,
                                 &http_session,
@@ -248,26 +257,24 @@ fn execute_inner(source_json: &str, request_json: &str) -> ExecuteResult<Value> 
                                 &options,
                                 request_info_map.clone(),
                             ),
-                            "explore_kinds" => execute_explore_kinds_with_state(
+                            Operation::ExploreKinds => execute_explore_kinds_with_state(
                                 &source,
                                 &options,
                                 request_info_map.clone(),
                             ),
-                            "info" => {
+                            Operation::Info => {
                                 execute_info(&source, &engine, &http_session, &params, &options)
                             }
-                            "toc" => {
+                            Operation::Toc => {
                                 execute_toc(&source, &engine, &http_session, &params, &options)
                             }
-                            "content" => {
+                            Operation::Content => {
                                 execute_content(&source, &engine, &http_session, &params, &options)
                             }
-                            "login_ui" => execute_login_ui(&source),
-                            "login" => execute_login(&source, &http_session, &params, &options),
-                            // `parse_request` guards this too; keep this branch in case a future caller bypasses it.
-                            _ => Err(ExecuteError::invalid_request(format!(
-                                "unsupported op: {operation}"
-                            ))),
+                            Operation::LoginUi => execute_login_ui(&source),
+                            Operation::Login => {
+                                execute_login(&source, &http_session, &params, &options)
+                            }
                         }
                     },
                 )
@@ -371,66 +378,6 @@ fn parse_source(raw: &str) -> ExecuteResult<BookSource> {
         return Err(ExecuteError::unsupported("不支持远程本地书籍"));
     }
     Ok(source)
-}
-
-fn parse_request(
-    raw: &str,
-) -> ExecuteResult<(
-    String,
-    Value,
-    ValidatedOptions,
-    Option<ExecuteSession>,
-    Option<InfoMapState>,
-)> {
-    let value = serde_json::from_str::<Value>(raw)
-        .map_err(|error| ExecuteError::invalid_request(format!("invalid request JSON: {error}")))?;
-    let object = value
-        .as_object()
-        .ok_or_else(|| ExecuteError::invalid_request("request must be a JSON object"))?;
-
-    if object.get("api").and_then(Value::as_u64) != Some(2) {
-        return Err(ExecuteError::invalid_request("api must be 2"));
-    }
-    let operation = object
-        .get("op")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ExecuteError::invalid_request("op is required"))?
-        .to_string();
-    if !matches!(
-        operation.as_str(),
-        "search" | "explore" | "explore_kinds" | "info" | "toc" | "content" | "login_ui" | "login"
-    ) {
-        return Err(ExecuteError::invalid_request(format!(
-            "unsupported op: {operation}"
-        )));
-    }
-    let params = object.get("params").cloned().unwrap_or_else(|| json!({}));
-    if !params.is_object() {
-        return Err(ExecuteError::invalid_request(
-            "params must be a JSON object",
-        ));
-    }
-    let raw_options = object.get("options").cloned().unwrap_or_else(|| json!({}));
-    let raw_options = serde_json::from_value::<ExecuteOptions>(raw_options)
-        .map_err(|error| ExecuteError::invalid_request(format!("invalid options: {error}")))?;
-    let options = validate_options(raw_options)?;
-    let session = match object.get("session") {
-        None | Some(Value::Null) => None,
-        Some(value) => Some(
-            serde_json::from_value::<ExecuteSession>(value.clone()).map_err(|error| {
-                ExecuteError::invalid_request(format!("invalid session: {error}"))
-            })?,
-        ),
-    };
-    let info_map = object
-        .get("infoMap")
-        .cloned()
-        .map(InfoMapState::from_value)
-        .transpose()
-        .map_err(|error| ExecuteError::invalid_request(format!("invalid infoMap: {error}")))?;
-    Ok((operation, params, options, session, info_map))
 }
 
 fn load_info_map_state(supplied: Option<InfoMapState>) -> ExecuteResult<InfoMapState> {

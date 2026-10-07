@@ -540,7 +540,12 @@ mod quickjs_rt {
         had_jobs
     }
 
+    #[cfg(feature = "kindle-eglibc-2-12")]
+    const RUNTIME_MEMORY_LIMIT: usize = 24 * 1024 * 1024;
+
+    #[cfg(not(feature = "kindle-eglibc-2-12"))]
     const RUNTIME_MEMORY_LIMIT: usize = 32 * 1024 * 1024;
+
     const RUNTIME_STACK_LIMIT: usize = 512 * 1024;
 
     /// A sandboxed JavaScript execution context.

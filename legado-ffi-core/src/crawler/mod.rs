@@ -15,9 +15,9 @@ use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8};
 use once_cell::sync::Lazy;
 mod http;
 pub mod session;
+pub(crate) use crate::runtime::SharedCookieStore;
 pub(crate) use http::{
-    HttpClient, HttpClientError, RawHttpResponse, SharedCookieStore, DEFAULT_USER_AGENT,
-    DEFAULT_WEBVIEW_USER_AGENT,
+    HttpClient, HttpClientError, RawHttpResponse, DEFAULT_USER_AGENT, DEFAULT_WEBVIEW_USER_AGENT,
 };
 pub use session::{current_active_session, with_active_session, ActiveSession, ExecuteSession};
 
