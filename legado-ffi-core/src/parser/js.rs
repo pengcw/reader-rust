@@ -31,6 +31,40 @@ use std::time::{Duration, Instant, SystemTime};
 use ureq::http::Method;
 use uuid::Uuid;
 
+thread_local! {
+    static LOGIN_MESSAGES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    static LOGIN_PREVIEW: RefCell<Option<JsonValue>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn with_login_messages<T>(run: impl FnOnce() -> T) -> (T, Vec<String>, Option<JsonValue>) {
+    struct Restore(Option<Vec<String>>, Option<JsonValue>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LOGIN_MESSAGES.with(|slot| *slot.borrow_mut() = self.0.take());
+            LOGIN_PREVIEW.with(|slot| *slot.borrow_mut() = self.1.take());
+        }
+    }
+    let restore = Restore(LOGIN_MESSAGES.with(|slot| slot.replace(Some(Vec::new()))),
+        LOGIN_PREVIEW.with(|slot| slot.replace(None)));
+    let result = run();
+    let messages = LOGIN_MESSAGES.with(|slot| slot.borrow_mut().take().unwrap_or_default());
+    let preview = LOGIN_PREVIEW.with(|slot| slot.borrow_mut().take());
+    drop(restore);
+    (result, messages, preview)
+}
+
+fn capture_login_message(message: Option<rquickjs::Coerced<String>>) {
+    if let Some(message) = message {
+        LOGIN_MESSAGES.with(|slot| {
+            if let Some(messages) = slot.borrow_mut().as_mut() {
+                if messages.len() < 8 && !message.0.trim().is_empty() {
+                    messages.push(message.0.chars().take(1024).collect());
+                }
+            }
+        });
+    }
+}
+
 static JS_KV: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static JS_CACHE: Lazy<Mutex<HashMap<String, JsCacheEntry>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
@@ -1226,7 +1260,14 @@ fn eval_js_inner_with_source(
             )?;
             java_obj.set(
                 "androidId",
-                Func::new(|| -> String { JS_DEVICE_ID.clone() }),
+                // Android ID 为 64 位十六进制字符串；不要改变 deviceID 的 UUID 兼容行为。
+                Func::new(|| -> String {
+                    let response = crate::host_services::call("device.android_id", &serde_json::json!({}));
+                    let id = response.get("data").and_then(JsonValue::as_str)
+                        .filter(|id| response["ok"] == true && !id.is_empty())
+                        .unwrap_or(JS_DEVICE_ID.as_str());
+                    md5_hex(id)[..16].to_string()
+                }),
             )?;
             java_obj.set("deviceID", Func::new(|| -> String { JS_DEVICE_ID.clone() }))?;
             java_obj.set("randomUUID", Func::new(|| -> String { Uuid::new_v4().to_string() }))?;
@@ -1770,12 +1811,20 @@ fn eval_js_inner_with_source(
             )?;
             java_obj.set(
                 "toast",
-                Func::new(|_msg: rquickjs::function::Opt<String>| {}),
+                Func::new(|msg: rquickjs::function::Opt<rquickjs::Coerced<String>>| capture_login_message(msg.0)),
             )?;
             java_obj.set(
                 "longToast",
-                Func::new(|_msg: rquickjs::function::Opt<String>| {}),
+                Func::new(|msg: rquickjs::function::Opt<rquickjs::Coerced<String>>| capture_login_message(msg.0)),
             )?;
+            java_obj.set("__browserPreview", Func::new(|url: String, title: String, html: String| -> bool {
+                if !LOGIN_MESSAGES.with(|slot| slot.borrow().is_some()) { return false; }
+                let Some(rendered) = java_web_view(&html, &url, "") else { return false; };
+                LOGIN_PREVIEW.with(|slot| *slot.borrow_mut() = Some(serde_json::json!({
+                    "title": title, "html": rendered,
+                })));
+                true
+            }))?;
             let base_url_for_html_format = base_url_state.clone();
             java_obj.set(
                 "htmlFormat",
@@ -1793,6 +1842,14 @@ fn eval_js_inner_with_source(
                 ctx.clone(),
                 r#"(function() {
                     const java = globalThis.java;
+                    java.startBrowser = function(url, title, html) {
+                        if (!java.__browserPreview(String(url || ''), String(title || ''), String(html || ''))) {
+                            throw new Error('网页只读预览失败或当前执行入口不支持预览');
+                        }
+                    };
+                    java.startBrowserAwait = function() {
+                        throw new Error('当前仅支持网页只读预览，不支持等待网页交互验证');
+                    };
                     java.hostCall = function(operation, arguments) {
                         const response = JSON.parse(java.__hostCall(
                             String(operation), JSON.stringify(arguments == null ? null : arguments)));
@@ -2573,8 +2630,10 @@ fn eval_js_inner_with_source(
                     };
                     java.createSymmetricCrypto = function(transformation, key, iv) {
                         const algorithm = String(transformation == null ? '' : transformation);
-                        const normalized = algorithm.toUpperCase() === 'DES'
-                            ? 'DES/ECB/PKCS5PADDING' : algorithm.toUpperCase();
+                        const upper = algorithm.toUpperCase();
+                        // JCA 简写 AES/DES 使用 ECB + PKCS5Padding，复用现有完整实现。
+                        const normalized = /^(AES|DES)$/.test(upper)
+                            ? upper + '/ECB/PKCS5PADDING' : upper;
                         if (!/^(AES|DES)\/(CBC|ECB)\/(PKCS5PADDING|PKCS7PADDING|NOPADDING)$/.test(normalized)) {
                             throw new Error(
                                 'createSymmetricCrypto: unsupported transformation ' + algorithm);
@@ -2640,7 +2699,7 @@ fn eval_js_inner_with_source(
                             }
                             const result = java.__symmetricCrypto(
                                 mode,
-                                algorithm,
+                                normalized,
                                 JSON.stringify(keyBytes),
                                 JSON.stringify(ivBytes),
                                 JSON.stringify(dataBytes));
@@ -4916,9 +4975,17 @@ fn java_web_view(html: &str, url: &str, js: &str) -> Option<String> {
             "User-Agent".to_string(),
             crate::crawler::DEFAULT_WEBVIEW_USER_AGENT.to_string(),
         )];
-        let response = client
-            .execute(Method::GET, url, &headers, None, Some(limit))
-            .ok()?;
+        let response = if url.starts_with("data:") {
+            // 复用已有的有类型 data URI 解码与大小限制，不另写解码器。
+            let spec = crate::crawler::RequestSpec {
+                url: url.to_string(), method: Method::GET, headers: Vec::new(), body: None,
+                charset: None, retry: 0, proxy: None, response_type: Some("base64".to_string()),
+                render_with_rakers: false, body_js: None,
+            };
+            execute_request_spec_limited(&client, &spec, Some(limit)).ok()?
+        } else {
+            client.execute(Method::GET, url, &headers, None, Some(limit)).ok()?
+        };
         let content_type = response
             .headers
             .get("content-type")
@@ -4926,7 +4993,7 @@ fn java_web_view(html: &str, url: &str, js: &str) -> Option<String> {
             .map(str::to_owned);
         (
             decode_body(&response.body, None, content_type.as_deref()),
-            Some(response.url),
+            (!url.starts_with("data:")).then_some(response.url),
         )
     };
 

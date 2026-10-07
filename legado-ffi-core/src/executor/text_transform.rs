@@ -81,7 +81,9 @@ pub(super) fn apply_from_params(values: &mut [String], params: &Value) {
     }
 }
 
-fn parse_transform_request(params: &Value) -> Option<(TextTransformDialect, Vec<TextTransformRule>)> {
+fn parse_transform_request(
+    params: &Value,
+) -> Option<(TextTransformDialect, Vec<TextTransformRule>)> {
     let dialect = params
         .get("textTransformDialect")
         .and_then(Value::as_str)
@@ -125,14 +127,29 @@ fn apply_java_rules(
     let mut output = input.to_string();
 
     for rule in rules {
-        // Android/qread replacement JavaScript needs match-scoped bindings and timeout
-        // semantics. Until that executor is added, skip the rule rather than leaking
-        // "@js:..." into user-visible text or changing the shared JS runtime.
-        if rule.replacement.trim_start().starts_with("@js:") {
+        if rule.pattern.is_empty() {
             continue;
         }
-
-        if rule.is_regex {
+        if !rule.is_regex {
+            output = output.replace(&rule.pattern, &rule.replacement);
+            continue;
+        }
+        if let Some(script) = rule.replacement.strip_prefix("@js:") {
+            let flags = if dialect == TextTransformDialect::Qread {
+                QREAD_REGEX_FLAGS
+            } else {
+                "uU"
+            };
+            // Preserve JS completion-value string coercion, including objects and null.
+            let script = format!("String(eval({}))", json!(script));
+            if let Ok(next) =
+                source_regex::replace_all_with(&output, &rule.pattern, flags, |matched| {
+                    eval_js(&script, matched, "")
+                })
+            {
+                output = next;
+            }
+        } else {
             let result = match dialect {
                 TextTransformDialect::Legado => {
                     source_regex::replace_all(&output, &rule.pattern, &rule.replacement)
@@ -148,8 +165,6 @@ fn apply_java_rules(
             if let Ok(next) = result {
                 output = next;
             }
-        } else {
-            output = output.replace(&rule.pattern, &rule.replacement);
         }
     }
 
@@ -243,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn reader3_invalid_regex_fails_open_for_the_whole_batch() {
+    fn reader3_invalid_regex_skips_only_that_rule() {
         let mut values = vec!["a".to_string(), "a".to_string()];
         apply_from_params(
             &mut values,
@@ -255,7 +270,7 @@ mod tests {
                 ]),
             ),
         );
-        assert_eq!(values, ["a", "a"]);
+        assert_eq!(values, ["ok", "ok"]);
     }
 
     #[test]
@@ -275,26 +290,82 @@ mod tests {
     }
 
     #[test]
-    fn js_replacement_is_fail_open_until_match_scoped_executor_exists() {
-        for is_regex in [false, true] {
+    fn java_js_replacement_runs_per_match_and_keeps_literal_output() {
+        for dialect in ["legado", "qread"] {
+            assert_eq!(
+                apply(
+                    "a b",
+                    dialect,
+                    json!([
+                        {"pattern":"[ab]","replacement":r"@js:result.toUpperCase() + '$1\\'","isRegex":true}
+                    ])
+                ),
+                "A$1\\ B$1\\"
+            );
+            assert_eq!(
+                apply(
+                    "a a",
+                    dialect,
+                    json!([
+                        {"pattern":"a","replacement":"@js:result","isRegex":false}
+                    ])
+                ),
+                "@js:result @js:result"
+            );
+        }
+    }
+
+    #[test]
+    fn java_js_replacement_error_discards_partial_output_and_continues() {
+        assert_eq!(
+            apply(
+                "a b",
+                "qread",
+                json!([
+                    {"pattern":"[ab]","replacement":"@js:if (result === 'b') throw Error('bad'); 'changed'","isRegex":true},
+                    {"pattern":"a","replacement":"ok","isRegex":false}
+                ])
+            ),
+            "ok b"
+        );
+    }
+
+    #[test]
+    fn java_js_prefix_is_exact_and_results_use_js_string_conversion() {
+        assert_eq!(
+            apply(
+                "a",
+                "qread",
+                json!([
+                    {"pattern":"a","replacement":" @js:result","isRegex":true}
+                ])
+            ),
+            " @js:result"
+        );
+        for (script, expected) in [
+            ("42", "42"),
+            ("null", "null"),
+            ("({a:1})", "[object Object]"),
+        ] {
             assert_eq!(
                 apply(
                     "a",
                     "qread",
                     json!([
-                        {"pattern":"a","replacement":"@js:result + 'x'","isRegex":is_regex},
-                        {"pattern":"a","replacement":"b","isRegex":false}
-                    ]),
+                        {"pattern":"a","replacement":format!("@js:{script}"),"isRegex":true}
+                    ])
                 ),
-                "b",
-                "isRegex={is_regex}"
+                expected
             );
         }
     }
 
     #[test]
     fn unknown_dialect_and_malformed_rules_leave_text_unchanged() {
-        assert_eq!(apply("a", "unknown", json!([{"pattern":"a","replacement":"b"}])), "a");
+        assert_eq!(
+            apply("a", "unknown", json!([{"pattern":"a","replacement":"b"}])),
+            "a"
+        );
         assert_eq!(
             apply(
                 "a",

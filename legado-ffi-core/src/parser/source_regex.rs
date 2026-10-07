@@ -237,9 +237,35 @@ pub(crate) fn replace_all_with_flags(
     replacement: &str,
     flags: &str,
 ) -> Result<String, RegexError> {
-    let regex =
-        get_cached_regex_with_flags(pattern, flags).ok_or(RegexError::InvalidPattern)?;
+    let regex = get_cached_regex_with_flags(pattern, flags).ok_or(RegexError::InvalidPattern)?;
     checked_replace(&regex, input, replacement, false)
+}
+
+// Callback results are literal text, not Java replacement expressions.
+pub(crate) fn replace_all_with(
+    input: &str,
+    pattern: &str,
+    flags: &str,
+    mut replace: impl FnMut(&str) -> anyhow::Result<String>,
+) -> anyhow::Result<String> {
+    let regex = get_cached_regex_with_flags(pattern, flags)
+        .ok_or_else(|| anyhow::anyhow!(RegexError::InvalidPattern))?;
+    let mut error = None;
+    let output = regex
+        .try_replace_all(input, |matched: &MatchInfo| {
+            if error.is_none() {
+                match replace(&matched.matched_text) {
+                    Ok(value) => return value,
+                    Err(err) => error = Some(err),
+                }
+            }
+            matched.matched_text.clone()
+        })
+        .map_err(|_| anyhow::anyhow!(RegexError::BudgetExceeded))?;
+    if let Some(error) = error {
+        return Err(error);
+    }
+    Ok(output)
 }
 
 pub(crate) fn replace_first_match(
@@ -267,10 +293,7 @@ mod tests {
 
     #[test]
     fn cache_separates_android_and_qread_flags() {
-        assert_eq!(
-            replace_all("a\nb", "^b", "x"),
-            Ok("a\nb".into())
-        );
+        assert_eq!(replace_all("a\nb", "^b", "x"), Ok("a\nb".into()));
         assert_eq!(
             replace_all_with_flags("a\nb", "^b", "x", "uUm"),
             Ok("a\nx".into())

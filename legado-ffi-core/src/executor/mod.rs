@@ -10,7 +10,7 @@ use crate::crawler::{
 use crate::model::book_source::{book_source_from_value, BookSource};
 use crate::parser::js::{
     eval_js, eval_js_with_bindings, with_js_http_clients, with_js_info_map, with_js_lib,
-    InfoMapState,
+    with_login_messages, InfoMapState,
 };
 use crate::parser::rule_engine::{
     dedupe_chapters_last_wins, normalize_list_rule, RuleEngine,
@@ -1431,7 +1431,7 @@ fn execute_login(
     }
 
     let login_url = source.login_url.as_deref().unwrap_or("").trim();
-    let login_script = strip_js_prefix(login_url);
+    let login_script = login_script(source);
     if login_script.is_none() && !login_url.is_empty() {
         let url = absolute_login_url(source).unwrap_or_else(|| login_url.to_string());
         return Err(web_login_error(
@@ -1450,10 +1450,10 @@ fn execute_login(
             script.push_str("\n;\nlogin();");
         }
         let bindings = login_bindings(&values);
-        let output = with_js_lib(source.js_lib.as_deref(), || {
+        let (output, messages, preview) = with_login_messages(|| with_js_lib(source.js_lib.as_deref(), || {
             eval_js_with_bindings(&script, "", &source.book_source_url, &bindings)
-        })
-        .map_err(|error| {
+        }));
+        let output = output.map_err(|error| {
             auth_required_error(
                 source,
                 None,
@@ -1471,7 +1471,9 @@ fn execute_login(
         }
         return Ok(success_without_http(json!({
             "result": output,
-            "message": "登录脚本执行成功",
+            "preview": preview,
+            // 原生书源用 toast/longToast 反馈状态；仅展示，不推断认证结果。
+            "message": if messages.is_empty() { "登录脚本执行成功".to_string() } else { messages.join("\n") },
         })));
     }
 
@@ -1490,6 +1492,18 @@ fn login_bindings(values: &Value) -> HashMap<String, Value> {
 
 fn is_absolute_http_url(value: &str) -> bool {
     url::Url::parse(value).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https"))
+}
+
+// Legado 的原生表单使用 getLoginJs()：无前缀的 loginUrl 也可作为脚本。
+// 无表单的相对网页登录 URL 保持原行为，明确的 HTTP URL 不当作脚本执行。
+fn login_script(source: &BookSource) -> Option<&str> {
+    let rule = source.login_url.as_deref()?.trim();
+    strip_js_prefix(rule).or_else(|| {
+        (!rule.is_empty()
+            && !is_absolute_http_url(rule)
+            && source.login_ui.as_deref().is_some_and(login_ui_configured))
+        .then_some(rule)
+    })
 }
 
 fn strip_js_prefix(rule: &str) -> Option<&str> {
@@ -1779,7 +1793,7 @@ fn map_fetch_error(error: FetchError, source: &BookSource) -> ExecuteError {
 
 fn absolute_login_url(source: &BookSource) -> Option<String> {
     let raw = source.login_url.as_deref()?.trim();
-    if raw.is_empty() || strip_js_prefix(raw).is_some() {
+    if raw.is_empty() || login_script(source).is_some() {
         return None;
     }
     let url = url::Url::parse(raw)
