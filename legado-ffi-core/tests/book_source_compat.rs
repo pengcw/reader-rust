@@ -1,4 +1,5 @@
 use reader_parser::crawler::analyze_url;
+use reader_parser::model::book::Book;
 use reader_parser::model::book_source::{book_source_from_value, BookSource};
 use reader_parser::model::rule::{SearchRule, TocRule};
 use reader_parser::parser::rule_engine::RuleEngine;
@@ -88,6 +89,45 @@ fn book_source_accepts_numeric_metadata_as_strings() {
 
     assert_eq!(source.last_update_time, Some(1_778_603_539_900));
     assert_eq!(source.respond_time, Some(180_000));
+}
+
+#[test]
+fn optional_i64_metadata_accepts_float_encoded_integers() {
+    // Some 32-bit hosts serialize millisecond timestamps with a decimal/exponent.
+    let source = book_source_from_value(serde_json::from_str(r#"{
+        "bookSourceUrl": "https://metadata.example",
+        "lastUpdateTime": 1.7786035399e12,
+        "respondTime": 180000.0
+    }"#).unwrap()).unwrap();
+    assert_eq!(source.last_update_time, Some(1_778_603_539_900));
+    assert_eq!(source.respond_time, Some(180_000));
+
+    let book: Book = serde_json::from_str(
+        r#"{"durChapterTime":1.7786035399e12,"lastCheckTime":180000.0,"group":4.0}"#,
+    ).unwrap();
+    assert_eq!(book.dur_chapter_time, Some(1_778_603_539_900));
+    assert_eq!(book.last_check_time, Some(180_000));
+    assert_eq!(book.group, Some(4));
+}
+
+#[test]
+fn optional_i64_metadata_does_not_wrap_or_saturate_invalid_numbers() {
+    let source = book_source_from_value(json!({
+        "bookSourceUrl": "https://metadata.example",
+        "lastUpdateTime": u64::MAX,
+        "respondTime": 1e200
+    })).unwrap();
+    assert_eq!(source.last_update_time, None);
+    assert_eq!(source.respond_time, None);
+
+    let book: Book = serde_json::from_value(json!({
+        "durChapterTime": -1e200,
+        "lastCheckTime": u64::MAX,
+        "group": 1.25
+    })).unwrap();
+    assert_eq!(book.dur_chapter_time, None);
+    assert_eq!(book.last_check_time, None);
+    assert_eq!(book.group, None);
 }
 
 #[test]
