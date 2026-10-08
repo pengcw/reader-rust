@@ -97,6 +97,8 @@ where
         Value::Null => Ok(None),
         Value::Number(num) => num
             .as_i64()
+            .or_else(|| num.as_u64().map(|u| u as i64))
+            .or_else(|| num.as_f64().map(|f| f as i64))
             .map(Some)
             .ok_or_else(|| serde::de::Error::custom("expected i64-compatible number")),
         Value::String(raw) => {
