@@ -15,13 +15,16 @@ pub struct Book {
     pub can_update: Option<bool>,
     pub dur_chapter_index: Option<i32>,
     pub dur_chapter_pos: Option<i32>,
+    #[serde(default, deserialize_with = "crate::model::deserialize_i64_option")]
     pub dur_chapter_time: Option<i64>,
     pub dur_chapter_title: Option<String>,
     pub intro: Option<String>,
     pub latest_chapter_title: Option<String>,
+    #[serde(default, deserialize_with = "crate::model::deserialize_i64_option")]
     pub last_check_time: Option<i64>,
     pub total_chapter_num: Option<i32>,
     pub r#type: Option<i32>,
+    #[serde(default, deserialize_with = "crate::model::deserialize_i64_option")]
     pub group: Option<i64>,
     pub word_count: Option<String>,
     pub info_html: Option<String>,

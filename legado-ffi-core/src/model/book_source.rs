@@ -24,7 +24,7 @@ pub struct BookSource {
     pub login_ui: Option<String>,
     pub login_check_js: Option<String>,
     pub cover_decode_js: Option<String>,
-    #[serde(deserialize_with = "deserialize_i64_option")]
+    #[serde(deserialize_with = "crate::model::deserialize_i64_option")]
     pub last_update_time: Option<i64>,
     pub weight: Option<i32>,
     pub explore_url: Option<String>,
@@ -44,7 +44,7 @@ pub struct BookSource {
     pub rule_review: Option<ReviewRule>,
     pub book_source_comment: Option<String>,
     pub variable_comment: Option<String>,
-    #[serde(deserialize_with = "deserialize_i64_option")]
+    #[serde(deserialize_with = "crate::model::deserialize_i64_option")]
     pub respond_time: Option<i64>,
     pub load_with_base_url: Option<bool>,
     pub single_url: Option<bool>,
@@ -85,37 +85,6 @@ where
     }
 }
 
-fn deserialize_i64_option<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<Value>::deserialize(deserializer)?;
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    match value {
-        Value::Null => Ok(None),
-        Value::Number(num) => num
-            .as_i64()
-            .or_else(|| num.as_u64().map(|u| u as i64))
-            .or_else(|| num.as_f64().map(|f| f as i64))
-            .map(Some)
-            .ok_or_else(|| serde::de::Error::custom("expected i64-compatible number")),
-        Value::String(raw) => {
-            let raw = raw.trim();
-            if raw.is_empty() || raw.eq_ignore_ascii_case("null") {
-                Ok(None)
-            } else {
-                raw.parse::<i64>()
-                    .map(Some)
-                    .map_err(serde::de::Error::custom)
-            }
-        }
-        other => Err(serde::de::Error::custom(format!(
-            "expected i64-compatible value, got {other}"
-        ))),
-    }
-}
 
 pub fn book_source_from_value(value: Value) -> serde_json::Result<BookSource> {
     serde_json::from_value(migrate_legacy_book_source_value(value))
