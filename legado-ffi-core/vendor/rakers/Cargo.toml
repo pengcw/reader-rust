@@ -108,7 +108,12 @@ optional = true
 [dependencies.ureq]
 version = "3.4"
 default-features = false
-features = ["rustls", "gzip", "socks-proxy"]
+# reader-rust SO intentionally disables socks-proxy to reduce binary size.
+# Its shared HttpClient rejects SOCKS; HTTP/HTTPS proxies remain supported.
+# The standalone rakers ureq fallback must not receive SOCKS proxy URLs.
+# To restore SOCKS, enable ureq/socks-proxy explicitly and review HttpClient's
+# protocol guard plus proxy/transport contract tests; Cargo unifies features.
+features = ["rustls", "gzip"]
 
 [dependencies.url]
 version = "2"

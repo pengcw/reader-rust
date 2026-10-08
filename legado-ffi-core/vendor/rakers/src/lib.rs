@@ -159,8 +159,12 @@ pub struct HttpConfig {
     pub user_agent: Option<String>,
     /// Additional headers sent with every request, in `(name, value)` form.
     pub headers: Vec<(String, String)>,
-    /// Optional proxy URL. Supports SOCKS5 (`socks5://`), SOCKS4 (`socks4://`),
-    /// and HTTP (`http://`) proxies. Use `socks5://127.0.0.1:9050` for Tor.
+    /// Optional proxy URL. This vendored reader-rust build disables ureq's
+    /// `socks-proxy` feature: do not pass SOCKS URLs to the standalone ureq
+    /// fallback, which may fail or panic. HTTP/HTTPS proxies remain supported.
+    /// With a custom transport, proxy handling is the transport's responsibility;
+    /// reader-rust's shared HttpClient explicitly rejects SOCKS.
+    /// See Cargo.toml's ureq feature comment before restoring SOCKS support.
     pub proxy: Option<String>,
     /// When `true`, custom `-H` headers are also forwarded on XHR requests
     /// the page's JavaScript initiates. Defaults to `false` to avoid leaking
@@ -466,11 +470,11 @@ fn build_meta_script(meta: &std::collections::HashMap<String, String>) -> String
     }
     let mut out = String::from("var _r_meta = {");
     for (name, content) in meta {
-        let name_esc = name.replace('\\', "\\\\").replace('\'', "\\'");
-        let content_esc = content.replace('\\', "\\\\").replace('\'', "\\'");
+        let name_js = serde_json::to_string(name).expect("string serialization");
+        let content_js = serde_json::to_string(content).expect("string serialization");
         out.push_str(&format!(
-            "'{name_esc}':{{name:'{name_esc}',content:'{content_esc}',\\\
-            getAttribute:function(n){{return n==='content'?this.content:n==='name'?this.name:null;}},\\\
+            "{name_js}:{{name:{name_js},content:{content_js},\
+            getAttribute:function(n){{return n==='content'?this.content:n==='name'?this.name:null;}},\
             hasAttribute:function(n){{return n==='content'||n==='name';}}}},",
         ));
     }
@@ -554,6 +558,13 @@ pub fn render_detailed(
     };
     let script_result =
         rt.execute_with_final_script(&scripts, page_url, cfg, &budget, final_script)?;
+    // A skipped lifecycle/Promise continuation is not a completed static preview.
+    if budget
+        .deadline()
+        .is_some_and(|deadline| Instant::now() >= deadline)
+    {
+        anyhow::bail!("Rakers render deadline exceeded");
+    }
 
     for msg in runtime::JsRuntime::logged_messages() {
         if is_verbose() {
@@ -765,6 +776,74 @@ mod tests {
     }
 
     #[test]
+    fn meta_script_preserves_escaped_content() {
+        let input = concat!(
+            "<html><head><meta name=\"viewport\" content=\"line1\nline2\\'\"></head><body>",
+            "<script>document.write('<p>' + document.querySelector('meta[name=\"viewport\"]').getAttribute('content') + '</p>');</script>",
+            "</body></html>",
+        );
+        let out = render_simple(input, false, None).unwrap();
+        assert!(
+            out.contains("<p>line1\nline2\\'</p>"),
+            "meta bridge failed: {out}"
+        );
+    }
+
+    #[test]
+    fn cumulative_network_deadline_is_not_a_successful_preview() {
+        struct DelayedTransport;
+        impl HttpTransport for DelayedTransport {
+            fn execute(&self, request: HttpRequest) -> Result<HttpResponse, String> {
+                std::thread::sleep(Duration::from_millis(100));
+                let body = if request.url.ends_with("/emoji.js") {
+                    "var emojiReady = true;"
+                } else {
+                    "comments-ok"
+                };
+                Ok(HttpResponse {
+                    url: request.url,
+                    status: 200,
+                    headers: Vec::new(),
+                    body: body.to_string(),
+                })
+            }
+        }
+        let input = concat!(
+            "<html><body><script src='/emoji.js'></script><script>",
+            "document.addEventListener('DOMContentLoaded', function() {",
+            "fetch('/comments').then(function(r) {return r.text();})",
+            ".then(function(text) {document.body.innerHTML = '<p>' + text + '</p>';});",
+            "});</script></body></html>",
+        );
+        for (timeout, succeeds) in [(150, false), (1000, true)] {
+            let cfg = HttpConfig {
+                transport: Some(Arc::new(DelayedTransport)),
+                render_timeout: Some(Duration::from_millis(timeout)),
+                ..Default::default()
+            };
+            let result = render(
+                input,
+                false,
+                Some("https://fixture.invalid/page"),
+                &cfg,
+                false,
+                None,
+                None,
+            );
+            if succeeds {
+                assert!(result.unwrap().contains("<p>comments-ok</p>"));
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("render deadline exceeded")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn html_inline_script_document_write() {
         let input = concat!(
             "<!DOCTYPE html><html><head><title>Test</title></head>",
@@ -835,7 +914,8 @@ mod tests {
 
     #[test]
     fn detailed_render_runs_final_script_after_page_lifecycle() {
-        let html = "<!DOCTYPE html><html><body><script>window.pageRan = true;</script></body></html>";
+        let html =
+            "<!DOCTYPE html><html><body><script>window.pageRan = true;</script></body></html>";
         let output = render_detailed(
             html,
             false,
@@ -1345,12 +1425,12 @@ mod tests {
             ..Default::default()
         };
         let started = Instant::now();
-        let out = render(js, true, None, &cfg, false, None, None).unwrap();
+        let error = render(js, true, None, &cfg, false, None, None).unwrap_err();
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "microtask loop escaped render budget"
         );
-        assert!(out.contains("<p>started</p>"));
+        assert!(error.to_string().contains("render deadline exceeded"));
     }
 
     #[test]

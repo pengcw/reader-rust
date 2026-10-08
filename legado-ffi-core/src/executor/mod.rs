@@ -1118,6 +1118,7 @@ fn execute_content(
     if let Some(rule) = &mut page_source.rule_content {
         rule.replace_regex = None;
     }
+    let chapter_fields = input_chapter_fields(params, &initial_url);
     let mut pending = VecDeque::from([(initial_url.clone(), true)]);
     let mut visited_urls = HashSet::new();
     let mut fragments = Vec::new();
@@ -1153,7 +1154,7 @@ fn execute_content(
                 chapter_title.as_deref(),
                 Some(&book_fields),
             );
-            request_context.chapter_fields = input_chapter_fields(params, &initial_url);
+            request_context.chapter_fields = chapter_fields.clone();
             Some(fetch_rule_with_context(
                 session,
                 source,
@@ -1187,6 +1188,7 @@ fn execute_content(
                 book_name.as_deref(),
                 chapter_title.as_deref(),
                 Some(&book_fields),
+                Some(&chapter_fields),
                 follow_next,
             )
         } else {
@@ -1199,6 +1201,7 @@ fn execute_content(
                 book_name.as_deref(),
                 chapter_title.as_deref(),
                 Some(&book_fields),
+                Some(&chapter_fields),
                 follow_next,
             )
         };
@@ -1245,6 +1248,7 @@ fn execute_content(
                 book_name.as_deref(),
                 chapter_title.as_deref(),
                 Some(&book_fields),
+                Some(&chapter_fields),
             ) {
                 let sub_content = if sub_content.to_ascii_lowercase().starts_with("http") {
                     if visited_urls.len() >= options.max_pages {
@@ -1280,13 +1284,14 @@ fn execute_content(
             }
         }
     }
-    let replacement_context = url_rule_context_with_fields(
+    let mut replacement_context = url_rule_context_with_fields(
         book_variable.as_deref(),
         chapter_variable.as_deref(),
         book_name.as_deref(),
         chapter_title.as_deref(),
         Some(&book_fields),
     );
+    replacement_context.chapter_fields = chapter_fields;
     let mut content = engine.replace_content_with_context(
         source,
         &fragments.join("\n"),

@@ -7,7 +7,7 @@ use crate::model::book_source::BookSource;
 use base64::{engine::general_purpose, Engine};
 #[cfg(test)]
 use encoding_rs::Encoding;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock as Lazy;
 mod http;
 mod response;
 pub mod session;
@@ -18,10 +18,10 @@ pub(crate) use http::{
 };
 pub(crate) use response::{decode_body, format_analyzed_body};
 pub use session::{current_active_session, with_active_session, ActiveSession, ExecuteSession};
-pub use url_rule::{analyze_url, analyze_url_with_context, UrlRuleContext};
-pub(crate) use url_rule::{analyze_url_with_headers, split_url_options, strip_url_options};
 #[cfg(test)]
 use url_rule::parse_source_headers;
+pub use url_rule::{analyze_url, analyze_url_with_context, UrlRuleContext};
+pub(crate) use url_rule::{analyze_url_with_headers, split_url_options, strip_url_options};
 
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
@@ -49,7 +49,6 @@ pub struct HttpSession {
     client: HttpClient,
     webview_client: HttpClient,
 }
-
 
 #[derive(Debug, Clone)]
 pub struct RequestSpec {
@@ -330,6 +329,8 @@ const RAKERS_MAX_REMOTE_SCRIPTS: usize = 8;
 const RAKERS_MAX_REQUESTS: usize = 32;
 const RAKERS_SCRIPT_TIMEOUT: Duration = Duration::from_secs(3);
 const RAKERS_RENDER_TIMEOUT: Duration = Duration::from_secs(15);
+// Read-only browser pages load external scripts before fetching their content.
+const RAKERS_WEBVIEW_RENDER_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct RakersHttpTransport {
@@ -389,6 +390,7 @@ fn render_rakers_page(
     proxy: Option<String>,
     clean: bool,
     max_response_bytes: usize,
+    render_timeout: Duration,
 ) -> Result<rakers::RenderOutput, FetchError> {
     let limit = max_response_bytes.max(1);
     // Do not copy raw source credentials into page-controlled requests. Cookies
@@ -401,7 +403,7 @@ fn render_rakers_page(
         transport: Some(rakers_http_transport(client, max_response_bytes)),
         max_requests: Some(RAKERS_MAX_REQUESTS),
         max_response_bytes: Some(max_response_bytes.max(1)),
-        render_timeout: Some(RAKERS_RENDER_TIMEOUT),
+        render_timeout: Some(render_timeout),
     };
     let rendered = rakers::render_detailed(
         html,
@@ -451,6 +453,7 @@ pub(crate) fn render_webview_with_rakers(
         None,
         false,
         max_response_bytes,
+        RAKERS_WEBVIEW_RENDER_TIMEOUT,
     )
 }
 
@@ -476,6 +479,7 @@ fn render_with_rakers(
         spec.proxy.clone(),
         true,
         max_response_bytes,
+        RAKERS_RENDER_TIMEOUT,
     )?
     .html)
 }
@@ -700,7 +704,6 @@ fn build_client_from_existing_policy(
     let _ = spec;
     build_client(15_000, None, Some(proxy))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1344,9 +1347,12 @@ mod tests {
             &source,
         )
         .unwrap();
-        assert_eq!(xml.body.as_deref(), Some("<root/>"));
+        // AnalyzeUrl expands angle-bracket choices before parsing options,
+        // including a one-item choice that happens to look like XML.
+        assert_eq!(xml.body.as_deref(), Some("root%2F"));
         assert!(xml.headers.iter().any(|(name, value)| {
-            name.eq_ignore_ascii_case("content-type") && value == "application/xml"
+            name.eq_ignore_ascii_case("content-type")
+                && value == "application/x-www-form-urlencoded"
         }));
 
         assert_eq!(

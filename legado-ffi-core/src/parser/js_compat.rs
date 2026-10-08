@@ -7,11 +7,18 @@ use chrono::{FixedOffset, Local, TimeZone};
 use ring::{digest, hmac};
 use serde_json::Value as JsonValue;
 
+pub(super) fn json_value_to_string(value: &JsonValue) -> String {
+    match value {
+        JsonValue::String(value) => value.clone(),
+        JsonValue::Null => String::new(),
+        value => value.to_string(),
+    }
+}
+
 pub(super) fn java_to_num_chapter(input: &str) -> String {
-    static TITLE_NUM_RE: once_cell::sync::Lazy<regex::Regex> =
-        once_cell::sync::Lazy::new(|| {
-            regex::Regex::new(r"(第)(.+?)(章)").expect("valid title number regex")
-        });
+    static TITLE_NUM_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(第)(.+?)(章)").expect("valid title number regex")
+    });
 
     let Some(captures) = TITLE_NUM_RE.captures(input) else {
         return input.to_string();
@@ -382,11 +389,7 @@ fn java_hmac_algorithm(algorithm: &str) -> Option<hmac::Algorithm> {
     }
 }
 
-pub(super) fn java_hmac_string_bytes(
-    data: &str,
-    algorithm: &str,
-    key: &str,
-) -> Option<Vec<u8>> {
+pub(super) fn java_hmac_string_bytes(data: &str, algorithm: &str, key: &str) -> Option<Vec<u8>> {
     let algorithm = java_hmac_algorithm(algorithm)?;
     let key = hmac::Key::new(algorithm, key.as_bytes());
     Some(hmac::sign(&key, data.as_bytes()).as_ref().to_vec())

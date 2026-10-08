@@ -4,7 +4,7 @@ use super::RequestSpec;
 use crate::parser::js_url::{eval_js_url_with_bindings, with_js_lib};
 use chardetng::EncodingDetector;
 use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8};
-use once_cell::sync::Lazy;
+use std::sync::LazyLock as Lazy;
 
 pub(crate) fn format_analyzed_body(
     spec: &RequestSpec,

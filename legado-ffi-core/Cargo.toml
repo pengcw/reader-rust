@@ -4,17 +4,24 @@ version = "1.0.9"
 edition = "2021"
 
 [features]
+default = []
+c-headers = ["safer-ffi/headers"]
 kindle-eglibc-2-12 = []
 
 [lib]
 name = "reader_parser"
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "generate_headers"
+path = "src/bin/generate_headers.rs"
+required-features = ["c-headers"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "3.4", default-features = false, features = ["rustls", "gzip"] }
-cookie_store = { version = "0.22", default-features = false, features = ["public_suffix", "serde"] }
+cookie_store = { version = "0.22", default-features = false, features = ["serde"] }
 anyhow = "1"
 aes = "0.8"
 cbc = "0.1"
@@ -32,13 +39,11 @@ regex = "1"
 java_regex = { path = "vendor/java_regex", version = "0.1.0" }
 urlencoding = "2"
 rand = "0.8"
-once_cell = "1"
-base64 = "0.22"
-uuid = { version = "1", features = ["v4"] }
+base64 = "0.23"
 url = "2"
 sxd-xpath = "0.4"
 sxd-document = "0.3"
-safer-ffi = { version = "0.1", features = ["headers"] }
+safer-ffi = "0.1"
 flate2 = "1.0"
 
 [target.'cfg(any(all(target_arch = "aarch64", target_os = "linux"), all(target_arch = "arm", target_os = "linux"), target_os = "android"))'.dependencies]

@@ -74,6 +74,16 @@ impl HttpClient {
         if let Some(proxy) = proxy {
             let proxy = Proxy::new(proxy)
                 .map_err(|error| HttpClientError::InvalidUrl(error.to_string()))?;
+            // This build has no ureq socks-proxy feature. Reject before the
+            // transport connector panics on a manually configured SOCKS proxy.
+            if !matches!(
+                proxy.protocol(),
+                ureq::ProxyProtocol::Http | ureq::ProxyProtocol::Https
+            ) {
+                return Err(HttpClientError::InvalidUrl(
+                    "SOCKS proxy transport is not supported".to_string(),
+                ));
+            }
             config = config.proxy(Some(proxy));
         }
 
@@ -537,6 +547,29 @@ mod tests {
 
         assert_eq!(response.status, 403);
         assert_eq!(response.body, b"forbidden");
+    }
+
+    #[test]
+    fn unsupported_socks_proxy_is_rejected_before_request() {
+        for scheme in ["socks", "socks4", "socks4a", "socks5", "socks5h", "SOCKS5"] {
+            let address = format!("{scheme}://private-user:private-password@127.0.0.1:1080");
+            let Err(HttpClientError::InvalidUrl(message)) =
+                HttpClient::new(2_000, None, Some(&address))
+            else {
+                panic!("unsupported SOCKS proxy must fail during client construction");
+            };
+            assert_eq!(message, "SOCKS proxy transport is not supported");
+            let client = HttpClient::standalone();
+            assert!(matches!(
+                client.with_proxy(&address),
+                Err(HttpClientError::InvalidUrl(_))
+            ));
+        }
+        for scheme in ["http", "https"] {
+            assert!(
+                HttpClient::new(2_000, None, Some(&format!("{scheme}://127.0.0.1:8080"))).is_ok()
+            );
+        }
     }
 
     #[test]

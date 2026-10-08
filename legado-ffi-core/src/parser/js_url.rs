@@ -58,6 +58,29 @@ pub fn eval_js_url_with_headers(
     )
 }
 
+/// Option JS keeps its completion value; java.url writes are a compatibility fallback.
+pub(crate) fn eval_js_url_option_with_headers(
+    script: &str,
+    result: &str,
+    key: &str,
+    page: i32,
+    source_key: &str,
+    base_url: &str,
+    bindings: Option<&HashMap<String, JsonValue>>,
+    headers: &mut Vec<(String, String)>,
+) -> anyhow::Result<String> {
+    let url = serde_json::to_string(result)?;
+    let script = serde_json::to_string(script)?;
+    // Run source eval in a function with no local bindings that could collide
+    // with the source's var declarations. Shared execution restores nested java state.
+    let wrapped = format!(
+        "(function(values) {{ return values[0] !== undefined ? values[0] : values[1] !== {url} ? values[1] : globalThis.result; }})((function() {{ java.url = {url}; return [eval({script}), java.url]; }})())"
+    );
+    eval_js_url_with_headers_inner(
+        &wrapped, result, key, page, source_key, base_url, bindings, headers, false,
+    )
+}
+
 pub fn eval_js_url_template_with_headers(
     script: &str,
     result: &str,

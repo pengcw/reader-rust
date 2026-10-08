@@ -128,3 +128,40 @@ impl SharedCookieStore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SharedCookieStore;
+    use url::Url;
+
+    #[test]
+    fn snapshot_preserves_domain_path_expiry_and_secure_scope() {
+        let origin = Url::parse("https://books.example.com/chapter/1").unwrap();
+        let jar = SharedCookieStore::default();
+        jar.add_set_cookie(
+            "token=secret; Domain=example.com; Path=/chapter; Secure",
+            &origin,
+        );
+        jar.add_set_cookie("host=only; Path=/", &origin);
+        jar.add_set_cookie("expired=no; Max-Age=0; Path=/", &origin);
+        jar.add_set_cookie("foreign=no; Domain=other.example; Path=/", &origin);
+        let snapshot = jar.snapshot().unwrap();
+        let restored = SharedCookieStore::default();
+        assert!(restored.restore(&snapshot));
+        assert_eq!(restored.snapshot(), Some(snapshot));
+        for (url, expected) in [
+            ("https://other.example.com/chapter/2", Some("token=secret")),
+            ("https://other.example.com/", None),
+            ("http://other.example.com/chapter/2", None),
+            ("https://unrelated.example/chapter/2", None),
+            ("https://books.example.com/", Some("host=only")),
+        ] {
+            assert_eq!(
+                restored
+                    .get_cookie_header(&Url::parse(url).unwrap())
+                    .as_deref(),
+                expected
+            );
+        }
+    }
+}

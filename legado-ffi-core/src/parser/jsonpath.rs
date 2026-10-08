@@ -105,7 +105,7 @@ fn regex_filter_query(value: &Value, rule: &str) -> Option<Option<Vec<Value>>> {
     }
     let operator = operator?;
     let (left, literal) = (&expression[..operator], &expression[operator + 2..]);
-    static CURRENT_PATH: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+    static CURRENT_PATH: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"^@(?:\.[\p{L}_$][\p{L}\p{N}_$]*)*$").unwrap()
     });
     if !CURRENT_PATH.is_match(left.trim()) {

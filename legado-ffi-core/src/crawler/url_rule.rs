@@ -3,15 +3,15 @@
 use super::{BodyJs, RequestSpec, DEFAULT_USER_AGENT};
 use crate::model::book_source::BookSource;
 use crate::parser::js_url::{
-    eval_js_url_template_with_headers, eval_js_url_with_bindings, eval_js_url_with_headers,
-    with_js_lib,
+    eval_js_url_option_with_headers, eval_js_url_template_with_headers, eval_js_url_with_bindings,
+    eval_js_url_with_headers, with_js_lib,
 };
 use crate::runtime::session::current_active_session;
 use crate::util::text::find_template_close;
 use encoding_rs::{Encoding, UTF_8};
-use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::LazyLock as Lazy;
 use ureq::http::header::{CONTENT_TYPE, USER_AGENT};
 use ureq::http::Method;
 
@@ -93,8 +93,6 @@ impl UrlRuleContext {
         }
     }
 }
-
-
 
 /// 将 Legado URL 规则变成可直接执行的请求。支持 source/header、JSON options、
 /// JS URL、`{{key}}` / `{key}`、`{{page}}` / `{page}` 与相对 URL。
@@ -190,7 +188,7 @@ fn compile_url_request(
         &mut headers,
     )?;
     rule = replace_legacy_placeholders(&rule, key, page);
-    rule = replace_page_choices_before_options(&rule, page);
+    rule = replace_page_choices(&rule, page);
 
     // Stage 5: split the final URL rule and parse optional JSON.
     let (url_part, options_text) = split_url_options(&rule);
@@ -210,7 +208,7 @@ fn compile_url_request(
         .and_then(Value::as_str)
         .filter(|script| !script.trim().is_empty())
     {
-        let rewritten = eval_js_url_with_headers(
+        let rewritten = eval_js_url_option_with_headers(
             script,
             &url,
             key,
@@ -449,27 +447,15 @@ fn expand_url_templates(
 fn replace_legacy_placeholders(rule: &str, key: &str, page: i32) -> String {
     let encoded_key = urlencoding::encode(key);
     let page = page.max(1).to_string();
-    rule.replace("{key}", &encoded_key)
-        .replace("{page}", &page)
-}
-
-fn replace_page_choices_before_options(rule: &str, page: i32) -> String {
-    let (url, options) = split_url_options(rule);
-    match options {
-        Some(options) => format!("{},{}", replace_page_choices(url, page), options),
-        None => replace_page_choices(url, page),
-    }
+    rule.replace("{key}", &encoded_key).replace("{page}", &page)
 }
 
 fn replace_page_choices(rule: &str, page: i32) -> String {
-    let Ok(re) = regex::Regex::new(r"<([^<>]*)>") else {
+    let Ok(re) = regex::Regex::new(r"<(.*?)>") else {
         return rule.to_string();
     };
     re.replace_all(rule, |captures: &regex::Captures| {
-        let choices = captures[1]
-            .split(',')
-            .map(str::trim)
-            .collect::<Vec<_>>();
+        let choices = captures[1].split(',').map(str::trim).collect::<Vec<_>>();
         choices
             .get(page.saturating_sub(1) as usize)
             .or_else(|| choices.last())
@@ -936,7 +922,6 @@ fn is_encoded_form(body: &str) -> bool {
     }
     true
 }
-
 
 fn value_to_string(value: &Value) -> Option<String> {
     (!value.is_null()).then(|| {

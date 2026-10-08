@@ -1,5 +1,4 @@
 use crate::crawler::UrlRuleContext;
-use crate::runtime::session::current_active_session;
 use crate::model::rule::{BookInfoRule, SearchRule, TocRule};
 use crate::model::{
     book::Book, book_chapter::BookChapter, book_source::BookSource, search::SearchBook,
@@ -9,6 +8,7 @@ use crate::parser::{
     js::{eval_js_template_with_bindings, eval_js_with_bindings, with_js_lib},
     jsonpath, rule_analyzer, source_regex,
 };
+use crate::runtime::session::current_active_session;
 use crate::util::text::{find_template_close, normalize_source_url};
 use serde_json::{json, Value};
 use std::borrow::Cow;
@@ -57,6 +57,7 @@ struct RuleVariableContext {
     book: Option<HashMap<String, String>>,
     book_fields: HashMap<String, String>,
     chapter: Option<HashMap<String, String>>,
+    chapter_fields: serde_json::Map<String, Value>,
     book_name: Option<String>,
     chapter_title: Option<String>,
 }
@@ -103,6 +104,7 @@ impl RuleVariableContext {
             book: self.book.clone(),
             book_fields: self.book_fields.clone(),
             chapter: Some(parse_variable_map(variable)),
+            chapter_fields: serde_json::Map::new(),
             book_name: self.book_name.clone(),
             chapter_title: Some(title.to_string()),
         }
@@ -264,6 +266,7 @@ impl RuleVariableContext {
                 chapter_variables.insert(key.clone(), value);
             }
         }
+        chapter.extend(self.chapter_fields.clone());
         chapter.insert("variableMap".to_string(), Value::Object(chapter_variables));
         if let Some(title) = &self.chapter_title {
             chapter.insert("title".to_string(), Value::String(title.clone()));
@@ -838,6 +841,7 @@ impl RuleEngine {
             book_name,
             chapter_title,
             book_fields,
+            None,
             true,
         )
     }
@@ -852,6 +856,7 @@ impl RuleEngine {
         book_name: Option<&str>,
         chapter_title: Option<&str>,
         book_fields: Option<&HashMap<String, String>>,
+        chapter_fields: Option<&serde_json::Map<String, Value>>,
         follow_next: bool,
     ) -> ContentPageResult {
         with_js_lib(source.js_lib.as_deref(), || {
@@ -862,6 +867,7 @@ impl RuleEngine {
                 chapter_title,
                 book_fields,
             );
+            context.chapter_fields = chapter_fields.cloned().unwrap_or_default();
             let content = self.content_with_context(source, body, base_url, &mut context);
             let next_urls = if follow_next {
                 self.next_content_urls_with_context(source, body, base_url, &mut context)
@@ -888,6 +894,7 @@ impl RuleEngine {
         book_name: Option<&str>,
         chapter_title: Option<&str>,
         book_fields: Option<&HashMap<String, String>>,
+        chapter_fields: Option<&serde_json::Map<String, Value>>,
         follow_next: bool,
     ) -> ContentPageResult {
         with_js_lib(source.js_lib.as_deref(), || {
@@ -898,6 +905,7 @@ impl RuleEngine {
                 chapter_title,
                 book_fields,
             );
+            context.chapter_fields = chapter_fields.cloned().unwrap_or_default();
             let title = self.content_title_in_context(source, body, base_url, &mut context);
             if let Some(title) = title.as_ref() {
                 context.chapter_title = Some(title.clone());
@@ -945,6 +953,7 @@ impl RuleEngine {
         book_name: Option<&str>,
         chapter_title: Option<&str>,
         book_fields: Option<&HashMap<String, String>>,
+        chapter_fields: Option<&serde_json::Map<String, Value>>,
     ) -> Option<String> {
         let rule = source.rule_content.as_ref()?.sub_content.as_deref()?.trim();
         if rule.is_empty() {
@@ -958,6 +967,7 @@ impl RuleEngine {
                 chapter_title,
                 book_fields,
             );
+            context.chapter_fields = chapter_fields.cloned().unwrap_or_default();
             self.eval_body_rule_with_context(rule, body, base_url, &mut context)
                 .map(|value| value.trim().to_string())
         })
@@ -970,13 +980,15 @@ impl RuleEngine {
         base_url: &str,
         context: &UrlRuleContext,
     ) -> String {
-        let context = RuleVariableContext::for_content_with_fields(
+        let chapter_fields = context.chapter_fields.clone();
+        let mut context = RuleVariableContext::for_content_with_fields(
             context.book_variable.as_deref(),
             context.chapter_variable.as_deref(),
             context.book_name.as_deref(),
             context.chapter_title.as_deref(),
             Some(&context.book_fields),
         );
+        context.chapter_fields = chapter_fields;
         with_js_lib(source.js_lib.as_deref(), || {
             apply_content_replacement(
                 content.to_string(),
@@ -1001,13 +1013,6 @@ impl RuleEngine {
         let rule = source.rule_content.clone().unwrap_or_default();
         let mut content_body = body.to_string();
 
-        if let Some(source_regex) = rule
-            .source_regex
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-        {
-            content_body = apply_legado_regex(&content_body, source_regex);
-        }
         if let Some(web_js) = rule.web_js.as_deref().filter(|s| !s.trim().is_empty()) {
             if let Ok(processed) = eval_js_with_bindings(
                 self.strip_mode_prefix(web_js),
@@ -1139,12 +1144,12 @@ impl RuleEngine {
         base_url: &str,
         context: &mut RuleVariableContext,
     ) -> Option<String> {
-        if serde_json::from_str::<Value>(body).is_ok() {
-            let value = serde_json::from_str::<Value>(body).ok()?;
-            eval_field_json_with_ctx(rule, &value, base_url, context)
-        } else {
-            let doc = html::parse_document(body);
-            eval_field_html_doc_with_ctx(rule, &doc, base_url, context)
+        match serde_json::from_str::<Value>(body) {
+            Ok(value) => eval_field_json_with_ctx(rule, &value, base_url, context),
+            Err(_) => {
+                let doc = html::parse_document(body);
+                eval_field_html_doc_with_ctx(rule, &doc, base_url, context)
+            }
         }
     }
 
@@ -1236,6 +1241,7 @@ impl RuleEngine {
             .map(|url| url.trim().to_string())
             .filter(|url| !url.is_empty())
             .map(|url| resolve_content_page_url(base_url, &url))
+            .filter(|url| !url.is_empty())
             .collect()
     }
 
@@ -2763,6 +2769,7 @@ fn normalize_toc_next_urls(base_url: &str, urls: Vec<String>) -> Vec<String> {
         .map(|url| url.trim().to_string())
         .filter(|url| !url.is_empty())
         .map(|url| resolve_url(base_url, &url))
+        .filter(|url| !url.is_empty())
         .filter(|url| {
             let identity = normalized_url_identity(url);
             identity != current && seen.insert(identity)
@@ -2874,6 +2881,9 @@ pub(crate) fn resolve_url(base: &str, url: &str) -> String {
     }
     let (path, options) = crate::crawler::split_url_options(&url);
     let resolved = resolve_url_path(crate::crawler::strip_url_options(base), path);
+    if resolved.is_empty() {
+        return resolved;
+    }
     match options {
         Some(_) => format!("{resolved}{}", &url[path.len()..]),
         None => resolved,
@@ -2891,6 +2901,10 @@ fn resolve_url_path(base: &str, url: &str) -> String {
         return url.to_string();
     }
     if url.starts_with("//") {
+        if let Some(base_url) = url::Url::parse(&base).ok().filter(|base| !base.cannot_be_a_base()) {
+            return format!("{}:{}", base_url.scheme(), url);
+        }
+        // Keep the existing HTTPS fallback when no usable base was supplied.
         return format!("https:{}", url);
     }
 
@@ -2898,6 +2912,9 @@ fn resolve_url_path(base: &str, url: &str) -> String {
         Ok(u) => u,
         Err(_) => return url.to_string(),
     };
+    if url.starts_with("javascript") {
+        return String::new();
+    }
     base_url.set_fragment(None);
 
     match base_url.join(&url) {
@@ -3108,6 +3125,15 @@ fn evaluate_template_expression(
             .into_iter()
             .next()
             .unwrap_or_default();
+    }
+    if expression.starts_with("@@") {
+        return eval_field_html_doc_with_ctx(
+            expression,
+            &html::parse_document(input),
+            base_url,
+            &mut ctx.clone(),
+        )
+        .unwrap_or_default();
     }
     if starts_with_ascii_case(expression, "@css:") {
         let selector = strip_prefix_ascii_case(expression, "@css:").unwrap_or(expression);
@@ -4632,6 +4658,116 @@ mod tests {
     use crate::model::rule::{BookInfoRule, ContentRule, SearchRule, TocRule};
     use crate::parser::js::eval_js;
 
+    #[test]
+    fn body_rule_json_and_html_branches_preserve_values() {
+        let engine = RuleEngine::new().unwrap();
+        for (body, rule, expected) in [
+            (r#"{"title":"正文🦀"}"#, "$.title", "正文🦀"),
+            (r#"[{"title":"数组正文"}]"#, "$[0].title", "数组正文"),
+            ("<p>HTML正文</p>", "p@text", "HTML正文"),
+            ("{invalid JSON}<p>回退正文</p>", "p@text", "回退正文"),
+        ] {
+            let mut context = RuleVariableContext::default();
+            assert_eq!(
+                engine.eval_body_rule_with_context(rule, body, "https://example.com", &mut context),
+                Some(expected.to_string()),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_default_templates_extract_fields_without_swallowing_variables() {
+        let input = "<a href='/chapter'>Chapter</a>";
+        let mut ctx = RuleVariableContext::default();
+        ctx.rule_data = Some(HashMap::from([("token".to_string(), "value".to_string())]));
+        for (expression, expected) in [
+            ("@@tag.a@text", "Chapter"),
+            ("@@tag.a@href", "/chapter"),
+            ("@@tag.missing@text", ""),
+            ("@token", "value"),
+        ] {
+            assert_eq!(
+                evaluate_template_expression(expression, input, "https://example.com", &ctx, None),
+                expected,
+                "{expression}"
+            );
+        }
+        assert_eq!(
+            interpolate_common_templates(
+                "{{@@tag.a@text}}/{{@token}}",
+                input,
+                "https://example.com",
+                &ctx
+            ),
+            "Chapter/value"
+        );
+    }
+
+    #[test]
+    fn audit_resource_regex_does_not_modify_text_content() {
+        let source = BookSource {
+            rule_content: Some(ContentRule {
+                content: Some(".body@text".to_string()),
+                source_regex: Some(".*##REMOVED".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            RuleEngine::new().unwrap().content(
+                &source,
+                "<p class='body'>original</p>",
+                "https://example.com"
+            ),
+            "original"
+        );
+    }
+
+    #[test]
+    fn audit_chapter_entity_fields_reach_content_next_page_and_replacement() {
+        let engine = RuleEngine::new().unwrap();
+        let source: BookSource = serde_json::from_value(serde_json::json!({
+            "ruleContent": {
+                "content": "@js:[chapter.index === 7, chapter.url, chapter.variableMap.token].join('|')",
+                "nextContentUrl": "@js:'/next/' + chapter.index",
+                "replaceRegex": "##{{chapter.title+chapter.index}}"
+            }
+        })).unwrap();
+        let fields = serde_json::Map::from_iter([
+            ("index".to_string(), serde_json::json!(7)),
+            ("url".to_string(), serde_json::json!("/chapter")),
+        ]);
+        let page = engine.content_page_with_context_follow(
+            &source,
+            "",
+            "https://example.com/chapter",
+            None,
+            Some(r#"{"token":"T"}"#),
+            None,
+            Some("Title"),
+            None,
+            Some(&fields),
+            true,
+        );
+        assert_eq!(page.content, "true|/chapter|T");
+        assert_eq!(page.next_urls, vec!["https://example.com/next/7"]);
+        let context = UrlRuleContext {
+            chapter_title: Some("Title".to_string()),
+            chapter_fields: fields,
+            ..Default::default()
+        };
+        assert_eq!(
+            engine.replace_content_with_context(
+                &source,
+                "Title7 body",
+                "https://example.com",
+                &context
+            ),
+            " body"
+        );
+    }
+
     // The same field contract is exercised against all three item contexts.
     fn with_combination_fixture(
         mut check: impl FnMut(
@@ -5193,6 +5329,7 @@ mod tests {
             None,
             Some("Book"),
             Some("Old"),
+            None,
             None,
             true,
         );

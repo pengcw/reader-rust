@@ -1,8 +1,11 @@
-use once_cell::sync::Lazy;
+use std::sync::LazyLock as Lazy;
 use scraper::{ElementRef, Html, Selector};
 use std::collections::HashSet;
 
 use crate::parser::rule_analyzer::{self, split_top_level};
+
+static UNIVERSAL_SELECTOR: Lazy<Selector> =
+    Lazy::new(|| Selector::parse("*").expect("valid universal selector"));
 
 #[cfg(test)]
 thread_local! {
@@ -1085,24 +1088,20 @@ fn select_css<'a>(doc: &'a Html, css_selector: &str) -> Vec<ElementRef<'a>> {
             .iter()
             .flat_map(|part| select_css(doc, part))
             .collect();
-        let all = Selector::parse("*").expect("valid universal selector");
-        return unique_in_document_order(matches, doc.select(&all));
+        return unique_in_document_order(matches, doc.select(&UNIVERSAL_SELECTOR));
     }
     if let Some(matches) = select_css_with_not(css_selector, |part| select_css(doc, part)) {
-        let all = Selector::parse("*").expect("valid universal selector");
-        return unique_in_document_order(matches, doc.select(&all));
+        return unique_in_document_order(matches, doc.select(&UNIVERSAL_SELECTOR));
     }
     if let Some(matches) = select_css_with_has(css_selector, |part| select_css(doc, part)) {
-        let all = Selector::parse("*").expect("valid universal selector");
-        return unique_in_document_order(matches, doc.select(&all));
+        return unique_in_document_order(matches, doc.select(&UNIVERSAL_SELECTOR));
     }
     if let Some(matches) = select_css_with_matches(css_selector, |part| {
         parse_css_selector(part)
             .map(|sel| doc.select(&sel).collect())
             .unwrap_or_default()
     }) {
-        let all = Selector::parse("*").expect("valid universal selector");
-        return unique_in_document_order(matches, doc.select(&all));
+        return unique_in_document_order(matches, doc.select(&UNIVERSAL_SELECTOR));
     }
     select_css_with_contains(css_selector, |part| {
         let Some(sel) = parse_css_selector(part) else {
@@ -1129,28 +1128,24 @@ pub(crate) fn select_css_from_element<'a>(
             .iter()
             .flat_map(|part| select_css_from_element(el, part))
             .collect();
-        let all = Selector::parse("*").expect("valid universal selector");
-        return unique_in_document_order(matches, el.select(&all));
+        return unique_in_document_order(matches, el.select(&UNIVERSAL_SELECTOR));
     }
     if let Some(matches) =
         select_css_with_not(css_selector, |part| select_css_from_element(el, part))
     {
-        let all = Selector::parse("*").expect("valid universal selector");
-        return unique_in_document_order(matches, el.select(&all));
+        return unique_in_document_order(matches, el.select(&UNIVERSAL_SELECTOR));
     }
     if let Some(matches) =
         select_css_with_has(css_selector, |part| select_css_from_element(el, part))
     {
-        let all = Selector::parse("*").expect("valid universal selector");
-        return unique_in_document_order(matches, el.select(&all));
+        return unique_in_document_order(matches, el.select(&UNIVERSAL_SELECTOR));
     }
     if let Some(matches) = select_css_with_matches(css_selector, |part| {
         parse_css_selector(part)
             .map(|sel| el.select(&sel).collect())
             .unwrap_or_default()
     }) {
-        let all = Selector::parse("*").expect("valid universal selector");
-        return unique_in_document_order(matches, el.select(&all));
+        return unique_in_document_order(matches, el.select(&UNIVERSAL_SELECTOR));
     }
     select_css_with_contains(css_selector, |part| {
         let Some(sel) = parse_css_selector(part) else {
@@ -1165,8 +1160,7 @@ fn child_elements<'a>(el: ElementRef<'a>) -> Vec<ElementRef<'a>> {
 }
 
 fn select_by_text_doc<'a>(doc: &'a Html, needle: &str) -> Vec<ElementRef<'a>> {
-    let sel = Selector::parse("*").unwrap();
-    doc.select(&sel)
+    doc.select(&UNIVERSAL_SELECTOR)
         .filter(|el| own_text(el).contains(needle))
         .collect()
 }
@@ -1176,12 +1170,10 @@ fn select_by_text_from_element<'a>(el: ElementRef<'a>, needle: &str) -> Vec<Elem
     if own_text(&el).contains(needle) {
         matches.push(el);
     }
-    if let Ok(sel) = Selector::parse("*") {
-        matches.extend(
-            el.select(&sel)
-                .filter(|candidate| own_text(candidate).contains(needle)),
-        );
-    }
+    matches.extend(
+        el.select(&UNIVERSAL_SELECTOR)
+            .filter(|candidate| own_text(candidate).contains(needle)),
+    );
     matches
 }
 
@@ -2924,14 +2916,18 @@ fn format_keep_img_with_script_text(
 
     // Reader cleaning drops script/style bodies; the JS facade only strips tags below.
     let mut text = preserve_image_metadata(content);
+    static CLEAN_KEEP_SCRIPT_RE: Lazy<regex::Regex> =
+        Lazy::new(|| regex::Regex::new(r"(?s)<!--.*?-->").unwrap());
+    static CLEAN_STRIP_ALL_RE: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<!--.*?-->")
+            .unwrap()
+    });
     let removed = if keep_script_text {
-        r"(?s)<!--.*?-->"
+        &*CLEAN_KEEP_SCRIPT_RE
     } else {
-        r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<!--.*?-->"
+        &*CLEAN_STRIP_ALL_RE
     };
-    if let Ok(re) = regex::Regex::new(removed) {
-        text = re.replace_all(&text, "").into_owned();
-    }
+    text = removed.replace_all(&text, "").into_owned();
 
     // Preserve extension review attributes as opaque data at their original text position.
     // The host decides presentation and action execution; no source-specific functions here.
@@ -3122,6 +3118,20 @@ pub fn clean_html(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleaning_modes_keep_their_script_policy_across_calls() {
+        let input = "<script>脚本文本</script><style>样式文本</style><!--隐藏\n注释--><p>正文🦀</p>";
+        for _ in 0..3 {
+            assert_eq!(format_keep_img(input, ""), "正文🦀");
+            let formatted = format_js_html(input, "");
+            assert!(formatted.contains("脚本文本"));
+            assert!(formatted.contains("样式文本"));
+            assert!(formatted.contains("正文🦀"));
+            assert!(!formatted.contains("隐藏"));
+            assert!(!formatted.contains("注释"));
+        }
+    }
 
     #[test]
     #[ignore = "manual XPath stage measurement; no timing assertions"]

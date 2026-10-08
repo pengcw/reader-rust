@@ -3,18 +3,20 @@
 //! Keep crawler transport details in this module so `js.rs` and `js_state.rs`
 //! do not need to depend directly on crawler networking types.
 
+pub(crate) use crate::crawler::HttpClient;
 use crate::crawler::{
     analyze_url_with_headers, decode_body, execute_request_spec, execute_request_spec_limited,
     format_analyzed_body, render_webview_with_rakers, HttpClientError, RequestSpec,
     DEFAULT_WEBVIEW_USER_AGENT,
 };
-pub(crate) use crate::crawler::HttpClient;
 use crate::model::book_source::BookSource;
+use crate::parser::js_compat::json_value_to_string;
 use crate::parser::js_state::ACTIVE_JS_BOOK_SOURCE;
 use base64::Engine;
-use once_cell::sync::Lazy;
+use encoding_rs::{Encoding, UTF_8};
 use serde_json::Value as JsonValue;
 use std::cell::RefCell;
+use std::sync::LazyLock as Lazy;
 use ureq::http::Method;
 
 #[derive(Clone)]
@@ -237,15 +239,36 @@ fn java_request_simple_response_with_client(
                     })
                 })
                 .collect::<serde_json::Map<String, JsonValue>>();
+            let mut header_values = std::collections::BTreeMap::<String, Vec<String>>::new();
+            for (name, value) in &response.headers {
+                if let Ok(value) = value.to_str() {
+                    header_values
+                        .entry(name.as_str().to_string())
+                        .or_default()
+                        .push(value.to_string());
+                }
+            }
+            let charset = response
+                .headers
+                .get(ureq::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(response_charset);
+            let encoding = charset.unwrap_or(UTF_8);
+            let body = encoding
+                .decode_without_bom_handling(&response.body)
+                .0
+                .into_owned();
             let status = response.status;
             serde_json::json!({
                 "__ffiStrResponse": true,
-                "body": String::from_utf8_lossy(&response.body).into_owned(),
+                "body": body,
+                "charset": charset.map(Encoding::name),
                 "bodyBase64": base64::engine::general_purpose::STANDARD.encode(&response.body),
                 "url": response.url,
                 "code": status,
                 "message": http_status_message(status),
                 "headers": headers,
+                "headerValues": header_values,
                 "isSuccessful": (200..300).contains(&status),
             })
         }
@@ -411,6 +434,60 @@ fn java_error_response(url: &str, error: &str) -> String {
     .to_string()
 }
 
+fn response_charset(content_type: &str) -> Option<&'static Encoding> {
+    content_type.split(';').find_map(|part| {
+        let (name, value) = part.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("charset") {
+            return None;
+        }
+        Encoding::for_label(value.trim().trim_matches(['\'', '"']).as_bytes())
+    })
+}
+
+/// Jsoup HTML parsing chooses BOM, declared charset, then a meta hint in 5KB.
+/// Unlike AnalyzeUrl decoding, this path never statistically guesses an encoding.
+pub(super) fn java_response_decode_text(
+    base64: &str,
+    charset: Option<&str>,
+    parse: bool,
+) -> Option<String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(base64)
+        .ok()?;
+    let declared = charset.and_then(|value| Encoding::for_label(value.as_bytes()));
+    let (encoding, skip) = if !parse {
+        (declared.unwrap_or(UTF_8), 0)
+    } else if let Some((encoding, skip)) = Encoding::for_bom(&bytes) {
+        (encoding, skip)
+    } else if let Some(encoding) = declared {
+        (encoding, 0)
+    } else {
+        let prefix = String::from_utf8_lossy(&bytes[..bytes.len().min(5120)]);
+        let document = scraper::Html::parse_document(&prefix);
+        static META: Lazy<scraper::Selector> = Lazy::new(|| {
+            scraper::Selector::parse("meta[http-equiv=content-type], meta[charset]")
+                .expect("valid meta selector")
+        });
+        let label = document.select(&META).find_map(|meta| {
+            meta.value()
+                .attr("http-equiv")
+                .and_then(|_| meta.value().attr("content"))
+                .and_then(response_charset)
+                .map(|encoding| encoding.name().to_string())
+                .or_else(|| meta.value().attr("charset").map(str::to_string))
+        });
+        (
+            label
+                .as_deref()
+                .and_then(|value| Encoding::for_label(value.as_bytes()))
+                .unwrap_or(UTF_8),
+            0,
+        )
+    };
+    let text = encoding.decode_without_bom_handling(&bytes[skip..]).0;
+    Some(serde_json::json!({"text":text, "charset":encoding.name()}).to_string())
+}
+
 fn java_request_headers(headers_json: &str) -> Vec<(String, String)> {
     serde_json::from_str::<JsonValue>(headers_json)
         .ok()
@@ -426,11 +503,65 @@ fn java_request_headers(headers_json: &str) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-fn json_value_to_string(value: &JsonValue) -> String {
-    match value {
-        JsonValue::String(value) => value.clone(),
-        JsonValue::Null => String::new(),
-        value => value.to_string(),
+#[cfg(test)]
+mod conversion_tests {
+    use super::*;
+
+    #[test]
+    fn response_parse_charset_priority_is_bom_header_meta_then_utf8() {
+        let decode = |bytes: &[u8], charset: Option<&str>, parse| -> JsonValue {
+            let input = base64::engine::general_purpose::STANDARD.encode(bytes);
+            serde_json::from_str(&java_response_decode_text(&input, charset, parse).unwrap())
+                .unwrap()
+        };
+        let html = "<meta charset='GBK'><p>中文</p>";
+        let encoded = encoding_rs::GBK.encode(html).0;
+        assert_eq!(decode(&encoded, Some("GBK"), false)["text"], html);
+        assert_ne!(decode(&encoded, None, false)["text"], html);
+        assert_eq!(decode(&encoded, None, true)["text"], html);
+        assert_eq!(decode(&encoded, Some("UTF-8"), true)["charset"], "UTF-8");
+        assert_eq!(
+            decode(&[0xef, 0xbb, 0xbf, b'A'], Some("GBK"), true)["text"],
+            "A"
+        );
+        assert_eq!(
+            decode(&[0xef, 0xbb, 0xbf, b'A'], Some("UTF-8"), false)["text"],
+            "\u{feff}A"
+        );
+        assert_eq!(decode(&[0xff, 0xfe, b'A', 0], None, true)["text"], "A");
+        assert_eq!(
+            decode(b"<!-- <meta charset='GBK'> --><p>ASCII</p>", None, true)["charset"],
+            "UTF-8"
+        );
+        assert_eq!(
+            decode(b"<meta charset='not-a-charset'><p>ASCII</p>", None, true)["charset"],
+            "UTF-8"
+        );
+        let late = format!("{}<meta charset='GBK'>", " ".repeat(5200));
+        assert_eq!(decode(late.as_bytes(), None, true)["charset"], "UTF-8");
+        assert_eq!(
+            response_charset("text/html; charset=\"GBK\""),
+            Some(encoding_rs::GBK)
+        );
+        assert_eq!(response_charset("text/html; charset='UTF-8'"), Some(UTF_8));
+    }
+
+    #[test]
+    fn json_conversion_preserves_variable_and_http_contracts() {
+        for (value, expected) in [
+            (serde_json::json!("text"), "text"),
+            (JsonValue::Null, ""),
+            (serde_json::json!(42), "42"),
+            (serde_json::json!(true), "true"),
+            (serde_json::json!([1, "x"]), r#"[1,"x"]"#),
+            (serde_json::json!({"key": "value"}), r#"{"key":"value"}"#),
+        ] {
+            assert_eq!(json_value_to_string(&value), expected);
+        }
+        assert_eq!(
+            java_request_headers(r#"{"X-Count":42,"X-Null":null}"#),
+            vec![("X-Count".to_string(), "42".to_string())]
+        );
     }
 }
 

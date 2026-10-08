@@ -1,44 +1,41 @@
-use crate::model::book_source::BookSource;
 use crate::parser::js_compat::{
     java_base64_decode, java_base64_decode_bytes, java_base64_encode_bytes, java_bytes_to_str,
-    java_digest_bytes, java_encode_uri, java_hmac_bytes, java_hmac_string_bytes,
-    java_str_to_bytes, java_time_format, java_time_format_utc, java_to_num_chapter,
-    java_to_url_json,
+    java_digest_bytes, java_encode_uri, java_hmac_bytes, java_hmac_string_bytes, java_str_to_bytes,
+    java_time_format, java_time_format_utc, java_to_num_chapter, java_to_url_json,
+    json_value_to_string,
 };
+pub(crate) use crate::parser::js_http::with_js_http_clients;
 use crate::parser::js_http::{
     decode_archive_text, java_analyzed_request_body, java_analyzed_request_response,
-    java_archive_input, java_request_simple, java_request_simple_response, java_web_view,
-    resolve_js_lib_entry, webview_user_agent,
+    java_archive_input, java_request_simple, java_request_simple_response,
+    java_response_decode_text, java_web_view, resolve_js_lib_entry, webview_user_agent,
+};
+#[cfg(test)]
+use crate::parser::js_http::{HttpClient, ACTIVE_JS_HTTP_CONTEXT};
+pub use crate::parser::js_state::with_js_lib;
+use crate::parser::js_state::{
+    active_info_map_state, capture_login_message, update_active_info_map, ACTIVE_JS_BOOK_SOURCE,
+    ACTIVE_JS_LIB, CLICK_BROWSER, LOGIN_MESSAGES, LOGIN_PREVIEW, MAX_INFO_MAP_BYTES,
+};
+pub(crate) use crate::parser::js_state::{
+    with_click_browser, with_js_info_map, with_login_messages, InfoMapState,
+};
+pub use crate::parser::js_url::{
+    eval_js_url, eval_js_url_template, eval_js_url_template_with_bindings,
+    eval_js_url_template_with_headers, eval_js_url_with_bindings, eval_js_url_with_headers,
 };
 use crate::parser::jsonpath;
 use crate::parser::rule_analyzer;
 use crate::parser::rule_engine;
 use crate::parser::source_regex;
-use crate::runtime::session::current_active_session;
 use crate::parser::{dom, html};
-pub use crate::parser::js_state::with_js_lib;
-pub use crate::parser::js_url::{
-    eval_js_url, eval_js_url_template, eval_js_url_template_with_bindings,
-    eval_js_url_template_with_headers, eval_js_url_with_bindings, eval_js_url_with_headers,
-};
-pub(crate) use crate::parser::js_http::{
-    with_js_http_client, with_js_http_clients, with_js_http_context,
-};
-pub(crate) use crate::parser::js_state::{
-    with_click_browser, with_js_info_map, with_login_messages, InfoMapState,
-};
-use crate::parser::js_state::{
-    active_info_map_state, capture_login_message, update_active_info_map, ACTIVE_JS_BOOK_SOURCE,
-    ACTIVE_JS_LIB, CLICK_BROWSER, LOGIN_MESSAGES, LOGIN_PREVIEW, MAX_INFO_MAP_BYTES,
-};
-#[cfg(test)]
-use crate::parser::js_http::{HttpClient, ACTIVE_JS_HTTP_CONTEXT};
+use crate::runtime::session::current_active_session;
 use crate::util::hash::md5_hex;
 use crate::util::text::strip_whitespace;
+use crate::util::uuid::generate_uuid_v4;
 use aes::Aes128;
 use base64::Engine;
 use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
-use once_cell::sync::Lazy;
 use rquickjs::context::EvalOptions;
 use rquickjs::function::Func;
 use rquickjs::{Context, Object, Runtime, Value};
@@ -48,9 +45,9 @@ use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::LazyLock as Lazy;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
-use uuid::Uuid;
 
 static JS_KV: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static JS_CACHE: Lazy<Mutex<HashMap<String, JsCacheEntry>>> =
@@ -69,7 +66,7 @@ static JS_DEVICE_ID: Lazy<String> = Lazy::new(|| {
     if let Some(existing) = map.get("__device_id") {
         return existing.clone();
     }
-    let generated = Uuid::new_v4().to_string();
+    let generated = generate_uuid_v4();
     map.insert("__device_id".to_string(), generated.clone());
     generated
 });
@@ -989,7 +986,7 @@ pub(super) fn eval_js_inner_with_source(
                 }),
             )?;
             java_obj.set("deviceID", Func::new(|| -> String { JS_DEVICE_ID.clone() }))?;
-            java_obj.set("randomUUID", Func::new(|| -> String { Uuid::new_v4().to_string() }))?;
+            java_obj.set("randomUUID", Func::new(|| -> String { generate_uuid_v4() }))?;
             java_obj.set(
                 "__secureRandomNextInt",
                 Func::new(|ctx: rquickjs::Ctx<'_>, bound: i32| -> rquickjs::Result<i32> {
@@ -1122,14 +1119,6 @@ pub(super) fn eval_js_inner_with_source(
             java_obj.set(
                 "hexEncodeToString",
                 Func::new(|input: String| -> String { hex::encode(input.as_bytes()) }),
-            )?;
-            java_obj.set(
-                "aesBase64DecodeToString",
-                Func::new(
-                    |input: String, key: String, algorithm: String, iv: String| -> String {
-                        java_aes_base64_decode_to_string(&input, &key, &algorithm, &iv)
-                    },
-                ),
             )?;
             java_obj.set(
                 "aesDecryptBytes",
@@ -1355,7 +1344,7 @@ pub(super) fn eval_js_inner_with_source(
             )?;
             java_obj.set(
                 "uuid",
-                Func::new(|| -> String { Uuid::new_v4().to_string() }),
+                Func::new(|| -> String { generate_uuid_v4() }),
             )?;
 
             let default_content_for_get_string = content_state.clone();
@@ -1393,7 +1382,7 @@ pub(super) fn eval_js_inner_with_source(
             java_obj.set(
                 "getStringList",
                 Func::new(
-                    move |rule: Option<String>,
+                    move |ctx: rquickjs::Ctx<'_>, rule: Option<String>,
                           content: Option<String>,
                           is_url: Option<bool>|
                           -> Vec<String> {
@@ -1405,13 +1394,13 @@ pub(super) fn eval_js_inner_with_source(
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .clone();
-                        java_get_string_list(
+                        with_js_reentrant_ctx(&ctx, || java_get_string_list(
                             rule.as_deref(),
                             content.as_deref(),
                             &default_content,
                             &base_url,
                             is_url.unwrap_or(false),
-                        )
+                        ))
                     },
                 ),
             )?;
@@ -1421,7 +1410,7 @@ pub(super) fn eval_js_inner_with_source(
             java_obj.set(
                 "getElements",
                 Func::new(
-                    move |rule: String, content: Option<String>, raw_css: Option<bool>| -> String {
+                    move |ctx: rquickjs::Ctx<'_>, rule: String, content: Option<String>, raw_css: Option<bool>| -> String {
                         let default_content = content_for_elements
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -1430,23 +1419,31 @@ pub(super) fn eval_js_inner_with_source(
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .clone();
-                        java_get_elements_json_with_mode(
+                        with_js_reentrant_ctx(&ctx, || java_get_elements_json_with_mode(
                             &rule,
                             content.as_deref().unwrap_or(&default_content),
                             &base_url,
                             raw_css.unwrap_or(false),
-                        )
+                        ))
                     },
                 ),
             )?;
             let content_for_element = content_state.clone();
+            let base_url_for_element = base_url_state.clone();
             java_obj.set(
                 "getElement",
-                Func::new(move |rule: String, content: Option<String>| -> Option<String> {
+                Func::new(move |ctx: rquickjs::Ctx<'_>, rule: String, content: Option<String>| -> Option<String> {
                     let default_content = content_for_element
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .clone();
+                    if let Some(script) = java_js_rule_script(&rule) {
+                        let base_url = base_url_for_element.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        let value = with_js_reentrant_ctx(&ctx, || java_element_js_value(
+                            script, content.as_deref().unwrap_or(&default_content), &base_url,
+                        )).unwrap_or(JsonValue::Null);
+                        return serde_json::to_string(&value).ok();
+                    }
                     let value: JsonValue = serde_json::from_str(
                         content.as_deref().unwrap_or(&default_content),
                     ).ok()?;
@@ -1507,14 +1504,7 @@ pub(super) fn eval_js_inner_with_source(
                         .unwrap_or_default()
                 }),
             )?;
-            java_obj.set(
-                "log",
-                Func::new(|msg: rquickjs::function::Opt<rquickjs::Coerced<String>>| {
-                    if let Some(m) = msg.0 {
-                        eprintln!("[legado::js] {}", m.0);
-                    }
-                }),
-            )?;
+            java_obj.set("log", Func::new(java_log))?;
             java_obj.set(
                 "toast",
                 Func::new(|msg: rquickjs::function::Opt<rquickjs::Coerced<String>>| capture_login_message(msg.0)),
@@ -1553,11 +1543,30 @@ pub(super) fn eval_js_inner_with_source(
             )?;
 
             java_obj.set("__clickCaptureActive", CLICK_BROWSER.with(|slot| slot.borrow().is_some()))?;
+            java_obj.set("__sourceAvailable", source_key.is_some() || ACTIVE_JS_BOOK_SOURCE.with(|slot| slot.borrow().is_some()))?;
+            java_obj.set(
+                "getCookie",
+                Func::new(|url: String, key: rquickjs::function::Opt<Option<String>>| -> String {
+                    current_active_session()
+                        .and_then(|active| match key.0.flatten() {
+                            Some(key) => active.get_cookie_key(&url, &key),
+                            None => active.get_cookie(&url),
+                        })
+                        .unwrap_or_default()
+                }),
+            )?;
+            java_obj.set("__responseDecodeText", Func::new(|bytes: String, charset: Option<String>, parse: bool| -> Option<String> {
+                java_response_decode_text(&bytes, charset.as_deref(), parse)
+            }))?;
             globals.set("java", java_obj)?;
             eval_script(
                 ctx.clone(),
                 r#"(function() {
                     const java = globalThis.java;
+                    const currentSource = globalThis.source;
+                    const sourceAvailable = java.__sourceAvailable;
+                    delete java.__sourceAvailable;
+                    java.getSource = () => sourceAvailable ? currentSource : null;
                     java.startBrowser = function(url, title, html) {
                         if (!java.__browserPreview(String(url || ''), String(title || ''), String(html || ''))) {
                             throw new Error('网页只读预览失败或当前执行入口不支持预览');
@@ -1698,9 +1707,21 @@ pub(super) fn eval_js_inner_with_source(
                     const responseFromJson = value => {
                         let raw;
                         try { raw = JSON.parse(String(value || '{}')); } catch (_) { raw = {}; }
-                        const body = String(raw.body == null ? '' : raw.body);
+                        let body = String(raw.body == null ? '' : raw.body);
+                        let charset = raw.charset == null ? null : String(raw.charset);
                         const headers = Object.assign({}, raw.headers || {});
                         const status = Number(raw.code || raw.status || 0);
+                        const headerValues = raw.headerValues || {};
+                        const responseCookies = new Map();
+                        for (const [name, values] of Object.entries(headerValues)) {
+                            if (name.toLowerCase() !== 'set-cookie') continue;
+                            for (const value of values) {
+                                const pair = String(value).split(';', 1)[0];
+                                const equals = pair.indexOf('=');
+                                if (equals <= 0) continue;
+                                responseCookies.set(pair.slice(0, equals).trim(), pair.slice(equals + 1).trim());
+                            }
+                        }
                         const header = name => {
                             const key = Object.keys(headers).find(k => k.toLowerCase() === String(name).toLowerCase());
                             return key === undefined ? null : headers[key];
@@ -1719,10 +1740,21 @@ pub(super) fn eval_js_inner_with_source(
                             headers: () => responseHeaders,
                             header,
                             hasHeader: name => header(name) !== null,
+                            multiHeaders: () => new Map(Object.entries(headerValues)),
+                            cookies: () => responseCookies,
+                            cookie: name => responseCookies.has(String(name)) ? responseCookies.get(String(name)) : null,
+                            hasCookie: name => responseCookies.has(String(name)),
                             contentType: () => header('content-type') || '',
-                            charset: () => {
-                                const match = /charset\s*=\s*([^;\s]+)/i.exec(header('content-type') || '');
-                                return match ? match[1] : 'UTF-8';
+                            charset: () => charset,
+                            parse() {
+                                const decoded = java.__responseDecodeText(String(raw.bodyBase64 || ''), charset, true);
+                                if (decoded == null) throw new Error('invalid response bytes');
+                                const parsed = JSON.parse(decoded);
+                                const document = org.jsoup.Jsoup.parse(parsed.text, String(raw.url || ''));
+                                charset = parsed.charset;
+                                // body() decodes the original bytes; parse() alone consumes a BOM.
+                                body = JSON.parse(java.__responseDecodeText(String(raw.bodyBase64 || ''), charset, false)).text;
+                                return document;
                             },
                             isSuccessful: () => status >= 200 && status < 300,
                             toString: () => body,
@@ -2266,7 +2298,16 @@ pub(super) fn eval_js_inner_with_source(
                     if (typeof globalThis.org.jsoup.Jsoup.parse !== 'function') {
                         globalThis.org.jsoup.Jsoup.parse = function(html, baseUri) {
                             let source = String(html == null ? '' : html);
-                            const base = String(baseUri == null ? '' : baseUri);
+                            let base = String(baseUri == null ? '' : baseUri);
+                            // Jsoup HtmlTreeBuilder uses the first resolvable base href
+                            // and keeps that document base after later DOM removal.
+                            for (const element of java.getElements('base[href]', source, true)) {
+                                const resolved = java.__jsoupAbsUrl(element.attr('href'), base);
+                                if (resolved !== '') {
+                                    base = resolved;
+                                    break;
+                                }
+                            }
                             const decorate = items => {
                                 for (const item of items) {
                                     const attr = item.attr.bind(item);
@@ -2284,6 +2325,8 @@ pub(super) fn eval_js_inner_with_source(
                                     };
                                     item.select = selector => decorate(select(selector));
                                     item.selectFirst = selector => item.select(selector).first();
+                                    item.absUrl = name => item.attr('abs:' + String(name));
+                                    item.baseUri = () => base;
                                 }
                                 items.attr = name => {
                                     const item = items.find(item => item.hasAttr(name));
@@ -2293,6 +2336,7 @@ pub(super) fn eval_js_inner_with_source(
                                 return items;
                             };
                             return {
+                                baseUri() { return base; },
                                 title() {
                                     const title = this.selectFirst('title');
                                     return title ? title.text() : '';
@@ -3092,6 +3136,38 @@ pub(super) fn eval_js_inner_with_source(
                     Packages.java.security = Packages.java.security || {};
                     Packages.java.security.SecureRandom = markClass('SecureRandom', SecureRandom);
                     Packages.java.lang.String = markClass('String', JavaString);
+                    // Deliberately limited to the string overloads used by source rules.
+                    function JavaStringBuilder(initial) {
+                        if (arguments.length > 1 || (arguments.length === 1 && typeof initial !== 'string')) {
+                            throw new TypeError('StringBuilder supports empty or string construction only');
+                        }
+                        if (!new.target) return arguments.length === 0
+                            ? new JavaStringBuilder() : new JavaStringBuilder(initial);
+                        let text = arguments.length === 0 ? '' : initial;
+                        const checkSize = size => {
+                            if (size > 262144) throw new RangeError('StringBuilder size limit exceeded');
+                        };
+                        checkSize(text.length);
+                        this.append = function(value) {
+                            if (arguments.length !== 1 || typeof value !== 'string') {
+                                throw new TypeError('StringBuilder.append supports one string only');
+                            }
+                            checkSize(text.length + value.length);
+                            text += value;
+                            return this;
+                        };
+                        this.toString = () => text;
+                    }
+                    Packages.java.lang.StringBuilder = markClass('StringBuilder', JavaStringBuilder);
+                    Packages.java.lang.Integer = markClass('Integer', {
+                        toHexString(value) {
+                            if (arguments.length !== 1 || !Number.isInteger(value)
+                                || value < -2147483648 || value > 2147483647) {
+                                throw new TypeError('Integer.toHexString requires a signed 32-bit integer');
+                            }
+                            return (value >>> 0).toString(16);
+                        }
+                    });
                     Packages.java.lang.System = markClass('System', globalThis.System);
                     Packages.java.io.ByteArrayInputStream = markClass('ByteArrayInputStream', ByteArrayInputStream);
                     Packages.java.io.ByteArrayOutputStream = markClass('ByteArrayOutputStream', ByteArrayOutputStream);
@@ -3167,6 +3243,65 @@ pub(super) fn eval_js_inner_with_source(
                     Packages.okhttp3 = Packages.okhttp3 || {};
                     Packages.okhttp3.HttpUrl = markClass('HttpUrl', JavaHttpUrl);
 
+                    // HtmlFormatter.kt at Legado 5198645: regex text formatting,
+                    // not DOM extraction, entity decoding, or reader cleaning.
+                    const formatHtmlText = (html, indent, keepImages = false) => {
+                        if (html === null) return '';
+                        if (typeof html !== 'string') throw new TypeError('HtmlFormatter requires string or null');
+                        return html
+                            .replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n').replace(/\\r/g, '\n')
+                            .replace(/(&nbsp;)+/g, ' ')
+                            .replace(/(&ensp;|&emsp;)/g, ' ')
+                            .replace(/(&thinsp;|&zwnj;|&zwj;|\u2009|\u200c|\u200d)/g, '')
+                            .replace(/<\/?(?:div|p|br|hr|h\d|article|dd|dl)[^>]*>/g, '\n')
+                            .replace(/<!--[^>]*-->/g, '')
+                            .replace(keepImages ? /<\/?(?!img)[a-zA-Z]+(?=[ >])[^<>]*>/g
+                                : /<\/?[a-zA-Z]+(?=[ >])[^<>]*>/g, '')
+                            // Java Pattern's default whitespace is ASCII, unlike JS \s.
+                            .replace(/[ \t\n\x0b\f\r]*\n+[ \t\n\x0b\f\r]*/g, '\n' + indent)
+                            .replace(/^[\n \t\x0b\f\r]+/g, indent)
+                            .replace(/[\n \t\x0b\f\r]+$/g, '');
+                    };
+                    Packages.io = Packages.io || {};
+                    Packages.io.legado = Packages.io.legado || {};
+                    Packages.io.legado.app = Packages.io.legado.app || {};
+                    Packages.io.legado.app.utils = Packages.io.legado.app.utils || {};
+                    Packages.io.legado.app.utils.HtmlFormatter = markClass('HtmlFormatter', {
+                        format(html) {
+                            if (arguments.length !== 1) throw new TypeError('HtmlFormatter.format supports one argument');
+                            return formatHtmlText(html, '　　');
+                        },
+                        formatIntro(html) {
+                            if (arguments.length !== 1) throw new TypeError('HtmlFormatter.formatIntro requires one argument');
+                            return formatHtmlText(html, '');
+                        },
+                        formatKeepImg(html, redirectUrl) {
+                            if (arguments.length < 1 || arguments.length > 2
+                                || (redirectUrl != null && !(redirectUrl instanceof JavaURL))) {
+                                throw new TypeError('HtmlFormatter.formatKeepImg requires content and optional Java URL');
+                            }
+                            const formatted = formatHtmlText(html, '　　', true);
+                            const image = /<img[^>]*[ \t\n\x0b\f\r]src[ \t\n\x0b\f\r]*=[ \t\n\x0b\f\r]*['"]([^'"{>]*\{(?:[^{}]|\{[^}>]+\})+\})['"][^>]*>|<img[^>]*[ \t\n\x0b\f\r]data-(?:src|original|srcset)[ \t\n\x0b\f\r]*=[ \t\n\x0b\f\r]*['"]([^'">]+)['"][^>]*>|<img[^>]*[ \t\n\x0b\f\r]src[ \t\n\x0b\f\r]*=[ \t\n\x0b\f\r]*"([^">]+)"[^>]*>|<img[^>]*[ \t\n\x0b\f\r](?:data-[^=>]*|src)=[ \t\n\x0b\f\r]*['"]([^'">]*)['"][^>]*>/gi;
+                            return formatted.replace(image, (tag, metadata, lazy, quoted, fallback) => {
+                                let address = metadata ?? lazy ?? quoted ?? fallback;
+                                let param = '';
+                                if (metadata !== undefined) {
+                                    const separator = /[ \t\n\x0b\f\r]*,[ \t\n\x0b\f\r]*(?=\{)/.exec(address);
+                                    if (separator !== null) {
+                                        param = ',' + address.slice(separator.index + separator[0].length);
+                                        address = address.slice(0, separator.index);
+                                    }
+                                }
+                                address = address.trim();
+                                if (redirectUrl != null && !/^(?:[a-z][a-z0-9+.-]*:\/\/|data:)/i.test(address)) {
+                                    address = address.startsWith('javascript') ? ''
+                                        : java.__jsoupAbsUrl(address, redirectUrl.toString()) || address;
+                                }
+                                return '<img src="' + address + param + '">';
+                            });
+                        }
+                    });
+
                     const exposeJavaValue = (target, value) => {
                         if (!value) return;
                         if (value.__javaName) {
@@ -3210,6 +3345,7 @@ pub(super) fn eval_js_inner_with_source(
             let dom_string_result = dom::install(&ctx)?;
             eval_script(ctx.clone(), include_str!("js_security.js"))?;
             eval_script(ctx.clone(), include_str!("js_des.js"))?;
+            eval_script(ctx.clone(), include_str!("js_aes.js"))?;
 
             if let Some(state) = active_info_map_state() {
                 install_info_map(&ctx, &state)?;
@@ -3297,6 +3433,37 @@ pub(super) fn eval_js_inner_with_source(
         runtime.run_gc();
         eval_result
     })
+}
+
+fn java_log<'js>(
+    ctx: rquickjs::Ctx<'js>,
+    msg: rquickjs::function::Opt<Value<'js>>,
+) -> rquickjs::Result<Value<'js>> {
+    let value = msg.0.unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+    let text: rquickjs::Coerced<String> = rquickjs::FromJs::from_js(&ctx, value.clone())?;
+    eprintln!("[legado::js] {}", text.0);
+    Ok(value)
+}
+
+fn scoped_java_variable(bindings: &HashMap<String, JsonValue>, key: &str) -> Option<String> {
+    let chapter = bindings.get("chapter");
+    let book = bindings.get("book");
+    let scoped_value = chapter
+        .and_then(|scope| scope.get("variableMap"))
+        .and_then(|variables| variables.get(key))
+        .or_else(|| {
+            book.and_then(|scope| scope.get("variableMap"))
+                .and_then(|variables| variables.get(key))
+        })
+        .or_else(|| chapter.and_then(|scope| scope.get(key)))
+        .or_else(|| book.and_then(|scope| scope.get(key)))
+        .or_else(|| {
+            (key == "bookName")
+                .then(|| book.and_then(|scope| scope.get("name")))
+                .flatten()
+        })
+        .or_else(|| bindings.get(key));
+    scoped_value.map(json_value_to_string)
 }
 
 fn wrapped_string_value<'js>(
@@ -3511,13 +3678,20 @@ pub(crate) fn java_get_string(
         return String::new();
     };
 
-    let target_content = content.unwrap_or(default_content).trim();
-    if target_content.is_empty() {
+    let js_rule = java_js_rule_script(rule).is_some();
+    let target_content = content.unwrap_or(default_content);
+    let target_content = if js_rule {
+        target_content
+    } else {
+        target_content.trim()
+    };
+    if target_content.is_empty() && !js_rule {
         return finalize_java_get_string_url(String::new(), base_url, is_url);
     }
 
-    // 支持 || 与 && 组合符 (规范 6.8 & 8.2)
-    let split = rule_analyzer::split_top_level(rule, &["||", "&&"]);
+    // JS rules own their logical operators; combine only extraction rules.
+    let delimiters: &[&str] = if js_rule { &[] } else { &["||", "&&"] };
+    let split = rule_analyzer::split_top_level(rule, delimiters);
     if let Some(delim) = split.delimiter.as_deref() {
         if delim == "||" {
             for part in split.parts {
@@ -3649,22 +3823,50 @@ pub(crate) fn java_get_string_list(
     base_url: &str,
     is_url: bool,
 ) -> Vec<String> {
+    let list = java_get_string_list_inner(rule, content, default_content, base_url);
+    if !is_url {
+        return list;
+    }
+    // AnalyzeRule normalizes and deduplicates only the completed URL list.
+    let mut urls = Vec::new();
+    for item in list {
+        let url = rule_engine::resolve_url(base_url, &item);
+        if !url.is_empty() && !urls.contains(&url) {
+            urls.push(url);
+        }
+    }
+    urls
+}
+
+fn java_get_string_list_inner(
+    rule: Option<&str>,
+    content: Option<&str>,
+    default_content: &str,
+    base_url: &str,
+) -> Vec<String> {
     let Some(rule) = rule.map(str::trim).filter(|s| !s.is_empty()) else {
         return Vec::new();
     };
 
-    let target_content = content.unwrap_or(default_content).trim();
-    if target_content.is_empty() {
+    let js_rule = java_js_rule_script(rule).is_some();
+    let target_content = content.unwrap_or(default_content);
+    let target_content = if js_rule {
+        target_content
+    } else {
+        target_content.trim()
+    };
+    if target_content.is_empty() && !js_rule {
         return Vec::new();
     }
 
-    // 支持 || 与 && / %% 组合符 (规范 6.9 & 8.2)
-    let split = rule_analyzer::split_top_level(rule, &["||", "&&", "%%"]);
+    // JS rules own their logical operators; combine only extraction rules.
+    let delimiters: &[&str] = if js_rule { &[] } else { &["||", "&&", "%%"] };
+    let split = rule_analyzer::split_top_level(rule, delimiters);
     if let Some(delim) = split.delimiter.as_deref() {
         if delim == "||" {
             for part in split.parts {
                 let res =
-                    java_get_string_list(Some(&part), content, default_content, base_url, is_url);
+                    java_get_string_list_inner(Some(&part), content, default_content, base_url);
                 if !res.is_empty() {
                     return res;
                 }
@@ -3673,12 +3875,11 @@ pub(crate) fn java_get_string_list(
         } else if delim == "&&" {
             let mut results = Vec::new();
             for part in split.parts {
-                results.extend(java_get_string_list(
+                results.extend(java_get_string_list_inner(
                     Some(&part),
                     content,
                     default_content,
                     base_url,
-                    is_url,
                 ));
             }
             return results;
@@ -3687,7 +3888,7 @@ pub(crate) fn java_get_string_list(
                 .parts
                 .iter()
                 .map(|part| {
-                    java_get_string_list(Some(part), content, default_content, base_url, is_url)
+                    java_get_string_list_inner(Some(part), content, default_content, base_url)
                 })
                 .collect();
             return rule_analyzer::interleave_result_groups(groups);
@@ -3705,15 +3906,40 @@ pub(crate) fn java_get_string_list(
         || main_rule.starts_with("js:")
     {
         let script = rule_engine::strip_js_rule(main_rule);
-        if let Ok(js_res) = eval_js(script, target_content, base_url) {
-            js_res
-                .lines()
-                .map(|s| s.to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        } else {
-            Vec::new()
-        }
+        // Tag the result before eval_js stringifies it: a real JS array is
+        // a list, while a string containing JSON remains ordinary text.
+        let encoded = serde_json::to_string(script).unwrap();
+        let tagged = format!(
+            r#"(function(values) {{
+            const raw = values[0] === undefined ? values[1] : values[0];
+            const value = java.__javaStringResult(raw) ?? raw;
+            return JSON.stringify(Array.isArray(value)
+                ? {{items: value.map(item => String(item))}}
+                : value == null ? {{items: []}}
+                : {{text: typeof value === 'string' ? value : JSON.stringify(value)}});
+        }})((function() {{ return [eval({encoded}), globalThis.result]; }})())"#
+        );
+        eval_js(&tagged, target_content, base_url)
+            .ok()
+            .and_then(|result| serde_json::from_str::<JsonValue>(&result).ok())
+            .map(|result| {
+                if let Some(items) = result.get("items").and_then(JsonValue::as_array) {
+                    items
+                        .iter()
+                        .filter_map(JsonValue::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                } else {
+                    result
+                        .get("text")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or_default()
+                        .split('\n')
+                        .map(str::to_owned)
+                        .collect()
+                }
+            })
+            .unwrap_or_default()
     } else if let Some(pure) = html::xpath_rule(main_rule) {
         html::select_xpath_from_context(target_content, pure)
             .unwrap_or_else(|| html::select_xpath(target_content, pure))
@@ -3792,14 +4018,6 @@ pub(crate) fn java_get_string_list(
             .collect();
     }
 
-    if is_url {
-        list = list
-            .into_iter()
-            .filter(|item| !item.is_empty())
-            .map(|item| rule_engine::resolve_url(base_url, &item))
-            .collect();
-    }
-
     list
 }
 
@@ -3820,6 +4038,28 @@ fn jsoup_remove_elements(source: &str, selector: &str) -> Option<String> {
     Some(document.html())
 }
 
+fn java_js_rule_script(rule: &str) -> Option<&str> {
+    let rule = rule.trim();
+    (rule.starts_with("@js:") || rule.starts_with("js:") || rule.starts_with("<js>"))
+        .then(|| rule_engine::strip_js_rule(rule))
+}
+
+fn java_element_js_value(script: &str, content: &str, base_url: &str) -> Option<JsonValue> {
+    // Keep the JS type before the generic evaluator converts it to text.
+    // Only undefined completion falls back to result; null and empty string do not.
+    let encoded = serde_json::to_string(script).ok()?;
+    let tagged = format!(
+        r#"(function(values) {{
+        return JSON.stringify({{value: values[0] === undefined ? values[1] : values[0]}});
+    }})((function() {{ return [eval({encoded}), globalThis.result]; }})())"#
+    );
+    let result = eval_js(&tagged, content, base_url).ok()?;
+    serde_json::from_str::<JsonValue>(&result)
+        .ok()?
+        .get("value")
+        .cloned()
+}
+
 fn java_get_elements_json_with_mode(
     rule: &str,
     content: &str,
@@ -3827,6 +4067,18 @@ fn java_get_elements_json_with_mode(
     raw_css: bool,
 ) -> String {
     let rule = rule.trim();
+    if !raw_css {
+        if let Some(script) = java_js_rule_script(rule) {
+            let values = match java_element_js_value(script, content, base_url) {
+                Some(JsonValue::Array(items)) => items
+                    .into_iter()
+                    .filter(|item| !item.is_null())
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            return serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string());
+        }
+    }
     let content = content.trim();
     if rule.is_empty() || content.is_empty() {
         return "[]".to_string();
@@ -3871,12 +4123,7 @@ fn java_get_elements_json_with_mode(
         }
     }
 
-    if !raw_css
-        && (rule.starts_with("@regex:")
-            || rule.starts_with(':')
-            || rule.starts_with("@js:")
-            || rule.starts_with("js:"))
-    {
+    if !raw_css && (rule.starts_with("@regex:") || rule.starts_with(':')) {
         let values = java_get_string_list(Some(rule), Some(content), "", base_url, false)
             .into_iter()
             .map(JsonValue::String)
@@ -3918,27 +4165,6 @@ fn java_get_elements_json_with_mode(
         })
         .collect::<Vec<_>>();
     serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string())
-}
-
-fn java_aes_base64_decode_to_string(input: &str, key: &str, algorithm: &str, iv: &str) -> String {
-    let algorithm = algorithm.to_ascii_uppercase();
-    if algorithm != "AES/CBC/PKCS5PADDING" && algorithm != "AES/CBC/PKCS7PADDING" {
-        return String::new();
-    }
-
-    let Ok(mut encrypted) = base64::engine::general_purpose::STANDARD.decode(input.trim()) else {
-        return String::new();
-    };
-
-    let Ok(cipher) = Aes128CbcDecryptor::new_from_slices(key.as_bytes(), iv.as_bytes()) else {
-        return String::new();
-    };
-
-    cipher
-        .decrypt_padded_mut::<Pkcs7>(&mut encrypted)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes.to_vec()).ok())
-        .unwrap_or_default()
 }
 
 fn java_aes_decrypt_byte_array(input: &str) -> Vec<u8> {
@@ -4237,11 +4463,12 @@ fn js_cache_delete(key: &str) -> bool {
         .is_some()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::crawler::session::{with_active_session, ExecuteSession};
+    use crate::model::book_source::BookSource;
+    use crate::parser::js_http::{with_js_http_client, with_js_http_context};
     use serde_json::json;
     use std::io::{BufRead, Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -4667,6 +4894,47 @@ mod tests {
     }
 
     #[test]
+    fn audit_get_source_preserves_source_identity_and_absence() {
+        let url = "https://example.com";
+        assert_eq!(
+            eval_js("java.getSource() === null", "", url).unwrap(),
+            "true"
+        );
+        let source = BookSource {
+            book_source_url: url.to_string(),
+            ..Default::default()
+        };
+        let client = HttpClient::standalone();
+        assert_eq!(
+            with_js_http_context(&client, &source, || {
+                eval_js("java.getSource() === source && java.getSource().getKey() === 'https://example.com'", "", url).unwrap()
+            }),
+            "true"
+        );
+        assert_eq!(
+            eval_js("java.getSource() === null", "", url).unwrap(),
+            "true"
+        );
+    }
+
+    #[test]
+    fn audit_log_preserves_input_type_and_object_identity() {
+        assert_eq!(eval_js(
+            "const obj = {value: 1}; [java.log(obj) === obj, java.log(42) === 42, java.log(true) === true, java.log(null) === null, java.log() === undefined, java.log('text') === 'text'].join('|')",
+            "", "https://example.com"
+        ).unwrap(), "true|true|true|true|true|true");
+        assert_eq!(
+            eval_js(
+                "result = java.log('new content'); result",
+                "old",
+                "https://example.com"
+            )
+            .unwrap(),
+            "new content"
+        );
+    }
+
+    #[test]
     fn java_log_coerces_numbers_and_other_values_to_strings() {
         let result = eval_js(
             r#"java.log(1700000000.125); java.log(true); java.log({ timestamp: 1700000000 }); java.log(null); java.log(); 'ok'"#,
@@ -4679,7 +4947,7 @@ mod tests {
 
     #[test]
     fn low_risk_compat_apis_cover_headers_encodings_cache_and_utc_time() {
-        let cache_key = format!("js-compat-{}", Uuid::new_v4());
+        let cache_key = format!("js-compat-{}", generate_uuid_v4());
         let script = format!(
             r#"
                 const bytes = java.strToBytes('中文', 'GBK');
@@ -4707,7 +4975,7 @@ mod tests {
             "中文|%D6%D0%CE%C4|a+b%2Fc%7E|中文|726561646572|114,101,97,100,101,114|reader|true|1970-01-01 08:00:00.000|true|cached|true|true"
         );
 
-        let expired_key = format!("js-expired-{}", Uuid::new_v4());
+        let expired_key = format!("js-expired-{}", generate_uuid_v4());
         JS_CACHE
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -4762,7 +5030,7 @@ mod tests {
     #[test]
     fn js_cache_is_isolated_by_session_and_restored_from_session_delta() {
         let url = "https://same-source.example/books";
-        let key = format!("session-cache-{}", Uuid::new_v4());
+        let key = format!("session-cache-{}", generate_uuid_v4());
         let (value, saved) = with_active_session(None, url, |_| {
             eval_js(
                 &format!("cache.put('{key}', 'user-a', 60); cache.get('{key}')"),
@@ -5660,6 +5928,51 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
     }
 
     #[test]
+    fn java_get_cookie_matches_legado_overloads_and_session_scope() {
+        let url = "https://example.com";
+        let initial = ExecuteSession {
+            cookies: Some("sid=initial_token; token=a=b=c".to_string()),
+            ..Default::default()
+        };
+        let (result, _) = with_active_session(Some(&initial), url, |active| {
+            let before = active.current_session();
+            let result = eval_js(
+                r#"[
+                    typeof java.getCookie('example.com') === 'string',
+                    java.getCookie('example.com') === cookie.getCookie('example.com'),
+                    java.getCookie('example.com', null) === cookie.getCookie('example.com'),
+                    java.getCookie('example.com', undefined) === cookie.getCookie('example.com'),
+                    java.getCookie('example.com', 'sid'),
+                    java.getCookie('https://example.com/path', 'token'),
+                    java.getCookie('example.com', 'missing'),
+                    java.getCookie('example.com', ''),
+                    java.getCookie('https://unrelated.example', 'sid')
+                ].join('|')"#,
+                "",
+                url,
+            )
+            .unwrap();
+            assert_eq!(
+                active.current_session(),
+                before,
+                "Cookie reads must not change session state"
+            );
+            result
+        });
+        assert_eq!(result, "true|true|true|true|initial_token|a=b=c|||");
+        let (result, _) = with_active_session(None, url, |_| {
+            eval_js("java.getCookie('example.com', 'sid')", "", url).unwrap()
+        });
+        assert_eq!(result, "");
+        assert_eq!(
+            eval_js("java.getCookie('example.com')", "", url).unwrap(),
+            ""
+        );
+        assert!(eval_js("java.getCookie()", "", url).is_err());
+        assert!(eval_js("java.getCookie('example.com', {})", "", url).is_err());
+    }
+
+    #[test]
     fn compat_cookie_replace_merges_existing_values() {
         let initial = ExecuteSession {
             cookies: Some("sid=old; keep=yes".to_string()),
@@ -6036,6 +6349,109 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
             )
         })
         .is_err());
+    }
+
+    #[test]
+    fn audit_simple_response_preserves_duplicate_headers_and_response_cookies() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/cookies", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = accept_with_timeout(&listener);
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            write!(stream, "HTTP/1.1 200 OK\r\nSet-Cookie: sid=first; Expires=Wed, 21 Oct 2037 07:28:00 GMT; Path=/\r\nSet-Cookie: token=a=b=c; Path=/\r\nX-Multi: first\r\nX-Multi: second\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
+        });
+        let initial = ExecuteSession {
+            cookies: Some("unrelated=session".to_string()),
+            ..Default::default()
+        };
+        let (result, _) = with_active_session(Some(&initial), &url, |_| {
+            eval_js(&format!("const r=java.get('{}', {{}}); [r.cookie('sid'),r.cookie('token'),r.cookie('missing') === null,r.hasCookie('token'),r.hasCookie('unrelated'),r.cookies().get('sid'),r.multiHeaders().get('set-cookie').length,r.multiHeaders().get('x-multi').join(','),r.body()].join('|')", url), "", &url).unwrap()
+        });
+        assert_eq!(
+            result,
+            "first|a=b=c|true|true|false|first|2|first,second|ok"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn simple_http_response_parse_preserves_charset_bytes_and_base_uri() {
+        let html = "<meta charset='GBK'><title>中文</title><a href='../chapter'>正文</a>";
+        let gbk = encoding_rs::GBK.encode(html).0.into_owned();
+        for (content_type, bytes, initial_charset, initial_matches) in [
+            ("text/html", gbk.clone(), "null", false),
+            ("text/html; charset=\"GBK\"", gbk, "GBK", true),
+            (
+                "text/html; charset=GBK",
+                [b"\xef\xbb\xbf".as_slice(), html.as_bytes()].concat(),
+                "GBK",
+                false,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/dir/index", listener.local_addr().unwrap());
+            let byte_count = bytes.len();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).unwrap();
+                stream.write_all(&bytes).unwrap();
+            });
+            let script = format!(
+                r#"const r=java.get('{url}', {{}});
+                const initial=[String(r.charset()),r.body().includes('中文')];
+                const d=r.parse(); const a=d.selectFirst('a');
+                JSON.stringify([initial,d.title(),a.text(),a.absUrl('href'),
+                    a.attr('abs:href'),d.baseUri(),a.baseUri(),
+                    d.selectFirst('.absent')===null,r.body().includes('中文'),
+                    r.bodyAsBytes().length,r.charset(),r.parse().title()])"#
+            );
+            let result = with_js_http_client(&HttpClient::standalone(), || {
+                eval_js(&script, "", &url).unwrap()
+            });
+            server.join().unwrap();
+            let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+            let base = url::Url::parse(&url)
+                .unwrap()
+                .join("../chapter")
+                .unwrap()
+                .to_string();
+            assert_eq!(
+                value,
+                serde_json::json!([
+                    [initial_charset, initial_matches],
+                    "中文",
+                    "正文",
+                    base,
+                    base,
+                    url,
+                    url,
+                    true,
+                    true,
+                    byte_count,
+                    if content_type == "text/html; charset=GBK" {
+                        "UTF-8"
+                    } else {
+                        "GBK"
+                    },
+                    "中文"
+                ])
+            );
+        }
     }
 
     #[test]

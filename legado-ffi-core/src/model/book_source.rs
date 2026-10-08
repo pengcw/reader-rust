@@ -429,11 +429,11 @@ fn find_legacy_url_marker(input: &str, marker: &str) -> Option<usize> {
 }
 
 fn convert_legacy_url_literal(input: &str) -> String {
-    static OFFSETS: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+    static OFFSETS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"<searchPage([-+]1)>|\{searchPage([-+]1)\}|searchPage([-+]1)").unwrap()
     });
-    static CHOICES: once_cell::sync::Lazy<regex::Regex> =
-        once_cell::sync::Lazy::new(|| regex::Regex::new(r"\{([^{}]*,[^{}]*)\}").unwrap());
+    static CHOICES: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\{([^{}]*,[^{}]*)\}").unwrap());
     let url = OFFSETS.replace_all(input, |captures: &regex::Captures<'_>| {
         let offset = captures.iter().skip(1).flatten().next().unwrap().as_str();
         format!("{{{{page{offset}}}}}")

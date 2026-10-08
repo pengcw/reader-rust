@@ -82,7 +82,7 @@ pub fn reader_eval(input: char_p::Ref<'_>, rule: char_p::Ref<'_>) -> char_p::Box
         return ffi_string(env!("CARGO_PKG_VERSION").to_string());
     }
     if rule == "@uuid" {
-        return ffi_string(uuid::Uuid::new_v4().to_string());
+        return ffi_string(crate::util::uuid::generate_uuid_v4());
     }
     if rule == "@android_id" {
         use rand::Rng;
