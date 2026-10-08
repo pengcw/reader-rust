@@ -92,6 +92,26 @@ fn book_source_accepts_numeric_metadata_as_strings() {
 }
 
 #[test]
+fn source_metadata_accepts_32bit_lua_json_numeric_shapes() {
+    // Representative 32-bit RapidJSON wire shape: small integers stay integers,
+    // while a millisecond timestamp can be encoded as a JSON floating number.
+    let raw = r#"{
+        "bookSourceUrl":"https://metadata.example",
+        "bookSourceType":1,
+        "customOrder":3,
+        "weight":10,
+        "lastUpdateTime":1778603539900.0,
+        "respondTime":180000
+    }"#;
+    let source = book_source_from_value(serde_json::from_str(raw).unwrap()).unwrap();
+    assert_eq!(source.book_source_type, Some(1));
+    assert_eq!(source.custom_order, Some(3));
+    assert_eq!(source.weight, Some(10));
+    assert_eq!(source.last_update_time, Some(1_778_603_539_900));
+    assert_eq!(source.respond_time, Some(180_000));
+}
+
+#[test]
 fn optional_i64_metadata_accepts_float_encoded_integers() {
     // Some 32-bit hosts serialize millisecond timestamps with a decimal/exponent.
     let source = book_source_from_value(serde_json::from_str(r#"{

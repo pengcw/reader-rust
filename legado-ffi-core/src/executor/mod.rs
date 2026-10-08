@@ -1793,12 +1793,21 @@ fn required_string(params: &Value, key: &str) -> ExecuteResult<String> {
 }
 
 fn optional_page(params: &Value) -> ExecuteResult<i32> {
-    let page = params.get("page").and_then(Value::as_i64).unwrap_or(1);
-    if !(1..=i32::MAX as i64).contains(&page) {
-        return Err(ExecuteError::invalid_request(
-            "params.page must be a positive integer",
-        ));
-    }
+    let page = match params.get("page") {
+        None | Some(Value::Null) => return Ok(1),
+        Some(Value::Number(number)) => number.as_i64().or_else(|| {
+            // Accept integral JSON floats from alternate Lua encoders, not fractions.
+            let value = number.as_f64()?;
+            (value.is_finite()
+                && value.fract() == 0.0
+                && (1.0..=i32::MAX as f64).contains(&value))
+                .then(|| value as i64)
+        }),
+        _ => None,
+    };
+    let page = page
+        .filter(|page| (1..=i32::MAX as i64).contains(page))
+        .ok_or_else(|| ExecuteError::invalid_request("params.page must be a positive integer"))?;
     Ok(page as i32)
 }
 
@@ -1882,7 +1891,8 @@ fn content_path_base(path: &str, strip_page_suffix: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        execute, input_book_state, input_chapter_state, uses_js_ajax_content_rule, BookSource,
+        execute, input_book_state, input_chapter_state, optional_page,
+        uses_js_ajax_content_rule, BookSource,
     };
     use base64::Engine;
     use serde_json::Value;
@@ -1890,6 +1900,40 @@ mod tests {
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn page_parameter_defaults_only_when_missing_or_null() {
+        for raw in [r#"{}"#, r#"{"page":null}"#] {
+            let params: Value = serde_json::from_str(raw).unwrap();
+            assert_eq!(optional_page(&params).unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn page_parameter_accepts_integer_json_forms() {
+        for raw in [r#"{"page":2}"#, r#"{"page":2.0}"#, r#"{"page":2e0}"#] {
+            let params: Value = serde_json::from_str(raw).unwrap();
+            assert_eq!(optional_page(&params).unwrap(), 2);
+        }
+    }
+
+    #[test]
+    fn page_parameter_rejects_invalid_values_instead_of_resetting_to_one() {
+        for raw in [
+            r#"{"page":"2"}"#,
+            r#"{"page":false}"#,
+            r#"{"page":1.5}"#,
+            r#"{"page":0}"#,
+            r#"{"page":-1}"#,
+            r#"{"page":2147483648}"#,
+            r#"{"page":1e30}"#,
+        ] {
+            let params: Value = serde_json::from_str(raw).unwrap();
+            let error = optional_page(&params).unwrap_err();
+            assert_eq!(error.kind, "invalid_request", "{raw}");
+            assert_eq!(error.message, "params.page must be a positive integer", "{raw}");
+        }
+    }
 
     fn accept_with_timeout(listener: &TcpListener) -> (TcpStream, SocketAddr) {
         listener.set_nonblocking(true).unwrap();

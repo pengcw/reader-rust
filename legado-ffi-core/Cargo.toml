@@ -6,7 +6,7 @@ edition = "2021"
 [features]
 default = []
 c-headers = ["safer-ffi/headers"]
-kindle-eglibc-2-12 = []
+kindle-eglibc-2-12 = ["rakers/kindle-eglibc-2-12"]
 
 [lib]
 name = "reader_parser"

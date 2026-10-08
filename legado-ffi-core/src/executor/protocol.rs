@@ -134,6 +134,16 @@ mod tests {
     }
 
     #[test]
+    fn lua_small_integer_wire_fields_keep_the_v2_contract() {
+        let request = parse_request(
+            r#"{"api":2,"op":"search","params":{"key":"book","page":2},"options":{"maxPages":100}}"#,
+        ).unwrap();
+        assert_eq!(request.operation, Operation::Search);
+        assert_eq!(request.params["page"], 2);
+        assert_eq!(request.options.max_pages, 100);
+    }
+
+    #[test]
     fn unknown_operation_keeps_existing_error_contract() {
         let error = match parse_request(r#"{"api":2,"op":"future_op","params":{}}"#) {
             Ok(_) => panic!("future_op must stay unsupported"),

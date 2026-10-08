@@ -48,6 +48,7 @@ boa = ["dep:boa_engine"]
 cli = ["dep:clap", "diff"]
 default = ["rquickjs"]
 diff = ["dep:similar"]
+kindle-eglibc-2-12 = []
 rquickjs = ["dep:rquickjs"]
 
 [lib]
