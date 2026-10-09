@@ -1,0 +1,36 @@
+# GitHub exposes manual workflow_dispatch only when this path exists on the
+# default branch. Actual FFI builds and releases use the selected feature ref's
+# version of this file; do not attempt to build the legacy master checkout.
+name: Build & Release FFI Libraries
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish or rebuild the Cargo version (requires FFI branch)'
+        required: false
+        default: false
+        type: boolean
+      target:
+        description: 'Target platform to build'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - armv7-linux-androideabi
+          - aarch64-linux-android
+          - armv7-unknown-linux-gnueabihf
+          - armv7-unknown-linux-gnueabi
+          - aarch64-unknown-linux-gnu
+          - x86_64-unknown-linux-gnu
+          - x86_64-pc-windows-msvc
+
+jobs:
+  use-ffi-branch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Choose the FFI branch
+        run: |
+          echo "::error::Use gh workflow run build-ffi.yml --ref feature/ffi-lua-parser ..."
+          exit 1
