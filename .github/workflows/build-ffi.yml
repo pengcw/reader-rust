@@ -1,11 +1,13 @@
 name: Build & Release FFI Libraries
 
 on:
-  push:
-    tags:
-      - '[0-9]*'
   workflow_dispatch:
     inputs:
+      publish:
+        description: 'Publish or rebuild the Cargo version (always builds all platforms)'
+        required: false
+        default: false
+        type: boolean
       target:
         description: 'Target platform to build'
         required: false
@@ -24,9 +26,9 @@ on:
 permissions:
   contents: write
 
-# Serialize runs for a ref: an already-published version must never be replaced.
+# Serialize publishing across branches while allowing normal test builds.
 concurrency:
-  group: ffi-release-${{ github.ref }}
+  group: ffi-${{ inputs.publish && 'publish' || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -62,16 +64,14 @@ jobs:
     steps:
       - name: Checkout repository
         if: >-
-          github.event.inputs.target == '' ||
-          github.event.inputs.target == 'all' ||
-          github.event.inputs.target == matrix.target
+          inputs.publish || inputs.target == 'all' ||
+          inputs.target == matrix.target
         uses: actions/checkout@v4
 
       - name: Setup Rust
         if: >-
-          github.event.inputs.target == '' ||
-          github.event.inputs.target == 'all' ||
-          github.event.inputs.target == matrix.target
+          inputs.publish || inputs.target == 'all' ||
+          inputs.target == matrix.target
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
@@ -80,9 +80,8 @@ jobs:
       - name: Install Cross
         if: >-
           matrix.use_cross == true &&
-          (github.event.inputs.target == '' ||
-          github.event.inputs.target == 'all' ||
-          github.event.inputs.target == matrix.target)
+          (inputs.publish || inputs.target == 'all' ||
+          inputs.target == matrix.target)
         run: |
           mkdir -p ~/.cargo/bin
           cross_url=https://github.com/cross-rs/cross/releases/download/v0.2.5
@@ -91,9 +90,8 @@ jobs:
 
       - name: Build Library (Cross)
         if: >-
-          (github.event.inputs.target == '' ||
-          github.event.inputs.target == 'all' ||
-          github.event.inputs.target == matrix.target) &&
+          (inputs.publish || inputs.target == 'all' ||
+          inputs.target == matrix.target) &&
           matrix.use_cross == true
         run: cross build --target ${{ matrix.target }} --release --lib
         working-directory: legado-ffi-core
@@ -105,9 +103,8 @@ jobs:
 
       - name: Build Library (Cargo)
         if: >-
-          (github.event.inputs.target == '' ||
-          github.event.inputs.target == 'all' ||
-          github.event.inputs.target == matrix.target) &&
+          (inputs.publish || inputs.target == 'all' ||
+          inputs.target == matrix.target) &&
           matrix.use_cross == false
         run: cargo build --target ${{ matrix.target }} --release --lib
         working-directory: legado-ffi-core
@@ -115,9 +112,8 @@ jobs:
       - name: Zip Artifact (Linux/Android)
         if: >-
           runner.os == 'Linux' &&
-          (github.event.inputs.target == '' ||
-          github.event.inputs.target == 'all' ||
-          github.event.inputs.target == matrix.target)
+          (inputs.publish || inputs.target == 'all' ||
+          inputs.target == matrix.target)
         shell: bash
         run: |
           artifact_dir="legado-ffi-core/target/${{ matrix.target }}/release"
@@ -129,9 +125,8 @@ jobs:
       - name: Zip Artifact (Windows)
         if: >-
           runner.os == 'Windows' &&
-          (github.event.inputs.target == '' ||
-          github.event.inputs.target == 'all' ||
-          github.event.inputs.target == matrix.target)
+          (inputs.publish || inputs.target == 'all' ||
+          inputs.target == matrix.target)
         shell: pwsh
         run: |
           $artifactDir = "legado-ffi-core/target/${{ matrix.target }}/release"
@@ -145,9 +140,8 @@ jobs:
 
       - name: Upload Artifact
         if: >-
-          github.event.inputs.target == '' ||
-          github.event.inputs.target == 'all' ||
-          github.event.inputs.target == matrix.target
+          inputs.publish || inputs.target == 'all' ||
+          inputs.target == matrix.target
         uses: actions/upload-artifact@v4
         with:
           name: reader-parser-ffi-${{ matrix.target }}
@@ -157,9 +151,8 @@ jobs:
   build-kindle:
     name: Build Kindle PW2+ (soft-float, old glibc)
     if: >-
-      github.event.inputs.target == '' ||
-      github.event.inputs.target == 'all' ||
-      github.event.inputs.target == 'armv7-unknown-linux-gnueabi'
+      inputs.publish || inputs.target == 'all' ||
+      inputs.target == 'armv7-unknown-linux-gnueabi'
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
@@ -244,10 +237,9 @@ jobs:
   build-ereader:
     name: Build KOReader ${{ matrix.toolchain }} (${{ matrix.target }})
     if: >-
-      github.event.inputs.target == '' ||
-      github.event.inputs.target == 'all' ||
-      github.event.inputs.target == 'armv7-unknown-linux-gnueabihf' ||
-      github.event.inputs.target == 'aarch64-unknown-linux-gnu'
+      inputs.publish || inputs.target == 'all' ||
+      inputs.target == 'armv7-unknown-linux-gnueabihf' ||
+      inputs.target == 'aarch64-unknown-linux-gnu'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -269,16 +261,14 @@ jobs:
     steps:
       - name: Checkout repository
         if: >-
-          github.event.inputs.target == '' ||
-          github.event.inputs.target == 'all' ||
-          github.event.inputs.target == matrix.target
+          inputs.publish || inputs.target == 'all' ||
+          inputs.target == matrix.target
         uses: actions/checkout@v4
 
       - name: Setup Rust with standard library sources
         if: >-
-          github.event.inputs.target == '' ||
-          github.event.inputs.target == 'all' ||
-          github.event.inputs.target == matrix.target
+          inputs.publish || inputs.target == 'all' ||
+          inputs.target == matrix.target
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_NIGHTLY }}
@@ -287,9 +277,8 @@ jobs:
 
       - name: Install build dependencies
         if: >-
-          github.event.inputs.target == '' ||
-          github.event.inputs.target == 'all' ||
-          github.event.inputs.target == matrix.target
+          inputs.publish || inputs.target == 'all' ||
+          inputs.target == matrix.target
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -297,9 +286,8 @@ jobs:
 
       - name: Install pinned KOReader e-ink toolchain
         if: >-
-          github.event.inputs.target == '' ||
-          github.event.inputs.target == 'all' ||
-          github.event.inputs.target == matrix.target
+          inputs.publish || inputs.target == 'all' ||
+          inputs.target == matrix.target
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/${{ matrix.toolchain }}.tar.zst"
@@ -332,9 +320,8 @@ jobs:
 
       - name: Build library and target std
         if: >-
-          github.event.inputs.target == '' ||
-          github.event.inputs.target == 'all' ||
-          github.event.inputs.target == matrix.target
+          inputs.publish || inputs.target == 'all' ||
+          inputs.target == matrix.target
         run: |
           cargo +"${RUST_NIGHTLY}" build --locked --release --lib \
             --target '${{ matrix.target }}' \
@@ -343,9 +330,8 @@ jobs:
 
       - name: Reject incompatible ELF before packaging
         if: >-
-          github.event.inputs.target == '' ||
-          github.event.inputs.target == 'all' ||
-          github.event.inputs.target == matrix.target
+          inputs.publish || inputs.target == 'all' ||
+          inputs.target == matrix.target
         run: |
           python3 scripts/check-ereader-elf.py \
             target/${{ matrix.target }}/release/libreader_parser.so \
@@ -354,9 +340,8 @@ jobs:
 
       - name: Package e-ink library
         if: >-
-          github.event.inputs.target == '' ||
-          github.event.inputs.target == 'all' ||
-          github.event.inputs.target == matrix.target
+          inputs.publish || inputs.target == 'all' ||
+          inputs.target == matrix.target
         run: |
           cd target/${{ matrix.target }}/release
           zip -9 legado_parser-${{ matrix.target }}.zip libreader_parser.so
@@ -364,9 +349,8 @@ jobs:
 
       - name: Upload e-ink artifact
         if: >-
-          github.event.inputs.target == '' ||
-          github.event.inputs.target == 'all' ||
-          github.event.inputs.target == matrix.target
+          inputs.publish || inputs.target == 'all' ||
+          inputs.target == matrix.target
         uses: actions/upload-artifact@v4
         with:
           name: reader-parser-ffi-${{ matrix.target }}
@@ -374,10 +358,10 @@ jobs:
           if-no-files-found: error
 
   publish-release:
-    name: Publish Versioned Release
+    name: Publish Cargo Version
     needs: [build, build-kindle, build-ereader]
     if: >-
-      ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') &&
+      ${{ inputs.publish &&
       needs.build.result == 'success' &&
       needs['build-kindle'].result == 'success' &&
       needs['build-ereader'].result == 'success' }}
@@ -385,29 +369,32 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout repository
+      - name: Checkout build commit
         uses: actions/checkout@v4
 
-      - name: Verify release version
+      - name: Read and validate Cargo version
+        id: version
         shell: bash
         run: |
           set -euo pipefail
-          version=$(grep '^version =' legado-ffi-core/Cargo.toml | cut -d '"' -f 2)
-          if [[ -z "$version" || "$GITHUB_REF_NAME" != "$version" ]]; then
-            echo "::error::Tag $GITHUB_REF_NAME must match Cargo version $version"
+          version=$(grep '^version =' legado-ffi-core/Cargo.toml | head -n 1 | cut -d '"' -f 2)
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid Cargo version: $version"
             exit 1
           fi
-          # A deliberate tag update can rebuild and replace the same release.
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Download all artifacts
+      - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: reader-parser-ffi-*
           merge-multiple: true
           path: artifacts
 
-      - name: Prepare versioned release
+      - name: Verify complete platform set and write manifest
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           mkdir -p release_zips
@@ -416,7 +403,7 @@ jobs:
             cp "$file" release_zips/
           done
 
-          # Never mix binaries from another run or publish an incomplete platform set.
+          # Never mix runs or release only a subset of architectures.
           targets=(
             armv7-linux-androideabi
             aarch64-linux-android
@@ -439,10 +426,10 @@ jobs:
             exit 1
           fi
 
-          # Each archive and manifest belongs exclusively to this version's tag.
           cd release_zips
-          printf '{\n  "version": "%s",\n' "$GITHUB_REF_NAME" > manifest.json
+          printf '{\n  "version": "%s",\n' "$RELEASE_VERSION" > manifest.json
           printf '  "build_time": "%s",\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> manifest.json
+          printf '  "commit": "%s",\n' "$GITHUB_SHA" >> manifest.json
           printf '  "checksums": {\n' >> manifest.json
           first=true
           for zip in *.zip; do
@@ -455,20 +442,48 @@ jobs:
           done
           printf '\n  }\n}\n' >> manifest.json
 
-      - name: Publish versioned GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Create or update version tag
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -fa "$RELEASE_VERSION" -m "reader-rust $RELEASE_VERSION ($GITHUB_SHA)" "$GITHUB_SHA"
+          git push --force origin "refs/tags/$RELEASE_VERSION"
+
+      - name: Create or update versioned Release
+        uses: softprops/action-gh-release@v2.5.1
         with:
-          tag_name: ${{ github.ref_name }}
-          name: Local Parser Extension ${{ github.ref_name }}
+          tag_name: ${{ steps.version.outputs.version }}
+          name: Local Parser Extension ${{ steps.version.outputs.version }}
           body: >-
-            FFI parser binaries built from tag ${{ github.ref_name }}.
-            Rebuilds of this tag replace its platform archives and SHA256 manifest.
+            FFI parser binaries for Cargo ${{ steps.version.outputs.version }}.
+            Re-publishing the same version replaces ZIP archives and manifest.json.
           draft: false
           prerelease: false
-          # Legacy Lua plugins use /releases/latest/download; never redirect them to a versioned release.
+          # Keep /releases/latest/download pointing at the legacy rolling release.
           make_latest: false
           overwrite_files: true
           files: |
             release_zips/*.zip
             release_zips/manifest.json
           fail_on_unmatched_files: true
+
+      - name: Confirm legacy Latest stays unchanged
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          current=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+          if [[ "$current" != "latest" ]]; then
+            legacy_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/latest" --jq .id)
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$legacy_id" -f make_latest=true >/dev/null
+          fi
+          current=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+          if [[ "$current" != "latest" ]]; then
+            echo "::error::Legacy latest Release was not preserved"
+            exit 1
+          fi
