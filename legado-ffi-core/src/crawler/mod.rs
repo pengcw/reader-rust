@@ -21,7 +21,7 @@ pub use session::{current_active_session, with_active_session, ActiveSession, Ex
 #[cfg(test)]
 use url_rule::parse_source_headers;
 pub use url_rule::{analyze_url, analyze_url_with_context, UrlRuleContext};
-pub(crate) use url_rule::{analyze_url_with_headers, split_url_options, strip_url_options};
+pub(crate) use url_rule::{analyze_url_with_headers, parse_url_options, split_url_options, strip_url_options};
 
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
@@ -330,7 +330,22 @@ const RAKERS_MAX_REQUESTS: usize = 32;
 const RAKERS_SCRIPT_TIMEOUT: Duration = Duration::from_secs(3);
 const RAKERS_RENDER_TIMEOUT: Duration = Duration::from_secs(15);
 // Read-only browser pages load external scripts before fetching their content.
-const RAKERS_WEBVIEW_RENDER_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_BROWSER_SCRIPT_TIMEOUT_MS: u64 = 3_000;
+pub(crate) const MAX_BROWSER_SCRIPT_TIMEOUT_MS: u64 = 30_000;
+pub(crate) const DEFAULT_BROWSER_RENDER_TIMEOUT_MS: u64 = 30_000;
+pub(crate) const MAX_BROWSER_RENDER_TIMEOUT_MS: u64 = 120_000;
+
+#[derive(Clone, Copy)]
+pub(crate) struct BrowserTimeouts {
+    pub script_ms: u64,
+    pub render_ms: u64,
+}
+
+impl Default for BrowserTimeouts {
+    fn default() -> Self {
+        Self { script_ms: DEFAULT_BROWSER_SCRIPT_TIMEOUT_MS, render_ms: DEFAULT_BROWSER_RENDER_TIMEOUT_MS }
+    }
+}
 
 #[derive(Clone)]
 struct RakersHttpTransport {
@@ -391,6 +406,7 @@ fn render_rakers_page(
     clean: bool,
     max_response_bytes: usize,
     render_timeout: Duration,
+    script_timeout: Duration,
 ) -> Result<rakers::RenderOutput, FetchError> {
     let limit = max_response_bytes.max(1);
     // Do not copy raw source credentials into page-controlled requests. Cookies
@@ -412,7 +428,7 @@ fn render_rakers_page(
         &config,
         clean,
         Some(RAKERS_MAX_REMOTE_SCRIPTS),
-        Some(RAKERS_SCRIPT_TIMEOUT),
+        Some(script_timeout),
         final_script,
     )
     .map_err(|error| FetchError::Rule(format!("Rakers render failed: {error}")))?;
@@ -436,6 +452,7 @@ pub(crate) fn render_webview_with_rakers(
     html: &str,
     final_script: Option<&str>,
     max_response_bytes: usize,
+    timeouts: BrowserTimeouts,
 ) -> Result<rakers::RenderOutput, FetchError> {
     let limit = max_response_bytes.max(1);
     if html.len() > limit {
@@ -453,7 +470,8 @@ pub(crate) fn render_webview_with_rakers(
         None,
         false,
         max_response_bytes,
-        RAKERS_WEBVIEW_RENDER_TIMEOUT,
+        Duration::from_millis(timeouts.render_ms),
+        Duration::from_millis(timeouts.script_ms),
     )
 }
 
@@ -480,6 +498,7 @@ fn render_with_rakers(
         true,
         max_response_bytes,
         RAKERS_RENDER_TIMEOUT,
+        RAKERS_SCRIPT_TIMEOUT,
     )?
     .html)
 }

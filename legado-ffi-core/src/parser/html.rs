@@ -2874,12 +2874,37 @@ pub(crate) fn format_js_html(content: &str, redirect_url: &str) -> String {
     format_keep_img_with_script_text(content, redirect_url, true)
 }
 
-// Move Legado's trailing image JSON out of its non-standard quoted src.
-// Keep it opaque: interpreting click actions belongs to the host.
+// Find the end of an opaque options object before parsing legacy quotes.
+// No evaluation: bounded scanning only identifies the object boundary.
+fn image_options_end(raw: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (i, byte) in raw.bytes().take(64 * 1024).enumerate() {
+        if let Some(delimiter) = quote {
+            if escaped { escaped = false; }
+            else if byte == b'\\' { escaped = true; }
+            else if byte == delimiter { quote = None; }
+        } else {
+            match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 { return Some(i + 1); }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+// Keep image options as canonical opaque data; only the host interprets actions.
 fn preserve_image_metadata(content: &str) -> String {
     use base64::Engine;
     static PREFIX: Lazy<regex::Regex> = Lazy::new(|| {
-        regex::Regex::new(r#"(?i)<img\b[^>]*?\b(?:src|data-src|data-original)\s*=\s*["']([^"'\s>]+?),(\{)"#).unwrap()
+        regex::Regex::new(r#"(?i)<img\b[^>]*?\b(?:src|data-src|data-original)\s*=\s*["']([^"'\s>]+?),\s*(\{)"#).unwrap()
     });
     let mut output = String::new();
     let mut cursor = 0;
@@ -2887,18 +2912,21 @@ fn preserve_image_metadata(content: &str) -> String {
         let whole = caps.get(0).unwrap();
         if whole.start() < cursor { continue; }
         let json_start = caps.get(2).unwrap().start();
-        let mut values = serde_json::Deserializer::from_str(&content[json_start..])
-            .into_iter::<serde_json::Value>();
-        if !matches!(values.next(), Some(Ok(serde_json::Value::Object(_)))) { continue; }
-        let json_end = json_start + values.byte_offset();
+        let Some(length) = image_options_end(&content[json_start..]) else { continue; };
+        let json_end = json_start + length;
+        let mut attribute_end = json_end;
+        while content.as_bytes().get(attribute_end).is_some_and(u8::is_ascii_whitespace) {
+            attribute_end += 1;
+        }
         let quote = content.as_bytes()[caps.get(1).unwrap().start() - 1];
-        if content.as_bytes().get(json_end) != Some(&quote) { continue; }
-        let encoded = base64::engine::general_purpose::STANDARD
-            .encode(&content.as_bytes()[json_start..json_end]);
-        output.push_str(&content[cursor..json_start - 1]);
+        if content.as_bytes().get(attribute_end) != Some(&quote) { continue; }
+        let Ok(meta) = crate::crawler::parse_url_options(&content[json_start..json_end]) else { continue; };
+        if !meta.is_object() { continue; }
+        let encoded = base64::engine::general_purpose::STANDARD.encode(meta.to_string());
+        output.push_str(&content[cursor..caps.get(1).unwrap().end()]);
         output.push(quote as char);
         output.push_str(&format!(r#" data-legado-image-meta="{}""#, encoded));
-        cursor = json_end + 1;
+        cursor = attribute_end + 1;
     }
     if cursor == 0 { return content.to_string(); }
     output.push_str(&content[cursor..]);
@@ -2961,9 +2989,13 @@ fn format_keep_img_with_script_text(
             text = img_re
                 .replace_all(&text, |caps: &regex::Captures| {
                     let img_tag = caps.get(0).unwrap().as_str();
+                    let mut inline_review = false;
+                    let mut dp_review = false;
                     let mut full_img = if let Some(src_caps) = src_re.captures(img_tag) {
                         let raw_src = src_caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-                        if !raw_src.is_empty() && !redirect_url.is_empty() {
+                        dp_review = raw_src.strip_prefix("dp:").is_some_and(|count| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()));
+                        inline_review = dp_review;
+                        if !raw_src.is_empty() && !redirect_url.is_empty() && !dp_review {
                             let abs_src =
                                 crate::parser::rule_engine::resolve_url(redirect_url, raw_src);
                             format!(r#"<img src="{}">"#, abs_src)
@@ -2976,6 +3008,16 @@ fn format_keep_img_with_script_text(
                     if let Some(start) = img_tag.find(" data-legado-image-meta=\"") {
                         let value_start = start + " data-legado-image-meta=\"".len();
                         if let Some(end) = img_tag[value_start..].find('"') {
+                            use base64::Engine;
+                            let decoded = base64::engine::general_purpose::STANDARD
+                                .decode(&img_tag[value_start..value_start + end]).ok();
+                            let meta = decoded.as_deref().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok());
+                            inline_review = meta.as_ref().is_some_and(|meta| {
+                                if dp_review { return meta.get("style").and_then(serde_json::Value::as_str) != Some("FULL"); }
+                                let action = meta.get("click").or_else(|| meta.get("js")).and_then(serde_json::Value::as_str);
+                                meta.get("style").and_then(serde_json::Value::as_str) == Some("text")
+                                    && action.is_some_and(|action| !action.trim().is_empty() && action.len() <= 65536)
+                            });
                             full_img.pop();
                             full_img.push_str(&img_tag[start..value_start + end + 1]);
                             full_img.push('>');
@@ -2984,7 +3026,7 @@ fn format_keep_img_with_script_text(
                     let placeholder =
                         format!("__READER_IMG_PLACEHOLDER_{}__", img_placeholders.len());
                     img_placeholders.push(full_img);
-                    format!("\n{}\n", placeholder)
+                    if inline_review { placeholder } else { format!("\n{}\n", placeholder) }
                 })
                 .into_owned();
         }

@@ -1,6 +1,6 @@
 use super::{validate_options, ExecuteError, ExecuteOptions, ExecuteResult, ValidatedOptions};
-use crate::runtime::session::ExecuteSession;
 use crate::parser::js::InfoMapState;
+use crate::runtime::session::ExecuteSession;
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,6 +14,7 @@ pub(super) enum Operation {
     LoginUi,
     Login,
     Click,
+    Preview,
 }
 
 impl Operation {
@@ -28,6 +29,7 @@ impl Operation {
             "login_ui" => Ok(Self::LoginUi),
             "login" => Ok(Self::Login),
             "click" => Ok(Self::Click),
+            "preview" => Ok(Self::Preview),
             _ => Err(ExecuteError::invalid_request(format!(
                 "unsupported op: {value}"
             ))),
@@ -100,8 +102,8 @@ pub(super) fn parse_request(raw: &str) -> ExecuteResult<ExecuteRequest> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{DEFAULT_MAX_PAGES, DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_TIMEOUT_MS};
+    use super::*;
 
     #[test]
     fn operation_names_match_v2_protocol() {
@@ -115,6 +117,7 @@ mod tests {
             ("login_ui", Operation::LoginUi),
             ("login", Operation::Login),
             ("click", Operation::Click),
+            ("preview", Operation::Preview),
         ];
 
         for (raw, expected) in cases {
@@ -129,7 +132,10 @@ mod tests {
         assert_eq!(request.operation, Operation::Search);
         assert_eq!(request.options.timeout_ms, DEFAULT_TIMEOUT_MS);
         assert_eq!(request.options.max_pages, DEFAULT_MAX_PAGES);
-        assert_eq!(request.options.max_response_bytes, DEFAULT_MAX_RESPONSE_BYTES);
+        assert_eq!(
+            request.options.max_response_bytes,
+            DEFAULT_MAX_RESPONSE_BYTES
+        );
         assert!(!request.options.debug);
     }
 
@@ -141,6 +147,26 @@ mod tests {
         assert_eq!(request.operation, Operation::Search);
         assert_eq!(request.params["page"], 2);
         assert_eq!(request.options.max_pages, 100);
+    }
+
+    #[test]
+    fn browser_timeout_defaults_limits_and_zero() {
+        for options in [json!({}), json!({"scriptTimeoutMs":0,"renderTimeoutMs":0})] {
+            let request = parse_request(&json!({"api":2,"op":"preview","options":options}).to_string()).unwrap();
+            assert_eq!(request.options.script_timeout_ms, 3000);
+            assert_eq!(request.options.render_timeout_ms, 30000);
+        }
+        let request = parse_request(r#"{"api":2,"op":"preview","options":{"scriptTimeoutMs":30000,"renderTimeoutMs":120000}}"#).unwrap();
+        assert_eq!(request.options.script_timeout_ms, 30000);
+        assert_eq!(request.options.render_timeout_ms, 120000);
+        for options in [
+            json!({"scriptTimeoutMs":30001}),
+            json!({"renderTimeoutMs":120001}),
+            json!({"scriptTimeoutMs":1000,"renderTimeoutMs":500}),
+            json!({"scriptTimeoutMs":-1}),
+        ] {
+            assert!(parse_request(&json!({"api":2,"op":"preview","options":options}).to_string()).is_err());
+        }
     }
 
     #[test]

@@ -4,7 +4,8 @@ use crate::parser::js_compat::{
     java_time_format, java_time_format_utc, java_to_num_chapter, java_to_url_json,
     json_value_to_string,
 };
-pub(crate) use crate::parser::js_http::with_js_http_clients;
+#[cfg(test)]
+use crate::parser::js_http::with_js_http_clients;
 use crate::parser::js_http::{
     decode_archive_text, java_analyzed_request_body, java_analyzed_request_response,
     java_archive_input, java_request_simple, java_request_simple_response,

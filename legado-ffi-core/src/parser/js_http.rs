@@ -7,7 +7,7 @@ pub(crate) use crate::crawler::HttpClient;
 use crate::crawler::{
     analyze_url_with_headers, decode_body, execute_request_spec, execute_request_spec_limited,
     format_analyzed_body, render_webview_with_rakers, HttpClientError, RequestSpec,
-    DEFAULT_WEBVIEW_USER_AGENT,
+    DEFAULT_WEBVIEW_USER_AGENT, BrowserTimeouts,
 };
 use crate::model::book_source::BookSource;
 use crate::parser::js_compat::json_value_to_string;
@@ -23,6 +23,24 @@ use ureq::http::Method;
 pub(super) struct JsHttpContext {
     request_client: HttpClient,
     webview_client: HttpClient,
+}
+
+thread_local! {
+    static BROWSER_TIMEOUTS: RefCell<BrowserTimeouts> = RefCell::new(BrowserTimeouts::default());
+}
+
+pub(crate) fn with_browser_http_clients<T>(
+    request_client: &HttpClient,
+    webview_client: &HttpClient,
+    source: &BookSource,
+    timeouts: BrowserTimeouts,
+    f: impl FnOnce() -> T,
+) -> T {
+    BROWSER_TIMEOUTS.with(|cell| {
+        crate::util::scoped::with_scoped_value(cell, timeouts, || {
+            with_js_http_clients(request_client, webview_client, source, f)
+        })
+    })
 }
 
 static JS_HTTP_CLIENT: Lazy<HttpClient> = Lazy::new(HttpClient::standalone);
@@ -122,8 +140,17 @@ pub(super) fn resolve_js_lib_entry(entry: &str) -> anyhow::Result<String> {
 }
 
 pub(super) fn java_web_view(html: &str, url: &str, js: &str) -> Option<String> {
+    render_webview(html, url, js, crate::executor::DEFAULT_MAX_RESPONSE_BYTES).map(|(html, _)| html)
+}
+
+// Shared by the JS facade and the native preview operation.
+pub(crate) fn render_webview(
+    html: &str,
+    url: &str,
+    js: &str,
+    limit: usize,
+) -> Option<(String, Option<String>)> {
     let client = active_js_webview_client();
-    let limit = crate::executor::DEFAULT_MAX_RESPONSE_BYTES;
     let url = url.trim();
 
     let (page_html, page_url) = if !html.trim().is_empty() {
@@ -171,13 +198,15 @@ pub(super) fn java_web_view(html: &str, url: &str, js: &str) -> Option<String> {
         &page_html,
         final_script,
         limit,
+        BROWSER_TIMEOUTS.with(|cell| *cell.borrow()),
     )
     .ok()?;
-    if final_script.is_some() {
-        output.script_result
+    let rendered = if final_script.is_some() {
+        output.script_result?
     } else {
-        Some(output.html)
-    }
+        output.html
+    };
+    Some((rendered, page_url))
 }
 
 pub(super) fn java_request_simple(

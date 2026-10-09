@@ -504,7 +504,7 @@ pub(crate) fn strip_url_options(rule: &str) -> &str {
     split_url_options(rule).0
 }
 
-fn parse_url_options(raw: &str) -> Result<Value, String> {
+pub(crate) fn parse_url_options(raw: &str) -> Result<Value, String> {
     serde_json::from_str(raw)
         .or_else(|_| serde_json::from_str(&escape_control_chars_in_json_strings(raw)))
         .or_else(|_| {

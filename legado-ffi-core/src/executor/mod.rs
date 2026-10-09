@@ -9,7 +9,7 @@ use crate::crawler::{
 };
 use crate::model::book_source::{book_source_from_value, BookSource};
 use crate::parser::js::{
-    eval_js, eval_js_with_bindings, with_js_http_clients, with_js_info_map, with_js_lib,
+    eval_js, eval_js_with_bindings, with_js_info_map, with_js_lib,
     with_login_messages, with_click_browser, InfoMapState,
 };
 use crate::parser::rule_engine::{
@@ -36,6 +36,8 @@ const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 #[serde(default, rename_all = "camelCase")]
 struct ExecuteOptions {
     timeout_ms: u64,
+    script_timeout_ms: u64,
+    render_timeout_ms: u64,
     max_pages: usize,
     max_response_bytes: usize,
     debug: bool,
@@ -45,6 +47,8 @@ impl Default for ExecuteOptions {
     fn default() -> Self {
         Self {
             timeout_ms: DEFAULT_TIMEOUT_MS,
+            script_timeout_ms: crate::crawler::DEFAULT_BROWSER_SCRIPT_TIMEOUT_MS,
+            render_timeout_ms: crate::crawler::DEFAULT_BROWSER_RENDER_TIMEOUT_MS,
             max_pages: DEFAULT_MAX_PAGES,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             debug: false,
@@ -55,6 +59,8 @@ impl Default for ExecuteOptions {
 #[derive(Debug, Clone)]
 struct ValidatedOptions {
     timeout_ms: u64,
+    script_timeout_ms: u64,
+    render_timeout_ms: u64,
     max_pages: usize,
     max_response_bytes: usize,
     debug: bool,
@@ -240,10 +246,14 @@ fn execute_inner(source_json: &str, request_json: &str) -> ExecuteResult<Value> 
         |active_session| {
             let result = (|| -> ExecuteResult<Value> {
                 let http_session = HttpSession::new(&source, options.timeout_ms)?;
-                with_js_http_clients(
+                crate::parser::js_http::with_browser_http_clients(
                     http_session.client(),
                     http_session.webview_client(),
                     &source,
+                    crate::crawler::BrowserTimeouts {
+                        script_ms: options.script_timeout_ms,
+                        render_ms: options.render_timeout_ms,
+                    },
                     || {
                         match operation {
                             Operation::Search => {
@@ -272,6 +282,7 @@ fn execute_inner(source_json: &str, request_json: &str) -> ExecuteResult<Value> 
                                 execute_content(&source, &engine, &http_session, &params, &options)
                             }
                             Operation::Click => execute_click(&source, &params),
+                            Operation::Preview => execute_preview(&params, &options),
                             Operation::LoginUi => execute_login_ui(&source),
                             Operation::Login => {
                                 execute_login(&source, &http_session, &params, &options)
@@ -410,6 +421,21 @@ fn validate_options(options: ExecuteOptions) -> ExecuteResult<ValidatedOptions> 
     } else {
         options.timeout_ms
     };
+    let script_timeout_ms = if options.script_timeout_ms == 0 {
+        crate::crawler::DEFAULT_BROWSER_SCRIPT_TIMEOUT_MS
+    } else { options.script_timeout_ms };
+    let render_timeout_ms = if options.render_timeout_ms == 0 {
+        crate::crawler::DEFAULT_BROWSER_RENDER_TIMEOUT_MS
+    } else { options.render_timeout_ms };
+    if script_timeout_ms > crate::crawler::MAX_BROWSER_SCRIPT_TIMEOUT_MS {
+        return Err(ExecuteError::invalid_request("scriptTimeoutMs must be at most 30000"));
+    }
+    if render_timeout_ms > crate::crawler::MAX_BROWSER_RENDER_TIMEOUT_MS {
+        return Err(ExecuteError::invalid_request("renderTimeoutMs must be at most 120000"));
+    }
+    if script_timeout_ms > render_timeout_ms {
+        return Err(ExecuteError::invalid_request("scriptTimeoutMs must not exceed renderTimeoutMs"));
+    }
     let max_pages = if options.max_pages == 0 {
         DEFAULT_MAX_PAGES
     } else {
@@ -437,6 +463,8 @@ fn validate_options(options: ExecuteOptions) -> ExecuteResult<ValidatedOptions> 
     }
     Ok(ValidatedOptions {
         timeout_ms,
+        script_timeout_ms,
+        render_timeout_ms,
         max_pages,
         max_response_bytes,
         debug: options.debug,
@@ -1433,6 +1461,28 @@ fn execute_login(
     Err(ExecuteError::invalid_request(
         "source.loginUrl or params.action is required",
     ))
+}
+
+fn execute_preview(params: &Value, options: &ValidatedOptions) -> ExecuteResult<Value> {
+    let url = params.get("url").and_then(Value::as_str).unwrap_or_default();
+    let html = params.get("html").and_then(Value::as_str).unwrap_or_default();
+    if !url.is_empty() {
+        let parsed = url::Url::parse(url)
+            .map_err(|_| ExecuteError::invalid_request("invalid preview URL"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(ExecuteError::invalid_request("preview URL must be HTTP(S)"));
+        }
+    }
+    if url.is_empty() && html.trim().is_empty() {
+        return Err(ExecuteError::invalid_request("preview requires URL or HTML"));
+    }
+    let (rendered, final_url) = crate::parser::js_http::render_webview(
+        html, url, "", options.max_response_bytes,
+    ).ok_or_else(|| ExecuteError::internal("preview rendering failed"))?;
+    Ok(success_without_http(json!({"preview":{
+        "html":rendered,"url":final_url,
+        "title":params.get("title").and_then(Value::as_str).unwrap_or("评论")
+    }})))
 }
 
 fn execute_click(source: &BookSource, params: &Value) -> ExecuteResult<Value> {
