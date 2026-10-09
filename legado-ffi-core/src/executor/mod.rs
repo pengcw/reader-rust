@@ -1476,9 +1476,9 @@ fn execute_preview(params: &Value, options: &ValidatedOptions) -> ExecuteResult<
     if url.is_empty() && html.trim().is_empty() {
         return Err(ExecuteError::invalid_request("preview requires URL or HTML"));
     }
-    let (rendered, final_url) = crate::parser::js_http::render_webview(
+    let (rendered, final_url) = crate::parser::js_http::try_render_webview(
         html, url, "", options.max_response_bytes,
-    ).ok_or_else(|| ExecuteError::internal("preview rendering failed"))?;
+    ).map_err(ExecuteError::from)?;
     Ok(success_without_http(json!({"preview":{
         "html":rendered,"url":final_url,
         "title":params.get("title").and_then(Value::as_str).unwrap_or("评论")

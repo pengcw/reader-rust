@@ -6,8 +6,8 @@
 pub(crate) use crate::crawler::HttpClient;
 use crate::crawler::{
     analyze_url_with_headers, decode_body, execute_request_spec, execute_request_spec_limited,
-    format_analyzed_body, render_webview_with_rakers, HttpClientError, RequestSpec,
-    DEFAULT_WEBVIEW_USER_AGENT, BrowserTimeouts,
+    format_analyzed_body, map_http_client_error, render_webview_with_rakers,
+    BrowserTimeouts, FetchError, HttpClientError, RequestSpec, DEFAULT_WEBVIEW_USER_AGENT,
 };
 use crate::model::book_source::BookSource;
 use crate::parser::js_compat::json_value_to_string;
@@ -140,16 +140,18 @@ pub(super) fn resolve_js_lib_entry(entry: &str) -> anyhow::Result<String> {
 }
 
 pub(super) fn java_web_view(html: &str, url: &str, js: &str) -> Option<String> {
-    render_webview(html, url, js, crate::executor::DEFAULT_MAX_RESPONSE_BYTES).map(|(html, _)| html)
+    try_render_webview(html, url, js, crate::executor::DEFAULT_MAX_RESPONSE_BYTES)
+        .ok()
+        .map(|(html, _)| html)
 }
 
-// Shared by the JS facade and the native preview operation.
-pub(crate) fn render_webview(
+// Preserve detailed failures for native preview; java.webView remains Option-based.
+pub(crate) fn try_render_webview(
     html: &str,
     url: &str,
     js: &str,
     limit: usize,
-) -> Option<(String, Option<String>)> {
+) -> Result<(String, Option<String>), FetchError> {
     let client = active_js_webview_client();
     let url = url.trim();
 
@@ -157,7 +159,7 @@ pub(crate) fn render_webview(
         (html.to_string(), (!url.is_empty()).then(|| url.to_string()))
     } else {
         if url.is_empty() {
-            return None;
+            return Err(FetchError::InvalidUrl("WebView requires URL or HTML".to_string()));
         }
         let headers = [("User-Agent".to_string(), webview_user_agent())];
         let response = if url.starts_with("data:") {
@@ -174,11 +176,12 @@ pub(crate) fn render_webview(
                 render_with_rakers: false,
                 body_js: None,
             };
-            execute_request_spec_limited(&client, &spec, Some(limit)).ok()?
+            execute_request_spec_limited(&client, &spec, Some(limit))
+                .map_err(map_http_client_error)?
         } else {
             client
                 .execute(Method::GET, url, &headers, None, Some(limit))
-                .ok()?
+                .map_err(map_http_client_error)?
         };
         let content_type = response
             .headers
@@ -199,14 +202,15 @@ pub(crate) fn render_webview(
         final_script,
         limit,
         BROWSER_TIMEOUTS.with(|cell| *cell.borrow()),
-    )
-    .ok()?;
+    )?;
     let rendered = if final_script.is_some() {
-        output.script_result?
+        output.script_result.ok_or_else(|| {
+            FetchError::Rule("WebView script returned no result".to_string())
+        })?
     } else {
         output.html
     };
-    Some((rendered, page_url))
+    Ok((rendered, page_url))
 }
 
 pub(super) fn java_request_simple(
@@ -535,6 +539,19 @@ fn java_request_headers(headers_json: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod conversion_tests {
     use super::*;
+
+    #[test]
+    fn webview_errors_remain_detailed_for_preview_and_optional_for_js() {
+        assert!(matches!(
+            try_render_webview("", "", "", 2),
+            Err(FetchError::InvalidUrl(_))
+        ));
+        assert!(matches!(
+            try_render_webview("HTML", "", "", 2),
+            Err(FetchError::ResponseTooLarge { limit: 2, .. })
+        ));
+        assert_eq!(java_web_view("", "", ""), None);
+    }
 
     #[test]
     fn response_parse_charset_priority_is_bom_header_meta_then_utf8() {

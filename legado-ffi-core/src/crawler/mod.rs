@@ -695,7 +695,7 @@ fn detect_auth_challenge(
     None
 }
 
-fn map_http_client_error(error: HttpClientError) -> FetchError {
+pub(crate) fn map_http_client_error(error: HttpClientError) -> FetchError {
     match error {
         HttpClientError::InvalidUrl(message) => FetchError::InvalidUrl(message),
         HttpClientError::Timeout(message) => FetchError::Timeout { url: None, message },
