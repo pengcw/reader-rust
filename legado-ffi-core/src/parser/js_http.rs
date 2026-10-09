@@ -152,6 +152,43 @@ pub(crate) fn try_render_webview(
     js: &str,
     limit: usize,
 ) -> Result<(String, Option<String>), FetchError> {
+    let (output, page_url) = render_webview_output(html, url, js, limit)?;
+    let rendered = if !js.trim().is_empty() {
+        output.script_result.ok_or_else(|| {
+            FetchError::Rule("WebView script returned no result".to_string())
+        })?
+    } else {
+        output.html
+    };
+    Ok((rendered, page_url))
+}
+
+/// Optional preview extjs runs in the original Rakers page runtime.
+/// It must evaluate to an HTML string; JS errors and empty results fall back to rendered HTML.
+/// Page/network failures and resource budget errors still propagate normally.
+pub(crate) fn try_render_preview(
+    html: &str,
+    url: &str,
+    ext_js: &str,
+    limit: usize,
+) -> Result<(String, Option<String>), FetchError> {
+    let (output, page_url) = render_webview_output(html, url, ext_js, limit)?;
+    let rendered = output
+        .script_result
+        .filter(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "undefined" && value != "null"
+        })
+        .unwrap_or(output.html);
+    Ok((rendered, page_url))
+}
+
+fn render_webview_output(
+    html: &str,
+    url: &str,
+    js: &str,
+    limit: usize,
+) -> Result<(rakers::RenderOutput, Option<String>), FetchError> {
     let client = active_js_webview_client();
     let url = url.trim();
 
@@ -203,14 +240,7 @@ pub(crate) fn try_render_webview(
         limit,
         BROWSER_TIMEOUTS.with(|cell| *cell.borrow()),
     )?;
-    let rendered = if final_script.is_some() {
-        output.script_result.ok_or_else(|| {
-            FetchError::Rule("WebView script returned no result".to_string())
-        })?
-    } else {
-        output.html
-    };
-    Ok((rendered, page_url))
+    Ok((output, page_url))
 }
 
 pub(super) fn java_request_simple(
@@ -551,6 +581,12 @@ mod conversion_tests {
             Err(FetchError::ResponseTooLarge { limit: 2, .. })
         ));
         assert_eq!(java_web_view("", "", ""), None);
+        // Unlike optional preview extjs, java.webView's explicit JS still requires
+        // a result; a throwing script must not silently fall back to page HTML.
+        assert!(matches!(
+            try_render_webview("<p>page</p>", "", "throw new Error('bad')", 1024),
+            Err(FetchError::Rule(_))
+        ));
     }
 
     #[test]

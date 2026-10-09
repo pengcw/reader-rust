@@ -2982,7 +2982,8 @@ fn format_keep_img_with_script_text(
 
     // 2. 提取并保留 <img> 标签，补全相对 URL，使用占位符保护
     let mut img_placeholders: Vec<String> = Vec::new();
-    if let Ok(img_re) = regex::Regex::new(r"(?i)<img\b[^>]*>") {
+    // Attribute values may contain '>'; don't split the tag inside a quoted action.
+    if let Ok(img_re) = regex::Regex::new(r#"(?is)<img\b(?:[^"'<>]|"[^"]*"|'[^']*')*>"#) {
         if let Ok(src_re) =
             regex::Regex::new(r#"(?i)\b(?:src|data-src|data-original)\s*=\s*["']?([^"'\s>]+)["']?"#)
         {
@@ -2991,6 +2992,7 @@ fn format_keep_img_with_script_text(
                     let img_tag = caps.get(0).unwrap().as_str();
                     let mut inline_review = false;
                     let mut dp_review = false;
+                    let mut image_meta = None;
                     let mut full_img = if let Some(src_caps) = src_re.captures(img_tag) {
                         let raw_src = src_caps.get(1).map(|m| m.as_str()).unwrap_or_default();
                         dp_review = raw_src.strip_prefix("dp:").is_some_and(|count| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()));
@@ -3015,12 +3017,46 @@ fn format_keep_img_with_script_text(
                             inline_review = meta.as_ref().is_some_and(|meta| {
                                 if dp_review { return meta.get("style").and_then(serde_json::Value::as_str) != Some("FULL"); }
                                 let action = meta.get("click").or_else(|| meta.get("js")).and_then(serde_json::Value::as_str);
-                                meta.get("style").and_then(serde_json::Value::as_str) == Some("text")
+                                matches!(meta.get("style").and_then(serde_json::Value::as_str), Some("text" | "TEXT"))
                                     && action.is_some_and(|action| !action.trim().is_empty() && action.len() <= 65536)
                             });
+                            image_meta = meta;
                             full_img.pop();
                             full_img.push_str(&img_tag[start..value_start + end + 1]);
                             full_img.push('>');
+                        }
+                    }
+                    // iOS book sources attach the action directly to img.onPress.
+                    // Preserve it in the existing opaque image metadata contract.
+                    if img_tag.to_ascii_lowercase().contains("onpress") {
+                        static IMAGE_SELECTOR: Lazy<Selector> =
+                            Lazy::new(|| Selector::parse("img").unwrap());
+                        let fragment = Html::parse_fragment(img_tag);
+                        let onpress = fragment.select(&IMAGE_SELECTOR).next()
+                            .and_then(|node| node.value().attr("onpress"))
+                            .filter(|action| !action.trim().is_empty() && action.len() <= 65536);
+                        if let Some(action) = onpress {
+                            let mut meta = image_meta.unwrap_or_else(|| serde_json::json!({}));
+                            if let Some(object) = meta.as_object_mut() {
+                                let existing = ["click", "js"].iter().any(|key| {
+                                    object.get(*key).and_then(serde_json::Value::as_str)
+                                        .is_some_and(|value| !value.trim().is_empty() && value.len() <= 65536)
+                                });
+                                if !existing {
+                                    object.insert("click".to_string(), serde_json::json!(action));
+                                    use base64::Engine;
+                                    let encoded = base64::engine::general_purpose::STANDARD.encode(meta.to_string());
+                                    if let Some(start) = full_img.find(" data-legado-image-meta=\"") {
+                                        full_img.truncate(start);
+                                    } else {
+                                        full_img.pop();
+                                    }
+                                    full_img.push_str(&format!(r#" data-legado-image-meta="{}">"#, encoded));
+                                }
+                                let style = meta.get("style").and_then(serde_json::Value::as_str);
+                                inline_review = if dp_review { style != Some("FULL") }
+                                    else { matches!(style, Some("text" | "TEXT")) };
+                            }
                         }
                     }
                     let placeholder =
@@ -3870,6 +3906,44 @@ mod tests {
             "正文\n<img src=\"data:image/svg+xml;base64,PHN2Zz4=\" data-legado-image-meta=\"{}\">", encoded));
         assert_eq!(format_keep_img(r#"<img src="data:image/png;base64,YQ==">"#, ""),
             r#"<img src="data:image/png;base64,YQ==">"#);
+    }
+
+    #[test]
+    fn image_onpress_preserves_complete_action_and_existing_options() {
+        use base64::Engine;
+        fn read_meta(html: &str) -> serde_json::Value {
+            let encoded = regex::Regex::new(r#"data-legado-image-meta="([^"]+)""#).unwrap();
+            let matched = encoded.captures(html).expect("image metadata");
+            serde_json::from_slice(
+                &base64::engine::general_purpose::STANDARD.decode(&matched[1]).unwrap(),
+            ).unwrap()
+        }
+
+        let output = format_keep_img(
+            r#"<p>正文<img src="/card.svg" title="2 > 1" onPress="java.showReadingBrowser('https://example.test/?a=1&amp;b=2','本章说 >')"></p>"#,
+            "https://example.test/chapter",
+        );
+        assert!(output.contains(r#"<img src="https://example.test/card.svg" data-legado-image-meta="#));
+        assert!(!output.contains(" onPress="));
+        assert_eq!(
+            read_meta(&output)["click"],
+            "java.showReadingBrowser('https://example.test/?a=1&b=2','本章说 >')",
+        );
+
+        // Existing click/js options take priority over img.onPress.
+        let source = r#"<img src="/card.svg,{"style":"FULL","js":"old()"}" onPress="new()">"#;
+        let output = format_keep_img(source, "https://example.test/chapter");
+        let meta = read_meta(&output);
+        assert_eq!(meta["js"], "old()");
+        assert!(meta.get("click").is_none());
+        assert_eq!(meta["style"], "FULL");
+
+        let source = r#"<p>正文<img src="dp:12,{'style':'TEXT'}" onPress="open()"/>后文</p>"#;
+        let output = format_keep_img(source, "");
+        assert!(output.contains("正文<img"), "TEXT review stays inline");
+        assert_eq!(read_meta(&output)["click"], "open()");
+        assert_eq!(read_meta(&output)["style"], "TEXT");
+        assert_eq!(format_keep_img(r#"<img src="/plain.jpg">"#, ""), r#"<img src="/plain.jpg">"#);
     }
 
     #[test]

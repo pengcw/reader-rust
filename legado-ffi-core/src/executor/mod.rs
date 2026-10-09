@@ -1476,8 +1476,18 @@ fn execute_preview(params: &Value, options: &ValidatedOptions) -> ExecuteResult<
     if url.is_empty() && html.trim().is_empty() {
         return Err(ExecuteError::invalid_request("preview requires URL or HTML"));
     }
-    let (rendered, final_url) = crate::parser::js_http::try_render_webview(
-        html, url, "", options.max_response_bytes,
+    // Optional source-specific script runs after page lifecycle in the same Rakers
+    // runtime. Errors/empty results fall back to ordinary preview HTML.
+    let extjs = match params.get("extjs") {
+        None | Some(Value::Null) => "",
+        Some(Value::String(script)) if script.len() <= 64 * 1024 => script.as_str(),
+        Some(Value::String(_)) => {
+            return Err(ExecuteError::invalid_request("params.extjs must be at most 64 KiB"));
+        }
+        _ => return Err(ExecuteError::invalid_request("params.extjs must be a string")),
+    };
+    let (rendered, final_url) = crate::parser::js_http::try_render_preview(
+        html, url, extjs, options.max_response_bytes,
     ).map_err(ExecuteError::from)?;
     Ok(success_without_http(json!({"preview":{
         "html":rendered,"url":final_url,
@@ -1950,6 +1960,62 @@ mod tests {
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn preview_extjs_uses_page_runtime_and_falls_back_on_script_errors() {
+        let source = serde_json::json!({
+            "bookSourceName": "preview fixture",
+            "bookSourceUrl": "https://example.test/"
+        });
+        let html = "<html><body><script>window.reviewText = 'ready'; document.body.innerHTML = '<p>original</p>';</script></body></html>";
+        let preview = |extjs: Option<Value>| -> Value {
+            let mut params = serde_json::json!({
+                "html": html,
+                "url": "https://example.test/reviews",
+            });
+            if let Some(extjs) = extjs {
+                params["extjs"] = extjs;
+            }
+            let request = serde_json::json!({"api":2,"op":"preview","params":params});
+            serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap()
+        };
+
+        let normal = preview(None);
+        assert_eq!(normal["ok"], true, "{normal}");
+        assert!(normal["data"]["preview"]["html"]
+            .as_str().unwrap().contains("<p>original</p>"), "{normal}");
+
+        let extracted = preview(Some(serde_json::json!(
+            "'<article>' + window.reviewText + ':' + document.readyState + '</article>'"
+        )));
+        assert_eq!(extracted["ok"], true, "{extracted}");
+        assert_eq!(extracted["data"]["preview"]["html"], "<article>ready:complete</article>");
+        assert_eq!(extracted["data"]["preview"]["url"], "https://example.test/reviews");
+
+        for bad in [
+            "throw new Error('broken extension')",
+            "const = invalid syntax",
+            "undefined",
+            "null",
+            "''",
+            "'  '",
+        ] {
+            let fallback = preview(Some(serde_json::json!(bad)));
+            assert_eq!(fallback["ok"], true, "{bad}: {fallback}");
+            assert_eq!(fallback["data"]["preview"]["html"], normal["data"]["preview"]["html"],
+                "{bad}: {fallback}");
+        }
+
+        assert_eq!(preview(Some(Value::Null))["data"]["preview"]["html"],
+            normal["data"]["preview"]["html"]);
+
+        for invalid in [serde_json::json!(true), serde_json::json!({"script":"1"}),
+                        serde_json::json!("a".repeat(64 * 1024 + 1))] {
+            let failed = preview(Some(invalid));
+            assert_eq!(failed["ok"], false, "{failed}");
+            assert_eq!(failed["error"]["kind"], "invalid_request", "{failed}");
+        }
+    }
 
     #[test]
     fn page_parameter_defaults_only_when_missing_or_null() {
