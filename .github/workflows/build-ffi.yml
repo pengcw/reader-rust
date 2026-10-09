@@ -470,6 +470,8 @@ jobs:
             Each platform archive is recorded in manifest.json with its SHA256.
           draft: false
           prerelease: false
+          # Legacy Lua plugins use /releases/latest/download; never redirect them to a versioned release.
+          make_latest: false
           files: |
             release_zips/*.zip
             release_zips/manifest.json

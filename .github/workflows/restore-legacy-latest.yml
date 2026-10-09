@@ -1,0 +1,37 @@
+# One-time repair: keep the legacy rolling release behind /releases/latest/download.
+# Delete this workflow once the repair run succeeds.
+name: Restore Legacy Latest Release
+
+on:
+  push:
+    branches:
+      - feature/ffi-lua-parser
+    paths:
+      - .github/workflows/restore-legacy-latest.yml
+
+permissions:
+  contents: write
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Restore legacy latest designation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This is the historical rolling release tag, not the semver release.
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/latest" --jq '.id')
+          if [[ -z "$id" ]]; then
+            echo "::error::Legacy latest release does not exist"
+            exit 1
+          fi
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$id" -f make_latest=true > /dev/null
+          current=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')
+          if [[ "$current" != 'latest' ]]; then
+            echo "::error::Latest still resolves to $current"
+            exit 1
+          fi
+          echo "Restored /releases/latest/download to legacy latest release"
