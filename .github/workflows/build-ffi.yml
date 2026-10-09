@@ -1,6 +1,9 @@
 name: Build & Release FFI Libraries
 
 on:
+  push:
+    tags:
+      - '[0-9]*'
   workflow_dispatch:
     inputs:
       target:
@@ -20,6 +23,11 @@ on:
 
 permissions:
   contents: write
+
+# Serialize runs for a ref: an already-published version must never be replaced.
+concurrency:
+  group: ffi-release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   # Keep build-std reproducible instead of following the moving nightly channel.
@@ -366,20 +374,35 @@ jobs:
           if-no-files-found: error
 
   publish-release:
-    name: Publish Binaries to GitHub Release
+    name: Publish Immutable Versioned Release
     needs: [build, build-kindle, build-ereader]
     if: >-
-      ${{ always() && !cancelled() && needs.build.result == 'success' &&
-      (needs['build-kindle'].result == 'success' ||
-      needs['build-kindle'].result == 'skipped') &&
-      (needs['build-ereader'].result == 'success' ||
-      needs['build-ereader'].result == 'skipped') }}
+      ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') &&
+      needs.build.result == 'success' &&
+      needs['build-kindle'].result == 'success' &&
+      needs['build-ereader'].result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Verify version and release immutability
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(grep '^version =' legado-ffi-core/Cargo.toml | cut -d '"' -f 2)
+          if [[ -z "$version" || "$GITHUB_REF_NAME" != "$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME must match Cargo version $version"
+            exit 1
+          fi
+          if gh release view "$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $version already exists; publish a new version instead"
+            exit 1
+          fi
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -388,87 +411,66 @@ jobs:
           merge-multiple: true
           path: artifacts
 
-
-      - name: Prepare releases
-        id: prepare
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Prepare versioned release
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p release_zips
           shopt -s nullglob
-
-          # 1) Merge the already-published zips first, then overlay this run's
-          #    binaries so the manifest always covers every asset on the rolling
-          #    release, with same-name assets from this run taking precedence.
-          gh release download latest \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern '*.zip' \
-            --dir release_zips \
-            --clobber || true
-
-          # 2) Collect the zips built in this run (overwrite same-name ones).
-          local_count=0
           for file in artifacts/*.zip artifacts/*/*.zip; do
-            if [ -f "$file" ]; then
-              cp -f "$file" release_zips/
-              local_count=$((local_count + 1))
+            cp "$file" release_zips/
+          done
+
+          # Never mix binaries from another run or publish an incomplete platform set.
+          targets=(
+            armv7-linux-androideabi
+            aarch64-linux-android
+            x86_64-unknown-linux-gnu
+            x86_64-pc-windows-msvc
+            armv7-unknown-linux-gnueabi
+            armv7-unknown-linux-gnueabihf
+            aarch64-unknown-linux-gnu
+          )
+          for target in "${targets[@]}"; do
+            zip="release_zips/legado_parser-${target}.zip"
+            if [[ ! -s "$zip" ]]; then
+              echo "::error::Missing release asset: $zip"
+              exit 1
             fi
           done
-
-          # 3) Nothing produced in this run: leave the online release untouched
-          #    (avoids overwriting manifest.json with an empty checksums map).
-          if [ "$local_count" -eq 0 ]; then
-            echo "skip_release=true" >> "$GITHUB_OUTPUT"
-            warning="::warning::No binaries produced in this run,"
-            warning+=" skipping release update."
-            echo "$warning"
-            exit 0
+          archives=(release_zips/*.zip)
+          if [[ "${#archives[@]}" -ne "${#targets[@]}" ]]; then
+            echo "::error::Unexpected release asset count: ${#archives[@]}"
+            exit 1
           fi
 
-          # Extract version from Cargo.toml
-          CARGO_VERSION=$(grep '^version =' \
-            legado-ffi-core/Cargo.toml | cut -d '"' -f 2)
-          VERSION="${CARGO_VERSION:-${GITHUB_REF_NAME:-latest}}"
-
-          # Generate manifest.json with SHA256 of each downloadable ZIP archive.
-          # Update.lua validates checksums[zip_name] before extraction.
+          # Each archive and manifest belongs exclusively to this version's tag.
           cd release_zips
-          echo "{" > manifest.json
-          echo '  "version": "'$VERSION'",' >> manifest.json
-          build_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          printf '  "build_time": "%s",\n' "$build_time" >> manifest.json
-          echo '  "checksums": {' >> manifest.json
-
+          printf '{\n  "version": "%s",\n' "$GITHUB_REF_NAME" > manifest.json
+          printf '  "build_time": "%s",\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> manifest.json
+          printf '  "checksums": {\n' >> manifest.json
           first=true
           for zip in *.zip; do
-             if [ -f "$zip" ]; then
-               hash=$(sha256sum "$zip" | awk '{print $1}')
-               if [ "$first" = true ]; then
-                   first=false
-               else
-                   echo ',' >> manifest.json
-               fi
-               echo -n '    "'$zip'": "'$hash'"' >> manifest.json
-             fi
+            if [[ "$first" == true ]]; then
+              first=false
+            else
+              printf ',\n' >> manifest.json
+            fi
+            printf '    "%s": "%s"' "$zip" "$(sha256sum "$zip" | cut -d ' ' -f 1)" >> manifest.json
           done
+          printf '\n  }\n}\n' >> manifest.json
 
-          echo '' >> manifest.json
-          echo '  }' >> manifest.json
-          echo "}" >> manifest.json
-          cd ..
-
-      - name: Create or Update Single GitHub Release
-        if: steps.prepare.outputs.skip_release != 'true'
+      - name: Publish versioned GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
-          name: Local Parser Extension
+          tag_name: ${{ github.ref_name }}
+          name: Local Parser Extension ${{ github.ref_name }}
           body: >-
-            Automated rolling release containing pre-compiled FFI parser
-            binaries for all supported platforms.
+            Immutable FFI parser binaries built together from tag ${{ github.ref_name }}.
+            Each platform archive is recorded in manifest.json with its SHA256.
           draft: false
           prerelease: false
           files: |
             release_zips/*.zip
             release_zips/manifest.json
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
