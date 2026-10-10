@@ -1992,6 +1992,12 @@ mod tests {
         assert_eq!(extracted["data"]["preview"]["html"], "<article>ready:complete</article>");
         assert_eq!(extracted["data"]["preview"]["url"], "https://example.test/reviews");
 
+        let statements = preview(Some(serde_json::json!(
+            "var extractedReview = window.reviewText; '<p>' + extractedReview + '</p>'"
+        )));
+        assert_eq!(statements["ok"], true, "{statements}");
+        assert_eq!(statements["data"]["preview"]["html"], "<p>ready</p>");
+
         for bad in [
             "throw new Error('broken extension')",
             "const = invalid syntax",
@@ -1999,6 +2005,13 @@ mod tests {
             "null",
             "''",
             "'  '",
+            "42",
+            "true",
+            "false",
+            "({})",
+            "['<p>not a string</p>']",
+            "new String('<p>not a primitive string</p>')",
+            "Promise.resolve('<p>not a string</p>')",
         ] {
             let fallback = preview(Some(serde_json::json!(bad)));
             assert_eq!(fallback["ok"], true, "{bad}: {fallback}");

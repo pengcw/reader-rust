@@ -6,8 +6,8 @@
 pub(crate) use crate::crawler::HttpClient;
 use crate::crawler::{
     analyze_url_with_headers, decode_body, execute_request_spec, execute_request_spec_limited,
-    format_analyzed_body, map_http_client_error, render_webview_with_rakers,
-    BrowserTimeouts, FetchError, HttpClientError, RequestSpec, DEFAULT_WEBVIEW_USER_AGENT,
+    format_analyzed_body, map_http_client_error, render_webview_with_rakers, BrowserTimeouts,
+    FetchError, HttpClientError, RequestSpec, DEFAULT_WEBVIEW_USER_AGENT,
 };
 use crate::model::book_source::BookSource;
 use crate::parser::js_compat::json_value_to_string;
@@ -154,9 +154,9 @@ pub(crate) fn try_render_webview(
 ) -> Result<(String, Option<String>), FetchError> {
     let (output, page_url) = render_webview_output(html, url, js, limit)?;
     let rendered = if !js.trim().is_empty() {
-        output.script_result.ok_or_else(|| {
-            FetchError::Rule("WebView script returned no result".to_string())
-        })?
+        output
+            .script_result
+            .ok_or_else(|| FetchError::Rule("WebView script returned no result".to_string()))?
     } else {
         output.html
     };
@@ -172,7 +172,17 @@ pub(crate) fn try_render_preview(
     ext_js: &str,
     limit: usize,
 ) -> Result<(String, Option<String>), FetchError> {
-    let (output, page_url) = render_webview_output(html, url, ext_js, limit)?;
+    // Check the JS type before Rakers coerces the result to a Rust string.
+    // Indirect eval retains the page-global scope and script completion value.
+    let script = if ext_js.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "(function() {{ var value = (0, eval)({}); return typeof value === 'string' ? value : undefined; }})()",
+            serde_json::to_string(ext_js).expect("serializing a string cannot fail"),
+        )
+    };
+    let (output, page_url) = render_webview_output(html, url, &script, limit)?;
     let rendered = output
         .script_result
         .filter(|value| {
@@ -196,7 +206,9 @@ fn render_webview_output(
         (html.to_string(), (!url.is_empty()).then(|| url.to_string()))
     } else {
         if url.is_empty() {
-            return Err(FetchError::InvalidUrl("WebView requires URL or HTML".to_string()));
+            return Err(FetchError::InvalidUrl(
+                "WebView requires URL or HTML".to_string(),
+            ));
         }
         let headers = [("User-Agent".to_string(), webview_user_agent())];
         let response = if url.starts_with("data:") {
