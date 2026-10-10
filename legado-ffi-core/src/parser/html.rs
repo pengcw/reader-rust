@@ -2904,7 +2904,7 @@ fn image_options_end(raw: &str) -> Option<usize> {
 fn preserve_image_metadata(content: &str) -> String {
     use base64::Engine;
     static PREFIX: Lazy<regex::Regex> = Lazy::new(|| {
-        regex::Regex::new(r#"(?i)<img\b[^>]*?\b(?:src|data-src|data-original)\s*=\s*["']([^"'\s>]+?),\s*(\{)"#).unwrap()
+        regex::Regex::new(r#"(?i)<img\b(?:[^"'<>]|"[^"]*"|'[^']*')*?\b(?:src|data-src|data-original)\s*=\s*["']([^"'\s>]+?),\s*(\{)"#).unwrap()
     });
     let mut output = String::new();
     let mut cursor = 0;
