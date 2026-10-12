@@ -6,6 +6,62 @@ use serde_json::{json, Value};
 // Java's U flag implies Unicode case behavior; java_regex models U/u separately,
 // so include both here to preserve the effective Java semantics.
 const QREAD_REGEX_FLAGS: &str = "uUm";
+const MAX_TRANSFORM_DIAGNOSTICS: usize = 16;
+
+/// Records bounded failure categories, never rule contents or exception messages.
+#[derive(Debug)]
+pub(super) struct TransformDiagnostics {
+    enabled: bool,
+    issues: Vec<TransformIssue>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TransformIssue {
+    rule_index: Option<usize>,
+    kind: &'static str,
+}
+
+impl TransformDiagnostics {
+    pub(super) fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            issues: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, rule_index: Option<usize>, kind: &'static str) {
+        if !self.enabled || self.issues.len() >= MAX_TRANSFORM_DIAGNOSTICS {
+            return;
+        }
+        let issue = TransformIssue { rule_index, kind };
+        if !self.issues.contains(&issue) {
+            self.issues.push(issue);
+        }
+    }
+
+    fn record_regex_error(&mut self, rule_index: usize, error: &source_regex::RegexError) {
+        let kind = match error {
+            source_regex::RegexError::InvalidPattern => "invalid_regex",
+            source_regex::RegexError::InvalidReplacement { .. } => "invalid_replacement",
+            source_regex::RegexError::BudgetExceeded => "regex_budget_exceeded",
+        };
+        self.record(Some(rule_index), kind);
+    }
+
+    pub(super) fn attach(&self, response: &mut Value, stage: &'static str) {
+        if self.issues.is_empty() {
+            return;
+        }
+        let diagnostics = self
+            .issues
+            .iter()
+            .map(|issue| {
+                json!({"stage": stage, "ruleIndex": issue.rule_index, "kind": issue.kind})
+            })
+            .collect::<Vec<_>>();
+        response["meta"]["debug"]["textTransformDiagnostics"] = json!(diagnostics);
+    }
+}
 
 const READER3_BATCH_JS: &str = r#"
 (function() {
@@ -60,8 +116,12 @@ struct TextTransformRule {
     is_regex: bool,
 }
 
-pub(super) fn apply_from_params(values: &mut [String], params: &Value) {
-    let Some((dialect, rules)) = parse_transform_request(params) else {
+pub(super) fn apply_from_params(
+    values: &mut [String],
+    params: &Value,
+    diagnostics: &mut TransformDiagnostics,
+) {
+    let Some((dialect, rules)) = parse_transform_request(params, diagnostics) else {
         return;
     };
 
@@ -71,11 +131,15 @@ pub(super) fn apply_from_params(values: &mut [String], params: &Value) {
                 for (value, transformed) in values.iter_mut().zip(transformed) {
                     *value = transformed;
                 }
+            } else {
+                // Reader3 catches individual rule errors inside its batch JS; do not
+                // change those semantics just to surface per-rule diagnostics.
+                diagnostics.record(None, "reader3_batch_failed");
             }
         }
         TextTransformDialect::Legado | TextTransformDialect::Qread => {
             for value in values {
-                *value = apply_java_rules(value, &rules, dialect);
+                *value = apply_java_rules(value, &rules, dialect, diagnostics);
             }
         }
     }
@@ -83,24 +147,38 @@ pub(super) fn apply_from_params(values: &mut [String], params: &Value) {
 
 fn parse_transform_request(
     params: &Value,
-) -> Option<(TextTransformDialect, Vec<TextTransformRule>)> {
-    let dialect = params
+    diagnostics: &mut TransformDiagnostics,
+) -> Option<(TextTransformDialect, Vec<(usize, TextTransformRule)>)> {
+    if params.get("textTransformDialect").is_none() && params.get("textTransformRules").is_none() {
+        return None;
+    }
+    let Some(dialect) = params
         .get("textTransformDialect")
         .and_then(Value::as_str)
-        .and_then(TextTransformDialect::parse)?;
-    let raw_rules = params.get("textTransformRules")?.as_array()?;
+        .and_then(TextTransformDialect::parse)
+    else {
+        diagnostics.record(None, "invalid_dialect");
+        return None;
+    };
+    let Some(raw_rules) = params.get("textTransformRules").and_then(Value::as_array) else {
+        diagnostics.record(None, "invalid_rules");
+        return None;
+    };
 
-    let rules = raw_rules
-        .iter()
-        .filter_map(|rule| serde_json::from_value(rule.clone()).ok())
-        .collect::<Vec<_>>();
+    let mut rules = Vec::new();
+    for (index, value) in raw_rules.iter().enumerate() {
+        match serde_json::from_value::<TextTransformRule>(value.clone()) {
+            Ok(rule) => rules.push((index, rule)),
+            Err(_) => diagnostics.record(Some(index), "invalid_rule"),
+        }
+    }
     (!rules.is_empty()).then_some((dialect, rules))
 }
 
-fn apply_reader3(values: &[String], rules: &[TextTransformRule]) -> Option<Vec<String>> {
+fn apply_reader3(values: &[String], rules: &[(usize, TextTransformRule)]) -> Option<Vec<String>> {
     let rules = rules
         .iter()
-        .map(|rule| {
+        .map(|(_, rule)| {
             json!({
                 "pattern": &rule.pattern,
                 "replacement": &rule.replacement,
@@ -121,12 +199,13 @@ fn apply_reader3(values: &[String], rules: &[TextTransformRule]) -> Option<Vec<S
 
 fn apply_java_rules(
     input: &str,
-    rules: &[TextTransformRule],
+    rules: &[(usize, TextTransformRule)],
     dialect: TextTransformDialect,
+    diagnostics: &mut TransformDiagnostics,
 ) -> String {
     let mut output = input.to_string();
 
-    for rule in rules {
+    for (index, rule) in rules {
         if rule.pattern.is_empty() {
             continue;
         }
@@ -142,12 +221,17 @@ fn apply_java_rules(
             };
             // Preserve JS completion-value string coercion, including objects and null.
             let script = format!("String(eval({}))", json!(script));
-            if let Ok(next) =
-                source_regex::replace_all_with(&output, &rule.pattern, flags, |matched| {
-                    eval_js(&script, matched, "")
-                })
-            {
-                output = next;
+            match source_regex::replace_all_with(&output, &rule.pattern, flags, |matched| {
+                eval_js(&script, matched, "")
+            }) {
+                Ok(next) => output = next,
+                Err(error) => {
+                    if let Some(regex_error) = error.downcast_ref::<source_regex::RegexError>() {
+                        diagnostics.record_regex_error(*index, regex_error);
+                    } else {
+                        diagnostics.record(Some(*index), "js_error");
+                    }
+                }
             }
         } else {
             let result = match dialect {
@@ -162,8 +246,9 @@ fn apply_java_rules(
                 ),
                 TextTransformDialect::Reader3 => unreachable!("Reader3 uses QuickJS"),
             };
-            if let Ok(next) = result {
-                output = next;
+            match result {
+                Ok(next) => output = next,
+                Err(error) => diagnostics.record_regex_error(*index, &error),
             }
         }
     }
@@ -184,7 +269,11 @@ mod tests {
 
     fn apply(input: &str, dialect: &str, rules: Value) -> String {
         let mut values = vec![input.to_string()];
-        apply_from_params(&mut values, &params(dialect, rules));
+        apply_from_params(
+            &mut values,
+            &params(dialect, rules),
+            &mut TransformDiagnostics::new(false),
+        );
         values.remove(0)
     }
 
@@ -269,6 +358,7 @@ mod tests {
                     {"pattern":"a","replacement":"ok","isRegex":false}
                 ]),
             ),
+            &mut TransformDiagnostics::new(false),
         );
         assert_eq!(values, ["ok", "ok"]);
     }
@@ -285,6 +375,7 @@ mod tests {
                     {"pattern":"b","replacement":"c","isRegex":false}
                 ]),
             ),
+            &mut TransformDiagnostics::new(false),
         );
         assert_eq!(values, ["c a", "c"]);
     }
@@ -358,6 +449,92 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn debug_reports_rule_indices_and_typed_failures_without_sensitive_values() {
+        let mut values = vec!["a b".to_string()];
+        let mut diagnostics = TransformDiagnostics::new(true);
+        apply_from_params(
+            &mut values,
+            &params(
+                "legado",
+                json!([
+                    {"replacement":"private input"},
+                    {"pattern":"[","replacement":"bad","isRegex":true},
+                    {"pattern":"a","replacement":"$9","isRegex":true},
+                    {"pattern":"a","replacement":"@js:throw Error('secret token')","isRegex":true},
+                    {"pattern":"[","replacement":"@js:result","isRegex":true},
+                    {"pattern":"a","replacement":"ok","isRegex":false}
+                ]),
+            ),
+            &mut diagnostics,
+        );
+        assert_eq!(values, ["ok b"]);
+        let mut result = json!({"meta":{"debug":{"responseBytes":3}}});
+        diagnostics.attach(&mut result, "content");
+        assert_eq!(result["meta"]["debug"]["responseBytes"], 3);
+        assert_eq!(
+            result["meta"]["debug"]["textTransformDiagnostics"],
+            json!([
+                {"stage":"content","ruleIndex":0,"kind":"invalid_rule"},
+                {"stage":"content","ruleIndex":1,"kind":"invalid_regex"},
+                {"stage":"content","ruleIndex":2,"kind":"invalid_replacement"},
+                {"stage":"content","ruleIndex":3,"kind":"js_error"},
+                {"stage":"content","ruleIndex":4,"kind":"invalid_regex"}
+            ])
+        );
+        assert!(!result.to_string().contains("secret token"));
+        assert!(!result.to_string().contains("private input"));
+    }
+
+    #[test]
+    fn debug_deduplicates_across_titles_and_caps_number_of_entries() {
+        let mut values = vec!["a".to_string(); 3];
+        let rules = (0..25)
+            .map(|_| json!({"pattern":"[","replacement":"bad","isRegex":true}))
+            .collect::<Vec<_>>();
+        let mut diagnostics = TransformDiagnostics::new(true);
+        apply_from_params(&mut values, &params("qread", json!(rules)), &mut diagnostics);
+        assert_eq!(values, ["a", "a", "a"]);
+        let mut response = json!({"meta":{"debug":{}}});
+        diagnostics.attach(&mut response, "toc");
+        let entries = response["meta"]["debug"]["textTransformDiagnostics"]
+            .as_array()
+            .unwrap();
+        assert_eq!(entries.len(), MAX_TRANSFORM_DIAGNOSTICS);
+        for (index, entry) in entries.iter().enumerate() {
+            assert_eq!(entry["stage"], "toc");
+            assert_eq!(entry["ruleIndex"], index);
+            assert_eq!(entry["kind"], "invalid_regex");
+        }
+    }
+
+    #[test]
+    fn debug_is_opt_in_and_reports_invalid_request_configuration() {
+        let mut values = vec!["a".to_string()];
+        let mut disabled = TransformDiagnostics::new(false);
+        apply_from_params(
+            &mut values,
+            &params("unknown", json!([{"pattern":"a"}])),
+            &mut disabled,
+        );
+        let mut response = json!({"meta":{}});
+        disabled.attach(&mut response, "content");
+        assert_eq!(response, json!({"meta":{}}));
+
+        let mut enabled = TransformDiagnostics::new(true);
+        apply_from_params(
+            &mut values,
+            &params("unknown", json!([{"pattern":"a"}])),
+            &mut enabled,
+        );
+        enabled.attach(&mut response, "content");
+        assert_eq!(values, ["a"]);
+        assert_eq!(
+            response["meta"]["debug"]["textTransformDiagnostics"],
+            json!([{"stage":"content","ruleIndex":null,"kind":"invalid_dialect"}])
+        );
     }
 
     #[test]

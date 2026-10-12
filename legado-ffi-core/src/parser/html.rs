@@ -1,6 +1,6 @@
-use std::sync::LazyLock as Lazy;
 use scraper::{ElementRef, Html, Selector};
 use std::collections::HashSet;
+use std::sync::LazyLock as Lazy;
 
 use crate::parser::rule_analyzer::{self, split_top_level};
 
@@ -68,13 +68,13 @@ fn legado_to_css(selector: &str) -> String {
     }
 
     // Handle id. prefix
-    if selector.starts_with("id.") {
-        return format!("#{}", &selector[3..]);
+    if let Some(rest) = selector.strip_prefix("id.") {
+        return format!("#{rest}");
     }
 
     // Handle tag. prefix
-    if selector.starts_with("tag.") {
-        return selector[4..].to_string();
+    if let Some(rest) = selector.strip_prefix("tag.") {
+        return rest.to_string();
     }
 
     // Everything else is standard CSS. Do not guess that descendant
@@ -82,7 +82,7 @@ fn legado_to_css(selector: &str) -> String {
     selector.to_string()
 }
 
-fn quote_unquoted_colon_attribute_value(attribute: &str) -> Option<String> {
+fn quote_unquoted_attribute_value(attribute: &str) -> Option<String> {
     let mut quote = None;
     let mut escaped = false;
     let mut equals = None;
@@ -117,7 +117,7 @@ fn quote_unquoted_colon_attribute_value(attribute: &str) -> Option<String> {
         .map_or(attribute.len(), |(index, _)| value_start + index);
     let value = &attribute[value_start..value_end];
     if value.is_empty()
-        || !value.contains(':')
+        || !(value.contains(':') || value.as_bytes().first().is_some_and(u8::is_ascii_digit))
         || value.chars().any(|ch| matches!(ch, '\\' | '\'' | '"'))
     {
         return None;
@@ -132,7 +132,7 @@ fn quote_unquoted_colon_attribute_value(attribute: &str) -> Option<String> {
     Some(normalized)
 }
 
-fn quote_unquoted_colon_attribute_values(selector: &str) -> Option<String> {
+fn quote_unquoted_attribute_values(selector: &str) -> Option<String> {
     let mut output = String::with_capacity(selector.len());
     let mut copied_until = 0;
     let mut bracket_start = None;
@@ -162,7 +162,7 @@ fn quote_unquoted_colon_attribute_values(selector: &str) -> Option<String> {
             ']' => {
                 if let Some(start) = bracket_start.take() {
                     if let Some(attribute) =
-                        quote_unquoted_colon_attribute_value(&selector[start + 1..index])
+                        quote_unquoted_attribute_value(&selector[start + 1..index])
                     {
                         output.push_str(&selector[copied_until..start + 1]);
                         output.push_str(&attribute);
@@ -242,7 +242,7 @@ fn normalize_jsoup_eq(selector: &str) -> Option<String> {
 fn parse_css_selector(css_selector: &str) -> Option<Selector> {
     let normalized = normalize_jsoup_eq(css_selector)?;
     Selector::parse(&normalized).ok().or_else(|| {
-        let quoted = quote_unquoted_colon_attribute_values(&normalized)?;
+        let quoted = quote_unquoted_attribute_values(&normalized)?;
         Selector::parse(&quoted).ok()
     })
 }
@@ -636,7 +636,10 @@ fn parse_selector_with_index(selector: &str) -> ParsedSelector {
 }
 
 pub(crate) fn css_rule_is_valid(rule: &str) -> bool {
-    let combinations = split_top_level(rule, &["&&", "||", "%%"]);
+    // Postprocessing is not selector syntax, even when it contains operators.
+    let stages = split_top_level(rule, &["##", "<js>", "@js:", "@JS:", "@Js:", "@jS:"]);
+    let selection = stages.parts.first().map(String::as_str).unwrap_or("");
+    let combinations = split_top_level(selection, &["&&", "||", "%%"]);
     combinations.parts.iter().all(|part| {
         let chain = split_top_level(part, &["@@"]);
         chain.parts.iter().all(|step| {
@@ -1121,6 +1124,17 @@ pub(crate) fn select_css_from_element<'a>(
 ) -> Vec<ElementRef<'a>> {
     let scoped = scope_child_selector(css_selector);
     let css_selector = scoped.as_ref();
+    let elements = || std::iter::once(el).chain(el.select(&UNIVERSAL_SELECTOR));
+    let select = |part: &str| {
+        let Some(sel) = parse_css_selector(part) else {
+            return Vec::new();
+        };
+        sel.matches_with_scope(&el, Some(el))
+            .then_some(el)
+            .into_iter()
+            .chain(el.select(&sel))
+            .collect()
+    };
     let groups = split_top_level(css_selector, &[","]);
     if groups.parts.len() > 1 {
         let matches = groups
@@ -1128,31 +1142,22 @@ pub(crate) fn select_css_from_element<'a>(
             .iter()
             .flat_map(|part| select_css_from_element(el, part))
             .collect();
-        return unique_in_document_order(matches, el.select(&UNIVERSAL_SELECTOR));
+        return unique_in_document_order(matches, elements());
     }
     if let Some(matches) =
         select_css_with_not(css_selector, |part| select_css_from_element(el, part))
     {
-        return unique_in_document_order(matches, el.select(&UNIVERSAL_SELECTOR));
+        return unique_in_document_order(matches, elements());
     }
     if let Some(matches) =
         select_css_with_has(css_selector, |part| select_css_from_element(el, part))
     {
-        return unique_in_document_order(matches, el.select(&UNIVERSAL_SELECTOR));
+        return unique_in_document_order(matches, elements());
     }
-    if let Some(matches) = select_css_with_matches(css_selector, |part| {
-        parse_css_selector(part)
-            .map(|sel| el.select(&sel).collect())
-            .unwrap_or_default()
-    }) {
-        return unique_in_document_order(matches, el.select(&UNIVERSAL_SELECTOR));
+    if let Some(matches) = select_css_with_matches(css_selector, select) {
+        return unique_in_document_order(matches, elements());
     }
-    select_css_with_contains(css_selector, |part| {
-        let Some(sel) = parse_css_selector(part) else {
-            return Vec::new();
-        };
-        el.select(&sel).collect()
-    })
+    select_css_with_contains(css_selector, select)
 }
 
 fn child_elements<'a>(el: ElementRef<'a>) -> Vec<ElementRef<'a>> {
@@ -1440,8 +1445,8 @@ pub fn extract_text(el: &ElementRef, extractor: &str) -> Option<String> {
                 return el.value().attr(attr_name).map(|v| v.to_string());
             }
 
-            if extractor.starts_with('@') {
-                el.value().attr(&extractor[1..]).map(|v| v.to_string())
+            if let Some(attribute) = extractor.strip_prefix('@') {
+                el.value().attr(attribute).map(|v| v.to_string())
             } else {
                 el.value().attr(extractor).map(|v| v.to_string())
             }
@@ -1781,7 +1786,24 @@ fn html_to_xpath_xml(html: &str) -> String {
         .expect("valid HTML void element regex")
     });
 
-    let without_doctype = DOCTYPE.replace_all(html, "");
+    // HTML serializers emit script/style data verbatim. Escape that text for
+    // the XML-only evaluator without removing nodes or changing XPath values.
+    static RAW_TEXT: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(
+            r"(?is)(<script\b[^>]*>)(.*?)(</script\s*>)|(<style\b[^>]*>)(.*?)(</style\s*>)",
+        )
+        .expect("valid raw text element regex")
+    });
+    let escaped = RAW_TEXT.replace_all(html, |captures: &regex::Captures| {
+        let offset = if captures.get(1).is_some() { 1 } else { 4 };
+        format!(
+            "{}{}{}",
+            &captures[offset],
+            html_escape_text(&captures[offset + 1]),
+            &captures[offset + 2],
+        )
+    });
+    let without_doctype = DOCTYPE.replace_all(&escaped, "");
     let xml = VOID_ELEMENT.replace_all(&without_doctype, |captures: &regex::Captures| {
         let whole = captures
             .get(0)
@@ -2467,7 +2489,7 @@ fn xpath_node_json(
 ) -> serde_json::Value {
     match node {
         sxd_xpath::nodeset::Node::Element(element) => {
-            let attrs = element
+            let attr_list = element
                 .attributes()
                 .into_iter()
                 .map(|attr| {
@@ -2478,7 +2500,8 @@ fn xpath_node_json(
                     };
                     (name, serde_json::Value::String(attr.value().to_string()))
                 })
-                .collect::<serde_json::Map<_, _>>();
+                .collect::<Vec<_>>();
+            let attrs = attr_list.iter().cloned().collect::<serde_json::Map<_, _>>();
             let serialize = |outer| {
                 if html_mode {
                     sxd_element_to_html(element, outer)
@@ -2491,7 +2514,7 @@ fn xpath_node_json(
             let mut item = serde_json::json!({
                 "__readerHtmlElement": true,
                 "__readerXPathNode": {"path":xpath_element_path(element), "htmlMode":html_mode},
-                "attrs":attrs, "html":serialize(false), "outerHtml":serialize(true), "text":node.string_value(),
+                "attrs":attrs, "attrList":attr_list, "html":serialize(false), "outerHtml":serialize(true), "text":node.string_value(),
             });
             if let Some(snapshot) = snapshot {
                 item["__readerXPathNode"]["document"] =
@@ -2882,16 +2905,22 @@ fn image_options_end(raw: &str) -> Option<usize> {
     let mut escaped = false;
     for (i, byte) in raw.bytes().take(64 * 1024).enumerate() {
         if let Some(delimiter) = quote {
-            if escaped { escaped = false; }
-            else if byte == b'\\' { escaped = true; }
-            else if byte == delimiter { quote = None; }
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                quote = None;
+            }
         } else {
             match byte {
                 b'\'' | b'"' => quote = Some(byte),
                 b'{' => depth += 1,
                 b'}' => {
                     depth = depth.checked_sub(1)?;
-                    if depth == 0 { return Some(i + 1); }
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
                 }
                 _ => {}
             }
@@ -2910,25 +2939,44 @@ fn preserve_image_metadata(content: &str) -> String {
     let mut cursor = 0;
     for caps in PREFIX.captures_iter(content) {
         let whole = caps.get(0).unwrap();
-        if whole.start() < cursor { continue; }
+        if whole.start() < cursor {
+            continue;
+        }
         let json_start = caps.get(2).unwrap().start();
-        let Some(length) = image_options_end(&content[json_start..]) else { continue; };
+        let Some(length) = image_options_end(&content[json_start..]) else {
+            continue;
+        };
         let json_end = json_start + length;
         let mut attribute_end = json_end;
-        while content.as_bytes().get(attribute_end).is_some_and(u8::is_ascii_whitespace) {
+        while content
+            .as_bytes()
+            .get(attribute_end)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
             attribute_end += 1;
         }
         let quote = content.as_bytes()[caps.get(1).unwrap().start() - 1];
-        if content.as_bytes().get(attribute_end) != Some(&quote) { continue; }
-        let Ok(meta) = crate::crawler::parse_url_options(&content[json_start..json_end]) else { continue; };
-        if !meta.is_object() { continue; }
+        if content.as_bytes().get(attribute_end) != Some(&quote) {
+            continue;
+        }
+        // These options live in an HTML attribute. Decode entities before
+        // packing them: later text unescaping cannot reach Base64 metadata.
+        let options = html_unescape(&content[json_start..json_end]);
+        let Ok(meta) = crate::crawler::parse_url_options(&options) else {
+            continue;
+        };
+        if !meta.is_object() {
+            continue;
+        }
         let encoded = base64::engine::general_purpose::STANDARD.encode(meta.to_string());
         output.push_str(&content[cursor..caps.get(1).unwrap().end()]);
         output.push(quote as char);
         output.push_str(&format!(r#" data-legado-image-meta="{}""#, encoded));
         cursor = attribute_end + 1;
     }
-    if cursor == 0 { return content.to_string(); }
+    if cursor == 0 {
+        return content.to_string();
+    }
     output.push_str(&content[cursor..]);
     output
 }
@@ -2963,22 +3011,33 @@ fn format_keep_img_with_script_text(
     static REVIEW_RE: Lazy<regex::Regex> = Lazy::new(|| {
         regex::Regex::new(r#"(?is)<(?:comment|note)\b(?:[^"'<>]|"[^"]*"|'[^']*')*>"#).unwrap()
     });
-    static REVIEW_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("comment, note").unwrap());
-    text = REVIEW_RE.replace_all(&text, |caps: &regex::Captures| {
-        let fragment = Html::parse_fragment(caps.get(0).unwrap().as_str());
-        let Some(node) = fragment.select(&REVIEW_SELECTOR).next() else { return String::new(); };
-        let mut attributes = serde_json::Map::new();
-        attributes.insert("tag".to_string(), serde_json::json!(node.value().name()));
-        for (name, value) in node.value().attrs() {
-            attributes.insert(name.to_string(), serde_json::json!(value));
-        }
-        use base64::Engine;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(
-            serde_json::to_vec(&attributes).unwrap());
-        let marker = format!("__READER_REVIEW_PLACEHOLDER_{}__", review_placeholders.len());
-        review_placeholders.push(format!(r#"<reader-review data-legado-review-meta="{}"></reader-review>"#, encoded));
-        marker
-    }).into_owned();
+    static REVIEW_SELECTOR: Lazy<Selector> =
+        Lazy::new(|| Selector::parse("comment, note").unwrap());
+    text = REVIEW_RE
+        .replace_all(&text, |caps: &regex::Captures| {
+            let fragment = Html::parse_fragment(caps.get(0).unwrap().as_str());
+            let Some(node) = fragment.select(&REVIEW_SELECTOR).next() else {
+                return String::new();
+            };
+            let mut attributes = serde_json::Map::new();
+            attributes.insert("tag".to_string(), serde_json::json!(node.value().name()));
+            for (name, value) in node.value().attrs() {
+                attributes.insert(name.to_string(), serde_json::json!(value));
+            }
+            use base64::Engine;
+            let encoded = base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&attributes).unwrap());
+            let marker = format!(
+                "__READER_REVIEW_PLACEHOLDER_{}__",
+                review_placeholders.len()
+            );
+            review_placeholders.push(format!(
+                r#"<reader-review data-legado-review-meta="{}"></reader-review>"#,
+                encoded
+            ));
+            marker
+        })
+        .into_owned();
 
     // 2. 提取并保留 <img> 标签，补全相对 URL，使用占位符保护
     let mut img_placeholders: Vec<String> = Vec::new();
@@ -2995,7 +3054,9 @@ fn format_keep_img_with_script_text(
                     let mut image_meta = None;
                     let mut full_img = if let Some(src_caps) = src_re.captures(img_tag) {
                         let raw_src = src_caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-                        dp_review = raw_src.strip_prefix("dp:").is_some_and(|count| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()));
+                        dp_review = raw_src.strip_prefix("dp:").is_some_and(|count| {
+                            !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit())
+                        });
                         inline_review = dp_review;
                         if !raw_src.is_empty() && !redirect_url.is_empty() && !dp_review {
                             let abs_src =
@@ -3012,13 +3073,26 @@ fn format_keep_img_with_script_text(
                         if let Some(end) = img_tag[value_start..].find('"') {
                             use base64::Engine;
                             let decoded = base64::engine::general_purpose::STANDARD
-                                .decode(&img_tag[value_start..value_start + end]).ok();
-                            let meta = decoded.as_deref().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok());
+                                .decode(&img_tag[value_start..value_start + end])
+                                .ok();
+                            let meta = decoded.as_deref().and_then(|bytes| {
+                                serde_json::from_slice::<serde_json::Value>(bytes).ok()
+                            });
                             inline_review = meta.as_ref().is_some_and(|meta| {
-                                if dp_review { return meta.get("style").and_then(serde_json::Value::as_str) != Some("FULL"); }
-                                let action = meta.get("click").or_else(|| meta.get("js")).and_then(serde_json::Value::as_str);
-                                matches!(meta.get("style").and_then(serde_json::Value::as_str), Some("text" | "TEXT"))
-                                    && action.is_some_and(|action| !action.trim().is_empty() && action.len() <= 65536)
+                                if dp_review {
+                                    return meta.get("style").and_then(serde_json::Value::as_str)
+                                        != Some("FULL");
+                                }
+                                let action = meta
+                                    .get("click")
+                                    .or_else(|| meta.get("js"))
+                                    .and_then(serde_json::Value::as_str);
+                                matches!(
+                                    meta.get("style").and_then(serde_json::Value::as_str),
+                                    Some("text" | "TEXT")
+                                ) && action.is_some_and(|action| {
+                                    !action.trim().is_empty() && action.len() <= 65536
+                                })
                             });
                             image_meta = meta;
                             full_img.pop();
@@ -3032,37 +3106,55 @@ fn format_keep_img_with_script_text(
                         static IMAGE_SELECTOR: Lazy<Selector> =
                             Lazy::new(|| Selector::parse("img").unwrap());
                         let fragment = Html::parse_fragment(img_tag);
-                        let onpress = fragment.select(&IMAGE_SELECTOR).next()
+                        let onpress = fragment
+                            .select(&IMAGE_SELECTOR)
+                            .next()
                             .and_then(|node| node.value().attr("onpress"))
                             .filter(|action| !action.trim().is_empty() && action.len() <= 65536);
                         if let Some(action) = onpress {
                             let mut meta = image_meta.unwrap_or_else(|| serde_json::json!({}));
                             if let Some(object) = meta.as_object_mut() {
                                 let existing = ["click", "js"].iter().any(|key| {
-                                    object.get(*key).and_then(serde_json::Value::as_str)
-                                        .is_some_and(|value| !value.trim().is_empty() && value.len() <= 65536)
+                                    object
+                                        .get(*key)
+                                        .and_then(serde_json::Value::as_str)
+                                        .is_some_and(|value| {
+                                            !value.trim().is_empty() && value.len() <= 65536
+                                        })
                                 });
                                 if !existing {
                                     object.insert("click".to_string(), serde_json::json!(action));
                                     use base64::Engine;
-                                    let encoded = base64::engine::general_purpose::STANDARD.encode(meta.to_string());
-                                    if let Some(start) = full_img.find(" data-legado-image-meta=\"") {
+                                    let encoded = base64::engine::general_purpose::STANDARD
+                                        .encode(meta.to_string());
+                                    if let Some(start) = full_img.find(" data-legado-image-meta=\"")
+                                    {
                                         full_img.truncate(start);
                                     } else {
                                         full_img.pop();
                                     }
-                                    full_img.push_str(&format!(r#" data-legado-image-meta="{}">"#, encoded));
+                                    full_img.push_str(&format!(
+                                        r#" data-legado-image-meta="{}">"#,
+                                        encoded
+                                    ));
                                 }
                                 let style = meta.get("style").and_then(serde_json::Value::as_str);
-                                inline_review = if dp_review { style != Some("FULL") }
-                                    else { matches!(style, Some("text" | "TEXT")) };
+                                inline_review = if dp_review {
+                                    style != Some("FULL")
+                                } else {
+                                    matches!(style, Some("text" | "TEXT"))
+                                };
                             }
                         }
                     }
                     let placeholder =
                         format!("__READER_IMG_PLACEHOLDER_{}__", img_placeholders.len());
                     img_placeholders.push(full_img);
-                    if inline_review { placeholder } else { format!("\n{}\n", placeholder) }
+                    if inline_review {
+                        placeholder
+                    } else {
+                        format!("\n{}\n", placeholder)
+                    }
                 })
                 .into_owned();
         }
@@ -3199,7 +3291,8 @@ mod tests {
 
     #[test]
     fn cleaning_modes_keep_their_script_policy_across_calls() {
-        let input = "<script>脚本文本</script><style>样式文本</style><!--隐藏\n注释--><p>正文🦀</p>";
+        let input =
+            "<script>脚本文本</script><style>样式文本</style><!--隐藏\n注释--><p>正文🦀</p>";
         for _ in 0..3 {
             assert_eq!(format_keep_img(input, ""), "正文🦀");
             let formatted = format_js_html(input, "");
@@ -3454,6 +3547,31 @@ mod tests {
             );
         }
         assert!(select_xpath_from_context("<root/>", "//*").is_none());
+    }
+
+    #[test]
+    fn css_self_match_keeps_root_order_pseudos_and_child_scope() {
+        let doc = parse_document("<div id='root'>own<span id='child'>child</span></div>");
+        let root = select_list(&doc, "#root")[0];
+        for (selector, expected) in [
+            ("#child,#root,#root", vec!["root", "child"]),
+            ("#root:not(.other)", vec!["root"]),
+            ("#root:has(span)", vec!["root"]),
+            ("#root:contains(own)", vec!["root"]),
+            ("#root:matches(own)", vec!["root"]),
+            ("> span", vec!["child"]),
+            ("#missing", vec![]),
+        ] {
+            let actual = select_css_from_element(root, selector);
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|el| el.value().attr("id").unwrap())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{selector}"
+            );
+        }
     }
 
     #[test]
@@ -3900,12 +4018,17 @@ mod tests {
     fn test_image_metadata_survives_content_cleaning() {
         use base64::Engine;
         let meta = r#"{"click":"showFanqieComment(\"https://example.com/review?a=1&b=2\",\"本章说 >\")","style":"FULL"}"#;
-        let input = format!(r#"<p>正文</p><img src="data:image/svg+xml;base64,PHN2Zz4=,{}">"#, meta);
+        let input = format!(
+            r#"<p>正文</p><img src="data:image/svg+xml;base64,PHN2Zz4=,{}">"#,
+            meta
+        );
         let encoded = base64::engine::general_purpose::STANDARD.encode(meta);
         assert_eq!(format_keep_img(&input, ""), format!(
             "正文\n<img src=\"data:image/svg+xml;base64,PHN2Zz4=\" data-legado-image-meta=\"{}\">", encoded));
-        assert_eq!(format_keep_img(r#"<img src="data:image/png;base64,YQ==">"#, ""),
-            r#"<img src="data:image/png;base64,YQ==">"#);
+        assert_eq!(
+            format_keep_img(r#"<img src="data:image/png;base64,YQ==">"#, ""),
+            r#"<img src="data:image/png;base64,YQ==">"#
+        );
     }
 
     #[test]
@@ -3915,15 +4038,20 @@ mod tests {
             let encoded = regex::Regex::new(r#"data-legado-image-meta="([^"]+)""#).unwrap();
             let matched = encoded.captures(html).expect("image metadata");
             serde_json::from_slice(
-                &base64::engine::general_purpose::STANDARD.decode(&matched[1]).unwrap(),
-            ).unwrap()
+                &base64::engine::general_purpose::STANDARD
+                    .decode(&matched[1])
+                    .unwrap(),
+            )
+            .unwrap()
         }
 
         let output = format_keep_img(
             r#"<p>正文<img src="/card.svg" title="2 > 1" onPress="java.showReadingBrowser('https://example.test/?a=1&amp;b=2','本章说 >')"></p>"#,
             "https://example.test/chapter",
         );
-        assert!(output.contains(r#"<img src="https://example.test/card.svg" data-legado-image-meta="#));
+        assert!(
+            output.contains(r#"<img src="https://example.test/card.svg" data-legado-image-meta="#)
+        );
         assert!(!output.contains(" onPress="));
         assert_eq!(
             read_meta(&output)["click"],
@@ -3943,7 +4071,10 @@ mod tests {
         assert!(output.contains("正文<img"), "TEXT review stays inline");
         assert_eq!(read_meta(&output)["click"], "open()");
         assert_eq!(read_meta(&output)["style"], "TEXT");
-        assert_eq!(format_keep_img(r#"<img src="/plain.jpg">"#, ""), r#"<img src="/plain.jpg">"#);
+        assert_eq!(
+            format_keep_img(r#"<img src="/plain.jpg">"#, ""),
+            r#"<img src="/plain.jpg">"#
+        );
     }
 
     #[test]
@@ -3952,11 +4083,22 @@ mod tests {
         let input = r#"<p>正文<comment count="12" onPress="customReview('https://example.com/?a=1&amp;b=2')"/></p><note ident="https://example.com/note" text="神评 &gt; 正文"/>"#;
         let output = format_keep_img(input, "");
         let regex = regex::Regex::new(r#"data-legado-review-meta="([^"]+)""#).unwrap();
-        let data: Vec<serde_json::Value> = regex.captures_iter(&output).map(|caps| {
-            serde_json::from_slice(&base64::engine::general_purpose::STANDARD.decode(&caps[1]).unwrap()).unwrap()
-        }).collect();
+        let data: Vec<serde_json::Value> = regex
+            .captures_iter(&output)
+            .map(|caps| {
+                serde_json::from_slice(
+                    &base64::engine::general_purpose::STANDARD
+                        .decode(&caps[1])
+                        .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
         assert_eq!(data.len(), 2);
-        assert_eq!(data[0]["onpress"], "customReview('https://example.com/?a=1&b=2')");
+        assert_eq!(
+            data[0]["onpress"],
+            "customReview('https://example.com/?a=1&b=2')"
+        );
         assert_eq!(data[0]["count"], "12");
         assert_eq!(data[1]["text"], "神评 > 正文");
         assert!(!output.contains("customReview"));

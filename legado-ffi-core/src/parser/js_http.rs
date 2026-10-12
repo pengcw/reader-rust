@@ -152,7 +152,7 @@ pub(crate) fn try_render_webview(
     js: &str,
     limit: usize,
 ) -> Result<(String, Option<String>), FetchError> {
-    let (output, page_url) = render_webview_output(html, url, js, limit)?;
+    let (output, page_url) = render_webview_output(html, url, js, limit, false)?;
     let rendered = if !js.trim().is_empty() {
         output
             .script_result
@@ -182,7 +182,7 @@ pub(crate) fn try_render_preview(
             serde_json::to_string(ext_js).expect("serializing a string cannot fail"),
         )
     };
-    let (output, page_url) = render_webview_output(html, url, &script, limit)?;
+    let (output, page_url) = render_webview_output(html, url, &script, limit, true)?;
     let rendered = output
         .script_result
         .filter(|value| {
@@ -198,6 +198,7 @@ fn render_webview_output(
     url: &str,
     js: &str,
     limit: usize,
+    async_http: bool,
 ) -> Result<(rakers::RenderOutput, Option<String>), FetchError> {
     let client = active_js_webview_client();
     let url = url.trim();
@@ -251,6 +252,7 @@ fn render_webview_output(
         final_script,
         limit,
         BROWSER_TIMEOUTS.with(|cell| *cell.borrow()),
+        async_http,
     )?;
     Ok((output, page_url))
 }
@@ -282,6 +284,7 @@ pub(super) fn java_request_simple_response(
         body,
         headers_json,
         &active_js_http_client(),
+        false,
     )
 }
 
@@ -291,15 +294,21 @@ fn java_request_simple_response_with_client(
     body: Option<String>,
     headers_json: &str,
     client: &HttpClient,
+    sniff_charset: bool,
 ) -> String {
     let method = Method::from_bytes(method.as_bytes()).unwrap_or(Method::GET);
-    let response = client.execute_once(
-        method,
-        url.trim(),
-        &java_request_headers(headers_json),
-        body.as_deref(),
-        None,
-    );
+    let mut headers = java_request_headers(headers_json);
+    if method == Method::POST
+        && !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+    {
+        headers.push((
+            "Content-Type".to_owned(),
+            "application/x-www-form-urlencoded".to_owned(),
+        ));
+    }
+    let response = client.execute_once(method, url.trim(), &headers, body.as_deref(), None);
     let payload = match response {
         Ok(response) => {
             let headers = response
@@ -316,23 +325,30 @@ fn java_request_simple_response_with_client(
                 .collect::<serde_json::Map<String, JsonValue>>();
             let mut header_values = std::collections::BTreeMap::<String, Vec<String>>::new();
             for (name, value) in &response.headers {
+                let name = name.as_str();
                 if let Ok(value) = value.to_str() {
                     header_values
-                        .entry(name.as_str().to_string())
+                        .entry(name.to_string())
                         .or_default()
                         .push(value.to_string());
                 }
             }
-            let charset = response
+            let content_type = response
                 .headers
                 .get(ureq::http::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .and_then(response_charset);
-            let encoding = charset.unwrap_or(UTF_8);
-            let body = encoding
-                .decode_without_bom_handling(&response.body)
-                .0
-                .into_owned();
+                .and_then(|value| value.to_str().ok());
+            let charset = content_type.and_then(response_charset);
+            // SimpleResponse.body() defaults to UTF-8; only the analyzed
+            // request path retains the crawler's charset detection.
+            let body = if sniff_charset {
+                decode_body(&response.body, None, content_type)
+            } else {
+                charset
+                    .unwrap_or(UTF_8)
+                    .decode_without_bom_handling(&response.body)
+                    .0
+                    .into_owned()
+            };
             let status = response.status;
             serde_json::json!({
                 "__ffiStrResponse": true,
@@ -409,7 +425,7 @@ pub(super) fn java_analyzed_request_response(url: &str, headers_json: &str) -> S
     let source = ACTIVE_JS_BOOK_SOURCE.with(|cell| cell.borrow().clone());
     let Some(source) = source else {
         let payload =
-            java_request_simple_response_with_client("GET", url, None, headers_json, &client);
+            java_request_simple_response_with_client("GET", url, None, headers_json, &client, true);
         if let Ok(value) = serde_json::from_str::<JsonValue>(&payload) {
             if value.get("code").and_then(JsonValue::as_u64) == Some(0) {
                 let error = value

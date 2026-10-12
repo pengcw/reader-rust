@@ -9,12 +9,11 @@ use crate::crawler::{
 };
 use crate::model::book_source::{book_source_from_value, BookSource};
 use crate::parser::js::{
-    eval_js, eval_js_with_bindings, with_js_info_map, with_js_lib,
-    with_login_messages, with_click_browser, InfoMapState,
+    eval_js, eval_js_toc_pre_update, eval_js_with_bindings, with_click_browser, with_js_info_map,
+    with_js_lib,
+    with_login_messages, InfoMapState,
 };
-use crate::parser::rule_engine::{
-    dedupe_chapters_last_wins, normalize_list_rule, RuleEngine,
-};
+use crate::parser::rule_engine::{dedupe_chapters_last_wins, normalize_list_rule, RuleEngine};
 use crate::runtime::session::with_active_session;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -254,39 +253,37 @@ fn execute_inner(source_json: &str, request_json: &str) -> ExecuteResult<Value> 
                         script_ms: options.script_timeout_ms,
                         render_ms: options.render_timeout_ms,
                     },
-                    || {
-                        match operation {
-                            Operation::Search => {
-                                execute_search(&source, &engine, &http_session, &params, &options)
-                            }
-                            Operation::Explore => execute_explore(
-                                &source,
-                                &engine,
-                                &http_session,
-                                &params,
-                                &options,
-                                request_info_map.clone(),
-                            ),
-                            Operation::ExploreKinds => execute_explore_kinds_with_state(
-                                &source,
-                                &options,
-                                request_info_map.clone(),
-                            ),
-                            Operation::Info => {
-                                execute_info(&source, &engine, &http_session, &params, &options)
-                            }
-                            Operation::Toc => {
-                                execute_toc(&source, &engine, &http_session, &params, &options)
-                            }
-                            Operation::Content => {
-                                execute_content(&source, &engine, &http_session, &params, &options)
-                            }
-                            Operation::Click => execute_click(&source, &params),
-                            Operation::Preview => execute_preview(&params, &options),
-                            Operation::LoginUi => execute_login_ui(&source),
-                            Operation::Login => {
-                                execute_login(&source, &http_session, &params, &options)
-                            }
+                    || match operation {
+                        Operation::Search => {
+                            execute_search(&source, &engine, &http_session, &params, &options)
+                        }
+                        Operation::Explore => execute_explore(
+                            &source,
+                            &engine,
+                            &http_session,
+                            &params,
+                            &options,
+                            request_info_map.clone(),
+                        ),
+                        Operation::ExploreKinds => execute_explore_kinds_with_state(
+                            &source,
+                            &options,
+                            request_info_map.clone(),
+                        ),
+                        Operation::Info => {
+                            execute_info(&source, &engine, &http_session, &params, &options)
+                        }
+                        Operation::Toc => {
+                            execute_toc(&source, &engine, &http_session, &params, &options)
+                        }
+                        Operation::Content => {
+                            execute_content(&source, &engine, &http_session, &params, &options)
+                        }
+                        Operation::Click => execute_click(&source, &params),
+                        Operation::Preview => execute_preview(&params, &options),
+                        Operation::LoginUi => execute_login_ui(&source),
+                        Operation::Login => {
+                            execute_login(&source, &http_session, &params, &options)
                         }
                     },
                 )
@@ -423,18 +420,28 @@ fn validate_options(options: ExecuteOptions) -> ExecuteResult<ValidatedOptions> 
     };
     let script_timeout_ms = if options.script_timeout_ms == 0 {
         crate::crawler::DEFAULT_BROWSER_SCRIPT_TIMEOUT_MS
-    } else { options.script_timeout_ms };
+    } else {
+        options.script_timeout_ms
+    };
     let render_timeout_ms = if options.render_timeout_ms == 0 {
         crate::crawler::DEFAULT_BROWSER_RENDER_TIMEOUT_MS
-    } else { options.render_timeout_ms };
+    } else {
+        options.render_timeout_ms
+    };
     if script_timeout_ms > crate::crawler::MAX_BROWSER_SCRIPT_TIMEOUT_MS {
-        return Err(ExecuteError::invalid_request("scriptTimeoutMs must be at most 30000"));
+        return Err(ExecuteError::invalid_request(
+            "scriptTimeoutMs must be at most 30000",
+        ));
     }
     if render_timeout_ms > crate::crawler::MAX_BROWSER_RENDER_TIMEOUT_MS {
-        return Err(ExecuteError::invalid_request("renderTimeoutMs must be at most 120000"));
+        return Err(ExecuteError::invalid_request(
+            "renderTimeoutMs must be at most 120000",
+        ));
     }
     if script_timeout_ms > render_timeout_ms {
-        return Err(ExecuteError::invalid_request("scriptTimeoutMs must not exceed renderTimeoutMs"));
+        return Err(ExecuteError::invalid_request(
+            "scriptTimeoutMs must not exceed renderTimeoutMs",
+        ));
     }
     let max_pages = if options.max_pages == 0 {
         DEFAULT_MAX_PAGES
@@ -804,6 +811,15 @@ fn execute_toc(
     params: &Value,
     options: &ValidatedOptions,
 ) -> ExecuteResult<Value> {
+    let run_pre_update = match params.get("runPreUpdateJs") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+        Some(Value::Bool(true)) => true,
+        _ => {
+            return Err(ExecuteError::invalid_request(
+                "runPreUpdateJs must be a boolean",
+            ))
+        }
+    };
     let initial_url = required_string(params, "url")?;
     let (variable, name) = input_book_state(params);
     let mut book_fields = input_book_fields(params);
@@ -819,7 +835,7 @@ fn execute_toc(
         None,
         Some(&book_fields),
     );
-    let detail_response = fetch_rule_with_context(
+    let detail_response = fetch_toc_rule_with_context(
         session,
         source,
         &initial_url,
@@ -838,7 +854,7 @@ fn execute_toc(
         name.as_deref(),
         Some(&book_fields),
     );
-    let toc_url = book_info
+    let mut toc_url = book_info
         .toc_url
         .as_ref()
         .filter(|url| !url.trim().is_empty())
@@ -876,6 +892,60 @@ fn execute_toc(
     }
 
     let mut book_variable = book_info.variable.clone();
+    if run_pre_update {
+        if let Some(script) = source
+            .rule_toc
+            .as_ref()
+            .and_then(|rule| rule.pre_update_js.as_deref())
+            .filter(|script| !script.trim().is_empty())
+        {
+            let mut book = serde_json::to_value(&book_info)
+                .map_err(|error| ExecuteError::internal(error.to_string()))?;
+            if let Some(fields) = book.as_object_mut() {
+                for (key, value) in &book_fields {
+                    fields.entry(key.clone()).or_insert_with(|| json!(value));
+                }
+                fields.insert("tocUrl".to_string(), json!(toc_url));
+                fields.insert(
+                    "variableMap".to_string(),
+                    book_variable
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                        .filter(Value::is_object)
+                        .unwrap_or_else(|| json!({})),
+                );
+            }
+            let bindings = HashMap::from([("book".to_string(), book)]);
+            // Legado ignores the hook's return value; only book mutations matter.
+            // Run once before the first TOC request, never again for subsequent pages.
+            let capture = format!(
+                "{{\n{script}\n}}\nJSON.stringify({{tocUrl:book.tocUrl,variableMap:book.variableMap}})"
+            );
+            match with_js_lib(source.js_lib.as_deref(), || {
+                eval_js_toc_pre_update(&capture, &toc_url, &bindings, &initial_url, &toc_url)
+            }) {
+                Ok(output) => {
+                    if let Ok(state) = serde_json::from_str::<Value>(&output) {
+                        if let Some(updated) = state
+                            .get("tocUrl")
+                            .and_then(Value::as_str)
+                            .filter(|url| !url.trim().is_empty())
+                        {
+                            toc_url = updated.to_string();
+                            book_fields.insert("tocUrl".to_string(), toc_url.clone());
+                            book_fields.insert("toc_url".to_string(), toc_url.clone());
+                        }
+                        if let Some(variables) =
+                            state.get("variableMap").filter(|value| value.is_object())
+                        {
+                            book_variable = Some(variables.to_string());
+                        }
+                    }
+                }
+                Err(error) => eprintln!("[legado::toc] preUpdateJs failed: {error}"),
+            }
+        }
+    }
     let reuse_detail_response = same_resource_url(&toc_url, &initial_url)
         || same_resource_url(&toc_url, &detail_response.url);
     let mut detail_toc_response = reuse_detail_response.then(|| detail_response.clone());
@@ -916,7 +986,7 @@ fn execute_toc(
             if let Some(response) = detail_toc_response.take() {
                 response
             } else {
-                fetch_rule_with_context(
+                fetch_toc_rule_with_context(
                     session,
                     source,
                     &url,
@@ -928,7 +998,7 @@ fn execute_toc(
                 )?
             }
         } else {
-            fetch_rule_with_context(
+            fetch_toc_rule_with_context(
                 session,
                 source,
                 &url,
@@ -983,7 +1053,8 @@ fn execute_toc(
         .iter()
         .map(|chapter| chapter.title.clone())
         .collect::<Vec<_>>();
-    text_transform::apply_from_params(&mut titles, params);
+    let mut transform_diagnostics = text_transform::TransformDiagnostics::new(options.debug);
+    text_transform::apply_from_params(&mut titles, params, &mut transform_diagnostics);
     for (chapter, title) in chapters.iter_mut().zip(titles) {
         chapter.title = title;
     }
@@ -992,13 +1063,9 @@ fn execute_toc(
     if let Some(variable) = book_variable {
         data["variable"] = json!(variable);
     }
-    Ok(success(
-        data,
-        visited_pages.len(),
-        truncated,
-        &response,
-        options,
-    ))
+    let mut result = success(data, visited_pages.len(), truncated, &response, options);
+    transform_diagnostics.attach(&mut result, "toc");
+    Ok(result)
 }
 
 fn same_resource_url(left: &str, right: &str) -> bool {
@@ -1326,7 +1393,12 @@ fn execute_content(
         &final_url,
         &replacement_context,
     );
-    text_transform::apply_from_params(std::slice::from_mut(&mut content), params);
+    let mut transform_diagnostics = text_transform::TransformDiagnostics::new(options.debug);
+    text_transform::apply_from_params(
+        std::slice::from_mut(&mut content),
+        params,
+        &mut transform_diagnostics,
+    );
     if content.is_empty() && !is_volume {
         return Err(ExecuteError::parse("content is empty"));
     }
@@ -1344,20 +1416,22 @@ fn execute_content(
     if let Some(title) = title {
         data["title"] = json!(title);
     }
-    match final_response {
-        Some(response) => Ok(success(
+    let mut result = match final_response {
+        Some(response) => success(
             data,
             visited_urls.len() + sub_requests,
             truncated,
             &response,
             options,
-        )),
+        ),
         None => {
             let mut response = success_without_http(data);
             response["meta"]["truncated"] = json!(truncated);
-            Ok(response)
+            response
         }
-    }
+    };
+    transform_diagnostics.attach(&mut result, "content");
+    Ok(result)
 }
 
 fn execute_login_ui(source: &BookSource) -> ExecuteResult<Value> {
@@ -1431,9 +1505,11 @@ fn execute_login(
             script.push_str("\n;\nlogin();");
         }
         let bindings = login_bindings(&values);
-        let (output, messages, preview) = with_login_messages(|| with_js_lib(source.js_lib.as_deref(), || {
-            eval_js_with_bindings(&script, "", &source.book_source_url, &bindings)
-        }));
+        let (output, messages, preview) = with_login_messages(|| {
+            with_js_lib(source.js_lib.as_deref(), || {
+                eval_js_with_bindings(&script, "", &source.book_source_url, &bindings)
+            })
+        });
         let output = output.map_err(|error| {
             auth_required_error(
                 source,
@@ -1464,8 +1540,14 @@ fn execute_login(
 }
 
 fn execute_preview(params: &Value, options: &ValidatedOptions) -> ExecuteResult<Value> {
-    let url = params.get("url").and_then(Value::as_str).unwrap_or_default();
-    let html = params.get("html").and_then(Value::as_str).unwrap_or_default();
+    let url = params
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let html = params
+        .get("html")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if !url.is_empty() {
         let parsed = url::Url::parse(url)
             .map_err(|_| ExecuteError::invalid_request("invalid preview URL"))?;
@@ -1474,7 +1556,9 @@ fn execute_preview(params: &Value, options: &ValidatedOptions) -> ExecuteResult<
         }
     }
     if url.is_empty() && html.trim().is_empty() {
-        return Err(ExecuteError::invalid_request("preview requires URL or HTML"));
+        return Err(ExecuteError::invalid_request(
+            "preview requires URL or HTML",
+        ));
     }
     // Optional source-specific script runs after page lifecycle in the same Rakers
     // runtime. Errors/empty results fall back to ordinary preview HTML.
@@ -1482,13 +1566,19 @@ fn execute_preview(params: &Value, options: &ValidatedOptions) -> ExecuteResult<
         None | Some(Value::Null) => "",
         Some(Value::String(script)) if script.len() <= 64 * 1024 => script.as_str(),
         Some(Value::String(_)) => {
-            return Err(ExecuteError::invalid_request("params.extjs must be at most 64 KiB"));
+            return Err(ExecuteError::invalid_request(
+                "params.extjs must be at most 64 KiB",
+            ));
         }
-        _ => return Err(ExecuteError::invalid_request("params.extjs must be a string")),
+        _ => {
+            return Err(ExecuteError::invalid_request(
+                "params.extjs must be a string",
+            ))
+        }
     };
-    let (rendered, final_url) = crate::parser::js_http::try_render_preview(
-        html, url, extjs, options.max_response_bytes,
-    ).map_err(ExecuteError::from)?;
+    let (rendered, final_url) =
+        crate::parser::js_http::try_render_preview(html, url, extjs, options.max_response_bytes)
+            .map_err(ExecuteError::from)?;
     Ok(success_without_http(json!({"preview":{
         "html":rendered,"url":final_url,
         "title":params.get("title").and_then(Value::as_str).unwrap_or("评论")
@@ -1496,28 +1586,50 @@ fn execute_preview(params: &Value, options: &ValidatedOptions) -> ExecuteResult<
 }
 
 fn execute_click(source: &BookSource, params: &Value) -> ExecuteResult<Value> {
-    let action = params.get("action").and_then(Value::as_str)
+    let action = params
+        .get("action")
+        .and_then(Value::as_str)
         .filter(|action| !action.trim().is_empty() && action.len() <= 64 * 1024)
-        .ok_or_else(|| ExecuteError::invalid_request("click action must be a nonempty string up to 64 KiB"))?;
+        .ok_or_else(|| {
+            ExecuteError::invalid_request("click action must be a nonempty string up to 64 KiB")
+        })?;
     let mut bindings = HashMap::new();
     for name in ["book", "chapter"] {
         if let Some(value) = params.get(name) {
-            if !value.is_object() { return Err(ExecuteError::invalid_request(format!("{name} must be an object"))); }
+            if !value.is_object() {
+                return Err(ExecuteError::invalid_request(format!(
+                    "{name} must be an object"
+                )));
+            }
             bindings.insert(name.to_string(), value.clone());
         }
     }
-    let (output, browser) = with_click_browser(|| with_js_lib(source.js_lib.as_deref(), || {
-        eval_js_with_bindings(action, "", &source.book_source_url, &bindings)
-    }));
-    output.map_err(|error| ExecuteError::invalid_request(format!("click script failed: {error}")))?;
-    let browser = browser.ok_or_else(|| ExecuteError::invalid_request("click did not open a browser"))?;
-    let url = browser.get("url").and_then(Value::as_str).unwrap_or_default();
-    let html = browser.get("html").and_then(Value::as_str).unwrap_or_default();
+    let (output, browser) = with_click_browser(|| {
+        with_js_lib(source.js_lib.as_deref(), || {
+            eval_js_with_bindings(action, "", &source.book_source_url, &bindings)
+        })
+    });
+    output
+        .map_err(|error| ExecuteError::invalid_request(format!("click script failed: {error}")))?;
+    let browser =
+        browser.ok_or_else(|| ExecuteError::invalid_request("click did not open a browser"))?;
+    let url = browser
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let html = browser
+        .get("html")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if !url.is_empty() && !is_absolute_http_url(url) {
-        return Err(ExecuteError::invalid_request("click browser URL must be HTTP(S)"));
+        return Err(ExecuteError::invalid_request(
+            "click browser URL must be HTTP(S)",
+        ));
     }
     if url.is_empty() && html.is_empty() {
-        return Err(ExecuteError::invalid_request("click browser URL and HTML are empty"));
+        return Err(ExecuteError::invalid_request(
+            "click browser URL and HTML are empty",
+        ));
     }
     Ok(success_without_http(json!({"browser":browser})))
 }
@@ -1644,10 +1756,37 @@ fn fetch_rule_with_context(
     options: &ValidatedOptions,
     context: Option<&UrlRuleContext>,
 ) -> ExecuteResult<HttpResponse> {
+    fetch_rule_with_context_mode(session, source, rule, key, page, base_url, options, context, false)
+}
+
+fn fetch_toc_rule_with_context(
+    session: &HttpSession,
+    source: &BookSource,
+    rule: &str,
+    key: &str,
+    page: i32,
+    base_url: &str,
+    options: &ValidatedOptions,
+    context: Option<&UrlRuleContext>,
+) -> ExecuteResult<HttpResponse> {
+    fetch_rule_with_context_mode(session, source, rule, key, page, base_url, options, context, true)
+}
+
+fn fetch_rule_with_context_mode(
+    session: &HttpSession,
+    source: &BookSource,
+    rule: &str,
+    key: &str,
+    page: i32,
+    base_url: &str,
+    options: &ValidatedOptions,
+    context: Option<&UrlRuleContext>,
+    webview_async: bool,
+) -> ExecuteResult<HttpResponse> {
     let spec = analyze_url_with_context(rule, key, page, base_url, source, context)
         .map_err(ExecuteError::url_rule)?;
     let response = session
-        .fetch(&spec, options.max_response_bytes)
+        .fetch_with_webview_async(&spec, options.max_response_bytes, webview_async)
         .map_err(|error| map_fetch_error(error, source))?;
     validate_login_response(source, response)
 }
@@ -1688,7 +1827,17 @@ fn validate_login_response(
     .map_err(|error| ExecuteError::parse(format!("loginCheckJs failed: {error}")))?;
 
     let trimmed = output.trim();
-    if trimmed.eq_ignore_ascii_case("false") || login_check_failed_text(trimmed) {
+    let parsed = serde_json::from_str::<Value>(trimmed).ok();
+    let is_str_response = parsed
+        .as_ref()
+        .and_then(|value| value.get("__ffiStrResponse"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    // A typed response may contain login UI text in its public HTML body.
+    // Keep explicit script rejection and response status checks authoritative.
+    if trimmed.eq_ignore_ascii_case("false")
+        || (!is_str_response && login_check_failed_text(trimmed))
+    {
         return Err(auth_required_error(
             source,
             Some(response.status),
@@ -1700,8 +1849,8 @@ fn validate_login_response(
         return Ok(response);
     }
 
-    let value = serde_json::from_str::<Value>(&output)
-        .map_err(|_| ExecuteError::parse("loginCheckJs must return a StrResponse"))?;
+    let value = parsed
+        .ok_or_else(|| ExecuteError::parse("loginCheckJs must return a StrResponse"))?;
     if !value.is_object() {
         return Err(ExecuteError::parse(
             "loginCheckJs must return a StrResponse",
@@ -1858,10 +2007,8 @@ fn optional_page(params: &Value) -> ExecuteResult<i32> {
         Some(Value::Number(number)) => number.as_i64().or_else(|| {
             // Accept integral JSON floats from alternate Lua encoders, not fractions.
             let value = number.as_f64()?;
-            (value.is_finite()
-                && value.fract() == 0.0
-                && (1.0..=i32::MAX as f64).contains(&value))
-                .then(|| value as i64)
+            (value.is_finite() && value.fract() == 0.0 && (1.0..=i32::MAX as f64).contains(&value))
+                .then_some(value as i64)
         }),
         _ => None,
     };
@@ -1951,8 +2098,8 @@ fn content_path_base(path: &str, strip_page_suffix: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        execute, input_book_state, input_chapter_state, optional_page,
-        uses_js_ajax_content_rule, BookSource,
+        execute, input_book_state, input_chapter_state, optional_page, uses_js_ajax_content_rule,
+        BookSource,
     };
     use base64::Engine;
     use serde_json::Value;
@@ -1982,15 +2129,26 @@ mod tests {
 
         let normal = preview(None);
         assert_eq!(normal["ok"], true, "{normal}");
-        assert!(normal["data"]["preview"]["html"]
-            .as_str().unwrap().contains("<p>original</p>"), "{normal}");
+        assert!(
+            normal["data"]["preview"]["html"]
+                .as_str()
+                .unwrap()
+                .contains("<p>original</p>"),
+            "{normal}"
+        );
 
         let extracted = preview(Some(serde_json::json!(
             "'<article>' + window.reviewText + ':' + document.readyState + '</article>'"
         )));
         assert_eq!(extracted["ok"], true, "{extracted}");
-        assert_eq!(extracted["data"]["preview"]["html"], "<article>ready:complete</article>");
-        assert_eq!(extracted["data"]["preview"]["url"], "https://example.test/reviews");
+        assert_eq!(
+            extracted["data"]["preview"]["html"],
+            "<article>ready:complete</article>"
+        );
+        assert_eq!(
+            extracted["data"]["preview"]["url"],
+            "https://example.test/reviews"
+        );
 
         let statements = preview(Some(serde_json::json!(
             "var extractedReview = window.reviewText; '<p>' + extractedReview + '</p>'"
@@ -2015,15 +2173,22 @@ mod tests {
         ] {
             let fallback = preview(Some(serde_json::json!(bad)));
             assert_eq!(fallback["ok"], true, "{bad}: {fallback}");
-            assert_eq!(fallback["data"]["preview"]["html"], normal["data"]["preview"]["html"],
-                "{bad}: {fallback}");
+            assert_eq!(
+                fallback["data"]["preview"]["html"], normal["data"]["preview"]["html"],
+                "{bad}: {fallback}"
+            );
         }
 
-        assert_eq!(preview(Some(Value::Null))["data"]["preview"]["html"],
-            normal["data"]["preview"]["html"]);
+        assert_eq!(
+            preview(Some(Value::Null))["data"]["preview"]["html"],
+            normal["data"]["preview"]["html"]
+        );
 
-        for invalid in [serde_json::json!(true), serde_json::json!({"script":"1"}),
-                        serde_json::json!("a".repeat(64 * 1024 + 1))] {
+        for invalid in [
+            serde_json::json!(true),
+            serde_json::json!({"script":"1"}),
+            serde_json::json!("a".repeat(64 * 1024 + 1)),
+        ] {
             let failed = preview(Some(invalid));
             assert_eq!(failed["ok"], false, "{failed}");
             assert_eq!(failed["error"]["kind"], "invalid_request", "{failed}");
@@ -2060,7 +2225,10 @@ mod tests {
             let params: Value = serde_json::from_str(raw).unwrap();
             let error = optional_page(&params).unwrap_err();
             assert_eq!(error.kind, "invalid_request", "{raw}");
-            assert_eq!(error.message, "params.page must be a positive integer", "{raw}");
+            assert_eq!(
+                error.message, "params.page must be a positive integer",
+                "{raw}"
+            );
         }
     }
 
@@ -2259,6 +2427,91 @@ mod tests {
             serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
         assert_eq!(result["ok"], true, "{result}");
         assert_eq!(result["data"]["chapters"][0]["title"], "final-old");
+    }
+
+    #[test]
+    fn execute_toc_transform_diagnostics_only_appear_in_debug_mode() {
+        for debug in [true, false] {
+            let base_url = serve_once(r#"{"chapters":[{"title":"raw","url":"/chapter/1"}]}"#);
+            let source = json!({
+                "bookSourceName": "TOC transform debug fixture",
+                "bookSourceUrl": base_url,
+                "ruleToc": {
+                    "chapterList": "$.chapters[*]",
+                    "chapterName": "$.title",
+                    "chapterUrl": "$.url"
+                }
+            });
+            let request = json!({
+                "api": 2,
+                "op": "toc",
+                "params": {
+                    "url": base_url,
+                    "textTransformDialect": "legado",
+                    "textTransformRules": [
+                        {"pattern":"[","replacement":"bad","isRegex":true},
+                        {"pattern":"raw","replacement":"clean","isRegex":false}
+                    ]
+                },
+                "options": {"debug": debug}
+            });
+            let response: Value = serde_json::from_str(&execute(
+                &source.to_string(),
+                &request.to_string(),
+            ))
+            .unwrap();
+            assert_eq!(response["ok"], true, "{response}");
+            assert_eq!(response["data"]["chapters"][0]["title"], "clean");
+            if debug {
+                assert_eq!(
+                    response["meta"]["debug"]["textTransformDiagnostics"],
+                    json!([{"stage":"toc","ruleIndex":0,"kind":"invalid_regex"}])
+                );
+                assert!(response["meta"]["debug"]["responseBytes"].is_number());
+            } else {
+                assert!(response["meta"].get("debug").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn execute_content_transform_diagnostics_only_appear_in_debug_mode() {
+        for debug in [true, false] {
+            let base_url = serve_once(r#"{"content":"raw"}"#);
+            let source = json!({
+                "bookSourceName": "content transform debug fixture",
+                "bookSourceUrl": base_url,
+                "ruleContent": {"content":"$.content"}
+            });
+            let request = json!({
+                "api": 2,
+                "op": "content",
+                "params": {
+                    "url": base_url,
+                    "textTransformDialect": "legado",
+                    "textTransformRules": [
+                        {"pattern":"raw","replacement":"$9","isRegex":true},
+                        {"pattern":"raw","replacement":"clean","isRegex":false}
+                    ]
+                },
+                "options": {"debug": debug}
+            });
+            let response: Value = serde_json::from_str(&execute(
+                &source.to_string(),
+                &request.to_string(),
+            ))
+            .unwrap();
+            assert_eq!(response["ok"], true, "{response}");
+            assert_eq!(response["data"]["content"], "clean");
+            if debug {
+                assert_eq!(
+                    response["meta"]["debug"]["textTransformDiagnostics"],
+                    json!([{"stage":"content","ruleIndex":0,"kind":"invalid_replacement"}])
+                );
+            } else {
+                assert!(response["meta"].get("debug").is_none());
+            }
+        }
     }
 
     #[test]

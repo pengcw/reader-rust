@@ -108,6 +108,15 @@ pub fn reader_eval(input: char_p::Ref<'_>, rule: char_p::Ref<'_>) -> char_p::Box
     if rule == "@text" {
         return ffi_string(crate::parser::html::html_to_text(input));
     }
+    if rule == "@normalize_reviews" {
+        let response = if input.len() > 16 * 1024 * 1024 {
+            json!({"ok":false,"error":{"kind":"invalid_argument","message":"review content exceeds limit"}})
+        } else {
+            // Pure parsing only: no source JS, HTTP, session, or host callbacks.
+            json!({"ok":true,"data":{"html":crate::parser::html::format_keep_img(input, "")}})
+        };
+        return ffi_string(response.to_string());
+    }
     if rule == "@merge" {
         return ffi_string(merge_search_results(input));
     }
@@ -127,9 +136,28 @@ pub fn reader_eval(input: char_p::Ref<'_>, rule: char_p::Ref<'_>) -> char_p::Box
         return ffi_string(response.to_string());
     }
 
-    if rule.contains(" -") || rule.starts_with('-') {
-        let parts = rule.split(" -").collect::<Vec<_>>();
-        let target_rule = parts.first().copied().unwrap_or_default().trim();
+    if rule.starts_with("##") {
+        return ffi_string(apply_legado_regex(input, rule));
+    }
+    if let Some(script) = strip_js_prefix(rule) {
+        return ffi_string(eval_js(script, input, "").unwrap_or_else(|error| {
+            json!({"error": format!("JS Eval Failed: {error}")}).to_string()
+        }));
+    }
+
+    // Preserve the legacy exclusion rule, not hyphens inside selectors/scripts.
+    let selection_end = crate::parser::rule_analyzer::find_next_delimiter(
+        rule,
+        &["@js:", "@jS:", "@Js:", "@JS:", "<js>", "##"],
+        0,
+    )
+    .map(|(index, _)| index)
+    .unwrap_or(rule.len());
+    let selection = &rule[..selection_end];
+    let exclusions = crate::parser::rule_analyzer::split_top_level(selection, &[" -"]);
+    if exclusions.delimiter.is_some() || rule.starts_with('-') {
+        let parts = crate::parser::rule_analyzer::split_top_level(rule, &[" -"]).parts;
+        let target_rule = parts.first().map(String::as_str).unwrap_or_default().trim();
         let mut output = if !target_rule.is_empty() && !target_rule.starts_with('-') {
             let document = crate::parser::html::parse_document(input);
             crate::parser::html::select_text(&document, &format!("{target_rule}@outerHtml"))
@@ -149,23 +177,12 @@ pub fn reader_eval(input: char_p::Ref<'_>, rule: char_p::Ref<'_>) -> char_p::Box
         return ffi_string(output);
     }
 
-    if rule.starts_with("##") {
-        return ffi_string(apply_legado_regex(input, rule));
-    }
-    if let Some(script) = strip_js_prefix(rule) {
-        return ffi_string(
-            eval_js(script, input, "")
-                .unwrap_or_else(|error| format!(r#"{{"error":"JS Eval Failed: {error}"}}"#)),
-        );
-    }
-    if rule.starts_with("//") {
-        let results = crate::parser::html::select_xpath(input, rule);
-        return ffi_string(serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string()));
-    }
-
-    let document = crate::parser::html::parse_document(input);
-    let results = crate::parser::html::select_text_list(&document, rule);
-    ffi_string(serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string()))
+    ffi_string(
+        match crate::parser::rule_engine::eval_rule_collection(input, rule) {
+            Ok(values) => Value::Array(values).to_string(),
+            Err(error) => json!({"error": format!("JS Eval Failed: {error}")}).to_string(),
+        },
+    )
 }
 
 /// ABI v2 书源业务入口：SO 自行完成 URL 规则、HTTP、Cookie、分页和解析。
@@ -553,6 +570,7 @@ fn render_rakers_html(
         max_requests: Some(32),
         max_response_bytes: Some(MAX_RAKERS_EVAL_HTML_BYTES),
         render_timeout,
+        async_http: false,
     };
     let rendered = rakers::render(
         html,
@@ -673,7 +691,10 @@ fn parse_book_source(raw: &str) -> Result<crate::model::book_source::BookSource,
 fn strip_js_prefix(rule: &str) -> Option<&str> {
     rule.strip_prefix("@js:")
         .or_else(|| rule.strip_prefix("js:"))
-        .or_else(|| rule.strip_prefix("<js>"))
+        .or_else(|| {
+            rule.strip_prefix("<js>")
+                .map(|rest| rest.strip_suffix("</js>").unwrap_or(rest).trim())
+        })
 }
 
 fn merge_search_results(raw_books: &str) -> String {

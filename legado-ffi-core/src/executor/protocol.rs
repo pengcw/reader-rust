@@ -152,7 +152,9 @@ mod tests {
     #[test]
     fn browser_timeout_defaults_limits_and_zero() {
         for options in [json!({}), json!({"scriptTimeoutMs":0,"renderTimeoutMs":0})] {
-            let request = parse_request(&json!({"api":2,"op":"preview","options":options}).to_string()).unwrap();
+            let request =
+                parse_request(&json!({"api":2,"op":"preview","options":options}).to_string())
+                    .unwrap();
             assert_eq!(request.options.script_timeout_ms, 3000);
             assert_eq!(request.options.render_timeout_ms, 30000);
         }
@@ -165,7 +167,10 @@ mod tests {
             json!({"scriptTimeoutMs":1000,"renderTimeoutMs":500}),
             json!({"scriptTimeoutMs":-1}),
         ] {
-            assert!(parse_request(&json!({"api":2,"op":"preview","options":options}).to_string()).is_err());
+            assert!(
+                parse_request(&json!({"api":2,"op":"preview","options":options}).to_string())
+                    .is_err()
+            );
         }
     }
 

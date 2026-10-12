@@ -87,6 +87,9 @@ thread_local! {
     static ACTIVE_JS_REENTRANT_CTX: RefCell<Option<NonNull<rquickjs::qjs::JSContext>>> =
         const { RefCell::new(None) };
 
+    // Populated only while running an explicitly requested TOC pre-update hook.
+    static PRE_UPDATE_TOC_SNAPSHOT: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
+
     static JS_ENV: (Runtime, Arc<AtomicU64>) = {
         let rt = Runtime::new().expect("Failed to create JS Runtime");
         rt.set_max_stack_size(512 * 1024);
@@ -135,6 +138,25 @@ pub fn eval_js_with_bindings(
         None,
         Some(bindings),
     )
+}
+
+/// `refreshTocUrl()` can reuse the detail page already fetched by `execute_toc`.
+/// The native callback is installed only for this scoped evaluation; JavaScript
+/// cannot enable it by setting a global flag.
+pub fn eval_js_toc_pre_update(
+    script: &str,
+    base_url: &str,
+    bindings: &HashMap<String, JsonValue>,
+    book_url: &str,
+    refreshed_toc_url: &str,
+) -> anyhow::Result<String> {
+    PRE_UPDATE_TOC_SNAPSHOT.with(|slot| {
+        crate::util::scoped::with_scoped_value(
+            slot,
+            Some((book_url.to_string(), refreshed_toc_url.to_string())),
+            || eval_js_with_bindings(script, "", base_url, bindings),
+        )
+    })
 }
 
 pub fn eval_js_search_with_source(
@@ -333,6 +355,11 @@ fn collect_header_map(ctx: &rquickjs::Ctx<'_>) -> anyhow::Result<Vec<(String, St
         .collect())
 }
 
+type HeaderMapContext<'a> = (
+    &'a serde_json::Map<String, JsonValue>,
+    &'a std::cell::RefCell<Option<Vec<(String, String)>>>,
+);
+
 pub(super) fn eval_js_inner_with_source(
     script: &str,
     input: Option<&str>,
@@ -342,10 +369,7 @@ pub(super) fn eval_js_inner_with_source(
     source_key: Option<&str>,
     bindings: Option<&HashMap<String, JsonValue>>,
     template_result: bool,
-    header_map: Option<(
-        &serde_json::Map<String, JsonValue>,
-        &std::cell::RefCell<Option<Vec<(String, String)>>>,
-    )>,
+    header_map: Option<HeaderMapContext<'_>>,
 ) -> anyhow::Result<String> {
     if let Some(raw_ctx) = ACTIVE_JS_REENTRANT_CTX.with(|cell| *cell.borrow()) {
         // SAFETY: the pointer is installed only for the duration of a native
@@ -459,6 +483,7 @@ pub(super) fn eval_js_inner_with_source(
                 source_obj.set("header", active_source.header.unwrap_or_default())?;
                 source_obj.set("loginUi", active_source.login_ui.unwrap_or_default())?;
                 source_obj.set("loginUrl", active_source.login_url.unwrap_or_default())?;
+                source_obj.set("variableComment", active_source.variable_comment.unwrap_or_default())?;
             }
 
             let source_key_for_get = source_key_val.clone();
@@ -1358,10 +1383,14 @@ pub(super) fn eval_js_inner_with_source(
                           is_url: Option<bool>,
                           unescape: Option<bool>|
                           -> String {
-                        let default_content = default_content_for_get_string
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .clone();
+                        let default_content = if content.is_none() {
+                            default_content_for_get_string
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone()
+                        } else {
+                            String::new()
+                        };
                         let base_url = base_url_for_get_string
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -1387,10 +1416,14 @@ pub(super) fn eval_js_inner_with_source(
                           content: Option<String>,
                           is_url: Option<bool>|
                           -> Vec<String> {
-                        let default_content = default_content_for_get_string_list
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .clone();
+                        let default_content = if content.is_none() {
+                            default_content_for_get_string_list
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone()
+                        } else {
+                            String::new()
+                        };
                         let base_url = base_url_for_get_string_list
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -1412,10 +1445,14 @@ pub(super) fn eval_js_inner_with_source(
                 "getElements",
                 Func::new(
                     move |ctx: rquickjs::Ctx<'_>, rule: String, content: Option<String>, raw_css: Option<bool>| -> String {
-                        let default_content = content_for_elements
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .clone();
+                        let default_content = if content.is_none() {
+                            content_for_elements
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone()
+                        } else {
+                            String::new()
+                        };
                         let base_url = base_url_for_elements
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -1434,10 +1471,14 @@ pub(super) fn eval_js_inner_with_source(
             java_obj.set(
                 "getElement",
                 Func::new(move |ctx: rquickjs::Ctx<'_>, rule: String, content: Option<String>| -> Option<String> {
-                    let default_content = content_for_element
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone();
+                    let default_content = if content.is_none() {
+                        content_for_element
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone()
+                    } else {
+                        String::new()
+                    };
                     if let Some(script) = java_js_rule_script(&rule) {
                         let base_url = base_url_for_element.lock().unwrap_or_else(|e| e.into_inner()).clone();
                         let value = with_js_reentrant_ctx(&ctx, || java_element_js_value(
@@ -1565,6 +1606,8 @@ pub(super) fn eval_js_inner_with_source(
                 r#"(function() {
                     const java = globalThis.java;
                     const currentSource = globalThis.source;
+                    // Source libraries may shadow the global Map helper.
+                    const NativeMap = globalThis.Map;
                     const sourceAvailable = java.__sourceAvailable;
                     delete java.__sourceAvailable;
                     java.getSource = () => sourceAvailable ? currentSource : null;
@@ -1630,7 +1673,7 @@ pub(super) fn eval_js_inner_with_source(
                         let value;
                         try { value = JSON.parse(raw); } catch (_) { return null; }
                         return value && typeof value === 'object' && !Array.isArray(value)
-                            ? new Map(Object.entries(value).map(([key, item]) => [key, String(item)]))
+                            ? new NativeMap(Object.entries(value).map(([key, item]) => [key, String(item)]))
                             : null;
                     };
                     globalThis.source.setVariable = function(value, extendedValue) {
@@ -1660,14 +1703,32 @@ pub(super) fn eval_js_inner_with_source(
                     java.digestBase64Str = (data, algorithm) => cryptoResult(
                         'digestBase64Str', algorithm,
                         java.__digestBase64(String(data), String(algorithm)));
-                    java.HMacHex = (data, algorithm, key) => cryptoResult(
-                        'HMacHex', algorithm,
-                        java.__hmacHexString(
-                            String(data), String(algorithm), String(key)));
-                    java.HMacBase64 = (data, algorithm, key) => cryptoResult(
-                        'HMacBase64', algorithm,
-                        java.__hmacBase64String(
-                            String(data), String(algorithm), String(key)));
+                    // Legacy MD5 is provided by KOReader's ffi/sha2; SHA stays native.
+                    const isHmacMd5 = algorithm => String(algorithm)
+                        .replace(/[^a-z0-9]/gi, '').toUpperCase() === 'HMACMD5';
+                    const hostHmacMd5 = java.__hostHmacMd5 = (keyHex, dataHex) => {
+                        if (keyHex.length > 32768 || dataHex.length > 524288) {
+                            const error = new Error('HMAC input too large');
+                            error.kind = 'limit_exceeded'; throw error;
+                        }
+                        const output = java.hostCall('crypto.hmac', {
+                            algorithm: 'HMACMD5', keyHex, dataHex
+                        });
+                        if (typeof output !== 'string' || !/^[0-9a-f]{32}$/i.test(output)) {
+                            const error = new Error('invalid HMAC response');
+                            error.kind = 'invalid_response'; throw error;
+                        }
+                        return output.toLowerCase();
+                    };
+                    java.HMacHex = (data, algorithm, key) => isHmacMd5(algorithm)
+                        ? hostHmacMd5(java.hexEncodeToString(String(key)), java.hexEncodeToString(String(data)))
+                        : cryptoResult('HMacHex', algorithm,
+                            java.__hmacHexString(String(data), String(algorithm), String(key)));
+                    java.HMacBase64 = (data, algorithm, key) => isHmacMd5(algorithm)
+                        ? java.__base64EncodeBytes(JSON.stringify(java.hexDecodeToByteArray(
+                            java.HMacHex(data, algorithm, key))), 2)
+                        : cryptoResult('HMacBase64', algorithm,
+                            java.__hmacBase64String(String(data), String(algorithm), String(key)));
                     java.toURL = function(url, baseUrl) {
                         const payload = baseUrl == null
                             ? java.__toURL(String(url))
@@ -1677,7 +1738,7 @@ pub(super) fn eval_js_inner_with_source(
                         return {
                             searchParams: raw.searchParams == null
                                 ? null
-                                : new Map(Object.entries(raw.searchParams)),
+                                : new NativeMap(Object.entries(raw.searchParams)),
                             host: String(raw.host || ''),
                             origin: String(raw.origin || ''),
                             pathname: String(raw.pathname || '')
@@ -1713,7 +1774,7 @@ pub(super) fn eval_js_inner_with_source(
                         const headers = Object.assign({}, raw.headers || {});
                         const status = Number(raw.code || raw.status || 0);
                         const headerValues = raw.headerValues || {};
-                        const responseCookies = new Map();
+                        const responseCookies = new NativeMap();
                         for (const [name, values] of Object.entries(headerValues)) {
                             if (name.toLowerCase() !== 'set-cookie') continue;
                             for (const value of values) {
@@ -1741,7 +1802,7 @@ pub(super) fn eval_js_inner_with_source(
                             headers: () => responseHeaders,
                             header,
                             hasHeader: name => header(name) !== null,
-                            multiHeaders: () => new Map(Object.entries(headerValues)),
+                            multiHeaders: () => new NativeMap(Object.entries(headerValues)),
                             cookies: () => responseCookies,
                             cookie: name => responseCookies.has(String(name)) ? responseCookies.get(String(name)) : null,
                             hasCookie: name => responseCookies.has(String(name)),
@@ -2025,7 +2086,6 @@ pub(super) fn eval_js_inner_with_source(
             globals.set("title", "")?;
             globals.set("nextChapterUrl", "")?;
             globals.set("rssArticle", Object::new(ctx.clone())?)?;
-            globals.set("__allowTocRefresh", false)?;
 
             if let Some(bindings) = bindings {
                 for (key, value) in bindings {
@@ -2104,8 +2164,8 @@ pub(super) fn eval_js_inner_with_source(
                     }
                     return map;
                 };
-                java.reGetBook = function() { if (globalThis.__allowTocRefresh !== true) throw new Error('java.reGetBook is only available in preUpdateJs'); throw new Error('java.reGetBook is not supported by this host'); };
-                java.refreshTocUrl = function() { if (globalThis.__allowTocRefresh !== true) throw new Error('java.refreshTocUrl is only available in preUpdateJs'); throw new Error('java.refreshTocUrl is not supported by this host'); };
+                java.reGetBook = function() { throw new Error('java.reGetBook is not supported by this host'); };
+                java.refreshTocUrl = function() { throw new Error('java.refreshTocUrl is only available in preUpdateJs'); };
                 })(globalThis.Map);"#,
             )?;
 
@@ -2211,6 +2271,18 @@ pub(super) fn eval_js_inner_with_source(
                                 // HTML data survives the JS return boundary without
                                 // replacing the public node methods. XPath IDs stay local.
                                 ...(context ? {} : { toJSON() { return item; } }),
+                                attributes() {
+                                    return item.attrList.map(([key, value]) => ({
+                                        getKey() { return key; },
+                                        getValue() { return value; },
+                                        toString() {
+                                            const escaped = value.replace(/&/g, '&amp;')
+                                                .replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                                                .replace(/"/g, '&quot;');
+                                            return key + '="' + escaped + '"';
+                                        }
+                                    }));
+                                },
                                 attr(name) { return attrs[String(name)] || ''; },
                                 hasAttr(name) { return Object.prototype.hasOwnProperty.call(attrs, String(name)); },
                                 hasClass(name) {
@@ -2333,6 +2405,7 @@ pub(super) fn eval_js_inner_with_source(
                                     const item = items.find(item => item.hasAttr(name));
                                     return item ? item.attr(name) : '';
                                 };
+                                items.text = () => items.map(item => item.text()).join(' ');
                                 items.isEmpty = () => items.length === 0;
                                 return items;
                             };
@@ -3067,6 +3140,12 @@ pub(super) fn eval_js_inner_with_source(
                         getInstance: algorithm => ({
                             init(key) { this.key = key; },
                             doFinal(data) {
+                                if (String(algorithm).replace(/[^a-z0-9]/gi, '').toUpperCase() === 'HMACMD5') {
+                                    const hex = bytes => bytes.map(byte =>
+                                        (byte & 255).toString(16).padStart(2, '0')).join('');
+                                    return java.hexDecodeToByteArray(java.__hostHmacMd5(
+                                        hex(toBytes(this.key ? this.key.key : [])), hex(toBytes(data))));
+                                }
                                 return JSON.parse(java.__hmacBytes(
                                     String(algorithm),
                                     JSON.stringify(this.key ? this.key.key : []),
@@ -3266,6 +3345,18 @@ pub(super) fn eval_js_inner_with_source(
                     Packages.io = Packages.io || {};
                     Packages.io.legado = Packages.io.legado || {};
                     Packages.io.legado.app = Packages.io.legado.app || {};
+                    Packages.io.legado.app.help = Packages.io.legado.app.help || {};
+                    Packages.io.legado.app.help.http = Packages.io.legado.app.help.http || {};
+                    Packages.io.legado.app.help.http.StrResponse = markClass('StrResponse', function(url, body) {
+                        if (arguments.length !== 2 || typeof url !== 'string' || typeof body !== 'string') {
+                            throw new TypeError('StrResponse supports URL and string body only');
+                        }
+                        let target = 'http://localhost/';
+                        try {
+                            if (/^https?:\/\//i.test(url) && java.toURL(url).host) target = url;
+                        } catch (_) {}
+                        return globalThis.__readerMakeStrResponse({url: target, body, code: 200, message: 'OK', headers: {}});
+                    });
                     Packages.io.legado.app.utils = Packages.io.legado.app.utils || {};
                     Packages.io.legado.app.utils.HtmlFormatter = markClass('HtmlFormatter', {
                         format(html) {
@@ -3366,6 +3457,26 @@ pub(super) fn eval_js_inner_with_source(
             if let Some((initial, _)) = header_map {
                 let java: Object<'_> = globals.get("java")?;
                 install_header_map(&ctx, &java, initial)?;
+            }
+            if let Some((book_url, toc_url)) =
+                PRE_UPDATE_TOC_SNAPSHOT.with(|slot| slot.borrow().clone())
+            {
+                let java: Object<'_> = globals.get("java")?;
+                java.set(
+                    "refreshTocUrl",
+                    Func::new(move |ctx: rquickjs::Ctx<'_>| -> rquickjs::Result<()> {
+                        let book: Object<'_> = ctx.globals().get("book")?;
+                        let current_url: String = book.get("bookUrl")?;
+                        if current_url != book_url {
+                            return Err(rquickjs::Exception::throw_type(
+                                &ctx,
+                                "refreshTocUrl cannot refresh a changed bookUrl in this host",
+                            ));
+                        }
+                        book.set("tocUrl", toc_url.as_str())?;
+                        Ok(())
+                    }),
+                )?;
             }
             let scoped_script = format!("{{\n{script}\n}}");
             let v = eval_script(ctx.clone(), &scoped_script)?;
@@ -4134,8 +4245,8 @@ fn java_get_elements_json_with_mode(
 
     let selector = if raw_css {
         rule
-    } else if rule.starts_with("@@") {
-        &rule[2..]
+    } else if let Some(selector) = rule.strip_prefix("@@") {
+        selector
     } else if lower_rule.starts_with("@css:") {
         &rule[5..]
     } else {
@@ -4151,14 +4262,16 @@ fn java_get_elements_json_with_mode(
     let values = elements
         .into_iter()
         .map(|element| {
-            let attrs = element
+            let attr_list = element
                 .value()
                 .attrs()
                 .map(|(name, value)| (name.to_string(), JsonValue::String(value.to_string())))
-                .collect::<serde_json::Map<_, _>>();
+                .collect::<Vec<_>>();
+            let attrs = attr_list.iter().cloned().collect::<serde_json::Map<_, _>>();
             serde_json::json!({
                 "__readerHtmlElement": true,
                 "attrs": attrs,
+                "attrList": attr_list,
                 "html": element.inner_html(),
                 "outerHtml": element.html(),
                 "text": element.text().collect::<Vec<_>>().join(" ").trim(),
@@ -5669,7 +5782,7 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let mut requests = Vec::new();
-            for _ in 0..3 {
+            for _ in 0..5 {
                 let (mut stream, _) = accept_with_timeout(&listener);
                 let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
                 let mut request = String::new();
@@ -5706,7 +5819,7 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
         let result = with_js_http_context(&client, &source, || {
             eval_js(
                 &format!(
-                    "(() => {{ const get = java.get('{url}', {{'X-Test':'get'}}); const post = java.post('{url}', 'body', {{'X-Test':'post'}}); const head = java.head('{url}', {{'X-Test':'head'}}); return [get.body(), get.statusCode(), post.body(), head.statusCode(), String(get), head.body(), get.headers().get('content-length')].join('|'); }})()"
+                    "(() => {{ const get = java.get('{url}', {{'X-Test':'get'}}); const post = java.post('{url}', 'body', {{'X-Test':'post'}}); const head = java.head('{url}', {{'X-Test':'head'}}); java.post('{url}', 'bid=42', {{}}); java.post('{url}', '{{}}', {{'content-type':'application/json'}}); return [get.body(), get.statusCode(), post.body(), head.statusCode(), String(get), head.body(), get.headers().get('content-length')].join('|'); }})()"
                 ),
                 "",
                 &url,
@@ -5723,8 +5836,12 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
             .all(|request| !request.contains("x-source:")));
         assert!(requests[1].starts_with("post /api "));
         assert!(requests[1].contains("x-test: post"));
+        assert!(requests[1].contains("content-type: application/x-www-form-urlencoded"));
         assert!(requests[2].starts_with("head /api "));
         assert!(requests[2].contains("x-test: head"));
+        assert!(requests[3].contains("content-type: application/x-www-form-urlencoded"));
+        assert!(requests[4].contains("content-type: application/json"));
+        assert!(!requests[4].contains("application/x-www-form-urlencoded"));
     }
 
     #[test]

@@ -187,6 +187,16 @@ impl HttpSession {
         spec: &RequestSpec,
         max_response_bytes: usize,
     ) -> Result<HttpResponse, FetchError> {
+        self.fetch_with_webview_async(spec, max_response_bytes, false)
+    }
+
+    /// Only the TOC executor opts in. Ordinary source fetches remain synchronous.
+    pub(crate) fn fetch_with_webview_async(
+        &self,
+        spec: &RequestSpec,
+        max_response_bytes: usize,
+        async_http: bool,
+    ) -> Result<HttpResponse, FetchError> {
         if let Some(response) = data_uri_response(spec, Some(max_response_bytes)) {
             let response = response.map_err(map_http_client_error)?;
             let body =
@@ -292,7 +302,14 @@ impl HttpSession {
                     )
                     .map_err(FetchError::Rule)?;
                     let body = if spec.render_with_rakers {
-                        render_with_rakers(&client, spec, &url, &body, max_response_bytes)?
+                        render_with_rakers(
+                            &client,
+                            spec,
+                            &url,
+                            &body,
+                            max_response_bytes,
+                            async_http,
+                        )?
                     } else {
                         body
                     };
@@ -407,6 +424,7 @@ fn render_rakers_page(
     max_response_bytes: usize,
     render_timeout: Duration,
     script_timeout: Duration,
+    async_http: bool,
 ) -> Result<rakers::RenderOutput, FetchError> {
     let limit = max_response_bytes.max(1);
     // Do not copy raw source credentials into page-controlled requests. Cookies
@@ -420,6 +438,7 @@ fn render_rakers_page(
         max_requests: Some(RAKERS_MAX_REQUESTS),
         max_response_bytes: Some(max_response_bytes.max(1)),
         render_timeout: Some(render_timeout),
+        async_http: async_http && !crate::host_services::is_offline(),
     };
     let rendered = rakers::render_detailed(
         html,
@@ -453,6 +472,7 @@ pub(crate) fn render_webview_with_rakers(
     final_script: Option<&str>,
     max_response_bytes: usize,
     timeouts: BrowserTimeouts,
+    async_http: bool,
 ) -> Result<rakers::RenderOutput, FetchError> {
     let limit = max_response_bytes.max(1);
     if html.len() > limit {
@@ -472,6 +492,7 @@ pub(crate) fn render_webview_with_rakers(
         max_response_bytes,
         Duration::from_millis(timeouts.render_ms),
         Duration::from_millis(timeouts.script_ms),
+        async_http,
     )
 }
 
@@ -481,6 +502,7 @@ fn render_with_rakers(
     page_url: &str,
     html: &str,
     max_response_bytes: usize,
+    async_http: bool,
 ) -> Result<String, FetchError> {
     let user_agent = spec
         .headers
@@ -499,6 +521,7 @@ fn render_with_rakers(
         max_response_bytes,
         RAKERS_RENDER_TIMEOUT,
         RAKERS_SCRIPT_TIMEOUT,
+        async_http,
     )?
     .html)
 }

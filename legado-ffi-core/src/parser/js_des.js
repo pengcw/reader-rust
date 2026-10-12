@@ -1,5 +1,8 @@
 // Legacy DES compatibility only. EVP operations use the existing host provider.
 (() => {
+    // Legado JsEncodeUtils: delegate to the shared host-backed cipher.
+    java.desEncodeToBase64String = (data, key, transformation, iv) =>
+        java.createSymmetricCrypto(transformation, key, iv).encryptBase64(data);
     const specs = new WeakMap(), secretKeys = new WeakMap();
     const fail = message => {
         const error = new Error(message);

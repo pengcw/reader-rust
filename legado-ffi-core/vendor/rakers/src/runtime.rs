@@ -1,0 +1,745 @@
+//! QuickJS execution runtime with LinkeDOM as the sole document implementation.
+
+const BOOTSTRAP_COMMON: &str = include_str!("bootstrap_common.js");
+
+// The virtual scheduler advances instantly to the next deadline, but never beyond
+// two seconds of page time. This is enough for startup/debounce work without waiting
+// on ads, clocks, or long-poll timers.
+const TIMER_PUMP_JS: &str = "_r_pump_timers(2000)";
+const DOM_CONTENT_LOADED_JS: &str = "_r_dispatch_dom_content_loaded()";
+const LOAD_JS: &str = "_r_dispatch_load()";
+
+// LinkeDOM preserves mutations outside <body>, including <head> and <html>.
+const LINKEDOM_READBACK_JS: &str = "document.toString()";
+
+fn escape_js_string(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+/// Build browser globals; LinkeDOM initializes the document after this bootstrap.
+fn make_bootstrap(page_url: Option<&str>, user_agent: Option<&str>) -> String {
+    let href = escape_js_string(page_url.unwrap_or("about:blank"));
+    let user_agent = escape_js_string(user_agent.unwrap_or("rakers/0.1.0"));
+    // Replace placeholders with sentinels first so values that happen to contain
+    // the other placeholder text are never rewritten on the second substitution.
+    BOOTSTRAP_COMMON
+        .replace("__HREF__", "\u{1}")
+        .replace("__USER_AGENT__", "\u{2}")
+        .replace('\u{1}', &href)
+        .replace('\u{2}', &user_agent)
+}
+
+fn request_headers_from_json(raw: &str) -> Vec<(String, String)> {
+    let Ok(serde_json::Value::Object(headers)) = serde_json::from_str(raw) else {
+        return Vec::new();
+    };
+    headers
+        .into_iter()
+        .filter(|(name, _)| {
+            !matches!(
+                name.to_ascii_lowercase().as_str(),
+                "cookie"
+                    | "host"
+                    | "content-length"
+                    | "connection"
+                    | "transfer-encoding"
+                    | "proxy-authorization"
+            )
+        })
+        .filter_map(|(name, value)| match value {
+            serde_json::Value::String(value) => Some((name, value)),
+            serde_json::Value::Number(value) => Some((name, value.to_string())),
+            serde_json::Value::Bool(value) => Some((name, value.to_string())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn browser_request_headers(headers_json: &str) -> Vec<(String, String)> {
+    let mut headers = request_headers_from_json(headers_json);
+    // Browser JavaScript cannot set transport-owned/credential headers directly.
+    // Cookie state comes only from the host cookie jar, so script code cannot
+    // replace or exfiltrate it by forging a raw Cookie header.
+    headers.retain(|(name, _)| {
+        !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "cookie"
+                | "host"
+                | "content-length"
+                | "connection"
+                | "proxy-authorization"
+                | "set-cookie"
+                | "transfer-encoding"
+                | "user-agent"
+        )
+    });
+    headers
+}
+
+fn perform_http_request(
+    cfg: &crate::HttpConfig,
+    budget: &crate::RequestBudget,
+    method: &str,
+    url: &str,
+    headers_json: &str,
+    body: &str,
+) -> String {
+    let headers = browser_request_headers(headers_json);
+    serialize_http_result(cfg.execute(
+        budget,
+        method,
+        url,
+        &headers,
+        (!body.is_empty()).then_some(body),
+        cfg.forward_headers,
+    ))
+}
+
+fn serialize_http_result(response: Result<crate::HttpResponse, String>) -> String {
+    match response {
+        Ok(response) => {
+            let mut response_headers = serde_json::Map::new();
+            for (name, value) in response.headers {
+                if name.eq_ignore_ascii_case("set-cookie")
+                    || name.eq_ignore_ascii_case("set-cookie2")
+                {
+                    continue;
+                }
+                response_headers
+                    .insert(name.to_ascii_lowercase(), serde_json::Value::String(value));
+            }
+            let status_text = ureq::http::StatusCode::from_u16(response.status)
+                .ok()
+                .and_then(|status| status.canonical_reason())
+                .unwrap_or("");
+            serde_json::json!({
+                "url": response.url,
+                "status": response.status,
+                "statusText": status_text,
+                "headers": response_headers,
+                "body": response.body,
+            })
+            .to_string()
+        }
+        Err(error) => serde_json::json!({"error": error}).to_string(),
+    }
+}
+
+// ── QuickJS engine ────────────────────────────────────────────────────────────
+
+mod quickjs_rt {
+    use std::cell::RefCell;
+    use std::sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver, SyncSender},
+    };
+    use std::time::{Duration, Instant};
+
+    use anyhow::anyhow;
+    use rquickjs::{
+        Context, Ctx, Function, Module, Object, Runtime, Value,
+        context::EvalOptions,
+        loader::{ImportAttributes, Loader, Resolver},
+        module::Declared,
+    };
+
+    struct StubModuleSystem;
+
+    impl Resolver for StubModuleSystem {
+        fn resolve<'js>(
+            &mut self,
+            _ctx: &Ctx<'js>,
+            _base: &str,
+            name: &str,
+            _attributes: Option<ImportAttributes<'js>>,
+        ) -> rquickjs::Result<String> {
+            Ok(name.to_string())
+        }
+    }
+
+    impl Loader for StubModuleSystem {
+        fn load<'js>(
+            &mut self,
+            ctx: &Ctx<'js>,
+            name: &str,
+            _attributes: Option<ImportAttributes<'js>>,
+        ) -> rquickjs::Result<Module<'js, Declared>> {
+            Module::declare(ctx.clone(), name, "export default {};")
+        }
+    }
+
+    thread_local! {
+        static WRITTEN:         RefCell<String>                        = const { RefCell::new(String::new()) };
+        static LOGGED:          RefCell<Vec<String>>                   = const { RefCell::new(Vec::new()) };
+        static BODY_INNER_HTML: RefCell<String>                        = const { RefCell::new(String::new()) };
+        // Deadline for the currently-executing script; None means no limit active.
+        static SCRIPT_DEADLINE: RefCell<Option<Instant>>               = const { RefCell::new(None) };
+        static HTTP_CONFIG:     RefCell<Option<crate::HttpConfig>>     = const { RefCell::new(None) };
+        static HTTP_BUDGET:     RefCell<Option<crate::RequestBudget>>  = const { RefCell::new(None) };
+        static ASYNC_HTTP:      RefCell<Option<AsyncHttp>>              = const { RefCell::new(None) };
+    }
+
+    // Render-local only: two network workers, no JS objects or host callbacks
+    // cross threads. The host already runs preview in a disposable subprocess.
+    struct AsyncHttp {
+        requests: SyncSender<(i32, crate::HttpRequest)>,
+        completions: Receiver<(i32, String)>,
+        next_id: i32,
+        pending: usize,
+    }
+
+    impl AsyncHttp {
+        fn new(cfg: &crate::HttpConfig, budget: &crate::RequestBudget) -> Self {
+            let (requests, queue) = mpsc::sync_channel::<(i32, crate::HttpRequest)>(32);
+            // Bound completed response buffering as well as active I/O.
+            let (done, completions) = mpsc::sync_channel(1);
+            let queue = Arc::new(Mutex::new(queue));
+            for _ in 0..2 {
+                let queue = Arc::clone(&queue);
+                let done = done.clone();
+                let cfg = cfg.clone();
+                let budget = budget.clone();
+                let _ = std::thread::spawn(move || loop {
+                    let job = queue.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                    let Ok((id, request)) = job else { break };
+                    let result = super::serialize_http_result(
+                        cfg.execute_prepared(&budget, request),
+                    );
+                    if done.send((id, result)).is_err() { break }
+                });
+            }
+            Self {
+                requests,
+                completions,
+                next_id: 0,
+                pending: 0,
+            }
+        }
+
+        fn submit(&mut self, request: crate::HttpRequest) -> Result<i32, String> {
+            self.next_id += 1;
+            self.requests
+                .try_send((self.next_id, request))
+                .map_err(|_| "Rakers HTTP queue is full".to_string())?;
+            self.pending += 1;
+            Ok(self.next_id)
+        }
+
+        fn receive(&mut self, deadline: Option<Instant>) -> Result<Option<(i32, String)>, String> {
+            if self.pending == 0 { return Ok(None) }
+            let wait = deadline
+                .map(|end| {
+                    end.saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(250))
+                })
+                .unwrap_or(Duration::from_millis(250));
+            if wait.is_zero() { return Err("Rakers render deadline exceeded".to_string()) }
+            match self.completions.recv_timeout(wait) {
+                Ok(completion) => {
+                    self.pending -= 1;
+                    Ok(Some(completion))
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err("Rakers HTTP workers stopped".to_string()),
+            }
+        }
+    }
+
+    fn has_pending_http() -> bool {
+        ASYNC_HTTP.with(|slot| slot.borrow().as_ref().is_some_and(|http| http.pending != 0))
+    }
+
+    struct HttpContextGuard;
+
+    impl Drop for HttpContextGuard {
+        fn drop(&mut self) {
+            HTTP_CONFIG.with(|slot| *slot.borrow_mut() = None);
+            HTTP_BUDGET.with(|slot| *slot.borrow_mut() = None);
+            ASYNC_HTTP.with(|slot| *slot.borrow_mut() = None);
+            SCRIPT_DEADLINE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    fn bounded_deadline(
+        timeout: Option<Duration>,
+        render_deadline: Option<Instant>,
+    ) -> Option<Instant> {
+        let local = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+        match (local, render_deadline) {
+            (Some(local), Some(render)) => Some(local.min(render)),
+            (Some(local), None) => Some(local),
+            (None, render) => render,
+        }
+    }
+
+    fn set_deadline(deadline: Option<Instant>) {
+        SCRIPT_DEADLINE.with(|d| *d.borrow_mut() = deadline);
+    }
+
+    fn clear_deadline() {
+        set_deadline(None);
+    }
+
+    // Pending jobs execute while Context::with holds the runtime lock, so use
+    // Ctx directly. rquickjs 0.12 fixes interrupt handling during pending jobs,
+    // allowing Promise callbacks to share the same deadline as their parent task.
+    fn drain_pending_jobs(ctx: &Ctx<'_>, deadline: Option<Instant>) -> bool {
+        let mut had_jobs = false;
+        let mut jobs = 0usize;
+        set_deadline(deadline);
+        while jobs < 2_000
+            && !deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            && ctx.execute_pending_job()
+        {
+            had_jobs = true;
+            jobs += 1;
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            // Clear a timeout exception left by an interrupted Promise job so the
+            // next page script starts with a clean exception state.
+            let _ = ctx.catch();
+        }
+        clear_deadline();
+        had_jobs
+    }
+
+    #[cfg(feature = "kindle-eglibc-2-12")]
+    const RUNTIME_MEMORY_LIMIT: usize = 24 * 1024 * 1024;
+
+    #[cfg(not(feature = "kindle-eglibc-2-12"))]
+    const RUNTIME_MEMORY_LIMIT: usize = 32 * 1024 * 1024;
+
+    const RUNTIME_STACK_LIMIT: usize = 512 * 1024;
+
+    /// A sandboxed JavaScript execution context.
+    pub struct JsRuntime {
+        timeout: Option<Duration>,
+    }
+
+    impl JsRuntime {
+        /// Create a new runtime with a custom per-script timeout (useful in tests).
+        pub fn with_timeout(timeout: Duration) -> Self {
+            WRITTEN.with(|w| w.borrow_mut().clear());
+            LOGGED.with(|l| l.borrow_mut().clear());
+            BODY_INNER_HTML.with(|b| b.borrow_mut().clear());
+            JsRuntime {
+                timeout: Some(timeout),
+            }
+        }
+
+        /// Create a new runtime with no per-script timeout.
+        pub fn without_timeout() -> Self {
+            WRITTEN.with(|w| w.borrow_mut().clear());
+            LOGGED.with(|l| l.borrow_mut().clear());
+            BODY_INNER_HTML.with(|b| b.borrow_mut().clear());
+            JsRuntime { timeout: None }
+        }
+
+        /// Evaluate the browser bootstrap and then each script in `scripts` in order.
+        ///
+        /// Scripts are evaluated in sloppy (non-strict) mode to match browser behaviour —
+        /// assignments to undeclared globals are allowed, as used by `SvelteKit` and webpack.
+        /// Errors from individual scripts are printed to stderr and skipped; the method
+        /// only returns `Err` if the bootstrap itself fails to evaluate.
+        pub fn execute(
+            &self,
+            scripts: &[String],
+            page_url: Option<&str>,
+            cfg: &crate::HttpConfig,
+            budget: &crate::RequestBudget,
+        ) -> anyhow::Result<()> {
+            self.execute_with_final_script(scripts, page_url, cfg, budget, "<html><head></head><body></body></html>", None)
+                .map(|_| ())
+        }
+
+        /// Execute a page and optionally evaluate one caller-provided script after
+        /// lifecycle/timer work has settled. The script result is coerced to a string.
+        pub fn execute_with_final_script(
+            &self,
+            scripts: &[String],
+            page_url: Option<&str>,
+            cfg: &crate::HttpConfig,
+            budget: &crate::RequestBudget,
+            html: &str,
+            final_script: Option<&str>,
+        ) -> anyhow::Result<Option<String>> {
+            HTTP_CONFIG.with(|slot| *slot.borrow_mut() = Some(cfg.clone()));
+            HTTP_BUDGET.with(|slot| *slot.borrow_mut() = Some(budget.clone()));
+            let _http_guard = HttpContextGuard;
+
+            let rt = Runtime::new().map_err(|e| anyhow!("quickjs runtime: {e:?}"))?;
+            rt.set_memory_limit(RUNTIME_MEMORY_LIMIT);
+            rt.set_max_stack_size(RUNTIME_STACK_LIMIT);
+            rt.set_loader(StubModuleSystem, StubModuleSystem);
+
+            // Check the per-script deadline every 10 000 opcodes to keep overhead near zero.
+            rt.set_interrupt_handler(Some(Box::new({
+                let mut counter = 0u32;
+                move || {
+                    counter = counter.wrapping_add(1);
+                    if !counter.is_multiple_of(10_000) {
+                        return false;
+                    }
+                    SCRIPT_DEADLINE.with(|d| d.borrow().is_some_and(|dl| Instant::now() > dl))
+                }
+            })));
+
+            let ctx = Context::full(&rt).map_err(|e| anyhow!("quickjs context: {e:?}"))?;
+
+            let final_result = ctx.with(|ctx| -> anyhow::Result<Option<String>> {
+                setup_document(&ctx)?;
+                setup_console(&ctx)?;
+                setup_http_bridge(&ctx)?;
+
+                let sloppy = || {
+                    let mut options = EvalOptions::default();
+                    options.global = true;
+                    options.strict = false;
+                    options
+                };
+
+                let render_deadline = budget.deadline();
+                set_deadline(render_deadline);
+                let bootstrap = super::make_bootstrap(page_url, cfg.user_agent.as_deref());
+                let bootstrap_result = ctx.eval_with_options::<Value, _>(bootstrap, sloppy());
+                clear_deadline();
+                bootstrap_result.map_err(|e| anyhow!("bootstrap error: {e:?}"))?;
+
+                // A document must always be initialized before page scripts run.
+                set_deadline(render_deadline);
+                let init_result = (|| -> anyhow::Result<()> {
+                    let module = rquickjs::Module::declare(ctx.clone(), "linkedom-worker",
+                        include_bytes!("linkedom/worker.min.js").as_slice())
+                        .map_err(|e| anyhow!("LinkeDOM module declaration: {e:?}"))?;
+                    let (module, ready) = module.eval()
+                        .map_err(|e| anyhow!("LinkeDOM module evaluation: {e:?}"))?;
+                    ready.finish::<()>()
+                        .map_err(|e| anyhow!("LinkeDOM module initialization: {e:?}"))?;
+                    ctx.globals().set("_r_linkedom", module.namespace().map_err(|e| anyhow!("{e:?}"))?)
+                        .map_err(|e| anyhow!("{e:?}"))?;
+                    ctx.eval_with_options::<Value, _>(include_str!("linkedom_adapter.js"), sloppy())
+                        .map_err(|e| anyhow!("LinkeDOM adapter: {e:?}"))?;
+                    set_deadline(bounded_deadline(self.timeout, render_deadline));
+                    let init = format!("_r_initialize_linkedom({});", serde_json::to_string(html)?);
+                    ctx.eval_with_options::<Value, _>(init, sloppy()).map_err(|e| {
+                        let exception = ctx.catch();
+                        let message = exception.as_exception()
+                            .and_then(|value| value.message())
+                            .unwrap_or_else(|| format!("{e:?}"));
+                        anyhow!("LinkeDOM document initialization: {message}")
+                    })?;
+                    Ok(())
+                })();
+                clear_deadline();
+                init_result?;
+
+                for script in scripts {
+                    if render_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        break;
+                    }
+                    let task_deadline = bounded_deadline(self.timeout, render_deadline);
+                    set_deadline(task_deadline);
+                    let result = ctx.eval_with_options::<Value, _>(script.as_str(), sloppy());
+                    if result.is_err() {
+                        let exc = ctx.catch();
+                        if let Some(e) = exc.as_exception() {
+                            let msg = e.message().unwrap_or_else(|| "unknown exception".into());
+                            eprintln!("[js error] {msg}");
+                            if crate::is_verbose()
+                                && let Some(stack) = e.stack()
+                            {
+                                eprintln!("[js stack] {stack}");
+                            }
+                        }
+                    }
+                    clear_deadline();
+                    drain_pending_jobs(&ctx, task_deadline);
+                }
+
+                // Initial scripts have finished: fire the minimal browser lifecycle,
+                // draining promise reactions after each event before advancing timers.
+                for lifecycle in [super::DOM_CONTENT_LOADED_JS, super::LOAD_JS] {
+                    if render_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        break;
+                    }
+                    let task_deadline = bounded_deadline(self.timeout, render_deadline);
+                    set_deadline(task_deadline);
+                    let _ = ctx.eval_with_options::<Value, _>(lifecycle, sloppy());
+                    clear_deadline();
+                    drain_pending_jobs(&ctx, task_deadline);
+                }
+
+                // Keep the legacy bounded virtual-timer pump, but wait for
+                // native network completions before evaluating final_script/DOM.
+                let mut timer_passes = 0u32;
+                let mut timer_idle = false;
+                loop {
+                    if render_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        break;
+                    }
+                    let mut fired = 0;
+                    let mut had_jobs = false;
+                    if timer_passes < 128 && !timer_idle {
+                        timer_passes += 1;
+                        let task_deadline = bounded_deadline(self.timeout, render_deadline);
+                        set_deadline(task_deadline);
+                        fired = ctx
+                            .eval_with_options::<Value, _>(super::TIMER_PUMP_JS, sloppy())
+                            .ok()
+                            .and_then(|v| v.as_int())
+                            .unwrap_or(0);
+                        clear_deadline();
+                        had_jobs = drain_pending_jobs(&ctx, task_deadline);
+                        timer_idle = fired == 0 && !had_jobs;
+                    }
+
+                    if has_pending_http() {
+                        let completion = ASYNC_HTTP.with(|slot| {
+                            slot.borrow_mut().as_mut().expect("pending HTTP has a scheduler")
+                                .receive(render_deadline)
+                        }).map_err(|error| anyhow!("{error}"))?;
+                        if let Some((id, raw)) = completion {
+                            let task_deadline = bounded_deadline(self.timeout, render_deadline);
+                            set_deadline(task_deadline);
+                            let deliver: Function = ctx.globals()
+                                .get("_r_async_complete").map_err(|e| anyhow!("{e:?}"))?;
+                            let result = deliver.call::<_, ()>((id, raw));
+                            clear_deadline();
+                            if let Err(error) = result {
+                                let _ = ctx.catch();
+                                eprintln!("[js error] async HTTP completion: {error:?}");
+                            }
+                            drain_pending_jobs(&ctx, task_deadline);
+                            timer_idle = false;
+                        }
+                    } else if timer_idle || (fired == 0 && !had_jobs) || timer_passes >= 128 {
+                        break;
+                    }
+                }
+                if has_pending_http()
+                    || render_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    return Err(anyhow!("Rakers render deadline exceeded"));
+                }
+
+                let final_result = if let Some(script) = final_script {
+                    let task_deadline = bounded_deadline(self.timeout, render_deadline);
+                    set_deadline(task_deadline);
+                    let result = match ctx
+                        .eval_with_options::<rquickjs::Coerced<String>, _>(script, sloppy())
+                    {
+                        Ok(value) => Some(value.0),
+                        Err(_) => {
+                            let exc = ctx.catch();
+                            if let Some(error) = exc.as_exception() {
+                                let message = error
+                                    .message()
+                                    .unwrap_or_else(|| "unknown exception".into());
+                                eprintln!("[js error] {message}");
+                            }
+                            None
+                        }
+                    };
+                    clear_deadline();
+                    drain_pending_jobs(&ctx, task_deadline);
+                    result
+                } else {
+                    None
+                };
+
+                set_deadline(bounded_deadline(self.timeout, render_deadline));
+                let readback = ctx.eval_with_options::<String, _>(super::LINKEDOM_READBACK_JS, sloppy())
+                    .map_err(|e| anyhow!("LinkeDOM document readback failed: {e:?}"));
+                clear_deadline();
+                let body_html = readback?;
+
+                let body_html = match body_html.as_str() {
+                    "undefined" | "null" | "" => String::new(),
+                    s => s.to_owned(),
+                };
+                BODY_INNER_HTML.with(|b| *b.borrow_mut() = body_html);
+
+                Ok(final_result)
+            })?;
+
+            Ok(final_result)
+        }
+
+        /// Return the accumulated output of all `document.write` / `document.writeln` calls.
+        pub fn written_html() -> String {
+            WRITTEN.with(|w| w.borrow().clone())
+        }
+
+        /// Return the serialized LinkeDOM document.
+        pub fn body_inner_html() -> String {
+            BODY_INNER_HTML.with(|b| b.borrow().clone())
+        }
+
+        /// Return all messages logged via `console.log`, `console.warn`, or `console.error`.
+        pub fn logged_messages() -> Vec<String> {
+            LOGGED.with(|l| l.borrow().clone())
+        }
+    }
+
+    /// Register `document.write` and `document.writeln`.
+    fn setup_document(ctx: &Ctx<'_>) -> anyhow::Result<()> {
+        let doc = Object::new(ctx.clone()).map_err(|e| anyhow!("{e:?}"))?;
+
+        doc.set(
+            "write",
+            Function::new(ctx.clone(), |s: String| {
+                WRITTEN.with(|w| w.borrow_mut().push_str(&s));
+                Ok::<(), rquickjs::Error>(())
+            })
+            .map_err(|e| anyhow!("{e:?}"))?,
+        )
+        .map_err(|e| anyhow!("{e:?}"))?;
+
+        doc.set(
+            "writeln",
+            Function::new(ctx.clone(), |s: String| {
+                WRITTEN.with(|w| {
+                    let mut w = w.borrow_mut();
+                    w.push_str(&s);
+                    w.push('\n');
+                });
+                Ok::<(), rquickjs::Error>(())
+            })
+            .map_err(|e| anyhow!("{e:?}"))?,
+        )
+        .map_err(|e| anyhow!("{e:?}"))?;
+
+        ctx.globals()
+            .set("document", doc)
+            .map_err(|e| anyhow!("{e:?}"))?;
+        Ok(())
+    }
+
+    /// Register `console.log`, `console.warn`, and `console.error`.
+    fn setup_console(ctx: &Ctx<'_>) -> anyhow::Result<()> {
+        use rquickjs::function::Rest;
+
+        let console = Object::new(ctx.clone()).map_err(|e| anyhow!("{e:?}"))?;
+
+        let log_fn = Function::new(ctx.clone(), |args: Rest<rquickjs::Coerced<String>>| {
+            let parts: Vec<String> = args.0.into_iter().map(|s| s.0).collect();
+            LOGGED.with(|l| l.borrow_mut().push(parts.join(" ")));
+            Ok::<(), rquickjs::Error>(())
+        })
+        .map_err(|e| anyhow!("{e:?}"))?;
+
+        let noop_fn = Function::new(ctx.clone(), || Ok::<(), rquickjs::Error>(()))
+            .map_err(|e| anyhow!("{e:?}"))?;
+
+        console
+            .set("log", log_fn.clone())
+            .map_err(|e| anyhow!("{e:?}"))?;
+        console
+            .set("warn", log_fn.clone())
+            .map_err(|e| anyhow!("{e:?}"))?;
+        console
+            .set("error", log_fn.clone())
+            .map_err(|e| anyhow!("{e:?}"))?;
+        console
+            .set("info", log_fn.clone())
+            .map_err(|e| anyhow!("{e:?}"))?;
+        console.set("debug", log_fn).map_err(|e| anyhow!("{e:?}"))?;
+        console
+            .set("table", noop_fn.clone())
+            .map_err(|e| anyhow!("{e:?}"))?;
+        console
+            .set("group", noop_fn.clone())
+            .map_err(|e| anyhow!("{e:?}"))?;
+        console
+            .set("groupEnd", noop_fn.clone())
+            .map_err(|e| anyhow!("{e:?}"))?;
+        console
+            .set("groupCollapsed", noop_fn.clone())
+            .map_err(|e| anyhow!("{e:?}"))?;
+        console
+            .set("time", noop_fn.clone())
+            .map_err(|e| anyhow!("{e:?}"))?;
+        console
+            .set("timeEnd", noop_fn.clone())
+            .map_err(|e| anyhow!("{e:?}"))?;
+        console
+            .set("assert", noop_fn)
+            .map_err(|e| anyhow!("{e:?}"))?;
+
+        ctx.globals()
+            .set("console", console)
+            .map_err(|e| anyhow!("{e:?}"))?;
+        Ok(())
+    }
+
+    /// Register sync HTTP for XHR/scripts, plus the opt-in async fetch bridge.
+    fn setup_http_bridge(ctx: &Ctx<'_>) -> anyhow::Result<()> {
+        let request_fn = Function::new(
+            ctx.clone(),
+            |method: String, url: String, headers: String, body: String| -> String {
+                let cfg = HTTP_CONFIG.with(|slot| slot.borrow().clone());
+                let budget = HTTP_BUDGET.with(|slot| slot.borrow().clone());
+                match (cfg, budget) {
+                    (Some(cfg), Some(budget)) => {
+                        super::perform_http_request(&cfg, &budget, &method, &url, &headers, &body)
+                    }
+                    _ => serde_json::json!({"error":"HTTP bridge is not initialized"}).to_string(),
+                }
+            },
+        )
+        .map_err(|e| anyhow!("{e:?}"))?;
+
+        ctx.globals()
+            .set("_r_request_sync", request_fn)
+            .map_err(|e| anyhow!("{e:?}"))?;
+
+        let async_enabled = HTTP_CONFIG.with(|slot| {
+            slot.borrow().as_ref().is_some_and(|cfg| cfg.async_http)
+        });
+        if async_enabled {
+            let start = Function::new(
+                ctx.clone(),
+                |method: String, url: String, headers: String, body: String| -> String {
+                    let cfg = HTTP_CONFIG.with(|slot| slot.borrow().clone());
+                    let budget = HTTP_BUDGET.with(|slot| slot.borrow().clone());
+                    let result = match (cfg, budget) {
+                        (Some(cfg), Some(budget)) => {
+                            let headers = super::browser_request_headers(&headers);
+                            cfg.prepare_request(
+                                &budget,
+                                &method,
+                                &url,
+                                &headers,
+                                (!body.is_empty()).then_some(body.as_str()),
+                                cfg.forward_headers,
+                            ).and_then(|request| {
+                                ASYNC_HTTP.with(|slot| {
+                                    let mut state = slot.borrow_mut();
+                                    state
+                                        .get_or_insert_with(|| AsyncHttp::new(&cfg, &budget))
+                                        .submit(request)
+                                })
+                            })
+                        }
+                        _ => Err("HTTP bridge is not initialized".to_string()),
+                    };
+                    match result {
+                        Ok(id) => serde_json::json!({"id": id}).to_string(),
+                        Err(error) => serde_json::json!({"error": error}).to_string(),
+                    }
+                },
+            ).map_err(|e| anyhow!("{e:?}"))?;
+            ctx.globals().set("_r_request_async_start", start)
+                .map_err(|e| anyhow!("{e:?}"))?;
+        }
+        Ok(())
+    }
+}
+
+pub use quickjs_rt::JsRuntime;

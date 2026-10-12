@@ -1,0 +1,26 @@
+# Vendored from crates.io java_regex 0.1.0 (MIT OR Apache-2.0).
+# Local runtime patch: read-only capture metadata getters in src/lib.rs.
+# Upstream documentation includes are omitted; the matcher/parser are unchanged.
+[package]
+name = "java_regex"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+authors = ["Mathieu Dutour Sikiric <mathieu.dutour@gmail.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/MathieuDutSik/java_regex"
+description = "Rust implementation of Java's java.util.regex.Pattern"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+unicode-blocks = { version = "0.1.9", default-features = false }
+unicode-general-category = { version = "1", default-features = false }
+unicode-properties = { version = "0.1.4", default-features = false, features = ["general-category"] }
+unicode-script = { version = "0.5.8", default-features = false }
+arbitrary = { version = "1", features = ["derive"], optional = true }
+
+[features]
+default = []
+fuzz-gen = ["dep:arbitrary"]

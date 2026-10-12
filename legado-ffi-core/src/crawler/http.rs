@@ -402,7 +402,13 @@ fn map_ureq_error(error: ureq::Error) -> HttpClientError {
 }
 
 fn map_io_error(error: std::io::Error, url: &Url) -> HttpClientError {
-    if error.kind() == std::io::ErrorKind::TimedOut {
+    // ureq can wrap its timeout in io::ErrorKind::Other while reading a body.
+    let is_timeout = error.kind() == std::io::ErrorKind::TimedOut
+        || error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<ureq::Error>())
+            .is_some_and(|source| matches!(source, ureq::Error::Timeout(_)));
+    if is_timeout {
         HttpClientError::Timeout(format!("{url}: {error}"))
     } else {
         HttpClientError::Network(error.to_string())
@@ -416,6 +422,117 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn p0_offline_diagnostics_deny_http_without_attempting_network() {
+        let client = HttpClient::standalone();
+        crate::host_services::with_offline(|| {
+            let error = client
+                .execute(
+                    Method::GET,
+                    "http://127.0.0.1:9/p0-must-not-connect",
+                    &[],
+                    None,
+                    Some(1024),
+                )
+                .unwrap_err();
+            assert!(
+                matches!(error, HttpClientError::Network(ref message) if message == "network is disabled in offline diagnostics"),
+                "offline mode must block before network I/O: {error}"
+            );
+        });
+        assert!(!crate::host_services::is_offline(), "offline scope must restore TLS");
+    }
+
+    #[test]
+    fn p0_http_timeout_bounds_slow_headers_and_body() {
+        for slow_body in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 1024];
+                stream.read(&mut request).unwrap();
+                if slow_body {
+                    // Respond with headers, then stall before the declared body.
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n")
+                        .unwrap();
+                }
+                thread::sleep(Duration::from_millis(200));
+            });
+            let client = HttpClient::new(50, None, None).unwrap();
+            let started = std::time::Instant::now();
+            let error = client
+                .execute(Method::GET, &format!("http://{address}/slow"), &[], None, Some(1024))
+                .unwrap_err();
+            eprintln!(
+                "P0 slow_{}: elapsed_ms={} error={error}",
+                if slow_body { "body" } else { "headers" },
+                started.elapsed().as_millis(),
+            );
+            assert!(matches!(error, HttpClientError::Timeout(_)), "{error}");
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn p0_cross_origin_redirect_strips_sensitive_headers() {
+        let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+        let destination_url = format!("http://{}/final", destination.local_addr().unwrap());
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin_url = format!("http://{}/start", origin.local_addr().unwrap());
+
+        let origin_server = thread::spawn(move || {
+            let (mut stream, _) = origin.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let n = stream.read(&mut request).unwrap();
+            let sent = String::from_utf8_lossy(&request[..n]).to_ascii_lowercase();
+            assert!(sent.contains("authorization: bearer private"));
+            assert!(sent.contains("cookie: session=private"));
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: {destination_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let destination_server = thread::spawn(move || {
+            let (mut stream, _) = destination.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let n = stream.read(&mut request).unwrap();
+            let received = String::from_utf8_lossy(&request[..n]).to_ascii_lowercase();
+            for header in ["authorization:", "cookie:", "proxy-authorization:"] {
+                assert!(
+                    !received.lines().any(|line| line.starts_with(header)),
+                    "cross-origin redirect forwarded {header}"
+                );
+            }
+            assert!(received.contains("x-p0-marker: keep"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+
+        let client = HttpClient::new(2_000, None, None).unwrap();
+        let response = client
+            .execute(
+                Method::GET,
+                &origin_url,
+                &[
+                    ("Authorization".into(), "Bearer private".into()),
+                    ("Cookie".into(), "session=private".into()),
+                    ("Proxy-Authorization".into(), "Basic private".into()),
+                    ("X-P0-Marker".into(), "keep".into()),
+                ],
+                None,
+                Some(1024),
+            )
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"ok");
+        origin_server.join().unwrap();
+        destination_server.join().unwrap();
+    }
 
     #[test]
     fn follows_redirects_and_carries_set_cookie() {
