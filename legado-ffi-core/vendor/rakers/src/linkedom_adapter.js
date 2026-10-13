@@ -93,11 +93,16 @@ function _r_initialize_linkedom(html) {
         },
         configurable: true
     });
-    var insertAdjacentHTML = elementProto.insertAdjacentHTML;
     elementProto.insertAdjacentHTML = function(position, html) {
         inertMarkup++;
-        try { return insertAdjacentHTML.call(this, position, html); }
-        finally { inertMarkup--; }
+        try {
+            // Native fragment parsing must not re-enter a page's innerHTML override.
+            var owner = this.ownerDocument, container = owner.createElement('');
+            htmlAccessors.set.call(container, html);
+            var fragment = owner.createDocumentFragment();
+            while (container.firstChild) fragment.appendChild(container.firstChild);
+            this.insertAdjacentElement(position, fragment);
+        } finally { inertMarkup--; }
     };
     function insertedScripts(node) {
         if (!node || typeof node !== 'object') return [];

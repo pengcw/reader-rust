@@ -14,7 +14,7 @@ edition = "2024"
 name = "rakers"
 version = "0.1.7"
 authors = ["tbro <tim@toma.tl>"]
-build = false
+build = "build.rs"
 exclude = [
     "TODO.org",
     "scripts/",
@@ -78,6 +78,12 @@ path = "tests/async_http_p0_baseline.rs"
 [[test]]
 name = "async_http_p1_contracts"
 path = "tests/async_http_p1_contracts.rs"
+
+[target.'cfg(target_os = "android")'.build-dependencies]
+rquickjs = { version = "=0.12.0", default-features = false, features = ["std", "bindgen"] }
+
+[target.'cfg(not(target_os = "android"))'.build-dependencies]
+rquickjs = { version = "=0.12.0", default-features = false, features = ["std"] }
 
 [dependencies.anyhow]
 version = "1"

@@ -15,6 +15,7 @@ pub use diff::diff_html;
 pub use pretty::pretty_print;
 pub use select::select_html;
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::io::Read;
 use std::sync::{
@@ -542,9 +543,9 @@ pub fn render_detailed(
     final_script: Option<&str>,
 ) -> anyhow::Result<RenderOutput> {
     let html = if is_js {
-        format!("<!DOCTYPE html><html><head></head><body><script>{input}</script></body></html>")
+        Cow::Owned(format!("<!DOCTYPE html><html><head></head><body><script>{input}</script></body></html>"))
     } else {
-        input.to_owned()
+        Cow::Borrowed(input)
     };
 
     let budget = RequestBudget::new(cfg);
@@ -1189,6 +1190,45 @@ mod tests {
         )
         .unwrap();
         assert!(out.contains("reader-rust-test/1.0"));
+    }
+
+    #[test]
+    fn browser_bootstrap_uses_runtime_values_without_leaking_inputs() {
+        let ua = "reader-rust/\"\\test\n\u{2028}__HREF__";
+        let page_url = "https://example.test/path?marker=__USER_AGENT__";
+        let cfg = HttpConfig {
+            user_agent: Some(ua.to_string()),
+            ..Default::default()
+        };
+        let output = render_detailed(
+            "<html><body><main>hello</main></body></html>",
+            false,
+            Some(page_url),
+            &cfg,
+            false,
+            None,
+            None,
+            Some("JSON.stringify([location.href,navigator.userAgent,typeof globalThis.__r_initial_href,typeof globalThis.__r_initial_ua])"),
+        ).unwrap();
+        let values: Vec<String> = serde_json::from_str(output.script_result.as_deref().unwrap()).unwrap();
+        assert_eq!(values, vec![page_url, ua, "undefined", "undefined"]);
+    }
+
+    #[test]
+    fn linkedom_initialization_preserves_large_html_string_values() {
+        let content = "中文😀\"\\\u{2028}\n".repeat(1024);
+        let html = format!("<html><body><main id=\"payload\">{content}</main></body></html>");
+        let output = render_detailed(
+            &html,
+            false,
+            None,
+            &HttpConfig::default(),
+            false,
+            None,
+            None,
+            Some("document.getElementById('payload').textContent"),
+        ).unwrap();
+        assert_eq!(output.script_result.as_deref(), Some(content.as_str()));
     }
 
     #[test]

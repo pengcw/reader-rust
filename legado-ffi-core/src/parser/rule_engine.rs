@@ -3797,7 +3797,7 @@ fn eval_field_html_with_cached_text(
             .into_iter()
             .next()
             .unwrap_or_default(),
-        ParseMode::Regex => regex_capture_first(pure.trim_start_matches(':').trim(), &input)
+        ParseMode::Regex => regex_capture_first(pure.trim_start_matches(':').trim(), input)
             .and_then(|row| row.get(1).or_else(|| row.first()).and_then(Clone::clone))
             .unwrap_or_default(),
         ParseMode::Js => eval_html_node_js(strip_js_rule(&source_rule.rule), *el, base_url, ctx)
@@ -3884,7 +3884,7 @@ fn eval_field_html_doc_with_cached_input(
     evaluate_put_entries(&source_rule.put_entries, ctx, |put_rule, ctx| {
         eval_field_html_doc_with_cached_input(put_rule, doc, serialized, base_url, ctx)
     });
-    let expanded = interpolate_common_templates(&source_rule.rule, &input, base_url, ctx);
+    let expanded = interpolate_common_templates(&source_rule.rule, input, base_url, ctx);
     let had_templates = expanded != source_rule.rule;
     source_rule.make_up_rule(&expanded);
     let (pure, js) = extract_js(&source_rule.rule);
@@ -3892,15 +3892,15 @@ fn eval_field_html_doc_with_cached_input(
     let mut text = match source_rule.mode {
         _ if pure.is_empty() && source_rule.replacement_rule.is_some() => input.clone(),
         ParseMode::Css => html::select_text(doc, pure).unwrap_or_default(),
-        ParseMode::XPath => html::select_xpath(&input, pure)
+        ParseMode::XPath => html::select_xpath(input, pure)
             .first()
             .cloned()
             .unwrap_or_default(),
-        ParseMode::Regex => regex_capture_first(pure.trim_start_matches(':').trim(), &input)
+        ParseMode::Regex => regex_capture_first(pure.trim_start_matches(':').trim(), input)
             .and_then(|row| row.get(1).or_else(|| row.first()).and_then(Clone::clone))
             .unwrap_or_default(),
         ParseMode::Js => {
-            eval_js_with_bindings(strip_js_rule(pure), &input, base_url, &ctx.js_bindings())
+            eval_js_with_bindings(strip_js_rule(pure), input, base_url, &ctx.js_bindings())
                 .unwrap_or_default()
         }
         ParseMode::JsonPath => String::new(),
@@ -3910,7 +3910,7 @@ fn eval_field_html_doc_with_cached_input(
     }
     if let Some(script) = js {
         let js_input = if source_rule.mode == ParseMode::Js && text.is_empty() {
-            &input
+            input
         } else {
             &text
         };

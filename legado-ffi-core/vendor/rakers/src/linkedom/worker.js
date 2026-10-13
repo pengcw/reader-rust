@@ -2430,23 +2430,31 @@ const createRecord =
   nextSibling: element?.nextSibling || null,
 });
 
+// DOM delivery uses the intrinsic microtask queue, not a page's Promise polyfill.
+const mutationMicrotask = Promise.resolve();
+const enqueueMutation = mutationMicrotask.then.bind(mutationMicrotask);
+
+const queueMutation = (observer, record) => {
+  const {callback, records, scheduled} = observer;
+  records.push(record);
+  if (!scheduled) {
+    observer.scheduled = true;
+    enqueueMutation(() => {
+      observer.scheduled = false;
+      callback(records.splice(0), observer);
+    });
+  }
+};
+
 const queueAttribute = (
   observer, target, attributeName, attributeFilter, attributeOldValue, oldValue
 ) => {
   if ((!attributeFilter || attributeFilter.includes(attributeName))) {
-    const {callback, records, scheduled} = observer;
-    records.push(createRecord(
+    queueMutation(observer, createRecord(
       'attributes', target, null,
       [], [],
       attributeName, attributeOldValue ? oldValue : void 0
     ));
-    if (!scheduled) {
-      observer.scheduled = true;
-      Promise.resolve().then(() => {
-        observer.scheduled = false;
-        callback(records.splice(0), observer);
-      });
-    }
   }
 };
 
@@ -2457,34 +2465,32 @@ const attributeChangedCallback = (element, attributeName, oldValue) => {
     for (const observer of observers) {
       for (const [
         target,
-        {
-          childList,
-          subtree,
-          attributes,
-          attributeFilter,
-          attributeOldValue
-        }
+        {subtree, attributes, attributeFilter, attributeOldValue}
       ] of observer.nodes) {
-        if (childList) {
-          if (
-            (subtree && (target === ownerDocument || target.contains(element))) ||
-            (!subtree && target.children.includes(element))
-          ) {
-            queueAttribute(
-              observer, element,
-              attributeName, attributeFilter, attributeOldValue, oldValue
-            );
-            break;
-          }
-        }
-        else if (
-          attributes &&
-          target === element
-        ) {
+        if (attributes &&
+            (target === element || (subtree && target.contains(element)))) {
           queueAttribute(
             observer, element,
             attributeName, attributeFilter, attributeOldValue, oldValue
           );
+          break;
+        }
+      }
+    }
+  }
+};
+
+const characterDataChangedCallback = (node, oldValue) => {
+  const {active, observers} = node.ownerDocument[MUTATION_OBSERVER];
+  if (active) {
+    for (const observer of observers) {
+      for (const [target, options] of observer.nodes) {
+        if (options.characterData &&
+            (target === node || (options.subtree && target.contains(node)))) {
+          queueMutation(observer, createRecord(
+            'characterData', node, null, [], [], null,
+            options.characterDataOldValue ? oldValue : null
+          ));
           break;
         }
       }
@@ -2504,18 +2510,10 @@ const moCallback = (element, parentNode) => {
             (!parentNode && ((subtree && (target === ownerDocument || /* c8 ignore next */target.contains(element))) ||
                             (!subtree && target[characterData ? 'childNodes' : 'children'].includes(element))))
           ) {
-            const {callback, records, scheduled} = observer;
-            records.push(createRecord(
+            queueMutation(observer, createRecord(
               'childList', target, element,
               parentNode ? [] : [element], parentNode ? [element] : []
             ));
-            if (!scheduled) {
-              observer.scheduled = true;
-              Promise.resolve().then(() => {
-                observer.scheduled = false;
-                callback(records.splice(0), observer);
-              });
-            }
             break;
           }
         }
@@ -2575,13 +2573,14 @@ class MutationObserverClass {
         attributeFilter: null,
         attributeOldValue: false,
         characterData: false,
-        // TODO: not implemented yet
-        // characterDataOldValue: false
+        characterDataOldValue: false
       }) {
         if (('attributeOldValue' in options) || ('attributeFilter' in options))
           options.attributes = true;
-        // if ('characterDataOldValue' in options)
-        //   options.characterData = true;
+        if (!('characterData' in options) && ('characterDataOldValue' in options))
+          options.characterData = true;
+        if (options.characterDataOldValue && options.characterData === false)
+          throw new TypeError('characterDataOldValue requires characterData');
         options.childList = !!options.childList;
         options.subtree = !!options.subtree;
         this.nodes.set(target, options);
@@ -3186,8 +3185,9 @@ let CharacterData$1 = class CharacterData extends Node$1 {
   /* c8 ignore start */
   get data() { return this[VALUE]; }
   set data(value) {
+    const oldValue = this[VALUE];
     this[VALUE] = $String(value);
-    moCallback(this, this.parentNode);
+    characterDataChangedCallback(this, oldValue);
   }
 
   get nodeValue() { return this.data; }
@@ -9679,11 +9679,7 @@ function requireCSSValue () {
 		},
 
 		_getConstructorName: function() {
-			var s = this.constructor.toString(),
-					c = s.match(/function\s([^\(]+)/),
-					name = c[1];
-
-			return name;
+			return this.constructor.name;
 		}
 	};
 

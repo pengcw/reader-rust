@@ -1,5 +1,5 @@
 // rakers browser-globals bootstrap.
-// Evaluated before every user script. Page URL and User-Agent placeholders are replaced by Rust.
+// Evaluated before every user script. Rust supplies the initial URL and User-Agent as JS values.
 
 var window = globalThis;
 var self   = window;
@@ -126,7 +126,8 @@ function _r_parse_url(href, base) {
 // ─── window ──────────────────────────────────────────────────────────────────
 
 (function() {
-    var _u = _r_parse_url("__HREF__");
+    var _u = _r_parse_url(typeof globalThis.__r_initial_href === 'string'
+        ? globalThis.__r_initial_href : 'about:blank');
     var _hash = _u.hash;
     var _loc = {
         href:     _u.href,     protocol: _u.protocol, host:     _u.host,
@@ -154,7 +155,8 @@ function _r_parse_url(href, base) {
     document.location = _loc;
 })();
 window.navigator = {
-    userAgent: "__USER_AGENT__", appName: 'rakers', appVersion: '0.1.0',
+    userAgent: typeof globalThis.__r_initial_ua === 'string'
+        ? globalThis.__r_initial_ua : 'rakers/0.1.0', appName: 'rakers', appVersion: '0.1.0',
     language: 'en-US', languages: ['en-US', 'en'],
     platform: 'Linux', vendor: '',
     onLine: true, cookieEnabled: true,
