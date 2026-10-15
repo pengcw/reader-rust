@@ -480,6 +480,11 @@ impl<'a> Engine<'a> {
                 kind,
             } => {
                 let rest = &nodes[1..];
+                if *kind != QuantKind::Possessive
+                    && matches!(inner.as_ref(), Node::Dot | Node::CharClass(_))
+                {
+                    return self.match_single_char_quantifier(inner, *min, *max, *kind, rest, pos, state);
+                }
                 match kind {
                     QuantKind::Greedy => {
                         self.match_greedy(inner, *min, *max, 0, rest, pos, pos, state)
@@ -736,6 +741,65 @@ impl<'a> Engine<'a> {
         } else {
             false
         }
+    }
+
+    // Matching a single character repeatedly needs no recursive backtracking.
+    // Keep a step budget, and try the continuation in Java's greedy/lazy order.
+    #[allow(clippy::too_many_arguments)]
+    fn match_single_char_quantifier(
+        &mut self,
+        atom: &Node,
+        min: u32,
+        max: u32,
+        kind: QuantKind,
+        rest: &[Node],
+        pos: usize,
+        state: &mut State,
+    ) -> bool {
+        let mut end = pos;
+        let mut count = 0u32;
+        loop {
+            // A reluctant quantifier must test the continuation *before*
+            // consuming the next character. Scanning the whole tail first
+            // can exhaust the budget even when a match is immediately available.
+            if kind == QuantKind::Reluctant && count >= min {
+                if !self.step() {
+                    return false;
+                }
+                if self.match_nodes(rest, end, state) {
+                    return true;
+                }
+            }
+            if count >= max || end >= self.text_len() {
+                break;
+            }
+            if !self.step() {
+                return false;
+            }
+            let ch = self.input[end];
+            let matched = match atom {
+                Node::Dot => self.flags.dotall || !self.is_lt(ch),
+                Node::CharClass(class) => self.match_char_class(class, ch),
+                _ => unreachable!("only single-character atoms use this path"),
+            };
+            if !matched {
+                break;
+            }
+            end += 1;
+            count += 1;
+        }
+        if kind == QuantKind::Reluctant || count < min {
+            return false;
+        }
+        for candidate in (pos + min as usize..=end).rev() {
+            if !self.step() {
+                return false;
+            }
+            if self.match_nodes(rest, candidate, state) {
+                return true;
+            }
+        }
+        false
     }
 
     #[allow(clippy::too_many_arguments)]

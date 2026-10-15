@@ -1,4 +1,24 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+// Some Legado sources encode this optional rule flag as a JSON boolean.
+// Keep the existing String model and preserve strings verbatim.
+fn deserialize_can_re_name<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Value {
+        Text(String),
+        Flag(bool),
+    }
+
+    Ok(Option::<Value>::deserialize(deserializer)?.map(|value| match value {
+        Value::Text(text) => text,
+        Value::Flag(flag) => flag.to_string(),
+    }))
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]
@@ -46,6 +66,7 @@ pub struct BookInfoRule {
     pub cover_url: Option<String>,
     pub word_count: Option<String>,
     pub toc_url: Option<String>,
+    #[serde(deserialize_with = "deserialize_can_re_name")]
     pub can_re_name: Option<String>,
     pub download_urls: Option<String>,
 }

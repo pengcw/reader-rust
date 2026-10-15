@@ -1771,9 +1771,48 @@ pub(crate) fn parse_xpath_package_with_mode(
 
     // HTML mode mirrors JXDocument.create(String): repair malformed HTML first,
     // then bridge the resulting DOM into the XML-only XPath evaluator.
-    let document = Html::parse_document(&prepared);
+    let mut document = Html::parse_document(&prepared);
     let repaired = html_to_xpath_xml(&document.html());
-    sxd_document::parser::parse(&repaired).map(|package| (package, true))
+    match sxd_document::parser::parse(&repaired) {
+        Ok(package) => Ok((package, true)),
+        Err(original_error) => {
+            // HTML5 tolerates attribute names that XML rejects (e.g. @ in
+            // unquoted metadata). Do not discard the entire readable body.
+            // Only retry if the HTML tree actually contains such attributes.
+            let ids: Vec<_> = document
+                .tree
+                .root()
+                .descendants()
+                .map(|node| node.id())
+                .collect();
+            let mut removed_invalid_attribute = false;
+            for id in ids {
+                if let Some(mut node) = document.tree.get_mut(id) {
+                    if let scraper::Node::Element(element) = node.value() {
+                        let before = element.attrs.len();
+                        element
+                            .attrs
+                            .retain(|name, _| xml_xpath_compatible_attribute_name(name.local.as_ref()));
+                        removed_invalid_attribute |= element.attrs.len() != before;
+                    }
+                }
+            }
+            if !removed_invalid_attribute {
+                return Err(original_error);
+            }
+            let repaired = html_to_xpath_xml(&document.html());
+            sxd_document::parser::parse(&repaired)
+                .map(|package| (package, true))
+                .map_err(|_| original_error)
+        }
+    }
+}
+
+fn xml_xpath_compatible_attribute_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else { return false };
+    (first.is_alphabetic() || matches!(first, '_' | ':'))
+        && chars.all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | ':' | '-' | '.'))
 }
 
 fn html_to_xpath_xml(html: &str) -> String {

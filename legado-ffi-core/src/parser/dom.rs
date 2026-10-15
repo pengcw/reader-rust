@@ -122,6 +122,19 @@ impl NodeContext {
                 .map(&mut descriptor)
                 .transpose()?
                 .unwrap_or(JsonValue::Null),
+            "previousElementSibling" => {
+                let (index, parent_path) = indices.split_last().expect("validated DOM path");
+                if *index == 0 {
+                    JsonValue::Null
+                } else {
+                    let mut previous_path = parent_path.to_vec();
+                    previous_path.push(index - 1);
+                    self.element(&previous_path)
+                        .map(&mut descriptor)
+                        .transpose()?
+                        .unwrap_or(JsonValue::Null)
+                }
+            }
             "elementSiblingIndex" => json!(indices.last().copied().unwrap_or(0)),
             "children" => {
                 let nodes: Vec<_> = element

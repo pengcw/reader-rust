@@ -37,6 +37,7 @@
             select: selector => collection(query('select', path, selector)),
             selectFirst: selector => collection(query('select', path, selector)).first(),
             parent: () => node(query('parent', path)),
+            previousElementSibling: () => node(query('previousElementSibling', path)),
             children: () => collection(query('children', path)),
             elementSiblingIndex: () => query('elementSiblingIndex', path),
             toString: () => query('outerHtml', path),

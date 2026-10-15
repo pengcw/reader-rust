@@ -1,3 +1,4 @@
+pub(crate) mod aes_gcm;
 pub(crate) mod chacha20;
 pub(crate) mod compression;
 pub(crate) mod crypto;
@@ -5,6 +6,7 @@ pub(crate) mod dom;
 pub mod html;
 pub(crate) mod http_url;
 pub mod js;
+pub(crate) mod js_bytecode;
 pub(crate) mod js_compat;
 pub(crate) mod js_http;
 pub(crate) mod js_state;

@@ -281,6 +281,12 @@ mod quickjs_rt {
         set_deadline(None);
     }
 
+    fn interrupt_deadline_exceeded() -> bool {
+        // QuickJS itself invokes the callback about every 10,000 opcodes.
+        // Do not throttle it a second time: that delays runaway-script timeouts.
+        SCRIPT_DEADLINE.with(|d| d.borrow().is_some_and(|dl| Instant::now() >= dl))
+    }
+
     // Pending jobs execute while Context::with holds the runtime lock, so use
     // Ctx directly. rquickjs 0.12 fixes interrupt handling during pending jobs,
     // allowing Promise callbacks to share the same deadline as their parent task.
@@ -373,17 +379,7 @@ mod quickjs_rt {
             rt.set_max_stack_size(RUNTIME_STACK_LIMIT);
             rt.set_loader(StubModuleSystem, StubModuleSystem);
 
-            // Check the per-script deadline every 10 000 opcodes to keep overhead near zero.
-            rt.set_interrupt_handler(Some(Box::new({
-                let mut counter = 0u32;
-                move || {
-                    counter = counter.wrapping_add(1);
-                    if !counter.is_multiple_of(10_000) {
-                        return false;
-                    }
-                    SCRIPT_DEADLINE.with(|d| d.borrow().is_some_and(|dl| Instant::now() > dl))
-                }
-            })));
+            rt.set_interrupt_handler(Some(Box::new(interrupt_deadline_exceeded)));
 
             let ctx = Context::full(&rt).map_err(|e| anyhow!("quickjs context: {e:?}"))?;
 

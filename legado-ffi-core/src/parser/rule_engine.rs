@@ -1122,11 +1122,10 @@ impl RuleEngine {
                     || rule_analyzer::split_top_level(selection, &["&&", "||", "%%"])
                         .delimiter
                         .is_some();
-                if has_stages {
+                if has_stages || js.is_some() {
+                    // Content selectors collect all paragraphs before running the
+                    // trailing script, just as they do without a JS stage.
                     eval_content_html_doc_with_ctx(content_rule, &doc, base_url, context)
-                } else if js.is_some() {
-                    eval_field_html_doc_with_ctx(content_rule, &doc, base_url, context)
-                        .unwrap_or_default()
                 } else {
                     html::select_all_text(&doc, self.strip_mode_prefix(content_rule))
                         .unwrap_or_default()
@@ -2141,7 +2140,34 @@ fn parse_book_info_html(
         ctx.set_book_field("tocUrl", val);
     }
     let can_re_name = eval_field(rule.can_re_name.as_ref(), ctx);
-    let download_urls = eval_field(rule.download_urls.as_ref(), ctx);
+    let download_urls = rule.download_urls.as_deref().and_then(|download_rule| {
+        // Scalar directives need mutable field context and standalone JS receives
+        // the HTML body as `result`, not a list of selected elements.
+        let (selection, _) = extract_js(download_rule);
+        if (selection.is_empty() && split_leading_js_transform(download_rule).is_none())
+            || starts_with_ascii_case(download_rule.trim(), "@get:")
+            || starts_with_ascii_case(download_rule.trim(), "@put:")
+            || starts_with_ascii_case(download_rule.trim(), "js:")
+        {
+            return eval_field(rule.download_urls.as_ref(), ctx);
+        }
+        let input = serialized.get_or_init(|| doc.html());
+        // A leading <js> stage transforms the *document* before selection;
+        // an inline <js> stage transforms a selected list instead.
+        let (body, list_rule) = prepare_list_rule_and_body(
+            Cow::Borrowed(input.as_str()), download_rule, base_url, ctx,
+        );
+        let json = serde_json::from_str::<Value>(&body).ok();
+        let values =
+            eval_collection_with_context(&body, json.as_ref(), list_rule, base_url, ctx).ok()?;
+        let urls: Vec<String> = values
+            .into_iter()
+            .map(value_to_rule_string)
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| resolve_url(base_url, &value))
+            .collect();
+        (!urls.is_empty()).then(|| urls.join("\n"))
+    });
 
     let final_toc_url = toc_url.or_else(|| Some(book_url.to_string()));
 
@@ -3220,13 +3246,14 @@ fn eval_list_js_checked(
 /// Standalone directives, regex and JS remain the responsibility of reader_eval.
 pub(crate) fn eval_rule_collection(input: &str, rule: &str) -> anyhow::Result<Vec<Value>> {
     let json = serde_json::from_str::<Value>(input).ok();
-    eval_collection_with_context(input, json.as_ref(), rule, &RuleVariableContext::default())
+    eval_collection_with_context(input, json.as_ref(), rule, "", &RuleVariableContext::default())
 }
 
 fn eval_collection_with_context(
     input: &str,
     json: Option<&Value>,
     rule: &str,
+    base_url: &str,
     ctx: &RuleVariableContext,
 ) -> anyhow::Result<Vec<Value>> {
     // Operators in scripts/replacements are not selection delimiters.
@@ -3242,7 +3269,7 @@ fn eval_collection_with_context(
     let mut values = if let Some(operator) = split.delimiter {
         let mut groups = Vec::new();
         for branch in split.parts {
-            let values = eval_collection_with_context(input, json, &branch, ctx)?;
+            let values = eval_collection_with_context(input, json, &branch, base_url, ctx)?;
             let matched = !values.is_empty();
             groups.push(values);
             if operator == "||" && matched {
@@ -3262,7 +3289,7 @@ fn eval_collection_with_context(
         };
         // No implicit regex fallback: invalid legacy selectors still produce [].
         let (mode, pure) = classify_rule_mode(selection, fallback, json.is_some());
-        let expanded = interpolate_templates(&pure, input, "", ctx, json);
+        let expanded = interpolate_templates(&pure, input, base_url, ctx, json);
         let strings =
             |values: Vec<String>| -> Vec<Value> { values.into_iter().map(Value::String).collect() };
         if pure.starts_with("{{") && pure.ends_with("}}") {
@@ -3295,12 +3322,18 @@ fn eval_collection_with_context(
             }
         }
     };
+    if let Some((script, remainder)) = split_leading_js_transform(post) {
+        let output = eval_list_js_checked(values, script, base_url, ctx)?;
+        let body = value_to_rule_string(output);
+        let json = serde_json::from_str::<Value>(&body).ok();
+        return eval_collection_with_context(&body, json.as_ref(), remainder, base_url, ctx);
+    }
     let replace_start = rule_analyzer::find_next_delimiter(post, &["##"], 0)
         .map(|(index, _)| index)
         .unwrap_or(post.len());
     let (js_rule, replacement) = post.split_at(replace_start);
     if let Some(script) = extract_js(js_rule).1 {
-        values = match eval_list_js_checked(values, script, "", ctx)? {
+        values = match eval_list_js_checked(values, script, base_url, ctx)? {
             Value::Array(values) => values,
             Value::Null => Vec::new(),
             value => vec![value],
@@ -3562,7 +3595,7 @@ impl FieldInput<'_> {
         if let Self::XPath(node, true) = self {
             if source.mode == ParseMode::XPath
                 && html::xpath_rule(rule).is_none()
-                && xpath_default_extractor(node, pure)
+                && (xpath_default_extractor(node, pure) || xpath_html_css_chain(pure))
             {
                 source.mode = ParseMode::Css;
             }
@@ -3609,6 +3642,12 @@ impl FieldInput<'_> {
                         Self::Html(element) => {
                             eval_html_node_js(strip_js_rule(&source.rule), element, base_url, ctx)
                         }
+                        Self::XPath(node, html_mode) => eval_js_with_bindings(
+                            strip_js_rule(pure),
+                            &xpath_js_input(node, html_mode),
+                            base_url,
+                            &ctx.js_bindings(),
+                        ),
                         _ => eval_js_with_bindings(
                             strip_js_rule(pure),
                             &input,
@@ -3701,7 +3740,15 @@ impl FieldInput<'_> {
         let mut post = SourceRule::compile("", self.fallback(), matches!(self, Self::Json(_)));
         post.make_up_rule(suffix);
         if let Some(script) = extract_js(&post.rule).1 {
-            if let Ok(result) = eval_js_with_bindings(script, &text, base_url, &ctx.js_bindings()) {
+            // Combined JSON selectors run before their shared JS suffix.
+            // Expand {{JSONPath}} against the original item, not the selected
+            // text; otherwise unresolved expressions leak into a later URL
+            // request and are mistakenly evaluated as URL JavaScript.
+            let script = match self {
+                Self::Json(value) => interpolate_json_templates(script, value, base_url, ctx),
+                _ => script.to_string(),
+            };
+            if let Ok(result) = eval_js_with_bindings(&script, &text, base_url, &ctx.js_bindings()) {
                 text = result;
             }
         }
@@ -3922,6 +3969,16 @@ fn eval_field_html_doc_with_cached_input(
     (!text.is_empty()).then_some(text)
 }
 
+// JS receives the selected HTML element, not only its flattened text.
+fn xpath_js_input(node: sxd_xpath::nodeset::Node<'_>, html_mode: bool) -> String {
+    match (node, html_mode) {
+        (sxd_xpath::nodeset::Node::Element(element), true) => {
+            html::sxd_element_to_html(element, true)
+        }
+        _ => node.string_value(),
+    }
+}
+
 fn xpath_default_extractor(node: sxd_xpath::nodeset::Node<'_>, rule: &str) -> bool {
     let sxd_xpath::nodeset::Node::Element(element) = node else {
         return false;
@@ -3937,6 +3994,19 @@ fn xpath_default_extractor(node: sxd_xpath::nodeset::Node<'_>, rule: &str) -> bo
             .attributes()
             .iter()
             .any(|attr| attr.name().local_part() == rule)
+}
+
+/// XPath list items can still use Legado's nested CSS/Jsoup field syntax,
+/// such as `a@text` and `a@href`. Do not reinterpret XPath paths or
+/// predicates that happen to contain attribute markers.
+fn xpath_html_css_chain(rule: &str) -> bool {
+    let parts = rule_analyzer::split_top_level(rule, &["@"]).parts;
+    parts.len() == 2
+        && html::css_rule_is_valid(parts[0].trim())
+        && matches!(
+            parts[1].trim(),
+            "text" | "textNodes" | "ownText" | "html" | "all" | "href" | "src"
+        )
 }
 
 fn xpath_css_field_values(node: sxd_xpath::nodeset::Node<'_>, rule: &str) -> Vec<String> {
@@ -4005,7 +4075,7 @@ fn eval_field_xpath_with_ctx(
     if source_rule.mode == ParseMode::XPath
         && html_mode
         && html::xpath_rule(rule).is_none()
-        && xpath_default_extractor(node, pure)
+        && (xpath_default_extractor(node, pure) || xpath_html_css_chain(pure))
     {
         source_rule.mode = ParseMode::Css;
     }
@@ -4029,8 +4099,13 @@ fn eval_field_xpath_with_ctx(
             .and_then(|row| row.get(1).or_else(|| row.first()).and_then(Clone::clone))
             .unwrap_or_default(),
         ParseMode::Js => {
-            eval_js_with_bindings(strip_js_rule(pure), &input, base_url, &ctx.js_bindings())
-                .unwrap_or_default()
+            eval_js_with_bindings(
+                strip_js_rule(pure),
+                &xpath_js_input(node, html_mode),
+                base_url,
+                &ctx.js_bindings(),
+            )
+            .unwrap_or_default()
         }
         ParseMode::Css if html_mode => xpath_css_field_values(node, pure)
             .into_iter()

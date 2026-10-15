@@ -19,6 +19,10 @@ use url::Url;
 const JS_CACHE_STATE_KEY: &str = "__reader_js_cache_v1";
 const JS_CACHE_MAX_ENTRIES: usize = 64;
 const JS_CACHE_MAX_VALUE_BYTES: usize = 16 * 1024;
+// Cache only medium/large jsLib scripts within one operation.
+// UTF-8 source byte length is inclusive: 20 KiB through 1024 KiB.
+const JS_LIB_SOURCE_MIN: usize = 20 * 1024;
+const JS_LIB_SOURCE_MAX: usize = 1024 * 1024;
 
 fn now_epoch_seconds() -> u64 {
     SystemTime::now()
@@ -51,6 +55,8 @@ pub struct ActiveSession {
     variables: Mutex<HashMap<String, Value>>,
     // Fetched JS is reused only inside this operation; never shared across users.
     script_cache: Mutex<HashMap<String, String>>,
+    // Ephemeral compiled jsLib; never serialized or retained past this operation.
+    js_lib_bytecode: Mutex<Option<(String, Arc<[u8]>)>>,
     // Legado's putMemory stores process-local values; never serialize them to session.
     memory_cache: Mutex<HashMap<String, Value>>,
     unknown_method_fallback: AtomicBool,
@@ -133,6 +139,7 @@ impl ActiveSession {
             header: Mutex::new(initial_header.clone()),
             variables: Mutex::new(initial_variables.clone().unwrap_or_default()),
             script_cache: Mutex::new(HashMap::new()),
+            js_lib_bytecode: Mutex::new(None),
             memory_cache: Mutex::new(HashMap::new()),
             unknown_method_fallback: AtomicBool::new(false),
             initial_session: ExecuteSession {
@@ -220,6 +227,22 @@ impl ActiveSession {
         if cache.len() < 16 && script.len() <= 512 * 1024 {
             cache.insert(key, script);
         }
+    }
+
+    pub(crate) fn allows_js_lib_bytecode(source: &str) -> bool {
+        (JS_LIB_SOURCE_MIN..=JS_LIB_SOURCE_MAX).contains(&source.len())
+    }
+
+    pub(crate) fn js_lib_bytecode_get(&self, source: &str) -> Option<Arc<[u8]>> {
+        self.js_lib_bytecode.lock().unwrap_or_else(|e| e.into_inner())
+            .as_ref().and_then(|(cached_source, bytes)| {
+                (cached_source == source).then(|| Arc::clone(bytes))
+            })
+    }
+
+    pub(crate) fn js_lib_bytecode_put(&self, source: &str, bytes: Arc<[u8]>) {
+        *self.js_lib_bytecode.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((source.to_owned(), bytes));
     }
 
     pub(crate) fn memory_cache_get(&self, key: &str) -> Option<Value> {

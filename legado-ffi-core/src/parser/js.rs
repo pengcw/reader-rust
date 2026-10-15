@@ -26,6 +26,7 @@ pub use crate::parser::js_url::{
     eval_js_url_template_with_headers, eval_js_url_with_bindings, eval_js_url_with_headers,
 };
 use crate::parser::jsonpath;
+use crate::parser::js_bytecode::{self, BootstrapSlot};
 use crate::parser::rule_analyzer;
 use crate::parser::rule_engine;
 use crate::parser::source_regex;
@@ -41,7 +42,7 @@ use rquickjs::context::EvalOptions;
 use rquickjs::function::Func;
 use rquickjs::{Context, Object, Runtime, Value};
 use serde_json::Value as JsonValue;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -81,7 +82,216 @@ impl Drop for TimerGuard {
     }
 }
 
+// Opt-in timing of the ordinary JS evaluator. No script contents, URLs, or
+// bindings are logged. Leave context isolation unchanged.
+static JS_PROFILE_ENABLED: Lazy<bool> =
+    Lazy::new(|| std::env::var("LEGADO_JS_PROFILE").as_deref() == Ok("1"));
+// Opt-in diagnostics for dynamic jsLib; normal requests use the operation-
+// scoped cache when eligible and retain the original evaluator otherwise.
+static JS_LIB_SPLIT_DIAG: Lazy<bool> =
+    Lazy::new(|| std::env::var("LEGADO_JS_LIB_DIAG").as_deref() == Ok("split"));
+static JS_LIB_CACHE_DIAG: Lazy<bool> =
+    Lazy::new(|| std::env::var("LEGADO_JS_LIB_DIAG").as_deref() == Ok("cache"));
+// Benchmark-only baseline for reader_execute. Normal requests use the
+// operation-scoped cache; do not change their behavior.
+static JS_LIB_BASELINE_DIAG: Lazy<bool> =
+    Lazy::new(|| std::env::var("LEGADO_JS_LIB_DIAG").as_deref() == Ok("baseline"));
+// One diagnostic sample per thread, off by default. Counts belong to the
+// entire thread-local Runtime, not to individual JavaScript objects or slots.
+static JS_MEMORY_PROFILE_ENABLED: Lazy<bool> =
+    Lazy::new(|| std::env::var("LEGADO_JS_MEMORY_PROFILE").as_deref() == Ok("1"));
+
+type JsMemorySample = (&'static str, rquickjs::qjs::JSMemoryUsage);
+
+fn record_js_memory(
+    samples: &mut Vec<JsMemorySample>,
+    stage: &'static str,
+    ctx: &rquickjs::Ctx<'_>,
+) {
+    if samples.is_empty() {
+        return;
+    }
+    // SAFETY: Context::with holds the Runtime lock on this thread. Taking
+    // Runtime::memory_usage() here would deadlock by reacquiring that lock.
+    let mut usage = std::mem::MaybeUninit::uninit();
+    unsafe {
+        let runtime = rquickjs::qjs::JS_GetRuntime(ctx.as_raw().as_ptr());
+        rquickjs::qjs::JS_ComputeMemoryUsage(runtime, usage.as_mut_ptr());
+        samples.push((stage, usage.assume_init()));
+    }
+}
+
+fn report_js_memory(samples: &[JsMemorySample]) {
+    if let Some((stage, first)) = samples.first() {
+        eprintln!("[legado::js_memory] stage={stage} used={} malloc={} objects={} props={} shapes={} atoms={} js_funcs={} c_funcs={}",
+            first.memory_used_size, first.malloc_size, first.obj_count, first.prop_count,
+            first.shape_count, first.atom_count, first.js_func_count, first.c_func_count);
+    }
+    for window in samples.windows(2) {
+        let (_, before) = &window[0];
+        let (stage, after) = &window[1];
+        eprintln!("[legado::js_memory] stage={stage} delta_used={:+} delta_malloc={:+} delta_objects={:+} delta_props={:+} delta_shapes={:+} delta_atoms={:+} delta_js_funcs={:+} delta_c_funcs={:+}",
+            after.memory_used_size - before.memory_used_size,
+            after.malloc_size - before.malloc_size,
+            after.obj_count - before.obj_count,
+            after.prop_count - before.prop_count,
+            after.shape_count - before.shape_count,
+            after.atom_count - before.atom_count,
+            after.js_func_count - before.js_func_count,
+            after.c_func_count - before.c_func_count);
+    }
+}
+
+#[derive(Default)]
+struct JsProfileTotals {
+    count: u64,
+    micros: [u128; 7],
+    setup_micros: [u128; 3],
+    cleanup_micros: [u128; 2],
+    slots_micros: [u128; 9],
+    bytecode_phase_micros: [[u128; 9]; 3], // ReadObject, EvalFunction, cold compile
+    lib_split_micros: [u128; 3], // compile/serialize, bytecode read, execute
+    lib_cache_hits: u64,
+    lib_bytecode_bytes: usize,
+    // Per JS invocation: native source, cookie/cache, java, then host parse/call/encode.
+    bridge_micros: [u128; 6],
+    bridge_calls: u64,
+}
+
+impl JsProfileTotals {
+    fn add(&mut self, stages: [u128; 7], setup: [u128; 3], cleanup: [u128; 2], slots: [u128; 9], phases: [[u128; 9]; 3], lib_split: [u128; 3], lib_cache: (u64, usize), bridge: ([u128; 6], u64)) {
+        self.count += 1;
+        for (total, elapsed) in self.micros.iter_mut().zip(stages) {
+            *total += elapsed;
+        }
+        for (total, elapsed) in self.setup_micros.iter_mut().zip(setup) {
+            *total += elapsed;
+        }
+        for (total, elapsed) in self.cleanup_micros.iter_mut().zip(cleanup) {
+            *total += elapsed;
+        }
+        for (total, elapsed) in self.slots_micros.iter_mut().zip(slots) {
+            *total += elapsed;
+        }
+        for (total, elapsed) in self.lib_split_micros.iter_mut().zip(lib_split) {
+            *total += elapsed;
+        }
+        self.lib_cache_hits += lib_cache.0;
+        self.lib_bytecode_bytes = self.lib_bytecode_bytes.max(lib_cache.1);
+        self.bridge_calls += bridge.1;
+        for (total, elapsed) in self.bridge_micros.iter_mut().zip(bridge.0) {
+            *total += elapsed;
+        }
+        for (total_group, samples) in self.bytecode_phase_micros.iter_mut().zip(phases) {
+            for (total, elapsed) in total_group.iter_mut().zip(samples) {
+                *total += elapsed;
+            }
+        }
+        if self.count.is_multiple_of(50) {
+            let avg = |index: usize| self.micros[index] / self.count as u128;
+            let setup_avg = |index: usize| self.setup_micros[index] / self.count as u128;
+            let cleanup_avg = |index: usize| self.cleanup_micros[index] / self.count as u128;
+            let slot_avg = |index: usize| self.slots_micros[index] / self.count as u128;
+            eprintln!(
+                "[legado::js_profile] calls={} avg_us context={} lib_lookup={} setup={} setup_script={} builtin_script={} dom={} setup_other={} lib_eval={} before_script={} script={} finish={} finish_drop={} finish_gc={} slot_java={} slot_source={} slot_xpath={} slot_jsoup={} slot_android={} slot_security={} slot_math={} slot_des={} slot_aes={}",
+                self.count, avg(0), avg(1), avg(2), setup_avg(0), setup_avg(1),
+                setup_avg(2), avg(2).saturating_sub(setup_avg(0) + setup_avg(1) + setup_avg(2)),
+                avg(3), avg(4), avg(5), avg(6), cleanup_avg(0), cleanup_avg(1),
+                slot_avg(0), slot_avg(1), slot_avg(2), slot_avg(3), slot_avg(4),
+                slot_avg(5), slot_avg(6), slot_avg(7), slot_avg(8)
+            );
+            // Keep the existing profiler line stable for older diagnostic parsers.
+            // Additional numeric-only line splits each fixed bootstrap phase.
+            let mut line = format!("[legado::js_bytecode] calls={} avg_us", self.count);
+            for (phase, values) in ["read", "eval", "compile"]
+                .into_iter().zip(&self.bytecode_phase_micros)
+            {
+                for (name, elapsed) in ["java", "source", "xpath", "jsoup", "android",
+                    "security", "math", "des", "aes"].into_iter().zip(values)
+                {
+                    use std::fmt::Write;
+                    let _ = write!(line, " {phase}_{name}={}", elapsed / self.count as u128);
+                }
+            }
+            eprintln!("{line}");
+            let bridge_avg = |index: usize| self.bridge_micros[index] / self.count as u128;
+            eprintln!(
+                "[legado::js_bridge] calls={} avg_us source={} cookie_cache={} java={} host_parse={} host_call={} host_encode={} host_calls={}",
+                self.count, bridge_avg(0), bridge_avg(1), bridge_avg(2),
+                bridge_avg(3), bridge_avg(4), bridge_avg(5), self.bridge_calls
+            );
+            if *JS_LIB_SPLIT_DIAG || *JS_LIB_CACHE_DIAG {
+                eprintln!(
+                    "[legado::js_lib] calls={} avg_us compile={} read={} execute={} hits={} bytecode_bytes={}",
+                    self.count, self.lib_split_micros[0] / self.count as u128,
+                    self.lib_split_micros[1] / self.count as u128,
+                    self.lib_split_micros[2] / self.count as u128,
+                    self.lib_cache_hits, self.lib_bytecode_bytes,
+                );
+            }
+        }
+    }
+}
+
+fn js_bridge_mark(index: usize, started: Option<Instant>) {
+    if let Some(started) = started {
+        JS_BRIDGE_METRICS.with(|metrics| metrics.borrow_mut().0[index] += started.elapsed().as_micros());
+    }
+}
+
+fn js_profile_mark(mark: &mut Option<Instant>, stages: &mut [u128; 7], index: usize) {
+    if let Some(start) = mark.as_mut() {
+        stages[index] = start.elapsed().as_micros();
+        *start = Instant::now();
+    }
+}
+
+fn eval_profiled_setup_script<'js>(
+    ctx: rquickjs::Ctx<'js>,
+    slot: BootstrapSlot,
+    bucket: usize,
+) -> anyhow::Result<Value<'js>> {
+    let mark = (*JS_PROFILE_ENABLED).then(Instant::now);
+    let mut timings = js_bytecode::BytecodeTimings::default();
+    let result = js_bytecode::eval(ctx, slot, (*JS_PROFILE_ENABLED).then_some(&mut timings));
+    if let Some(mark) = mark {
+        let elapsed = mark.elapsed().as_micros();
+        JS_SETUP_METRICS.with(|totals| totals.borrow_mut()[bucket] += elapsed);
+        JS_SETUP_SLOT_METRICS.with(|totals| totals.borrow_mut()[slot as usize] += elapsed);
+        JS_BYTECODE_PHASE_METRICS.with(|totals| {
+            let mut totals = totals.borrow_mut();
+            let index = slot as usize;
+            totals[0][index] += timings.read_us;
+            totals[1][index] += timings.eval_us;
+            totals[2][index] += timings.compile_us;
+        });
+    }
+    result
+}
+
+fn eval_fixed_setup_script<'js>(
+    ctx: rquickjs::Ctx<'js>,
+    slot: BootstrapSlot,
+) -> anyhow::Result<Value<'js>> {
+    eval_profiled_setup_script(ctx, slot, 0)
+}
+
+fn eval_builtin_setup_script<'js>(
+    ctx: rquickjs::Ctx<'js>,
+    slot: BootstrapSlot,
+) -> anyhow::Result<Value<'js>> {
+    eval_profiled_setup_script(ctx, slot, 1)
+}
+
 thread_local! {
+    static JS_SETUP_METRICS: RefCell<[u128; 3]> = const { RefCell::new([0; 3]) };
+    static JS_SETUP_SLOT_METRICS: RefCell<[u128; 9]> = const { RefCell::new([0; 9]) };
+    static JS_BYTECODE_PHASE_METRICS: RefCell<[[u128; 9]; 3]> = const { RefCell::new([[0; 9]; 3]) };
+    static JS_LIB_SPLIT_METRICS: RefCell<[u128; 3]> = const { RefCell::new([0; 3]) };
+    static JS_LIB_CACHE_STATS: RefCell<(u64, usize)> = const { RefCell::new((0, 0)) };
+    static JS_BRIDGE_METRICS: RefCell<([u128; 6], u64)> = const { RefCell::new(([0; 6], 0)) };
+    static JS_PROFILE_TOTALS: RefCell<JsProfileTotals> = RefCell::new(JsProfileTotals::default());
+    static JS_MEMORY_PROFILE_SAMPLED: Cell<bool> = const { Cell::new(false) };
     // Native JS callbacks may need AnalyzeUrl to evaluate nested header/URL JavaScript.
     // Reuse the currently borrowed QuickJS context instead of entering Context::with again.
     static ACTIVE_JS_REENTRANT_CTX: RefCell<Option<NonNull<rquickjs::qjs::JSContext>>> =
@@ -422,10 +632,31 @@ pub(super) fn eval_js_inner_with_source(
     }
 
     JS_ENV.with(|(runtime, start_time)| {
+        let mut profile_mark = (*JS_PROFILE_ENABLED).then(Instant::now);
+        let mut profile_stages = [0u128; 7];
+        let mut profile_cleanup = [0u128; 2];
+        if *JS_PROFILE_ENABLED {
+            JS_SETUP_METRICS.with(|totals| *totals.borrow_mut() = [0; 3]);
+            JS_SETUP_SLOT_METRICS.with(|totals| *totals.borrow_mut() = [0; 9]);
+            JS_BYTECODE_PHASE_METRICS.with(|totals| *totals.borrow_mut() = [[0; 9]; 3]);
+            JS_LIB_SPLIT_METRICS.with(|totals| *totals.borrow_mut() = [0; 3]);
+            JS_LIB_CACHE_STATS.with(|stats| *stats.borrow_mut() = (0, 0));
+            JS_BRIDGE_METRICS.with(|metrics| *metrics.borrow_mut() = ([0; 6], 0));
+        }
+        let mut memory_samples: Vec<JsMemorySample> = Vec::new();
+        if *JS_MEMORY_PROFILE_ENABLED
+            && JS_MEMORY_PROFILE_SAMPLED.with(|sampled| !sampled.replace(true))
+        {
+            memory_samples.push(("runtime_before", runtime.memory_usage()));
+        }
         // A fresh context prevents top-level `const` in jsLib from being
         // redeclared and keeps implicit JS globals out of other sources.
         // Native callbacks still reuse this context through ACTIVE_JS_REENTRANT_CTX.
         let ctx = Context::full(runtime)?;
+        if !memory_samples.is_empty() {
+            memory_samples.push(("context", runtime.memory_usage()));
+        }
+        js_profile_mark(&mut profile_mark, &mut profile_stages, 0);
         let now = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -440,6 +671,7 @@ pub(super) fn eval_js_inner_with_source(
             let base_url_state = Arc::new(Mutex::new(base_url_value.to_string()));
             let variable_overrides = Arc::new(Mutex::new(HashMap::<String, String>::new()));
             let shared_js = active_js_lib_script()?;
+            js_profile_mark(&mut profile_mark, &mut profile_stages, 1);
 
             globals.set("input", input_value)?;
             globals.set("result", input_value)?;
@@ -469,6 +701,9 @@ pub(super) fn eval_js_inner_with_source(
                     })
                 })
                 .unwrap_or_default();
+            // Segment totals are an upper bound for registration: they also
+            // include object setup and captured state, not only Func::new.
+            let native_mark = (*JS_PROFILE_ENABLED).then(Instant::now);
             let source_obj = Object::new(ctx.clone())?;
             let sk_clone = source_key_val.clone();
             source_obj.set("key", source_key_val.clone())?;
@@ -674,6 +909,8 @@ pub(super) fn eval_js_inner_with_source(
             )?;
 
             globals.set("source", source_obj)?;
+            js_bridge_mark(0, native_mark);
+            let native_mark = (*JS_PROFILE_ENABLED).then(Instant::now);
 
             let cookie_obj = Object::new(ctx.clone())?;
             cookie_obj.set(
@@ -801,6 +1038,8 @@ pub(super) fn eval_js_inner_with_source(
                 }),
             )?;
             globals.set("cache", cache_obj)?;
+            js_bridge_mark(1, native_mark);
+            let native_mark = (*JS_PROFILE_ENABLED).then(Instant::now);
 
             let java_obj = Object::new(ctx.clone())?;
             let file_cache_namespace = ACTIVE_JS_BOOK_SOURCE.with(|cell| {
@@ -932,10 +1171,22 @@ pub(super) fn eval_js_inner_with_source(
             java_obj.set(
                 "__hostCall",
                 Func::new(|operation: String, arguments: String| -> String {
-                    match serde_json::from_str::<JsonValue>(&arguments) {
-                        Ok(arguments) => crate::host_services::call(&operation, &arguments).to_string(),
-                        Err(_) => serde_json::json!({"ok":false,"error":{"kind":"invalid_argument","message":"invalid host arguments JSON"}}).to_string(),
+                    let mark = (*JS_PROFILE_ENABLED).then(Instant::now);
+                    let parsed = serde_json::from_str::<JsonValue>(&arguments);
+                    js_bridge_mark(3, mark);
+                    if *JS_PROFILE_ENABLED {
+                        JS_BRIDGE_METRICS.with(|metrics| metrics.borrow_mut().1 += 1);
                     }
+                    let Ok(arguments) = parsed else {
+                        return serde_json::json!({"ok":false,"error":{"kind":"invalid_argument","message":"invalid host arguments JSON"}}).to_string();
+                    };
+                    let mark = (*JS_PROFILE_ENABLED).then(Instant::now);
+                    let response = crate::host_services::call(&operation, &arguments);
+                    js_bridge_mark(4, mark);
+                    let mark = (*JS_PROFILE_ENABLED).then(Instant::now);
+                    let encoded = response.to_string();
+                    js_bridge_mark(5, mark);
+                    encoded
                 }),
             )?;
             let info_map_source_key = source_key_val.clone();
@@ -1158,6 +1409,13 @@ pub(super) fn eval_js_inner_with_source(
                 }),
             )?;
             java_obj.set(
+                "__aesGcm",
+                Func::new(|ctx: rquickjs::Ctx<'_>, input: String| -> rquickjs::Result<String> {
+                    super::aes_gcm::execute_json(&input)
+                        .map_err(|error| rquickjs::Exception::throw_type(&ctx, &error.to_string()))
+                }),
+            )?;
+            java_obj.set(
                 "__aesDecryptByteArray",
                 Func::new(|input: String| -> String {
                     serde_json::to_string(&java_aes_decrypt_byte_array(&input))
@@ -1305,6 +1563,24 @@ pub(super) fn eval_js_inner_with_source(
                         .and_then(|bytes| crate::parser::compression::gunzip(&bytes).ok())
                         .and_then(|bytes| String::from_utf8(bytes).ok())
                         .unwrap_or_default()
+                }),
+            )?;
+            java_obj.set(
+                "__gzipBytes",
+                Func::new(|input: String| -> String {
+                    use crate::parser::compression::{self, Error};
+                    let result = if input.len() > compression::MAX_OUTPUT * 4 + 2 {
+                        Err(Error::LimitExceeded)
+                    } else {
+                        serde_json::from_str::<Vec<u8>>(&input)
+                            .map_err(|_| Error::InvalidInput)
+                            .and_then(|bytes| compression::gzip(&bytes))
+                    };
+                    match result {
+                        Ok(bytes) => serde_json::json!({"ok":true,"data":bytes}),
+                        Err(error) => serde_json::json!({"ok":false,"error":{
+                            "kind":error.kind(),"message":"gzip operation failed"}}),
+                    }.to_string()
                 }),
             )?;
             for (name, nowrap) in [
@@ -1601,447 +1877,10 @@ pub(super) fn eval_js_inner_with_source(
                 java_response_decode_text(&bytes, charset.as_deref(), parse)
             }))?;
             globals.set("java", java_obj)?;
-            eval_script(
-                ctx.clone(),
-                r#"(function() {
-                    const java = globalThis.java;
-                    const currentSource = globalThis.source;
-                    // Source libraries may shadow the global Map helper.
-                    const NativeMap = globalThis.Map;
-                    const sourceAvailable = java.__sourceAvailable;
-                    delete java.__sourceAvailable;
-                    java.getSource = () => sourceAvailable ? currentSource : null;
-                    java.startBrowser = function(url, title, html) {
-                        if (!java.__browserPreview(String(url || ''), String(title || ''), String(html || ''))) {
-                            throw new Error('网页只读预览失败或当前执行入口不支持预览');
-                        }
-                    };
-                    java.startBrowserAwait = function() {
-                        throw new Error('当前仅支持网页只读预览，不支持等待网页交互验证');
-                    };
-                    if (java.__clickCaptureActive) {
-                        java.showReadingBrowser = java.startBrowser;
-                        java.startBrowserDp = java.startBrowser;
-                        java.showBrowser = function(url, html, preloadJs) {
-                            if (preloadJs && String(preloadJs).trim() !== 'window.java=java;') {
-                                throw new Error('不支持自定义网页预加载脚本');
-                            }
-                            java.startBrowser(url, '评论', html);
-                        };
-                    }
-                    java.hostCall = function(operation, arguments) {
-                        const response = JSON.parse(java.__hostCall(
-                            String(operation), JSON.stringify(arguments == null ? null : arguments)));
-                        if (!response.ok) {
-                            const error = new Error(response.error.message);
-                            error.kind = response.error.kind;
-                            throw error;
-                        }
-                        return response.data;
-                    };
-                    const chineseConvert = (direction, value) => {
-                        const text = String(value == null ? '' : value);
-                        if (text.length > 65536) {
-                            const error = new Error('Chinese text input too large');
-                            error.kind = 'limit_exceeded'; throw error;
-                        }
-                        if (text === '') return '';
-                        const output = java.hostCall('text.chinese.convert', {direction, text});
-                        if (typeof output !== 'string' || output.length > 262144) {
-                            const error = new Error('invalid Chinese conversion response');
-                            error.kind = 'invalid_response'; throw error;
-                        }
-                        return output;
-                    };
-                    java.t2s = value => chineseConvert('t2s', value);
-                    java.s2t = value => chineseConvert('s2t', value);
-                    const nativeSourceSetVariable = globalThis.source.setVariable;
-                    const nativeSourceRemoveVariable = globalThis.source.__removeVariable;
-                    const nativeSourceRemoveLoginInfo = globalThis.source.__removeLoginInfo;
-                    const nativeSourceGetLoginHeader = globalThis.source.getLoginHeader;
-                    globalThis.source.removeLoginInfo = function() {
-                        nativeSourceRemoveLoginInfo();
-                        globalThis.loginInfo = null;
-                    };
-                    globalThis.source.getLoginHeader = function() {
-                        const value = nativeSourceGetLoginHeader();
-                        return value == null ? null : value;
-                    };
-                    globalThis.source.getLoginHeaderMap = function() {
-                        const raw = source.getLoginHeader();
-                        if (raw == null) return null;
-                        let value;
-                        try { value = JSON.parse(raw); } catch (_) { return null; }
-                        return value && typeof value === 'object' && !Array.isArray(value)
-                            ? new NativeMap(Object.entries(value).map(([key, item]) => [key, String(item)]))
-                            : null;
-                    };
-                    globalThis.source.setVariable = function(value, extendedValue) {
-                        if (arguments.length > 1) {
-                            nativeSourceSetVariable(
-                                String(value == null ? '' : value),
-                                String(extendedValue == null ? '' : extendedValue));
-                            return;
-                        }
-                        if (value == null) {
-                            nativeSourceRemoveVariable();
-                            return;
-                        }
-                        nativeSourceSetVariable(String(value));
-                    };
-                    const nativeBase64Encode = java.base64Encode;
-                    const nativeBase64Decode = java.base64Decode;
-                    const cryptoResult = (name, algorithm, value) => {
-                        if (value == null) {
-                            throw new Error(name + ': unsupported algorithm ' + algorithm);
-                        }
-                        return value;
-                    };
-                    java.digestHex = (data, algorithm) => cryptoResult(
-                        'digestHex', algorithm,
-                        java.__digestHex(String(data), String(algorithm)));
-                    java.digestBase64Str = (data, algorithm) => cryptoResult(
-                        'digestBase64Str', algorithm,
-                        java.__digestBase64(String(data), String(algorithm)));
-                    // Legacy MD5 is provided by KOReader's ffi/sha2; SHA stays native.
-                    const isHmacMd5 = algorithm => String(algorithm)
-                        .replace(/[^a-z0-9]/gi, '').toUpperCase() === 'HMACMD5';
-                    const hostHmacMd5 = java.__hostHmacMd5 = (keyHex, dataHex) => {
-                        if (keyHex.length > 32768 || dataHex.length > 524288) {
-                            const error = new Error('HMAC input too large');
-                            error.kind = 'limit_exceeded'; throw error;
-                        }
-                        const output = java.hostCall('crypto.hmac', {
-                            algorithm: 'HMACMD5', keyHex, dataHex
-                        });
-                        if (typeof output !== 'string' || !/^[0-9a-f]{32}$/i.test(output)) {
-                            const error = new Error('invalid HMAC response');
-                            error.kind = 'invalid_response'; throw error;
-                        }
-                        return output.toLowerCase();
-                    };
-                    java.HMacHex = (data, algorithm, key) => isHmacMd5(algorithm)
-                        ? hostHmacMd5(java.hexEncodeToString(String(key)), java.hexEncodeToString(String(data)))
-                        : cryptoResult('HMacHex', algorithm,
-                            java.__hmacHexString(String(data), String(algorithm), String(key)));
-                    java.HMacBase64 = (data, algorithm, key) => isHmacMd5(algorithm)
-                        ? java.__base64EncodeBytes(JSON.stringify(java.hexDecodeToByteArray(
-                            java.HMacHex(data, algorithm, key))), 2)
-                        : cryptoResult('HMacBase64', algorithm,
-                            java.__hmacBase64String(String(data), String(algorithm), String(key)));
-                    java.toURL = function(url, baseUrl) {
-                        const payload = baseUrl == null
-                            ? java.__toURL(String(url))
-                            : java.__toURL(String(url), String(baseUrl));
-                        const raw = JSON.parse(payload);
-                        if (raw.error) throw new Error(raw.error);
-                        return {
-                            searchParams: raw.searchParams == null
-                                ? null
-                                : new NativeMap(Object.entries(raw.searchParams)),
-                            host: String(raw.host || ''),
-                            origin: String(raw.origin || ''),
-                            pathname: String(raw.pathname || '')
-                        };
-                    };
-                    java.logType = value => {
-                        let type;
-                        if (value === null || value === undefined) type = 'null';
-                        else if (typeof value === 'string') type = 'java.lang.String';
-                        else if (typeof value === 'boolean') type = 'java.lang.Boolean';
-                        else if (typeof value === 'number') type = 'java.lang.Double';
-                        else if (value instanceof Uint8Array) type = '[B';
-                        else if (Array.isArray(value)) type = 'org.mozilla.javascript.NativeArray';
-                        else if (typeof value === 'function') type = 'org.mozilla.javascript.NativeFunction';
-                        else type = 'org.mozilla.javascript.NativeObject';
-                        java.log(type);
-                    };
-                    const headersJson = headers => {
-                        if (headers == null) return '{}';
-                        if (typeof headers === 'string') {
-                            try {
-                                const parsed = JSON.parse(headers);
-                                return JSON.stringify(parsed && typeof parsed === 'object' ? parsed : {});
-                            } catch (_) { return '{}'; }
-                        }
-                        return typeof headers === 'object' ? JSON.stringify(headers) : '{}';
-                    };
-                    const responseFromJson = value => {
-                        let raw;
-                        try { raw = JSON.parse(String(value || '{}')); } catch (_) { raw = {}; }
-                        let body = String(raw.body == null ? '' : raw.body);
-                        let charset = raw.charset == null ? null : String(raw.charset);
-                        const headers = Object.assign({}, raw.headers || {});
-                        const status = Number(raw.code || raw.status || 0);
-                        const headerValues = raw.headerValues || {};
-                        const responseCookies = new NativeMap();
-                        for (const [name, values] of Object.entries(headerValues)) {
-                            if (name.toLowerCase() !== 'set-cookie') continue;
-                            for (const value of values) {
-                                const pair = String(value).split(';', 1)[0];
-                                const equals = pair.indexOf('=');
-                                if (equals <= 0) continue;
-                                responseCookies.set(pair.slice(0, equals).trim(), pair.slice(equals + 1).trim());
-                            }
-                        }
-                        const header = name => {
-                            const key = Object.keys(headers).find(k => k.toLowerCase() === String(name).toLowerCase());
-                            return key === undefined ? null : headers[key];
-                        };
-                        const responseHeaders = Object.assign({}, headers, {
-                            get: name => header(name),
-                            names: () => Object.keys(headers),
-                            toMultimap: () => Object.assign({}, headers)
-                        });
-                        return {
-                            body: () => body,
-                            bodyAsBytes: () => java.base64DecodeToByteArray(raw.bodyBase64 || ''),
-                            statusCode: () => status,
-                            code: () => status,
-                            url: () => String(raw.url || ''),
-                            headers: () => responseHeaders,
-                            header,
-                            hasHeader: name => header(name) !== null,
-                            multiHeaders: () => new NativeMap(Object.entries(headerValues)),
-                            cookies: () => responseCookies,
-                            cookie: name => responseCookies.has(String(name)) ? responseCookies.get(String(name)) : null,
-                            hasCookie: name => responseCookies.has(String(name)),
-                            contentType: () => header('content-type') || '',
-                            charset: () => charset,
-                            parse() {
-                                const decoded = java.__responseDecodeText(String(raw.bodyBase64 || ''), charset, true);
-                                if (decoded == null) throw new Error('invalid response bytes');
-                                const parsed = JSON.parse(decoded);
-                                const document = org.jsoup.Jsoup.parse(parsed.text, String(raw.url || ''));
-                                charset = parsed.charset;
-                                // body() decodes the original bytes; parse() alone consumes a BOM.
-                                body = JSON.parse(java.__responseDecodeText(String(raw.bodyBase64 || ''), charset, false)).text;
-                                return document;
-                            },
-                            isSuccessful: () => status >= 200 && status < 300,
-                            toString: () => body,
-                            toJSON: () => raw
-                        };
-                    };
-                    const nativeVariableGet = java.__nativeVariableGet;
-                    java.ajax = value => {
-                        const target = Array.isArray(value) ? value[0] : value;
-                        return java.__nativeAjax(String(target == null ? '' : target));
-                    };
-                    java.importScript = path => {
-                        const value = java.__importScript(String(path == null ? '' : path));
-                        if (value == null) {
-                            throw new Error('importScript: content is empty or local paths are unsupported by this host');
-                        }
-                        return value;
-                    };
-                    java.webView = (html, url, js) => java.__nativeWebView(
-                        String(html == null ? '' : html),
-                        String(url == null ? '' : url),
-                        String(js == null ? '' : js)
-                    );
-                    java.get = function(url, headers) {
-                        const target = String(url == null ? '' : url);
-                        if (arguments.length < 2 && !/^https?:\/\//i.test(target)) {
-                            return nativeVariableGet(target);
-                        }
-                        return responseFromJson(java.__nativeGet(target, headersJson(headers)));
-                    };
-                    java.post = (url, body, headers) => responseFromJson(java.__nativePost(
-                        String(url), String(body == null ? '' : body), headersJson(headers)));
-                    java.head = (url, headers) => responseFromJson(java.__nativeHead(
-                        String(url), headersJson(headers)));
-                    const callableString = text => new Proxy(() => text, {
-                        get(target, key) {
-                            if (key === Symbol.toPrimitive || key === 'toJSON') return () => text;
-                            if (key in String.prototype || key === 'length' || /^\d+$/.test(String(key))) {
-                                const value = text[key];
-                                return typeof value === 'function' ? value.bind(text) : value;
-                            }
-                            return Reflect.get(target, key);
-                        }
-                    });
-                    const strResponseFromJson = value => {
-                        let raw;
-                        try { raw = typeof value === 'string' ? JSON.parse(value) : value || {}; }
-                        catch (_) { raw = {}; }
-                        const bodyText = String(raw.body == null ? '' : raw.body);
-                        const url = String(raw.url || '');
-                        const code = Number(raw.code ?? raw.status ?? 200);
-                        const message = String(raw.message == null ? 'OK' : raw.message);
-                        const headers = Object.assign({}, raw.headers || {});
-                        const responseHeaders = Object.assign({}, headers, {
-                            get(name) {
-                                const key = Object.keys(headers).find(k => k.toLowerCase() === String(name).toLowerCase());
-                                return key === undefined ? null : headers[key];
-                            },
-                            names: () => Object.keys(headers),
-                            toMultimap: () => Object.assign({}, headers)
-                        });
-                        const isSuccessful = raw.isSuccessful == null
-                            ? code >= 200 && code < 300 : !!raw.isSuccessful;
-                        const rawResponseBody = () => {
-                            const value = new String(bodyText);
-                            value.string = () => bodyText;
-                            value.close = () => {};
-                            return value;
-                        };
-                        const rawRequest = { url: () => url };
-                        const rawResponse = {
-                            request: () => rawRequest,
-                            body: rawResponseBody,
-                            url: () => url,
-                            code: () => code,
-                            message: () => message,
-                            headers: () => responseHeaders,
-                            isSuccessful: () => isSuccessful,
-                            toString: () => `Response{code=${code}, message=${message}, url=${url}}`
-                        };
-                        return {
-                            __ffiStrResponse: true,
-                            body: callableString(bodyText),
-                            header: name => responseHeaders.get(name),
-                            url: () => url,
-                            code: () => code,
-                            message: () => message,
-                            headers: () => responseHeaders,
-                            raw: () => rawResponse,
-                            isSuccessful: () => isSuccessful,
-                            toString: () => rawResponse.toString(),
-                            toJSON: () => ({
-                                __ffiStrResponse: true,
-                                body: bodyText,
-                                url,
-                                code,
-                                message,
-                                headers,
-                                isSuccessful
-                            })
-                        };
-                    };
-                    globalThis.__readerMakeStrResponse = strResponseFromJson;
-                    java.connect = (url, headers) => strResponseFromJson(
-                        java.__nativeConnect(
-                            String(url), headers == null ? '' : headersJson(headers)));
-                    java.ajaxAll = urls => Array.from(urls || [], url =>
-                        strResponseFromJson(java.__nativeAjaxAllItem(String(url))));
-                    java.strToBytes = (value, charset) => JSON.parse(
-                        java.__strToBytes(String(value), charset == null ? '' : String(charset)));
-                    java.bytesToStr = (bytes, charset) => java.__bytesToStr(
-                        JSON.stringify(Array.from(bytes == null ? [] : bytes)),
-                        charset == null ? '' : String(charset));
-                    java.hexDecodeToByteArray = value => JSON.parse(
-                        java.__hexDecodeBytes(String(value)));
-                    java.base64Encode = function(value, flags) {
-                        const text = String(value == null ? '' : value);
-                        if (arguments.length < 2) return nativeBase64Encode(text);
-                        return java.__base64EncodeBytes(
-                            JSON.stringify(java.strToBytes(text, 'UTF-8')),
-                            Number(flags || 0));
-                    };
-                    java.base64Decode = function(value, charsetOrFlags) {
-                        const text = String(value == null ? '' : value);
-                        if (typeof charsetOrFlags === 'number') {
-                            const bytes = JSON.parse(java.__base64DecodeBytes(
-                                text, Number(charsetOrFlags)));
-                            return java.bytesToStr(bytes, 'UTF-8');
-                        }
-                        return charsetOrFlags == null
-                            ? nativeBase64Decode(text)
-                            : nativeBase64Decode(text, String(charsetOrFlags));
-                    };
-                    java.base64DecodeToByteArray = function(value, flags) {
-                        if (value == null || String(value).trim() === '') return null;
-                        return JSON.parse(java.__base64DecodeBytes(
-                            String(value), Number(flags || 0)));
-                    };
-                    const fileCacheCall = (action, arguments) => {
-                        const response = JSON.parse(java.__fileCache(action, JSON.stringify(arguments)));
-                        if (!response.ok) {
-                            const error = new Error(response.error.message);
-                            error.kind = response.error.kind; throw error;
-                        }
-                        return response.data;
-                    };
-                    globalThis.cache.getFile = key => {
-                        const value = fileCacheCall('get', {key: String(key)});
-                        if (value !== null && (typeof value !== 'string' || value.length > 262144)) {
-                            const error = new Error('invalid file cache response');
-                            error.kind = 'invalid_response'; throw error;
-                        }
-                        return value;
-                    };
-                    globalThis.cache.putFile = (key, value, saveTime) => {
-                        const ttl = saveTime == null ? 0 : Number(saveTime);
-                        const text = String(value == null ? '' : value);
-                        if (!Number.isInteger(ttl) || ttl < -2147483648 || ttl > 2147483647
-                            || text.length > 262144) {
-                            const error = new Error('invalid file cache value or TTL');
-                            error.kind = 'invalid_argument'; throw error;
-                        }
-                        if (fileCacheCall('put', {key: String(key), value: text, saveTime: ttl}) !== true) {
-                            const error = new Error('invalid file cache write response');
-                            error.kind = 'invalid_response'; throw error;
-                        }
-                    };
-                    const nativeCacheGet = globalThis.cache.get;
-                    const nativeCachePut = globalThis.cache.put;
-                    const nativeCacheDelete = globalThis.cache.delete;
-                    globalThis.cache.get = key => {
-                        const value = nativeCacheGet(String(key));
-                        return value == null ? null : value;
-                    };
-                    globalThis.cache.put = (key, value, saveTime) => {
-                        let stored;
-                        if (typeof value === 'string') stored = value;
-                        else {
-                            try { stored = JSON.stringify(value); }
-                            catch (_) { stored = String(value); }
-                        }
-                        if (stored === undefined) stored = String(value);
-                        const ok = saveTime == null
-                            ? nativeCachePut(String(key), stored)
-                            : nativeCachePut(String(key), stored, Number(saveTime));
-                        if (!ok) throw new Error('cache.put: session cache limit exceeded');
-                    };
-                    globalThis.cache.delete = key => {
-                        key = String(key);
-                        try {
-                            if (fileCacheCall('delete', {key}) !== true) {
-                                const error = new Error('invalid file cache delete response');
-                                error.kind = 'invalid_response'; throw error;
-                            }
-                        } catch (error) {
-                            // Keep legacy memory-only deletion when the optional
-                            // service/source context is not configured. Real errors
-                            // are terminal and must not clear memory or be retried.
-                            if (error.kind !== 'unavailable' && error.kind !== 'unsupported') throw error;
-                        }
-                        nativeCacheDelete(key);
-                        localMemory.delete(key);
-                        cache.__memoryDelete(key);
-                    };
-                    // Memory entries are per active FFI operation, never persisted
-                    // into the caller's session delta or shared across users.
-                    const localMemory = new Map();
-                    globalThis.cache.getFromMemory = key => {
-                        key = String(key);
-                        const stored = cache.__memoryGet(key);
-                        return stored == null ? (localMemory.get(key) ?? null) : JSON.parse(stored);
-                    };
-                    globalThis.cache.putMemory = (key, value) => {
-                        key = String(key);
-                        localMemory.set(key, value);
-                        const encoded = JSON.stringify(value);
-                        if (encoded !== undefined) cache.__memoryPut(key, encoded);
-                    };
-                    globalThis.cache.deleteMemory = key => {
-                        key = String(key);
-                        localMemory.delete(key);
-                        cache.__memoryDelete(key);
-                    };
-                })();"#,
-            )?;
+            js_bridge_mark(2, native_mark);
+            record_js_memory(&mut memory_samples, "native_bindings", &ctx);
+            eval_fixed_setup_script(ctx.clone(), BootstrapSlot::Java)?;
+            record_js_memory(&mut memory_samples, "java", &ctx);
 
             globals.set(
                 "kv_get",
@@ -2093,256 +1932,9 @@ pub(super) fn eval_js_inner_with_source(
                     globals.set(key.as_str(), js_value)?;
                 }
             }
-            eval_script(
-                ctx.clone(),
-                r#"(function(NativeMap) {
-                source.getLoginInfo = function() {
-                    if (globalThis.loginInfo == null) return source.__getLoginInfo() ?? null;
-                    return typeof globalThis.loginInfo === 'string'
-                        ? globalThis.loginInfo : JSON.stringify(globalThis.loginInfo);
-                };
-                source.putLoginInfo = function(info) {
-                    const raw = String(info);
-                    const saved = source.__putLoginInfo(raw);
-                    if (saved) globalThis.loginInfo = raw;
-                    return saved;
-                };
-                let initializingLoginInfo = false;
-                source.getLoginInfoMap = function() {
-                    const raw = source.getLoginInfo();
-                    let value = {};
-                    if (raw != null) {
-                        try { value = JSON.parse(raw); } catch (_) {}
-                        if (!value || typeof value !== 'object') value = {};
-                    } else if (!initializingLoginInfo) {
-                        const rule = String(source.loginUi || '').trim();
-                        let ui;
-                        try { ui = JSON.parse(rule); } catch (_) {}
-                        // V2 defaults belong to the interactive login state, not this Map.
-                        if (!(ui && !Array.isArray(ui) && Number(ui.version) === 2) && rule) {
-                            initializingLoginInfo = true;
-                            const savedBindings = [globalThis.result, globalThis.book, globalThis.chapter];
-                            try {
-                                const inlineJs = text => {
-                                    const match = String(text || '').trim().match(/^(?:@js:([\s\S]*)|<js>([\s\S]*)<\/js>)$/i);
-                                    return match ? (match[1] === undefined ? match[2] : match[1]).trim() : null;
-                                };
-                                const script = inlineJs(rule);
-                                if (script !== null) {
-                                    globalThis.result = new NativeMap();
-                                    globalThis.book = null;
-                                    globalThis.chapter = null;
-                                    const login = inlineJs(source.loginUrl) ?? String(source.loginUrl || '').trim();
-                                    const output = (0, eval)(login + '\n' + script);
-                                    try { ui = JSON.parse(output == null ? '' : String(output)); } catch (_) { ui = null; }
-                                }
-                                if (Array.isArray(ui)) {
-                                    const defaults = new NativeMap();
-                                    for (const row of ui) {
-                                        if (!row || typeof row !== 'object') {
-                                            defaults.clear(); break;
-                                        }
-                                        if (row.type !== 'button') defaults.set(String(row.name ?? ''), String(row.default ?? ''));
-                                    }
-                                    value = Object.fromEntries(defaults);
-                                    if (defaults.size) source.putLoginInfo(JSON.stringify(value));
-                                }
-                            } finally {
-                                [globalThis.result, globalThis.book, globalThis.chapter] = savedBindings;
-                                initializingLoginInfo = false;
-                            }
-                        }
-                    }
-                    const map = new NativeMap(Object.entries(value).map(([key, item]) => [key, String(item)]));
-                    // Config keys supplement, never shadow, native Map members.
-                    for (const key of map.keys()) {
-                        if (key in map) continue;
-                        Object.defineProperty(map, key, {
-                            get: () => map.get(key),
-                            configurable: true
-                        });
-                    }
-                    return map;
-                };
-                java.reGetBook = function() { throw new Error('java.reGetBook is not supported by this host'); };
-                java.refreshTocUrl = function() { throw new Error('java.refreshTocUrl is only available in preUpdateJs'); };
-                })(globalThis.Map);"#,
-            )?;
+            eval_fixed_setup_script(ctx.clone(), BootstrapSlot::Source)?;
 
-            eval_script(
-                ctx.clone(),
-                r#"if (globalThis.java && globalThis.java.getString) {
-                    const _xpathDocuments = new Map();
-                    const _xpathDocumentIds = new Map();
-                    let _xpathDocumentBytes = 0;
-                    const _internXPathDocument = document => {
-                        if (_xpathDocumentIds.has(document)) return _xpathDocumentIds.get(document);
-                        const bytes = document.length * 2;
-                        if (_xpathDocuments.size >= 64 || _xpathDocumentBytes + bytes > 8 * 1024 * 1024) {
-                            throw new RangeError('XPath document pool budget exceeded');
-                        }
-                        const id = _xpathDocuments.size;
-                        _xpathDocuments.set(id, document);
-                        _xpathDocumentIds.set(document, id);
-                        _xpathDocumentBytes += bytes;
-                        return id;
-                    };
-                    const _readerNodeContent = (rule, content, rawCss = false) => {
-                        if (!content || typeof content !== 'object' || !('__readerXPathNode' in content)) return content;
-                        const xpath = !rawCss && /^\s*(?:@xpath:|\/|\.\/|id\()/i.test(String(rule));
-                        if (xpath) {
-                            const node = content.__readerXPathNode;
-                            const document = node && _xpathDocuments.get(node.documentId);
-                            return JSON.stringify({__readerXPathNode: node && {
-                                document: document === undefined ? node.document : document,
-                                path: node.path, htmlMode: node.htmlMode
-                            }});
-                        }
-                        return typeof content.outerHtml === 'function' ? content.outerHtml() : '';
-                    };
-                    const _orig_getString = globalThis.java.getString;
-                    globalThis.java.getString = function(rule, content, isUrl, unescape) {
-                        const r = (rule !== undefined && rule !== null) ? String(rule) : undefined;
-                        if (typeof content === 'boolean' && arguments.length === 2) {
-                            return _orig_getString(r, undefined, false, content);
-                        }
-                        content = _readerNodeContent(r, content);
-                        if (typeof content === 'object' && content !== null) {
-                            try { content = JSON.stringify(content); } catch (e) {}
-                        }
-                        const c = (content !== undefined && content !== null) ? String(content) : undefined;
-                        return _orig_getString(r, c, isUrl, unescape);
-                    };
-                    const _orig_getStringList = globalThis.java.getStringList;
-                    globalThis.java.getStringList = function(rule, content, isUrl) {
-                        if (rule == null || String(rule) === '') return null;
-                        content = _readerNodeContent(rule, content);
-                        if (typeof content === 'object' && content !== null) {
-                            try { content = JSON.stringify(content); } catch (e) {}
-                        }
-                        const r = String(rule);
-                        const c = (content !== undefined && content !== null) ? String(content) : undefined;
-                        const values = _orig_getStringList(r, c, isUrl);
-                        Object.defineProperties(values, {
-                            size: { value() { return this.length; } },
-                            get: { value(index) {
-                                if (!Number.isInteger(index) || index < 0 || index >= this.length) {
-                                    throw new RangeError('string list index out of bounds');
-                                }
-                                return this[index];
-                            } }
-                        });
-                        return values;
-                    };
-                    const _nativeSetContent = globalThis.java.__setContent;
-                    globalThis.java.setContent = function(content, newBaseUrl) {
-                        if (content == null) throw new Error('content cannot be null');
-                        if (typeof content === 'object') {
-                            try { content = JSON.stringify(content); } catch (e) {}
-                        }
-                        const normalized = String(content);
-                        const base = newBaseUrl == null ? undefined : String(newBaseUrl);
-                        if (base === undefined) _nativeSetContent(normalized);
-                        else _nativeSetContent(normalized, base);
-                        if (base !== undefined) {
-                            globalThis.baseUrl = base;
-                            globalThis.base_url = base;
-                        }
-                        return globalThis.java;
-                    };
-                    const _nativeGetElements = globalThis.java.getElements;
-                    const _nativeGetElement = globalThis.java.getElement;
-                    const _decorateItems = (values, rawCss = false) => {
-                        if (!Array.isArray(values)) values = [];
-                        const carrier = values.find(item => item && item.__readerXPathNode
-                            && typeof item.__readerXPathNode.document === 'string');
-                        const documentId = carrier ? _internXPathDocument(carrier.__readerXPathNode.document) : undefined;
-                        const items = values.map(item => {
-                            if (!item || item.__readerHtmlElement !== true) return item;
-                            const attrs = item.attrs || {};
-                            const node = item.__readerXPathNode;
-                            const context = node ? {
-                                documentId: documentId === undefined ? node.documentId : documentId,
-                                path: node.path, htmlMode: node.htmlMode
-                            } : undefined;
-                            return {
-                                __readerIndex: item.__readerIndex,
-                                __readerXPathNode: context,
-                                // HTML data survives the JS return boundary without
-                                // replacing the public node methods. XPath IDs stay local.
-                                ...(context ? {} : { toJSON() { return item; } }),
-                                attributes() {
-                                    return item.attrList.map(([key, value]) => ({
-                                        getKey() { return key; },
-                                        getValue() { return value; },
-                                        toString() {
-                                            const escaped = value.replace(/&/g, '&amp;')
-                                                .replace(/</g, '&lt;').replace(/>/g, '&gt;')
-                                                .replace(/"/g, '&quot;');
-                                            return key + '="' + escaped + '"';
-                                        }
-                                    }));
-                                },
-                                attr(name) { return attrs[String(name)] || ''; },
-                                hasAttr(name) { return Object.prototype.hasOwnProperty.call(attrs, String(name)); },
-                                hasClass(name) {
-                                    return String(attrs.class || '').split(/\s+/).includes(String(name));
-                                },
-                                html() { return item.html || ''; },
-                                text() { return item.text || ''; },
-                                outerHtml() { return item.outerHtml || ''; },
-                                select(selector) {
-                                    const rule = String(selector);
-                                    const xpath = /^\s*(?:@xpath:|\/|\.\/|id\()/i.test(rule);
-                                    const content = xpath && context
-                                        ? {__readerXPathNode: context} : item.outerHtml || '';
-                                    return _wrapElements(rule, content, xpath ? false : true);
-                                },
-                                toString() { return item.outerHtml || ''; }
-                            };
-                        });
-                        items.first = function() { return this.length ? this[0] : null; };
-                        items.get = function(index) {
-                            const position = Number(index);
-                            return Number.isInteger(position) && position >= 0 && position < this.length
-                                ? this[position] : null;
-                        };
-                        items.size = function() { return this.length; };
-                        items.toArray = function() { return Array.from(this); };
-                        return items;
-                    };
-                    const _wrapElements = (rule, content, rawCss = false) => {
-                        content = _readerNodeContent(rule, content, rawCss);
-                        const raw = _nativeGetElements(rule, content, rawCss);
-                        let values;
-                        try { values = JSON.parse(raw); } catch (e) { values = []; }
-                        return _decorateItems(values, rawCss);
-                    };
-                    globalThis.__wrapReaderElements = values => _decorateItems(values, false);
-                    if (Array.isArray(globalThis.result)) {
-                        globalThis.result = _decorateItems(globalThis.result, false);
-                    }
-                    const _attachVariableMap = value => {
-                        if (!value || typeof value !== 'object') return;
-                        if (typeof value.getVariable !== 'function') {
-                            value.getVariable = function(key) {
-                                const variables = this.variableMap || {};
-                                const found = variables[String(key)];
-                                return found == null ? '' : String(found);
-                            };
-                        }
-                    };
-                    _attachVariableMap(globalThis.book);
-                    _attachVariableMap(globalThis.chapter);
-                    globalThis.java.getElements = _wrapElements;
-                    globalThis.java.getElement = function(rule, content) {
-                        const jsonValue = _nativeGetElement(rule, _readerNodeContent(rule, content, false));
-                        if (jsonValue != null) return JSON.parse(jsonValue);
-                        const items = _wrapElements(rule, content);
-                        return items.length > 0 ? items[0] : null;
-                    };
-                }"#,
-            )?;
+            eval_fixed_setup_script(ctx.clone(), BootstrapSlot::XPath)?;
 
             globals.get::<_, Object<'_>>("java")?.set(
                 "__jsoupRemove",
@@ -2360,1091 +1952,67 @@ pub(super) fn eval_js_inner_with_source(
                         .unwrap_or_default()
                 }),
             )?;
-            eval_script(
-                ctx.clone(),
-                r#"(function() {
-                    const asObject = value => value && (typeof value === 'object' || typeof value === 'function')
-                        ? value : {};
-                    globalThis.org = asObject(globalThis.org);
-                    globalThis.org.jsoup = asObject(globalThis.org.jsoup);
-                    globalThis.org.jsoup.Jsoup = asObject(globalThis.org.jsoup.Jsoup);
-                    if (typeof globalThis.org.jsoup.Jsoup.parse !== 'function') {
-                        globalThis.org.jsoup.Jsoup.parse = function(html, baseUri) {
-                            let source = String(html == null ? '' : html);
-                            let base = String(baseUri == null ? '' : baseUri);
-                            // Jsoup HtmlTreeBuilder uses the first resolvable base href
-                            // and keeps that document base after later DOM removal.
-                            for (const element of java.getElements('base[href]', source, true)) {
-                                const resolved = java.__jsoupAbsUrl(element.attr('href'), base);
-                                if (resolved !== '') {
-                                    base = resolved;
-                                    break;
-                                }
-                            }
-                            const decorate = items => {
-                                for (const item of items) {
-                                    const attr = item.attr.bind(item);
-                                    const hasAttr = item.hasAttr.bind(item);
-                                    const select = item.select.bind(item);
-                                    item.attr = name => {
-                                        name = String(name);
-                                        if (!name.startsWith('abs:')) return attr(name);
-                                        const key = name.slice(4);
-                                        return hasAttr(key) ? java.__jsoupAbsUrl(attr(key), base) : '';
-                                    };
-                                    item.hasAttr = name => {
-                                        name = String(name);
-                                        return name.startsWith('abs:') ? item.attr(name) !== '' : hasAttr(name);
-                                    };
-                                    item.select = selector => decorate(select(selector));
-                                    item.selectFirst = selector => item.select(selector).first();
-                                    item.absUrl = name => item.attr('abs:' + String(name));
-                                    item.baseUri = () => base;
-                                }
-                                items.attr = name => {
-                                    const item = items.find(item => item.hasAttr(name));
-                                    return item ? item.attr(name) : '';
-                                };
-                                items.text = () => items.map(item => item.text()).join(' ');
-                                items.isEmpty = () => items.length === 0;
-                                return items;
-                            };
-                            return {
-                                baseUri() { return base; },
-                                title() {
-                                    const title = this.selectFirst('title');
-                                    return title ? title.text() : '';
-                                },
-                                body() { return this.selectFirst('body'); },
-                                selectFirst(selector) { return this.select(selector).first(); },
-                                select(selector) {
-                                    const rule = String(selector);
-                                    const items = decorate(globalThis.java.getElements(rule, source, true));
-                                    items.remove = function() {
-                                        const updated = globalThis.java.__jsoupRemove(source, rule);
-                                        if (updated == null) throw new Error('invalid jsoup remove selector');
-                                        source = updated;
-                                        return items;
-                                    };
-                                    return items;
-                                }
-                            };
-                        };
-                    }
-                })();"#,
-            )?;
+            eval_fixed_setup_script(ctx.clone(), BootstrapSlot::Jsoup)?;
 
-            eval_script(
-                ctx.clone(),
-                r#"(function() {
-                    const preferenceKey = (name, key) => `__prefs:${String(name)}:${String(key)}`;
-                    const sharedPreferences = name => ({
-                        getString(key, defaultValue) {
-                            const value = source.getVariable(preferenceKey(name, key));
-                            return value === '' ? String(defaultValue == null ? '' : defaultValue) : value;
-                        },
-                        edit() {
-                            const changes = {};
-                            const editor = {
-                                putString(key, value) { changes[String(key)] = String(value); return editor; },
-                                remove(key) { changes[String(key)] = null; return editor; },
-                                commit() {
-                                    for (const [key, value] of Object.entries(changes)) {
-                                        source.setVariable(preferenceKey(name, key), value == null ? '' : value);
-                                    }
-                                    return true;
-                                },
-                                apply() { editor.commit(); }
-                            };
-                            return editor;
-                        }
-                    });
-                    const hostContext = {
-                        MODE_PRIVATE: 0,
-                        getSharedPreferences(name) { return sharedPreferences(name); }
-                    };
-                    const log = {
-                        d(tag, message) { java.log(`[D] ${String(tag)}: ${String(message)}`); return 0; },
-                        e(tag, message) { java.log(`[E] ${String(tag)}: ${String(message)}`); return 0; }
-                    };
-                    const toBytes = value => {
-                        if (Array.isArray(value)) return value.map(byte => Number(byte) & 0xff);
-                        if (value instanceof Uint8Array) return Array.from(value);
-                        return java.strToBytes(String(value == null ? '' : value), 'UTF-8');
-                    };
-                    java.createSymmetricCrypto = function(transformation, key, iv) {
-                        const algorithm = String(transformation == null ? '' : transformation);
-                        const upper = algorithm.toUpperCase();
-                        // JCA 简写 AES/DES 使用 ECB + PKCS5Padding，复用现有完整实现。
-                        const normalized = /^(AES|DES)$/.test(upper)
-                            ? upper + '/ECB/PKCS5PADDING' : upper;
-                        if (!/^(AES|DES)\/(CBC|ECB)\/(PKCS5PADDING|PKCS7PADDING|NOPADDING)$/.test(normalized)) {
-                            throw new Error(
-                                'createSymmetricCrypto: unsupported transformation ' + algorithm);
-                        }
-                        const des = normalized.startsWith('DES/');
-                        const symmetricBytes = value => {
-                            if (Array.isArray(value) || value instanceof Uint8Array) {
-                                return Array.from(value, byte => {
-                                    if (!Number.isInteger(byte) || byte < -128 || byte > 255) {
-                                        throw new Error('createSymmetricCrypto: invalid byte');
-                                    }
-                                    return (byte + 256) % 256;
-                                });
-                            }
-                            return toBytes(value);
-                        };
-                        const keyBytes = symmetricBytes(key);
-                        const ivBytes = iv == null ? [] : symmetricBytes(iv);
-                        const cbc = normalized.split('/')[1] === 'CBC';
-                        const blockSize = des ? 8 : 16;
-                        if (!(des ? keyBytes.length === 8 : [16, 24, 32].includes(keyBytes.length))
-                            || (cbc ? ivBytes.length !== blockSize : ivBytes.length !== 0)) {
-                            throw new Error('createSymmetricCrypto: invalid key or iv');
-                        }
-                        const native = !des;
-                        let capabilities;
-                        if (!native) {
-                            capabilities = java.hostCall('crypto.capabilities', {});
-                            const combination = capabilities && capabilities.symmetric
-                                && capabilities.symmetric[normalized];
-                            if (!capabilities || capabilities.protocol !== 1 || !combination
-                                || !Array.isArray(combination.keyBytes)
-                                || !combination.keyBytes.includes(keyBytes.length)
-                                || !Number.isSafeInteger(capabilities.maxInputBytes)
-                                || capabilities.maxInputBytes < 0) {
-                                throw new Error('createSymmetricCrypto: host combination unavailable');
-                            }
-                        }
-                        const invoke = (mode, data) => {
-                            const dataBytes = Array.isArray(data) || data instanceof Uint8Array
-                                ? symmetricBytes(data)
-                                : mode.startsWith('decrypt')
-                                    ? JSON.parse(java.__decodeSymmetricInput(String(data == null ? '' : data)))
-                                    : symmetricBytes(data);
-                            if (!native) {
-                                if (dataBytes.length > capabilities.maxInputBytes) {
-                                    throw new Error('createSymmetricCrypto: input too large');
-                                }
-                                const bytes = java.hostCall('crypto.symmetric', {
-                                    action: mode, transformation: normalized,
-                                    key: keyBytes, iv: ivBytes, data: dataBytes
-                                });
-                                if (!Array.isArray(bytes) || bytes.length > dataBytes.length + 16
-                                    || !bytes.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255)) {
-                                    throw new Error('createSymmetricCrypto: invalid host byte response');
-                                }
-                                return bytes;
-                            }
-                            const nativeLimit = 262144 + (mode === 'decrypt' && !normalized.endsWith('/NOPADDING') ? 16 : 0);
-                            if (dataBytes.length > nativeLimit) {
-                                const error = new Error('createSymmetricCrypto: input too large');
-                                error.kind = 'limit_exceeded'; throw error;
-                            }
-                            const result = java.__symmetricCrypto(
-                                mode,
-                                normalized,
-                                JSON.stringify(keyBytes),
-                                JSON.stringify(ivBytes),
-                                JSON.stringify(dataBytes));
-                            if (result == null) {
-                                const error = new Error('createSymmetricCrypto: invalid block length or padding');
-                                error.kind = 'operation_failed'; throw error;
-                            }
-                            return JSON.parse(result);
-                        };
-                        return {
-                            encrypt(data) {
-                                return invoke('encrypt', data);
-                            },
-                            encryptBase64(data) {
-                                return java.__base64EncodeBytes(
-                                    JSON.stringify(invoke('encrypt', data)), 2);
-                            },
-                            encryptHex(data) {
-                                return invoke('encrypt', data)
-                                    .map(byte => byte.toString(16).padStart(2, '0'))
-                                    .join('');
-                            },
-                            decrypt(data) {
-                                return invoke('decrypt', data);
-                            },
-                            decryptStr(data) {
-                                return java.bytesToStr(invoke('decrypt', data), 'UTF-8');
-                            }
-                        };
-                    };
-                    const cryptoKeyValue = value => {
-                        if (Array.isArray(value) || value instanceof Uint8Array) {
-                            if (value.length > 16384) throw new Error('crypto key too large');
-                            return Array.from(value, byte => {
-                                if (!Number.isInteger(byte) || byte < -128 || byte > 255) {
-                                    const error = new Error('invalid crypto key byte');
-                                    error.kind = 'invalid_argument'; throw error;
-                                }
-                                return (byte + 256) % 256;
-                            });
-                        }
-                        const text = String(value == null ? '' : value);
-                        if (text.length > 16384) throw new Error('crypto key too large');
-                        if (text.includes('-----BEGIN ')) return text;
-                        return JSON.parse(java.__base64DecodeBytes(text, 0));
-                    };
-                    java.createAsymmetricCrypto = function(transformation) {
-                        const name = String(transformation == null ? '' : transformation).toUpperCase();
-                        const algorithm = name === 'RSA' ? 'RSA/ECB/PKCS1PADDING' : name;
-                        if (algorithm !== 'RSA/ECB/PKCS1PADDING') {
-                            throw new Error('createAsymmetricCrypto: unsupported transformation');
-                        }
-                        let publicKey, privateKey, capabilities;
-                        const keyValue = cryptoKeyValue;
-                        const invoke = (action, data, usePublicKey) => {
-                            // Android defaults to PUBLIC for BOTH encrypt and decrypt.
-                            const usePublic = usePublicKey === undefined ? true : Boolean(usePublicKey);
-                            if ((action === 'decrypt') === usePublic) {
-                                const error = new Error('createAsymmetricCrypto: unsupported key direction');
-                                error.kind = 'unsupported';
-                                throw error;
-                            }
-                            const key = usePublic ? publicKey : privateKey;
-                            if (key == null) throw new Error('createAsymmetricCrypto: selected key is missing');
-                            if (!capabilities) capabilities = java.hostCall('crypto.rsa.capabilities', {});
-                            if (!capabilities || capabilities.protocol !== 1 || capabilities.available !== true
-                                || capabilities.transformation !== algorithm
-                                || !Number.isSafeInteger(capabilities.maxInputBytes)
-                                || capabilities.maxInputBytes < 0
-                                || !Number.isSafeInteger(capabilities.maxEncryptBytes)
-                                || capabilities.maxEncryptBytes < 0
-                                || !Number.isSafeInteger(capabilities.maxOutputBytes)
-                                || capabilities.maxOutputBytes < 0) {
-                                throw new Error('createAsymmetricCrypto: host capability unavailable');
-                            }
-                            const input = action === 'decrypt' && typeof data === 'string'
-                                ? JSON.parse(java.__decodeSymmetricInput(data)) : toBytes(data);
-                            const limit = action === 'encrypt'
-                                ? capabilities.maxEncryptBytes : capabilities.maxInputBytes;
-                            if (input.length > limit) {
-                                throw new Error('createAsymmetricCrypto: input too large');
-                            }
-                            const output = java.hostCall('crypto.asymmetric', {
-                                action, transformation: algorithm, usePublicKey: usePublic, key, data: input
-                            });
-                            if (!Array.isArray(output) || output.length > capabilities.maxOutputBytes
-                                || !output.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255)) {
-                                throw new Error('createAsymmetricCrypto: invalid host byte response');
-                            }
-                            return output;
-                        };
-                        const object = {
-                            setPublicKey(value) { publicKey = keyValue(value); return object; },
-                            setPrivateKey(value) { privateKey = keyValue(value); return object; },
-                            encrypt(data, usePublicKey) { return invoke('encrypt', data, usePublicKey); },
-                            encryptBase64(data, usePublicKey) {
-                                return java.__base64EncodeBytes(JSON.stringify(invoke('encrypt', data, usePublicKey)), 2);
-                            },
-                            encryptHex(data, usePublicKey) {
-                                return invoke('encrypt', data, usePublicKey)
-                                    .map(byte => byte.toString(16).padStart(2, '0')).join('');
-                            },
-                            decrypt(data, usePublicKey) { return invoke('decrypt', data, usePublicKey); },
-                            decryptStr(data, usePublicKey) {
-                                return java.bytesToStr(invoke('decrypt', data, usePublicKey), 'UTF-8');
-                            }
-                        };
-                        return object;
-                    };
-                    java.createSign = function(algorithm) {
-                        const name = String(algorithm == null ? '' : algorithm).toUpperCase();
-                        if (name !== 'SHA256WITHRSA') throw new Error('createSign: unsupported algorithm');
-                        let privateKey, publicKey;
-                        const capabilities = {maxInputBytes:16384,maxSignatureBytes:512};
-                        const signatureError = (kind, message) => {
-                            const error = new Error('createSign: ' + message);
-                            error.kind = kind; return error;
-                        };
-                        const signatureBytes = value => Array.from(value, byte => {
-                            if (!Number.isInteger(byte) || byte < -128 || byte > 255) {
-                                const error = new Error('createSign: invalid byte');
-                                error.kind = 'invalid_argument'; throw error;
-                            }
-                            return (byte + 256) % 256;
-                        });
-                        const invoke = (action, data, signature, charset) => {
-                            const key = action === 'sign' ? privateKey : publicKey;
-                            if (key == null) throw signatureError('invalid_argument', 'selected key is missing');
-                            if (typeof data !== 'string' && !Array.isArray(data) && !(data instanceof Uint8Array)) {
-                                throw signatureError('invalid_argument', 'text or byte input required');
-                            }
-                            if (data.length > capabilities.maxInputBytes) throw signatureError('limit_exceeded', 'input too large');
-                            const input = typeof data === 'string'
-                                ? java.strToBytes(data, charset == null ? 'UTF-8' : String(charset)) : signatureBytes(data);
-                            if (input.length > capabilities.maxInputBytes) throw signatureError('limit_exceeded', 'input too large');
-                            let sig;
-                            if (action === 'verify') {
-                                if (!Array.isArray(signature) && !(signature instanceof Uint8Array)) {
-                                    throw signatureError('invalid_argument', 'signature bytes required');
-                                }
-                                if (signature.length > capabilities.maxSignatureBytes) throw signatureError('limit_exceeded', 'signature too large');
-                                sig = signatureBytes(signature);
-                            }
-                            const response = JSON.parse(java.__signature(JSON.stringify({
-                                action, algorithm: name, key, data: input, signature: sig
-                            })));
-                            if (!response.ok) {
-                                const error = new Error(response.error.message);
-                                error.kind = response.error.kind; throw error;
-                            }
-                            const result = response.data;
-                            if (action === 'verify') {
-                                if (typeof result !== 'boolean') throw new Error('createSign: invalid verification response');
-                            } else if (!Array.isArray(result) || result.length < 128
-                                || result.length > capabilities.maxSignatureBytes
-                                || !result.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255)) {
-                                throw new Error('createSign: invalid signature response');
-                            }
-                            return result;
-                        };
-                        const object = {
-                            setPrivateKey(value) { privateKey = cryptoKeyValue(value); return object; },
-                            setPublicKey(value) { publicKey = cryptoKeyValue(value); return object; },
-                            sign(data, charset) { return invoke('sign', data, undefined, charset); },
-                            signHex(data, charset) {
-                                return invoke('sign', data, undefined, charset)
-                                    .map(byte => byte.toString(16).padStart(2, '0')).join('');
-                            },
-                            verify(data, signature) { return invoke('verify', data, signature); }
-                        };
-                        return object;
-                    };
-                    const archiveInput = value => {
-                        if (Array.isArray(value) || value instanceof Uint8Array) {
-                            if (value.length > 524288) throw new Error('archive input too large');
-                            return toBytes(value);
-                        }
-                        const text = String(value == null ? '' : value);
-                        if (/^https?:\/\//i.test(text)) {
-                            const response = JSON.parse(java.__archiveInput(text));
-                            if (!response.ok) {
-                                const error = new Error(response.error.message);
-                                error.kind = response.error.kind; throw error;
-                            }
-                            return response.data;
-                        }
-                        if (text.length > 1048576 || text.length % 2 !== 0 || !/^[0-9a-f]*$/i.test(text)) {
-                            throw new Error('archive input must be hexadecimal or bytes');
-                        }
-                        return JSON.parse(java.__hexDecodeBytes(text));
-                    };
-                    const archiveBytes = (operation, arguments) => {
-                        const output = java.hostCall(operation, arguments);
-                        if (output === null) return null;
-                        if (!Array.isArray(output) || output.length > 262144
-                            || !output.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255)) {
-                            throw new Error('invalid archive byte response');
-                        }
-                        return output;
-                    };
-                    java.getZipByteArrayContent = function(input, path) {
-                        return archiveBytes('compression.zip.read', {
-                            data: archiveInput(input), path: String(path)
-                        });
-                    };
-                    java.getZipStringContent = function(input, path, charset) {
-                        const bytes = java.getZipByteArrayContent(input, path);
-                        if (bytes === null) return '';
-                        const text = java.__decodeArchiveText(
-                            JSON.stringify(bytes), charset == null ? '' : String(charset));
-                        if (text === null || text === undefined) {
-                            const error = new Error('getZipStringContent: invalid bytes or unsupported charset');
-                            error.kind = 'invalid_argument';
-                            throw error;
-                        }
-                        return text;
-                    };
-                    // Project extension: unlike existing ungzip, this returns raw bytes.
-                    java.gunzipBytes = function(input) {
-                        const response = JSON.parse(java.__gunzipBytes(JSON.stringify(archiveInput(input))));
-                        if (!response.ok) {
-                            const error = new Error(response.error.message);
-                            error.kind = response.error.kind;
-                            throw error;
-                        }
-                        return response.data;
-                    };
-                    const base64 = {
-                        DEFAULT: 0, NO_PADDING: 1, NO_WRAP: 2, CRLF: 4, URL_SAFE: 8,
-                        encodeToString(value, flags) {
-                            return java.__base64EncodeBytes(
-                                JSON.stringify(toBytes(value)), Number(flags || 0));
-                        },
-                        decode(value, flags) {
-                            const input = Array.isArray(value) || value instanceof Uint8Array
-                                ? String.fromCharCode(...toBytes(value))
-                                : String(value == null ? '' : value);
-                            return JSON.parse(java.__base64DecodeBytes(
-                                input, Number(flags || 0)));
-                        }
-                    };
-                    const javaBase64Encoder = flags => ({
-                        encodeToString(value) { return base64.encodeToString(value, flags); },
-                        withoutPadding() { return javaBase64Encoder(flags | base64.NO_PADDING); }
-                    });
-                    const javaBase64 = {
-                        getEncoder() { return javaBase64Encoder(base64.NO_WRAP); },
-                        getDecoder() { return { decode: value => base64.decode(value, 0) }; },
-                        getUrlEncoder() { return javaBase64Encoder(base64.URL_SAFE | base64.NO_WRAP); },
-                        getUrlDecoder() { return { decode: value => base64.decode(value, base64.URL_SAFE) }; }
-                    };
-                    globalThis.System = Object.assign(globalThis.System || {}, {
-                        currentTimeMillis: () => java.now()
-                    });
-                    const randomUuid = () => {
-                        const value = java.randomUUID();
-                        return { toString: () => value };
-                    };
-                    globalThis.UUID = { randomUUID: randomUuid };
-                    java.util = java.util || {};
-                    java.util.UUID = { randomUUID: randomUuid };
-                    java.util.Base64 = javaBase64;
-
-                    if (!String.prototype.getBytes) {
-                        Object.defineProperty(String.prototype, 'getBytes', {
-                            value(charset) {
-                                return java.strToBytes(
-                                    String(this), charset == null ? 'UTF-8' : String(charset));
-                            }
-                        });
-                    }
-
-                    const JsString = globalThis.String;
-                    const javaStrings = new WeakMap();
-                    function JavaString(value, charset) {
-                        const text = Array.isArray(value) || value instanceof Uint8Array
-                            ? java.bytesToStr(
-                                value, charset == null ? 'UTF-8' : JsString(charset))
-                            : JsString(value == null ? '' : value);
-                        if (!new.target) return text;
-                        const wrapped = new JsString(text);
-                        javaStrings.set(wrapped, text);
-                        return wrapped;
-                    }
-                    java.__javaStringResult = value => javaStrings.get(value);
-                    const streamRange = (bytes, offset, length) => {
-                        if (!Array.isArray(bytes) && !(bytes instanceof Uint8Array)) {
-                            throw new Error('byte array required');
-                        }
-                        const start = offset === undefined ? 0 : Number(offset);
-                        const count = length === undefined ? bytes.length - start : Number(length);
-                        if (!Number.isInteger(start) || !Number.isInteger(count)
-                            || start < 0 || count < 0 || start + count > bytes.length) {
-                            throw new Error('invalid stream byte range');
-                        }
-                        return [start, count];
-                    };
-                    function ByteArrayInputStream(bytes, offset, length) {
-                        if (!new.target) return new ByteArrayInputStream(bytes, offset, length);
-                        const [start, count] = streamRange(bytes, offset, length);
-                        if (count > 524288) throw new Error('stream input too large');
-                        this.bytes = toBytes(bytes.slice(start, start + count));
-                        this.position = 0;
-                        this.markPosition = 0;
-                        this.closed = false;
-                    }
-                    ByteArrayInputStream.prototype = {
-                        checkOpen() { if (this.closed) throw new Error('stream is closed'); },
-                        read(buffer, offset, length) {
-                            this.checkOpen();
-                            if (buffer === undefined) {
-                                return this.position < this.bytes.length ? this.bytes[this.position++] : -1;
-                            }
-                            const [start, count] = streamRange(buffer, offset, length);
-                            if (count === 0) return 0;
-                            if (this.position === this.bytes.length) return -1;
-                            const n = Math.min(count, this.bytes.length - this.position);
-                            for (let i = 0; i < n; ++i) buffer[start + i] = this.bytes[this.position++];
-                            return n;
-                        },
-                        readAllBytes() {
-                            this.checkOpen();
-                            const result = this.bytes.slice(this.position);
-                            this.position = this.bytes.length;
-                            return result;
-                        },
-                        readNBytes(length) {
-                            this.checkOpen();
-                            if (!Number.isInteger(length) || length < 0) throw new Error('invalid read length');
-                            const result = this.bytes.slice(this.position, this.position + length);
-                            this.position += result.length;
-                            return result;
-                        },
-                        available() { this.checkOpen(); return this.bytes.length - this.position; },
-                        skip(count) {
-                            this.checkOpen();
-                            if (!Number.isSafeInteger(count)) throw new Error('invalid skip count');
-                            const n = Math.min(Math.max(0, count), this.bytes.length - this.position);
-                            this.position += n;
-                            return n;
-                        },
-                        mark() { this.markPosition = this.position; },
-                        reset() { this.checkOpen(); this.position = this.markPosition; },
-                        markSupported() { return true; },
-                        close() {} // JDK ByteArrayInputStream close is a no-op.
-                    };
-                    function GZIPInputStream(input, size) {
-                        if (!new.target) return new GZIPInputStream(input, size);
-                        if (!(input instanceof ByteArrayInputStream)) throw new Error('ByteArrayInputStream required');
-                        if (size !== undefined && (!Number.isInteger(size) || size <= 0 || size > 262144)) {
-                            throw new Error('invalid gzip buffer size');
-                        }
-                        input.checkOpen();
-                        const decoded = java.gunzipBytes(input.bytes.slice(input.position));
-                        input.position = input.bytes.length;
-                        this.bytes = decoded;
-                        this.position = 0;
-                        this.closed = false;
-                        this.input = input;
-                    }
-                    GZIPInputStream.prototype = Object.create(ByteArrayInputStream.prototype);
-                    Object.assign(GZIPInputStream.prototype, {
-                        available() { this.checkOpen(); return this.position < this.bytes.length ? 1 : 0; },
-                        markSupported() { return false; },
-                        mark() {},
-                        reset() { throw new Error('gzip mark/reset is unsupported'); },
-                        close() { if (!this.closed) { this.closed = true; this.input.close(); } }
-                    });
-                    function Inflater(nowrap = false) {
-                        if (!new.target) return new Inflater(nowrap);
-                        if (typeof nowrap !== 'boolean') throw new Error('boolean nowrap required');
-                        this.nowrap = nowrap;
-                        this.ended = false;
-                    }
-                    Inflater.prototype.end = function() { this.ended = true; };
-                    function InflaterInputStream(input, inflater, size) {
-                        if (!new.target) return new InflaterInputStream(input, inflater, size);
-                        if (!(input instanceof ByteArrayInputStream)) throw new Error('ByteArrayInputStream required');
-                        if (size !== undefined && (!Number.isInteger(size) || size <= 0 || size > 262144)) {
-                            throw new Error('invalid inflater buffer size');
-                        }
-                        this.ownsInflater = inflater === undefined;
-                        inflater = this.ownsInflater ? new Inflater() : inflater;
-                        if (!(inflater instanceof Inflater) || inflater.ended) throw new Error('active Inflater required');
-                        input.checkOpen();
-                        const decode = inflater.nowrap ? java.__inflateRawBytes : java.__inflateZlibBytes;
-                        const response = JSON.parse(decode(JSON.stringify(input.bytes.slice(input.position))));
-                        if (!response.ok) {
-                            const error = new Error(response.error.message);
-                            error.kind = response.error.kind; throw error;
-                        }
-                        input.position = input.bytes.length;
-                        this.bytes = response.data;
-                        this.position = 0;
-                        this.closed = false;
-                        this.input = input;
-                        this.inflater = inflater;
-                    }
-                    InflaterInputStream.prototype = Object.create(GZIPInputStream.prototype);
-                    Object.assign(InflaterInputStream.prototype, {
-                        checkOpen() {
-                            ByteArrayInputStream.prototype.checkOpen.call(this);
-                            if (this.inflater.ended) throw new Error('inflater is ended');
-                        },
-                        reset() { throw new Error('inflater mark/reset is unsupported'); },
-                        close() {
-                            GZIPInputStream.prototype.close.call(this);
-                            if (this.ownsInflater) this.inflater.end();
-                        }
-                    });
-                    function ByteArrayOutputStream(size) {
-                        if (!new.target) return new ByteArrayOutputStream(size);
-                        if (size !== undefined && (!Number.isInteger(size) || size < 0 || size > 262144)) {
-                            throw new Error('invalid output stream size');
-                        }
-                        this.bytes = [];
-                    }
-                    ByteArrayOutputStream.prototype = {
-                        write(value, offset, length) {
-                            if (typeof value === 'number') {
-                                if (!Number.isInteger(value)) throw new Error('integer byte required');
-                                if (this.bytes.length >= 262144) throw new Error('output stream too large');
-                                this.bytes.push(value & 255);
-                                return;
-                            }
-                            const [start, count] = streamRange(value, offset, length);
-                            if (this.bytes.length + count > 262144) throw new Error('output stream too large');
-                            for (let i = 0; i < count; ++i) this.bytes.push(Number(value[start + i]) & 255);
-                        },
-                        toByteArray() { return this.bytes.slice(); },
-                        toString(charset) { return java.bytesToStr(this.bytes, charset == null ? 'UTF-8' : String(charset)); },
-                        size() { return this.bytes.length; },
-                        reset() { this.bytes = []; },
-                        writeTo(stream) { stream.write(this.bytes); },
-                        flush() {},
-                        close() {} // JDK ByteArrayOutputStream close is a no-op.
-                    };
-                    function SecureRandom() {
-                        if (arguments.length !== 0) throw new TypeError('unsupported SecureRandom constructor');
-                        if (!new.target) return new SecureRandom();
-                    }
-                    SecureRandom.prototype.nextInt = function(bound) {
-                        if (arguments.length !== 1 || !Number.isInteger(bound)
-                            || bound <= 0 || bound > 2147483647) {
-                            throw new TypeError('positive Java int bound required');
-                        }
-                        return java.__secureRandomNextInt(bound);
-                    };
-                    function SecretKeySpec(key, algorithm) {
-                        const name = JsString(algorithm);
-                        return {
-                            key: name.toUpperCase() === 'CHACHA20' ? chachaBytes(key, 32) : toBytes(key),
-                            algorithm: name
-                        };
-                    }
-                    function IvParameterSpec(iv) {
-                        return { iv: toBytes(iv) };
-                    }
-                    class JavaHashMap extends Map {
-                        get(key) { return this.has(key) ? super.get(key) : null; }
-                        put(key, value) {
-                            const previous = this.get(key);
-                            this.set(key, value);
-                            return previous;
-                        }
-                        toJSON() { return Object.fromEntries(this); }
-                    }
-                    class JavaArrayList extends Array {
-                        constructor() {
-                            if (arguments.length !== 0) throw new TypeError('unsupported ArrayList constructor');
-                            super();
-                        }
-                        static get [Symbol.species]() { return Array; }
-                        add(value) {
-                            if (arguments.length !== 1) throw new TypeError('unsupported ArrayList.add overload');
-                            this.push(value);
-                            return true;
-                        }
-                        size() {
-                            if (arguments.length !== 0) throw new TypeError('ArrayList.size takes no arguments');
-                            return this.length;
-                        }
-                        get(index) {
-                            if (arguments.length !== 1 || !Number.isInteger(index) || index < 0 || index >= this.length) {
-                                throw new RangeError('ArrayList index out of bounds');
-                            }
-                            return this[index];
-                        }
-                    }
-                    function JavaLinkedHashMap(values) {
-                        if (arguments.length > 1) throw new TypeError('unsupported LinkedHashMap constructor');
-                        let entries = [];
-                        if (arguments.length === 1) {
-                            if (values instanceof Map) entries = values;
-                            else if (values && (Object.getPrototypeOf(values) === Object.prototype
-                                || Object.getPrototypeOf(values) === null)) entries = Object.entries(values);
-                            else throw new TypeError('LinkedHashMap source must be a Map or object');
-                        }
-                        const map = new JavaHashMap(entries);
-                        Object.setPrototypeOf(map, JavaLinkedHashMap.prototype);
-                        return map;
-                    }
-                    Object.setPrototypeOf(JavaLinkedHashMap.prototype, JavaHashMap.prototype);
-                    const Arrays = {
-                        copyOf(value, length) {
-                            if ((!Array.isArray(value) && !(value instanceof Uint8Array))
-                                || !Number.isInteger(length) || length < 0 || length > 524288) {
-                                throw new Error('invalid byte array copy');
-                            }
-                            return Arrays.copyOfRange(value, 0, length);
-                        },
-                        copyOfRange(value, start, end) {
-                            const bytes = Array.from(value == null ? [] : value).slice(start, end);
-                            while (bytes.length < end - start) bytes.push(0);
-                            return bytes;
-                        }
-                    };
-                    const chachaBytes = (value, limit) => {
-                        if ((!Array.isArray(value) && !(value instanceof Uint8Array)) || value.length > limit) {
-                            throw new TypeError('invalid ChaCha20 byte array');
-                        }
-                        return Array.from(value, byte => {
-                            if (!Number.isInteger(byte) || byte < -128 || byte > 255) {
-                                throw new TypeError('invalid ChaCha20 byte');
-                            }
-                            return byte & 255;
-                        });
-                    };
-                    function GCMParameterSpec(tagBits, nonce) {
-                        if (arguments.length !== 2 || tagBits !== 128) {
-                            throw new TypeError('only 128-bit authentication tags are supported');
-                        }
-                        const iv = chachaBytes(nonce, 12);
-                        if (iv.length !== 12) throw new TypeError('nonce must be 12 bytes');
-                        return {tLen: tagBits, iv};
-                    }
-                    const chachaCipher = () => {
-                        let state = null;
-                        return {
-                            init(mode, key, parameters) {
-                                state = null;
-                                if (arguments.length !== 3 || mode !== 2) {
-                                    throw new TypeError('only ChaCha20 decryption is supported');
-                                }
-                                const bytes = chachaBytes(key && key.key, 32);
-                                const nonce = chachaBytes(parameters && parameters.iv, 12);
-                                if (bytes.length !== 32 || nonce.length !== 12
-                                    || JsString(key.algorithm).toUpperCase() !== 'CHACHA20'
-                                    || (parameters.tLen !== undefined && parameters.tLen !== 128)) {
-                                    throw new TypeError('invalid ChaCha20 parameters');
-                                }
-                                state = {key: bytes, nonce};
-                            },
-                            doFinal(data) {
-                                if (arguments.length !== 1 || state === null) {
-                                    throw new TypeError('ChaCha20 cipher must be initialized; only doFinal(bytes) is supported');
-                                }
-                                try {
-                                    const bytes = chachaBytes(data, 262160);
-                                    const output = JSON.parse(java.__chacha20Poly1305Decrypt(JSON.stringify({
-                                        key: state.key, nonce: state.nonce, data: bytes
-                                    })));
-                                    return output.map(byte => byte > 127 ? byte - 256 : byte);
-                                } catch (error) {
-                                    state = null;
-                                    throw error;
-                                }
-                            }
-                        };
-                    };
-                    const Cipher = {
-                        DECRYPT_MODE: 2,
-                        getInstance(algorithm) {
-                            if (JsString(algorithm).toUpperCase() === 'CHACHA20-POLY1305') {
-                                if (arguments.length !== 1) throw new TypeError('unsupported ChaCha20 provider overload');
-                                return chachaCipher();
-                            }
-                            return {
-                                init(mode, key, iv) { this.mode = mode; this.key = key; this.iv = iv; },
-                                doFinal(data) {
-                                    const bytes = toBytes(data);
-                                    if (bytes.length % 16 !== 0) {
-                                        throw new TypeError('AES ciphertext must contain complete blocks');
-                                    }
-                                    return JSON.parse(java.__aesDecryptByteArray(JSON.stringify({
-                                        algorithm, mode: this.mode, key: this.key.key,
-                                        iv: this.iv.iv, data: bytes
-                                    })));
-                                }
-                            };
-                        }
-                    };
-                    const Mac = {
-                        getInstance: algorithm => ({
-                            init(key) { this.key = key; },
-                            doFinal(data) {
-                                if (String(algorithm).replace(/[^a-z0-9]/gi, '').toUpperCase() === 'HMACMD5') {
-                                    const hex = bytes => bytes.map(byte =>
-                                        (byte & 255).toString(16).padStart(2, '0')).join('');
-                                    return java.hexDecodeToByteArray(java.__hostHmacMd5(
-                                        hex(toBytes(this.key ? this.key.key : [])), hex(toBytes(data))));
-                                }
-                                return JSON.parse(java.__hmacBytes(
-                                    String(algorithm),
-                                    JSON.stringify(this.key ? this.key.key : []),
-                                    JSON.stringify(toBytes(data))));
-                            }
-                        })
-                    };
-                    const URLEncoder = {
-                        encode(value, charset) {
-                            return java.encodeURI(
-                                String(value), charset == null ? 'UTF-8' : String(charset))
-                                .replace(/%20/g, '+')
-                                .replace(/%2A/gi, '*')
-                                .replace(/~/g, '%7E');
-                        }
-                    };
-                    const URLDecoder = {
-                        decode(value) {
-                            return decodeURIComponent(String(value).replace(/\+/g, ' '));
-                        }
-                    };
-                    const DatatypeConverter = {
-                        printHexBinary(value) {
-                            return toBytes(value)
-                                .map(byte => byte.toString(16).padStart(2, '0'))
-                                .join('')
-                                .toUpperCase();
-                        },
-                        parseHexBinary(value) {
-                            return JSON.parse(java.__hexDecodeBytes(String(value)));
-                        }
-                    };
-                    const markClass = (name, value) => {
-                        try {
-                            Object.defineProperty(value, '__javaName', {
-                                value: name, configurable: true
-                            });
-                        } catch (_) {}
-                        return value;
-                    };
-
-                    globalThis.Packages = globalThis.Packages || {};
-                    Packages.org = globalThis.org;
-                    Packages.java = Packages.java || {};
-                    Packages.java.lang = Packages.java.lang || {};
-                    Packages.java.net = Packages.java.net || {};
-                    Packages.java.io = Packages.java.io || {};
-                    Packages.java.nio = Packages.java.nio || {};
-                    Packages.java.util = Packages.java.util || {};
-                    Packages.java.util.zip = Packages.java.util.zip || {};
-                    Packages.javax = Packages.javax || {};
-                    Packages.javax.crypto = Packages.javax.crypto || {};
-                    Packages.javax.crypto.spec = Packages.javax.crypto.spec || {};
-                    Packages.javax.xml = Packages.javax.xml || {};
-                    Packages.javax.xml.bind = Packages.javax.xml.bind || {};
-                    Packages.android = Packages.android || {};
-                    Packages.android.util = Packages.android.util || {};
-
-                    Packages.java.nio.ByteBuffer = markClass('ByteBuffer', {
-                        allocate(capacity) {
-                            if (!Number.isInteger(capacity) || capacity < 0 || capacity > 262144) {
-                                throw new Error('invalid byte buffer capacity');
-                            }
-                            const bytes = new Array(capacity).fill(0);
-                            return { array: () => bytes };
-                        }
-                    });
-                    Packages.java.security = Packages.java.security || {};
-                    Packages.java.security.SecureRandom = markClass('SecureRandom', SecureRandom);
-                    Packages.java.lang.String = markClass('String', JavaString);
-                    // Deliberately limited to the string overloads used by source rules.
-                    function JavaStringBuilder(initial) {
-                        if (arguments.length > 1 || (arguments.length === 1 && typeof initial !== 'string')) {
-                            throw new TypeError('StringBuilder supports empty or string construction only');
-                        }
-                        if (!new.target) return arguments.length === 0
-                            ? new JavaStringBuilder() : new JavaStringBuilder(initial);
-                        let text = arguments.length === 0 ? '' : initial;
-                        const checkSize = size => {
-                            if (size > 262144) throw new RangeError('StringBuilder size limit exceeded');
-                        };
-                        checkSize(text.length);
-                        this.append = function(value) {
-                            if (arguments.length !== 1 || typeof value !== 'string') {
-                                throw new TypeError('StringBuilder.append supports one string only');
-                            }
-                            checkSize(text.length + value.length);
-                            text += value;
-                            return this;
-                        };
-                        this.toString = () => text;
-                    }
-                    Packages.java.lang.StringBuilder = markClass('StringBuilder', JavaStringBuilder);
-                    Packages.java.lang.Integer = markClass('Integer', {
-                        toHexString(value) {
-                            if (arguments.length !== 1 || !Number.isInteger(value)
-                                || value < -2147483648 || value > 2147483647) {
-                                throw new TypeError('Integer.toHexString requires a signed 32-bit integer');
-                            }
-                            return (value >>> 0).toString(16);
-                        }
-                    });
-                    Packages.java.lang.System = markClass('System', globalThis.System);
-                    Packages.java.io.ByteArrayInputStream = markClass('ByteArrayInputStream', ByteArrayInputStream);
-                    Packages.java.io.ByteArrayOutputStream = markClass('ByteArrayOutputStream', ByteArrayOutputStream);
-                    Packages.java.util.zip.GZIPInputStream = markClass('GZIPInputStream', GZIPInputStream);
-                    Packages.java.util.zip.Inflater = markClass('Inflater', Inflater);
-                    Packages.java.util.zip.InflaterInputStream = markClass('InflaterInputStream', InflaterInputStream);
-                    Packages.java.net.URLEncoder = markClass('URLEncoder', URLEncoder);
-                    Packages.java.net.URLDecoder = markClass('URLDecoder', URLDecoder);
-                    Packages.java.util.Arrays = markClass('Arrays', Arrays);
-                    Packages.java.util.HashMap = markClass('HashMap', JavaHashMap);
-                    Packages.java.util.ArrayList = markClass('ArrayList', JavaArrayList);
-                    Packages.java.util.LinkedHashMap = markClass('LinkedHashMap', JavaLinkedHashMap);
-                    Packages.java.util.Base64 = markClass('Base64', javaBase64);
-                    Packages.java.util.UUID = markClass('UUID', java.util.UUID);
-                    Packages.javax.crypto.Mac = markClass('Mac', Mac);
-                    Packages.javax.crypto.Cipher = markClass('Cipher', Cipher);
-                    Packages.javax.crypto.spec.SecretKeySpec =
-                        markClass('SecretKeySpec', SecretKeySpec);
-                    Packages.javax.crypto.spec.IvParameterSpec =
-                        markClass('IvParameterSpec', IvParameterSpec);
-                    Packages.javax.crypto.spec.GCMParameterSpec =
-                        markClass('GCMParameterSpec', GCMParameterSpec);
-                    // Rhino-style aliases used by the real decrypt script; java remains the host helper.
-                    java.lang = Packages.java.lang;
-                    java.security = Packages.java.security;
-                    globalThis.javax = Packages.javax;
-                    Packages.javax.xml.bind.DatatypeConverter =
-                        markClass('DatatypeConverter', DatatypeConverter);
-                    Packages.android.util.Base64 = markClass('Base64', base64);
-                    Packages.android.text = Packages.android.text || {};
-                    Packages.android.text.TextUtils = markClass('TextUtils', {
-                        isEmpty(value) {
-                            if (arguments.length !== 1) throw new TypeError('TextUtils.isEmpty requires one argument');
-                            if (value == null) return true;
-                            if (typeof value !== 'string' && !(value instanceof JsString)) {
-                                throw new TypeError('TextUtils.isEmpty requires a string');
-                            }
-                            return value.length === 0;
-                        }
-                    });
-
-                    // Thin URL facade: parsing stays in the existing Rust-backed helper.
-                    function JavaURL(spec) {
-                        if (!new.target) return new JavaURL(spec);
-                        const text = JsString(spec);
-                        const parsed = java.toURL(text);
-                        Object.defineProperties(this, {
-                            host: { value: parsed.host, enumerable: true },
-                            path: { value: parsed.pathname, enumerable: true },
-                            pathname: { value: parsed.pathname, enumerable: true }
-                        });
-                        this.toString = () => text;
-                    }
-                    JavaURL.prototype.getHost = function() { return this.host; };
-                    JavaURL.prototype.getPath = function() { return this.path; };
-                    Packages.java.net.URL = markClass('URL', JavaURL);
-                    const JavaHttpUrl = {
-                        parse(spec) {
-                            const payload = java.__httpUrl(JsString(spec));
-                            if (payload == null) return null;
-                            const parsed = JSON.parse(payload);
-                            return Object.freeze({
-                                host: parsed.host,
-                                toString: () => parsed.url,
-                                topPrivateDomain() {
-                                    const error = new Error('HttpUrl.topPrivateDomain requires public suffix support');
-                                    error.kind = 'unsupported';
-                                    throw error;
-                                }
-                            });
-                        }
-                    };
-                    Packages.okhttp3 = Packages.okhttp3 || {};
-                    Packages.okhttp3.HttpUrl = markClass('HttpUrl', JavaHttpUrl);
-
-                    // HtmlFormatter.kt at Legado 5198645: regex text formatting,
-                    // not DOM extraction, entity decoding, or reader cleaning.
-                    const formatHtmlText = (html, indent, keepImages = false) => {
-                        if (html === null) return '';
-                        if (typeof html !== 'string') throw new TypeError('HtmlFormatter requires string or null');
-                        return html
-                            .replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n').replace(/\\r/g, '\n')
-                            .replace(/(&nbsp;)+/g, ' ')
-                            .replace(/(&ensp;|&emsp;)/g, ' ')
-                            .replace(/(&thinsp;|&zwnj;|&zwj;|\u2009|\u200c|\u200d)/g, '')
-                            .replace(/<\/?(?:div|p|br|hr|h\d|article|dd|dl)[^>]*>/g, '\n')
-                            .replace(/<!--[^>]*-->/g, '')
-                            .replace(keepImages ? /<\/?(?!img)[a-zA-Z]+(?=[ >])[^<>]*>/g
-                                : /<\/?[a-zA-Z]+(?=[ >])[^<>]*>/g, '')
-                            // Java Pattern's default whitespace is ASCII, unlike JS \s.
-                            .replace(/[ \t\n\x0b\f\r]*\n+[ \t\n\x0b\f\r]*/g, '\n' + indent)
-                            .replace(/^[\n \t\x0b\f\r]+/g, indent)
-                            .replace(/[\n \t\x0b\f\r]+$/g, '');
-                    };
-                    Packages.io = Packages.io || {};
-                    Packages.io.legado = Packages.io.legado || {};
-                    Packages.io.legado.app = Packages.io.legado.app || {};
-                    Packages.io.legado.app.help = Packages.io.legado.app.help || {};
-                    Packages.io.legado.app.help.http = Packages.io.legado.app.help.http || {};
-                    Packages.io.legado.app.help.http.StrResponse = markClass('StrResponse', function(url, body) {
-                        if (arguments.length !== 2 || typeof url !== 'string' || typeof body !== 'string') {
-                            throw new TypeError('StrResponse supports URL and string body only');
-                        }
-                        let target = 'http://localhost/';
-                        try {
-                            if (/^https?:\/\//i.test(url) && java.toURL(url).host) target = url;
-                        } catch (_) {}
-                        return globalThis.__readerMakeStrResponse({url: target, body, code: 200, message: 'OK', headers: {}});
-                    });
-                    Packages.io.legado.app.utils = Packages.io.legado.app.utils || {};
-                    Packages.io.legado.app.utils.HtmlFormatter = markClass('HtmlFormatter', {
-                        format(html) {
-                            if (arguments.length !== 1) throw new TypeError('HtmlFormatter.format supports one argument');
-                            return formatHtmlText(html, '　　');
-                        },
-                        formatIntro(html) {
-                            if (arguments.length !== 1) throw new TypeError('HtmlFormatter.formatIntro requires one argument');
-                            return formatHtmlText(html, '');
-                        },
-                        formatKeepImg(html, redirectUrl) {
-                            if (arguments.length < 1 || arguments.length > 2
-                                || (redirectUrl != null && !(redirectUrl instanceof JavaURL))) {
-                                throw new TypeError('HtmlFormatter.formatKeepImg requires content and optional Java URL');
-                            }
-                            const formatted = formatHtmlText(html, '　　', true);
-                            const image = /<img[^>]*[ \t\n\x0b\f\r]src[ \t\n\x0b\f\r]*=[ \t\n\x0b\f\r]*['"]([^'"{>]*\{(?:[^{}]|\{[^}>]+\})+\})['"][^>]*>|<img[^>]*[ \t\n\x0b\f\r]data-(?:src|original|srcset)[ \t\n\x0b\f\r]*=[ \t\n\x0b\f\r]*['"]([^'">]+)['"][^>]*>|<img[^>]*[ \t\n\x0b\f\r]src[ \t\n\x0b\f\r]*=[ \t\n\x0b\f\r]*"([^">]+)"[^>]*>|<img[^>]*[ \t\n\x0b\f\r](?:data-[^=>]*|src)=[ \t\n\x0b\f\r]*['"]([^'">]*)['"][^>]*>/gi;
-                            return formatted.replace(image, (tag, metadata, lazy, quoted, fallback) => {
-                                let address = metadata ?? lazy ?? quoted ?? fallback;
-                                let param = '';
-                                if (metadata !== undefined) {
-                                    const separator = /[ \t\n\x0b\f\r]*,[ \t\n\x0b\f\r]*(?=\{)/.exec(address);
-                                    if (separator !== null) {
-                                        param = ',' + address.slice(separator.index + separator[0].length);
-                                        address = address.slice(0, separator.index);
-                                    }
-                                }
-                                address = address.trim();
-                                if (redirectUrl != null && !/^(?:[a-z][a-z0-9+.-]*:\/\/|data:)/i.test(address)) {
-                                    address = address.startsWith('javascript') ? ''
-                                        : java.__jsoupAbsUrl(address, redirectUrl.toString()) || address;
-                                }
-                                return '<img src="' + address + param + '">';
-                            });
-                        }
-                    });
-
-                    const exposeJavaValue = (target, value) => {
-                        if (!value) return;
-                        if (value.__javaName) {
-                            target[value.__javaName] = value;
-                            return;
-                        }
-                        if (typeof value === 'object') {
-                            for (const candidate of Object.values(value)) {
-                                if (candidate && candidate.__javaName) {
-                                    target[candidate.__javaName] = candidate;
-                                }
-                            }
-                        }
-                    };
-                    globalThis.JavaImporter = function(...values) {
-                        values.forEach(value => exposeJavaValue(this, value));
-                        this.importPackage = (...packages) => {
-                            packages.forEach(pkg => exposeJavaValue(this, pkg));
-                            return this;
-                        };
-                        this.importClass = this.importPackage;
-                    };
-                    globalThis.URLEncoder = URLEncoder;
-                    globalThis.URLDecoder = URLDecoder;
-                    globalThis.Log = log;
-                    globalThis.android = globalThis.android || {};
-                    globalThis.android.util = globalThis.android.util || {};
-                    globalThis.android.util.Log = log;
-                    globalThis.android.util.Base64 = base64;
-                    globalThis.application = hostContext;
-                    globalThis.context = hostContext;
-                    globalThis.activity = Object.assign({}, hostContext);
-                    globalThis.app = hostContext;
-                })();"#,
-            )?;
+            record_js_memory(&mut memory_samples, "before_android", &ctx);
+            eval_fixed_setup_script(ctx.clone(), BootstrapSlot::Android)?;
+            record_js_memory(&mut memory_samples, "android", &ctx);
 
             // Capture before source scripts can replace the helper; only marked wrappers unwrap.
             let java_string_result: rquickjs::Function<'_> = globals
                 .get::<_, Object<'_>>("java")?
                 .get("__javaStringResult")?;
+            let dom_start = (*JS_PROFILE_ENABLED).then(Instant::now);
             let dom_string_result = dom::install(&ctx)?;
-            eval_script(ctx.clone(), include_str!("js_security.js"))?;
-            eval_script(ctx.clone(), include_str!("js_des.js"))?;
-            eval_script(ctx.clone(), include_str!("js_aes.js"))?;
+            if let Some(dom_start) = dom_start {
+                JS_SETUP_METRICS.with(|totals| totals.borrow_mut()[2] += dom_start.elapsed().as_micros());
+            }
+            eval_builtin_setup_script(ctx.clone(), BootstrapSlot::Security)?;
+            eval_builtin_setup_script(ctx.clone(), BootstrapSlot::Math)?;
+            eval_builtin_setup_script(ctx.clone(), BootstrapSlot::Des)?;
+            eval_builtin_setup_script(ctx.clone(), BootstrapSlot::Aes)?;
 
             if let Some(state) = active_info_map_state() {
                 install_info_map(&ctx, &state)?;
             }
+            record_js_memory(&mut memory_samples, "setup_done", &ctx);
+            js_profile_mark(&mut profile_mark, &mut profile_stages, 2);
             if !shared_js.trim().is_empty() {
-                eval_script(ctx.clone(), &shared_js)?;
+                if *JS_LIB_SPLIT_DIAG {
+                    let mut times = [0; 3];
+                    let result = eval_js_lib_split(ctx.clone(), &shared_js, &mut times);
+                    if *JS_PROFILE_ENABLED {
+                        JS_LIB_SPLIT_METRICS.with(|totals| {
+                            let mut totals = totals.borrow_mut();
+                            for (total, elapsed) in totals.iter_mut().zip(times) {
+                                *total += elapsed;
+                            }
+                        });
+                    }
+                    result?;
+                } else if *JS_LIB_BASELINE_DIAG {
+                    eval_script(ctx.clone(), &shared_js)?;
+                } else if let Some(session) = current_active_session() {
+                    let mut times = [0; 3];
+                    let collect = *JS_PROFILE_ENABLED && *JS_LIB_CACHE_DIAG;
+                    let result = eval_js_lib_for_operation(
+                        ctx.clone(), &shared_js, &session, collect.then_some(&mut times),
+                    );
+                    if collect {
+                        JS_LIB_SPLIT_METRICS.with(|totals| {
+                            let mut totals = totals.borrow_mut();
+                            for (total, elapsed) in totals.iter_mut().zip(times) {
+                                *total += elapsed;
+                            }
+                        });
+                    }
+                    result?;
+                } else {
+                    eval_script(ctx.clone(), &shared_js)?;
+                }
             }
+            record_js_memory(&mut memory_samples, "jslib", &ctx);
+            js_profile_mark(&mut profile_mark, &mut profile_stages, 3);
 
             eval_script(
                 ctx.clone(),
@@ -3478,8 +2046,10 @@ pub(super) fn eval_js_inner_with_source(
                     }),
                 )?;
             }
+            js_profile_mark(&mut profile_mark, &mut profile_stages, 4);
             let scoped_script = format!("{{\n{script}\n}}");
             let v = eval_script(ctx.clone(), &scoped_script)?;
+            js_profile_mark(&mut profile_mark, &mut profile_stages, 5);
             if let Some((_, updated)) = header_map {
                 *updated.borrow_mut() = Some(collect_header_map(&ctx)?);
             }
@@ -3541,8 +2111,37 @@ pub(super) fn eval_js_inner_with_source(
             }
             Ok(result)
         });
+        // Capture partial runs without entering Context::with on the default path.
+        if !memory_samples.is_empty() {
+            ctx.with(|ctx| record_js_memory(&mut memory_samples, "after_eval", &ctx));
+        }
+        let drop_mark = (*JS_PROFILE_ENABLED).then(Instant::now);
         drop(ctx);
+        if !memory_samples.is_empty() {
+            memory_samples.push(("after_drop", runtime.memory_usage()));
+        }
+        if let Some(mark) = drop_mark {
+            profile_cleanup[0] = mark.elapsed().as_micros();
+        }
+        let gc_mark = (*JS_PROFILE_ENABLED).then(Instant::now);
         runtime.run_gc();
+        if !memory_samples.is_empty() {
+            memory_samples.push(("after_gc", runtime.memory_usage()));
+            report_js_memory(&memory_samples);
+        }
+        if let Some(mark) = gc_mark {
+            profile_cleanup[1] = mark.elapsed().as_micros();
+        }
+        js_profile_mark(&mut profile_mark, &mut profile_stages, 6);
+        if *JS_PROFILE_ENABLED {
+            let setup = JS_SETUP_METRICS.with(|totals| *totals.borrow());
+            let slots = JS_SETUP_SLOT_METRICS.with(|totals| *totals.borrow());
+            let phases = JS_BYTECODE_PHASE_METRICS.with(|totals| *totals.borrow());
+            let lib_split = JS_LIB_SPLIT_METRICS.with(|totals| *totals.borrow());
+            let lib_cache = JS_LIB_CACHE_STATS.with(|stats| *stats.borrow());
+            let bridge = JS_BRIDGE_METRICS.with(|metrics| *metrics.borrow());
+            JS_PROFILE_TOTALS.with(|totals| totals.borrow_mut().add(profile_stages, setup, profile_cleanup, slots, phases, lib_split, lib_cache, bridge));
+        }
         eval_result
     })
 }
@@ -3904,7 +2503,8 @@ pub(crate) fn java_get_string(
     } else {
         // 默认 CSS / HTML 模式
         let pure = if let Some(stripped) = main_rule
-            .strip_prefix("@css:")
+            .strip_prefix("@@")
+            .or_else(|| main_rule.strip_prefix("@css:"))
             .or_else(|| main_rule.strip_prefix("@CSS:"))
         {
             stripped.trim()
@@ -4112,7 +2712,8 @@ fn java_get_string_list_inner(
             .collect()
     } else {
         let pure = if let Some(stripped) = main_rule
-            .strip_prefix("@css:")
+            .strip_prefix("@@")
+            .or_else(|| main_rule.strip_prefix("@css:"))
             .or_else(|| main_rule.strip_prefix("@CSS:"))
         {
             stripped.trim()
@@ -4389,6 +2990,82 @@ fn java_symmetric_crypto(
 
 // Legado rules commonly assign undeclared globals, so evaluate them as sloppy
 // global scripts rather than modules/strict scripts.
+// Diagnostic alternative to eval_script, never used without explicit opt-in.
+// Compile only once per invocation, then execute exactly once in the same
+// fresh Context. This separates compilation from top-level side effects.
+fn eval_js_lib_split<'js>(
+    ctx: rquickjs::Ctx<'js>,
+    script: &str,
+    timings: &mut [u128; 3],
+) -> anyhow::Result<Value<'js>> {
+    let source = std::ffi::CString::new(script)?;
+    let raw_ctx = ctx.as_raw().as_ptr();
+    let compile_start = Instant::now();
+    // SAFETY: script and filename remain valid for the entire call. Match
+    // eval_script's non-strict global mode and eval_script filename.
+    let compiled = unsafe {
+        rquickjs::qjs::JS_Eval(
+            raw_ctx, source.as_ptr(), script.len() as _, c"eval_script".as_ptr(),
+            (rquickjs::qjs::JS_EVAL_TYPE_GLOBAL | rquickjs::qjs::JS_EVAL_FLAG_COMPILE_ONLY) as _,
+        )
+    };
+    timings[0] = compile_start.elapsed().as_micros();
+    if unsafe { rquickjs::qjs::JS_IsException(compiled) } {
+        return Err(anyhow::anyhow!("JS Exception: {:?}", ctx.catch()));
+    }
+    // SAFETY: JS_EvalFunction consumes the owned bytecode value even on error.
+    let exec_start = Instant::now();
+    let result = unsafe { rquickjs::qjs::JS_EvalFunction(raw_ctx, compiled) };
+    timings[2] = exec_start.elapsed().as_micros();
+    if unsafe { rquickjs::qjs::JS_IsException(result) } {
+        Err(anyhow::anyhow!("JS Exception: {:?}", ctx.catch()))
+    } else {
+        Ok(unsafe { Value::from_raw(ctx, result) })
+    }
+}
+
+// Production: only reuse serialized bytecode within one active reader_execute
+// operation. Never keep the source or bytecode after the session is dropped.
+fn eval_js_lib_for_operation<'js>(
+    ctx: rquickjs::Ctx<'js>,
+    script: &str,
+    session: &crate::runtime::session::ActiveSession,
+    mut times: Option<&mut [u128; 3]>,
+) -> anyhow::Result<Value<'js>> {
+    if !crate::runtime::session::ActiveSession::allows_js_lib_bytecode(script) {
+        return eval_script(ctx, script);
+    }
+    let bytes = if let Some(bytes) = session.js_lib_bytecode_get(script) {
+        if times.is_some() {
+            JS_LIB_CACHE_STATS.with(|stats| stats.borrow_mut().0 += 1);
+        }
+        bytes
+    } else {
+        // Compile once for this operation. Errors propagate without retry.
+        let start = times.as_ref().map(|_| Instant::now());
+        let compiled = js_bytecode::compile(&ctx, script);
+        if let Some(start) = start {
+            times.as_deref_mut().unwrap()[0] = start.elapsed().as_micros();
+        }
+        let bytes = compiled?;
+        session.js_lib_bytecode_put(script, bytes.clone());
+        bytes
+    };
+    if times.is_some() {
+        JS_LIB_CACHE_STATS.with(|stats| {
+            let mut stats = stats.borrow_mut();
+            stats.1 = stats.1.max(bytes.len());
+        });
+    }
+    let mut phases = js_bytecode::BytecodeTimings::default();
+    let result = js_bytecode::execute(ctx, &bytes, times.as_ref().map(|_| &mut phases));
+    if let Some(times) = times {
+        times[1] = phases.read_us;
+        times[2] = phases.eval_us;
+    }
+    result
+}
+
 fn eval_script<'js>(ctx: rquickjs::Ctx<'js>, script: &str) -> anyhow::Result<Value<'js>> {
     let mut options = EvalOptions::default();
     options.global = true;
@@ -4410,6 +3087,17 @@ fn active_js_lib_script() -> anyhow::Result<String> {
     let Some(js_lib) = js_lib.filter(|value| !value.trim().is_empty()) else {
         return Ok(String::new());
     };
+    // Plain inline source needs only trimming, not content hashing or a
+    // second cached copy. It is still evaluated in each fresh Context.
+    // Keep JSON-object libraries on the existing URL/session cache path.
+    let trimmed = js_lib.trim();
+    if !trimmed.starts_with('{') {
+        return Ok(if trimmed.len() == js_lib.len() {
+            js_lib
+        } else {
+            trimmed.to_string()
+        });
+    }
     let cache_key = md5_hex(&js_lib);
     // A remote library can depend on a user's cookies. Keep it in the active
     // operation only; a process-global cache would expose one user's script
@@ -6123,6 +4811,19 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
         "#;
         let result = eval_js(script, "", "https://example.com").unwrap();
         assert_eq!(result, "first|2|last|last|first|p1|<b>one</b>|one");
+    }
+
+    #[test]
+    fn java_get_string_css_prefix_matches_plain_rules() {
+        let script = r#"
+            java.setContent('<a href="https://fixture.invalid/book.txt">第一下载地址(首选)</a>');
+            [java.getString('@@text.第一下载地址(首选)@href'),
+             java.getString('text.第一下载地址(首选)@href'),
+             java.getStringList('@@a@href').join('|'),
+             java.getString('@@a@href')].join('|')
+        "#;
+        let result = eval_js(script, "", "https://fixture.invalid").unwrap();
+        assert_eq!(result, vec!["https://fixture.invalid/book.txt"; 4].join("|"));
     }
 
     #[test]
