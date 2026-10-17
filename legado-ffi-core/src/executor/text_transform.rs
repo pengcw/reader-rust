@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 // so include both here to preserve the effective Java semantics.
 const QREAD_REGEX_FLAGS: &str = "uUm";
 const MAX_TRANSFORM_DIAGNOSTICS: usize = 16;
+pub(super) const TITLE_TRANSFORM_MIN_BYTES: usize = 16 * 1024;
 
 /// Records bounded failure categories, never rule contents or exception messages.
 #[derive(Debug)]
@@ -119,6 +120,7 @@ struct TextTransformRule {
 pub(super) fn apply_from_params(
     values: &mut [String],
     params: &Value,
+    min_output_bytes: usize,
     diagnostics: &mut TransformDiagnostics,
 ) {
     let Some((dialect, rules)) = parse_transform_request(params, diagnostics) else {
@@ -139,7 +141,14 @@ pub(super) fn apply_from_params(
         }
         TextTransformDialect::Legado | TextTransformDialect::Qread => {
             for value in values {
-                *value = apply_java_rules(value, &rules, dialect, diagnostics);
+                let max_output_bytes = value.len().max(min_output_bytes);
+                *value = apply_java_rules(
+                    value,
+                    &rules,
+                    dialect,
+                    max_output_bytes,
+                    diagnostics,
+                );
             }
         }
     }
@@ -201,6 +210,7 @@ fn apply_java_rules(
     input: &str,
     rules: &[(usize, TextTransformRule)],
     dialect: TextTransformDialect,
+    max_output_bytes: usize,
     diagnostics: &mut TransformDiagnostics,
 ) -> String {
     let mut output = input.to_string();
@@ -210,6 +220,19 @@ fn apply_java_rules(
             continue;
         }
         if !rule.is_regex {
+            if rule.replacement.len() > rule.pattern.len() {
+                let growth_per_match = rule.replacement.len() - rule.pattern.len();
+                let exceeds_limit = output
+                    .matches(&rule.pattern)
+                    .count()
+                    .checked_mul(growth_per_match)
+                    .and_then(|growth| output.len().checked_add(growth))
+                    .is_none_or(|next_len| next_len > max_output_bytes);
+                if exceeds_limit {
+                    diagnostics.record(Some(*index), "output_limit_exceeded");
+                    continue;
+                }
+            }
             output = output.replace(&rule.pattern, &rule.replacement);
             continue;
         }
@@ -272,6 +295,7 @@ mod tests {
         apply_from_params(
             &mut values,
             &params(dialect, rules),
+            usize::MAX,
             &mut TransformDiagnostics::new(false),
         );
         values.remove(0)
@@ -358,6 +382,7 @@ mod tests {
                     {"pattern":"a","replacement":"ok","isRegex":false}
                 ]),
             ),
+            usize::MAX,
             &mut TransformDiagnostics::new(false),
         );
         assert_eq!(values, ["ok", "ok"]);
@@ -375,6 +400,7 @@ mod tests {
                     {"pattern":"b","replacement":"c","isRegex":false}
                 ]),
             ),
+            usize::MAX,
             &mut TransformDiagnostics::new(false),
         );
         assert_eq!(values, ["c a", "c"]);
@@ -468,6 +494,7 @@ mod tests {
                     {"pattern":"a","replacement":"ok","isRegex":false}
                 ]),
             ),
+            usize::MAX,
             &mut diagnostics,
         );
         assert_eq!(values, ["ok b"]);
@@ -495,7 +522,12 @@ mod tests {
             .map(|_| json!({"pattern":"[","replacement":"bad","isRegex":true}))
             .collect::<Vec<_>>();
         let mut diagnostics = TransformDiagnostics::new(true);
-        apply_from_params(&mut values, &params("qread", json!(rules)), &mut diagnostics);
+        apply_from_params(
+            &mut values,
+            &params("qread", json!(rules)),
+            usize::MAX,
+            &mut diagnostics,
+        );
         assert_eq!(values, ["a", "a", "a"]);
         let mut response = json!({"meta":{"debug":{}}});
         diagnostics.attach(&mut response, "toc");
@@ -517,6 +549,7 @@ mod tests {
         apply_from_params(
             &mut values,
             &params("unknown", json!([{"pattern":"a"}])),
+            usize::MAX,
             &mut disabled,
         );
         let mut response = json!({"meta":{}});
@@ -527,6 +560,7 @@ mod tests {
         apply_from_params(
             &mut values,
             &params("unknown", json!([{"pattern":"a"}])),
+            usize::MAX,
             &mut enabled,
         );
         enabled.attach(&mut response, "content");

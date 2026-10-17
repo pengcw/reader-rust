@@ -9,6 +9,7 @@ use base64::{engine::general_purpose, Engine};
 use encoding_rs::Encoding;
 use std::sync::LazyLock as Lazy;
 mod http;
+pub(crate) mod script_cache;
 mod response;
 pub mod session;
 mod url_rule;
@@ -61,6 +62,8 @@ pub struct RequestSpec {
     pub proxy: Option<String>,
     pub response_type: Option<String>,
     pub render_with_rakers: bool,
+    pub render_timeout_ms: Option<u64>,
+    pub blocked_scripts: Vec<regex::Regex>,
     pub(crate) body_js: Option<BodyJs>,
 }
 
@@ -182,20 +185,50 @@ impl HttpSession {
         &self.webview_client
     }
 
+    /// Render an already supplied document without repeating the main-page GET.
+    pub(crate) fn render_supplied_html(
+        &self,
+        spec: &RequestSpec,
+        html: &str,
+        max_response_bytes: usize,
+        render_timeout_ms: u64,
+    ) -> Result<String, FetchError> {
+        if html.len() > max_response_bytes {
+            return Err(FetchError::ResponseTooLarge {
+                url: spec.url.clone(), limit: max_response_bytes,
+            });
+        }
+        if !spec.render_with_rakers {
+            return Ok(html.to_string());
+        }
+        let client = match spec.proxy.as_deref().filter(|p| !p.trim().is_empty()) {
+            Some(proxy) => self.webview_client.with_proxy(proxy).map_err(map_http_client_error)?,
+            None => self.webview_client.clone(),
+        };
+        if let Ok(url) = url::Url::parse(&spec.url) {
+            let cookie = spec.headers.iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+                .map(|(_, value)| value.as_str()).collect::<Vec<_>>().join("; ");
+            if !cookie.is_empty() {
+                client.seed_cookie_header(&cookie, &url);
+            }
+        }
+        render_with_rakers(&client, spec, &spec.url, html, max_response_bytes, render_timeout_ms)
+    }
+
     pub fn fetch(
         &self,
         spec: &RequestSpec,
         max_response_bytes: usize,
     ) -> Result<HttpResponse, FetchError> {
-        self.fetch_with_webview_async(spec, max_response_bytes, false)
+        self.fetch_with_render_timeout(spec, max_response_bytes, DEFAULT_BROWSER_RENDER_TIMEOUT_MS)
     }
 
-    /// Only the TOC executor opts in. Ordinary source fetches remain synchronous.
-    pub(crate) fn fetch_with_webview_async(
+    pub(crate) fn fetch_with_render_timeout(
         &self,
         spec: &RequestSpec,
         max_response_bytes: usize,
-        async_http: bool,
+        render_timeout_ms: u64,
     ) -> Result<HttpResponse, FetchError> {
         if let Some(response) = data_uri_response(spec, Some(max_response_bytes)) {
             let response = response.map_err(map_http_client_error)?;
@@ -308,7 +341,7 @@ impl HttpSession {
                             &url,
                             &body,
                             max_response_bytes,
-                            async_http,
+                            render_timeout_ms,
                         )?
                     } else {
                         body
@@ -345,7 +378,6 @@ impl HttpSession {
 const RAKERS_MAX_REMOTE_SCRIPTS: usize = 8;
 const RAKERS_MAX_REQUESTS: usize = 32;
 const RAKERS_SCRIPT_TIMEOUT: Duration = Duration::from_secs(3);
-const RAKERS_RENDER_TIMEOUT: Duration = Duration::from_secs(15);
 // Read-only browser pages load external scripts before fetching their content.
 pub(crate) const DEFAULT_BROWSER_SCRIPT_TIMEOUT_MS: u64 = 3_000;
 pub(crate) const MAX_BROWSER_SCRIPT_TIMEOUT_MS: u64 = 30_000;
@@ -374,15 +406,17 @@ impl rakers::HttpTransport for RakersHttpTransport {
     fn execute(&self, request: rakers::HttpRequest) -> Result<rakers::HttpResponse, String> {
         let method = Method::from_bytes(request.method.as_bytes())
             .map_err(|error| format!("invalid HTTP method: {error}"))?;
-        let response = self
-            .client
-            .execute(
-                method,
-                &request.url,
-                &request.headers,
-                request.body.as_deref(),
+        let response = if request.purpose == rakers::RequestPurpose::Script {
+            self.client.execute_script(
+                method, &request.url, &request.headers, request.body.as_deref(),
                 Some(self.max_response_bytes.max(1)),
             )
+        } else {
+            self.client.execute(
+                method, &request.url, &request.headers, request.body.as_deref(),
+                Some(self.max_response_bytes.max(1)),
+            )
+        }
             .map_err(|error| error.to_string())?;
         let headers = response
             .headers
@@ -425,6 +459,7 @@ fn render_rakers_page(
     render_timeout: Duration,
     script_timeout: Duration,
     async_http: bool,
+    blocked_scripts: &[regex::Regex],
 ) -> Result<rakers::RenderOutput, FetchError> {
     let limit = max_response_bytes.max(1);
     // Do not copy raw source credentials into page-controlled requests. Cookies
@@ -438,6 +473,7 @@ fn render_rakers_page(
         max_requests: Some(RAKERS_MAX_REQUESTS),
         max_response_bytes: Some(max_response_bytes.max(1)),
         render_timeout: Some(render_timeout),
+        blocked_scripts: blocked_scripts.to_vec(),
         async_http: async_http && !crate::host_services::is_offline(),
     };
     let rendered = rakers::render_detailed(
@@ -473,6 +509,7 @@ pub(crate) fn render_webview_with_rakers(
     max_response_bytes: usize,
     timeouts: BrowserTimeouts,
     async_http: bool,
+    blocked_scripts: &[regex::Regex],
 ) -> Result<rakers::RenderOutput, FetchError> {
     let limit = max_response_bytes.max(1);
     if html.len() > limit {
@@ -493,6 +530,7 @@ pub(crate) fn render_webview_with_rakers(
         Duration::from_millis(timeouts.render_ms),
         Duration::from_millis(timeouts.script_ms),
         async_http,
+        blocked_scripts,
     )
 }
 
@@ -502,7 +540,7 @@ fn render_with_rakers(
     page_url: &str,
     html: &str,
     max_response_bytes: usize,
-    async_http: bool,
+    render_timeout_ms: u64,
 ) -> Result<String, FetchError> {
     let user_agent = spec
         .headers
@@ -519,9 +557,10 @@ fn render_with_rakers(
         spec.proxy.clone(),
         true,
         max_response_bytes,
-        RAKERS_RENDER_TIMEOUT,
+        Duration::from_millis(spec.render_timeout_ms.unwrap_or(render_timeout_ms)),
         RAKERS_SCRIPT_TIMEOUT,
-        async_http,
+        true,
+        &spec.blocked_scripts,
     )?
     .html)
 }
@@ -586,13 +625,6 @@ fn data_uri_response(
 /// Execute an AnalyzeUrl request for JavaScript APIs while preserving its request
 /// options and the source-bound cookie session. Unlike `fetch`, this returns
 /// non-2xx HTTP responses instead of converting their status into an error.
-pub(crate) fn execute_request_spec(
-    client: &HttpClient,
-    spec: &RequestSpec,
-) -> Result<RawHttpResponse, HttpClientError> {
-    execute_request_spec_limited(client, spec, None)
-}
-
 pub(crate) fn execute_request_spec_limited(
     client: &HttpClient,
     spec: &RequestSpec,
@@ -977,6 +1009,34 @@ mod tests {
                 .headers
                 .iter()
                 .any(|(name, value)| name == "X-Test" && value == "keep"));
+        }
+    }
+
+    #[test]
+    fn url_block_is_validated_and_scoped_to_webview_requests() {
+        let base = "https://example.test";
+        let source = BookSource { book_source_url: base.into(), ..Default::default() };
+        let spec = analyze_url(r#"/page,{"webView":true,"block":["^/beacon\\.js$"]}"#, "", 1, base, &source).unwrap();
+        assert!(spec.render_with_rakers);
+        assert!(spec.blocked_scripts[0].is_match("/beacon.js"));
+        assert!(!spec.blocked_scripts[0].is_match("/beacon.js?foo=1"));
+        assert!(analyze_url("/page", "", 1, base, &source).unwrap().blocked_scripts.is_empty());
+        for rule in [
+            r#"/page,{"webView":false,"block":["^/beacon"]}"#,
+            r#"/page,{"webView":false,"block":"legacy"}"#,
+            r#"/page,{"webView":"false","block":["["]}"#,
+            r#"/page,{"block":[1]}"#,
+        ] {
+            let plain = analyze_url(rule, "", 1, base, &source).unwrap();
+            assert!(!plain.render_with_rakers, "{rule}");
+            assert!(plain.blocked_scripts.is_empty(), "{rule}");
+        }
+        for rule in [
+            r#"/page,{"webView":true,"block":"x"}"#,
+            r#"/page,{"webView":true,"block":[1]}"#,
+            r#"/page,{"webView":true,"block":["["]}"#,
+        ] {
+            assert!(analyze_url(rule, "", 1, base, &source).is_err(), "{rule}");
         }
     }
 

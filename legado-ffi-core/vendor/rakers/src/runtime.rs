@@ -704,6 +704,26 @@ mod quickjs_rt {
             .set("_r_request_sync", request_fn)
             .map_err(|e| anyhow!("{e:?}"))?;
 
+        // Dynamic <script src> only; fetch, XHR and generic HTTP remain uncached.
+        let script_fn = Function::new(
+            ctx.clone(),
+            |method: String, url: String, headers: String, body: String| -> String {
+                let cfg = HTTP_CONFIG.with(|slot| slot.borrow().clone());
+                let budget = HTTP_BUDGET.with(|slot| slot.borrow().clone());
+                match (cfg, budget) {
+                    (Some(cfg), Some(budget)) if method == "GET" && body.is_empty() => {
+                        let headers = super::browser_request_headers(&headers);
+                        super::serialize_http_result(cfg.execute_script(
+                            &budget, &url, &headers, cfg.forward_headers,
+                        ))
+                    }
+                    _ => serde_json::json!({"error":"Script HTTP bridge is unavailable"}).to_string(),
+                }
+            },
+        ).map_err(|e| anyhow!("{e:?}"))?;
+        ctx.globals().set("_r_script_request_sync", script_fn)
+            .map_err(|e| anyhow!("{e:?}"))?;
+
         let async_enabled = HTTP_CONFIG.with(|slot| {
             slot.borrow().as_ref().is_some_and(|cfg| cfg.async_http)
         });

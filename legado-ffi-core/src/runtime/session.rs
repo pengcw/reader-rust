@@ -19,6 +19,14 @@ use url::Url;
 const JS_CACHE_STATE_KEY: &str = "__reader_js_cache_v1";
 const JS_CACHE_MAX_ENTRIES: usize = 64;
 const JS_CACHE_MAX_VALUE_BYTES: usize = 16 * 1024;
+
+const SESSION_VARIABLE_MAX_ENTRIES: usize = 64;
+const SESSION_VARIABLE_MAX_KEY_BYTES: usize = 256;
+const SESSION_VARIABLE_MAX_VALUE_BYTES: usize = 64 * 1024;
+
+const MEMORY_CACHE_MAX_ENTRIES: usize = 64;
+const MEMORY_CACHE_MAX_KEY_BYTES: usize = 256;
+const MEMORY_CACHE_MAX_VALUE_BYTES: usize = 256 * 1024;
 // Cache only medium/large jsLib scripts within one operation.
 // UTF-8 source byte length is inclusive: 20 KiB through 1024 KiB.
 const JS_LIB_SOURCE_MIN: usize = 20 * 1024;
@@ -29,6 +37,55 @@ fn now_epoch_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn value_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Number(_) => 24,
+        Value::String(value) => value.len(),
+        Value::Array(values) => values
+            .iter()
+            .fold(0usize, |size, value| size.saturating_add(value_bytes(value))),
+        Value::Object(values) => values.iter().fold(0usize, |size, (key, value)| {
+            size.saturating_add(key.len())
+                .saturating_add(value_bytes(value))
+        }),
+    }
+}
+
+fn js_cache_state_within_limits(value: &Value) -> bool {
+    let Some(entries) = value.as_object() else {
+        return false;
+    };
+    if entries.len() > JS_CACHE_MAX_ENTRIES {
+        return false;
+    }
+    entries.iter().all(|(key, entry)| {
+        key.len() <= SESSION_VARIABLE_MAX_KEY_BYTES
+            && entry
+                .get("value")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.len() <= JS_CACHE_MAX_VALUE_BYTES)
+            && value_bytes(entry) <= JS_CACHE_MAX_VALUE_BYTES + 512
+    })
+}
+
+fn variable_entry_within_limits(key: &str, value: &Value) -> bool {
+    key.len() <= SESSION_VARIABLE_MAX_KEY_BYTES
+        && if key == JS_CACHE_STATE_KEY {
+            js_cache_state_within_limits(value)
+        } else {
+            value_bytes(value) <= SESSION_VARIABLE_MAX_VALUE_BYTES
+        }
+}
+
+fn variable_map_within_limits(values: &HashMap<String, Value>) -> bool {
+    values.len() <= SESSION_VARIABLE_MAX_ENTRIES
+        && values
+            .iter()
+            .all(|(key, value)| variable_entry_within_limits(key, value))
 }
 
 /// 对称会话 DTO：输入与输出同构
@@ -44,6 +101,14 @@ pub struct ExecuteSession {
     pub header: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variables: Option<HashMap<String, Value>>,
+}
+
+impl ExecuteSession {
+    pub(crate) fn variables_within_limits(&self) -> bool {
+        self.variables
+            .as_ref()
+            .is_none_or(variable_map_within_limits)
+    }
 }
 
 /// 执行运行时的活动会话状态句柄
@@ -192,25 +257,55 @@ impl ActiveSession {
         }
     }
 
-    pub fn set_variable(&self, key: &str, value: Value) {
+    pub fn set_variable(&self, key: &str, value: Value) -> bool {
+        if value_bytes(&value) > SESSION_VARIABLE_MAX_VALUE_BYTES {
+            return false;
+        }
+
         let mut map = self.variables.lock().unwrap_or_else(|e| e.into_inner());
+        let mut new_entries = 0usize;
+        let mut check_key = |candidate: &str| {
+            if candidate.len() > SESSION_VARIABLE_MAX_KEY_BYTES {
+                return false;
+            }
+            if !map.contains_key(candidate) {
+                new_entries += 1;
+            }
+            true
+        };
+        let keys_ok = if key.is_empty() {
+            check_key("variable") && check_key("sourceVariable")
+        } else {
+            check_key(key)
+                && (map.contains_key("variable") || key == "variable" || check_key("variable"))
+        };
+        if !keys_ok || map.len().saturating_add(new_entries) > SESSION_VARIABLE_MAX_ENTRIES {
+            return false;
+        }
+
         if key.is_empty() {
             map.insert("variable".to_string(), value.clone());
             map.insert("sourceVariable".to_string(), value);
         } else {
             map.insert(key.to_string(), value.clone());
-            // Also maintain default variable if not set
+            // Also maintain default variable if not set.
             if !map.contains_key("variable") {
                 map.insert("variable".to_string(), value);
             }
         }
+        true
     }
 
-    pub fn set_variable_exact(&self, key: &str, value: Value) {
-        self.variables
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key.to_string(), value);
+    pub fn set_variable_exact(&self, key: &str, value: Value) -> bool {
+        if !variable_entry_within_limits(key, &value) {
+            return false;
+        }
+        let mut map = self.variables.lock().unwrap_or_else(|e| e.into_inner());
+        if !map.contains_key(key) && map.len() >= SESSION_VARIABLE_MAX_ENTRIES {
+            return false;
+        }
+        map.insert(key.to_string(), value);
+        true
     }
 
     /// Cache values live in the caller-owned session, never in a process-wide map.
@@ -253,11 +348,21 @@ impl ActiveSession {
             .cloned()
     }
 
-    pub(crate) fn memory_cache_put(&self, key: String, value: Value) {
-        self.memory_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key, value);
+    pub(crate) fn memory_cache_put_serialized(&self, key: String, encoded: &str) -> bool {
+        if key.len() > MEMORY_CACHE_MAX_KEY_BYTES
+            || encoded.len() > MEMORY_CACHE_MAX_VALUE_BYTES
+        {
+            return false;
+        }
+        let Ok(value) = serde_json::from_str(encoded) else {
+            return false;
+        };
+        let mut cache = self.memory_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if !cache.contains_key(&key) && cache.len() >= MEMORY_CACHE_MAX_ENTRIES {
+            return false;
+        }
+        cache.insert(key, value);
+        true
     }
 
     pub(crate) fn memory_cache_delete(&self, key: &str) {
@@ -292,6 +397,11 @@ impl ActiveSession {
             return false;
         }
         let mut variables = self.variables.lock().unwrap_or_else(|e| e.into_inner());
+        if !variables.contains_key(JS_CACHE_STATE_KEY)
+            && variables.len() >= SESSION_VARIABLE_MAX_ENTRIES
+        {
+            return false;
+        }
         let entries = variables
             .entry(JS_CACHE_STATE_KEY.to_string())
             .or_insert_with(|| Value::Object(serde_json::Map::new()));

@@ -1,5 +1,9 @@
 // LinkeDOM DOM adapter. Networking and scheduling remain host-owned.
 function _r_initialize_linkedom(html) {
+    // Keep the script-purpose transport private to DOM insertion machinery.
+    // Arbitrary page JS must not be able to label its own fetch/XHR as a script.
+    var scriptRequest = globalThis._r_script_request_sync;
+    delete globalThis._r_script_request_sync;
     var previous = document;
     document = _r_linkedom.parseHTML(html).document;
     // LinkeDOM reads RegExp.$1/$4/$6 while parsing DOCTYPE, which QuickJS lacks.
@@ -69,7 +73,7 @@ function _r_initialize_linkedom(html) {
             var event = 'error', saved = document.currentScript;
             try {
                 var url = _r_parse_url(script.src, window.location.href).href;
-                var response = JSON.parse(_r_request_sync('GET', url, '{}', '') || '{}');
+                var response = JSON.parse(scriptRequest('GET', url, '{}', '') || '{}');
                 if (!response.error && response.status >= 200 && response.status < 300) {
                     event = 'load'; document.currentScript = script;
                     try { (0, eval)(String(response.body || '')); }
@@ -123,23 +127,32 @@ function _r_initialize_linkedom(html) {
             return result;
         };
     });
+    // Both Image() and createElement('img') share the same no-decoder behavior.
+    var imageProto = _r_linkedom.HTMLImageElement.prototype;
+    var imagePending = new WeakMap();
+    Object.defineProperties(imageProto, {
+        complete: {get: function() { return !imagePending.has(this); }},
+        naturalWidth: {get: function() { return 0; }},
+        naturalHeight: {get: function() { return 0; }}
+    });
+    var imageSetAttribute = imageProto.setAttribute;
+    imageProto.setAttribute = function(name, value) {
+        var result = imageSetAttribute.call(this, name, value);
+        if (String(name).toLowerCase() === 'src') {
+            var image = this;
+            if (imagePending.has(image)) clearTimeout(imagePending.get(image));
+            imagePending.delete(image);
+            if (String(value)) imagePending.set(image, setTimeout(function() {
+                imagePending.delete(image);
+                image.dispatchEvent(new _r_linkedom.Event('error'));
+            }, 0));
+        }
+        return result;
+    };
     window.Image = function(width, height) {
-        var image = document.createElement('img'), pending = 0;
+        var image = document.createElement('img');
         image.width = width === undefined ? 0 : Number(width) >>> 0;
         image.height = height === undefined ? 0 : Number(height) >>> 0;
-        image.complete = true; image.naturalWidth = 0; image.naturalHeight = 0;
-        Object.defineProperty(image, 'src', {
-            get: function() { return image.getAttribute('src') || ''; },
-            set: function(value) {
-                image.setAttribute('src', String(value));
-                if (pending) clearTimeout(pending);
-                image.complete = !String(value);
-                if (String(value)) pending = setTimeout(function() {
-                    pending = 0; image.complete = true;
-                    image.dispatchEvent(new _r_linkedom.Event('error'));
-                }, 0);
-            }
-        });
         return image;
     };
     window.Image.prototype = _r_linkedom.HTMLImageElement.prototype;

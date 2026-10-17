@@ -5,9 +5,9 @@
 
 pub(crate) use crate::crawler::HttpClient;
 use crate::crawler::{
-    analyze_url_with_headers, decode_body, execute_request_spec, execute_request_spec_limited,
-    format_analyzed_body, map_http_client_error, render_webview_with_rakers, BrowserTimeouts,
-    FetchError, HttpClientError, RequestSpec, DEFAULT_WEBVIEW_USER_AGENT,
+    analyze_url_with_headers, decode_body, execute_request_spec_limited, format_analyzed_body,
+    map_http_client_error, render_webview_with_rakers, BrowserTimeouts, FetchError,
+    HttpClientError, RequestSpec, DEFAULT_WEBVIEW_USER_AGENT,
 };
 use crate::model::book_source::BookSource;
 use crate::parser::js_compat::json_value_to_string;
@@ -23,6 +23,7 @@ use ureq::http::Method;
 pub(super) struct JsHttpContext {
     request_client: HttpClient,
     webview_client: HttpClient,
+    max_response_bytes: usize,
 }
 
 thread_local! {
@@ -34,11 +35,18 @@ pub(crate) fn with_browser_http_clients<T>(
     webview_client: &HttpClient,
     source: &BookSource,
     timeouts: BrowserTimeouts,
+    max_response_bytes: usize,
     f: impl FnOnce() -> T,
 ) -> T {
     BROWSER_TIMEOUTS.with(|cell| {
         crate::util::scoped::with_scoped_value(cell, timeouts, || {
-            with_js_http_clients(request_client, webview_client, source, f)
+            with_js_http_clients_limited(
+                request_client,
+                webview_client,
+                source,
+                max_response_bytes,
+                f,
+            )
         })
     })
 }
@@ -59,6 +67,7 @@ pub(crate) fn with_js_http_client<T>(client: &HttpClient, f: impl FnOnce() -> T)
     let context = JsHttpContext {
         request_client: client.clone(),
         webview_client: client.clone(),
+        max_response_bytes: crate::executor::DEFAULT_MAX_RESPONSE_BYTES,
     };
     ACTIVE_JS_HTTP_CONTEXT
         .with(|cell| crate::util::scoped::with_scoped_value(cell, Some(context), f))
@@ -71,9 +80,26 @@ pub(crate) fn with_js_http_clients<T>(
     source: &BookSource,
     f: impl FnOnce() -> T,
 ) -> T {
+    with_js_http_clients_limited(
+        request_client,
+        webview_client,
+        source,
+        crate::executor::DEFAULT_MAX_RESPONSE_BYTES,
+        f,
+    )
+}
+
+fn with_js_http_clients_limited<T>(
+    request_client: &HttpClient,
+    webview_client: &HttpClient,
+    source: &BookSource,
+    max_response_bytes: usize,
+    f: impl FnOnce() -> T,
+) -> T {
     let context = JsHttpContext {
         request_client: request_client.clone(),
         webview_client: webview_client.clone(),
+        max_response_bytes: max_response_bytes.max(1),
     };
     ACTIVE_JS_BOOK_SOURCE.with(|source_cell| {
         crate::util::scoped::with_scoped_value(source_cell, Some(source.clone()), || {
@@ -112,6 +138,16 @@ fn active_js_webview_client() -> HttpClient {
         .unwrap_or_else(|| JS_HTTP_CLIENT.clone())
 }
 
+fn active_js_max_response_bytes() -> usize {
+    ACTIVE_JS_HTTP_CONTEXT
+        .with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .map(|context| context.max_response_bytes)
+        })
+        .unwrap_or(crate::executor::DEFAULT_MAX_RESPONSE_BYTES)
+}
+
 pub(super) fn webview_user_agent() -> String {
     DEFAULT_WEBVIEW_USER_AGENT.to_string()
 }
@@ -134,7 +170,14 @@ pub(super) fn decode_archive_text(bytes: &[u8], charset: &str) -> Option<String>
 pub(super) fn resolve_js_lib_entry(entry: &str) -> anyhow::Result<String> {
     let value = entry.trim();
     if url::Url::parse(value).is_ok_and(|url| matches!(url.scheme(), "http" | "https")) {
-        return Ok(active_js_http_client().request_text(Method::GET, value, &[], None)?);
+        let response = active_js_http_client().execute_script(
+            Method::GET,
+            value,
+            &[],
+            None,
+            Some(active_js_max_response_bytes()),
+        )?;
+        return Ok(String::from_utf8_lossy(&response.body).into_owned());
     }
     Ok(value.to_string())
 }
@@ -152,7 +195,7 @@ pub(crate) fn try_render_webview(
     js: &str,
     limit: usize,
 ) -> Result<(String, Option<String>), FetchError> {
-    let (output, page_url) = render_webview_output(html, url, js, limit, false)?;
+    let (output, page_url) = render_webview_output(html, url, js, limit, false, false, &[])?;
     let rendered = if !js.trim().is_empty() {
         output
             .script_result
@@ -163,34 +206,14 @@ pub(crate) fn try_render_webview(
     Ok((rendered, page_url))
 }
 
-/// Optional preview extjs runs in the original Rakers page runtime.
-/// It must evaluate to an HTML string; JS errors and empty results fall back to rendered HTML.
-/// Page/network failures and resource budget errors still propagate normally.
-pub(crate) fn try_render_preview(
+/// Thin, no-rule compatibility preview: render one page without extension execution.
+pub(crate) fn render_preview(
     html: &str,
     url: &str,
-    ext_js: &str,
     limit: usize,
 ) -> Result<(String, Option<String>), FetchError> {
-    // Check the JS type before Rakers coerces the result to a Rust string.
-    // Indirect eval retains the page-global scope and script completion value.
-    let script = if ext_js.trim().is_empty() {
-        String::new()
-    } else {
-        format!(
-            "(function() {{ var value = (0, eval)({}); return typeof value === 'string' ? value : undefined; }})()",
-            serde_json::to_string(ext_js).expect("serializing a string cannot fail"),
-        )
-    };
-    let (output, page_url) = render_webview_output(html, url, &script, limit, true)?;
-    let rendered = output
-        .script_result
-        .filter(|value| {
-            let value = value.trim();
-            !value.is_empty() && value != "undefined" && value != "null"
-        })
-        .unwrap_or(output.html);
-    Ok((rendered, page_url))
+    let (output, page_url) = render_webview_output(html, url, "", limit, true, true, &[])?;
+    Ok((output.html, page_url))
 }
 
 fn render_webview_output(
@@ -199,6 +222,8 @@ fn render_webview_output(
     js: &str,
     limit: usize,
     async_http: bool,
+    reject_http_errors: bool,
+    blocked_scripts: &[regex::Regex],
 ) -> Result<(rakers::RenderOutput, Option<String>), FetchError> {
     let client = active_js_webview_client();
     let url = url.trim();
@@ -224,6 +249,8 @@ fn render_webview_output(
                 proxy: None,
                 response_type: Some("base64".to_string()),
                 render_with_rakers: false,
+                render_timeout_ms: None,
+                blocked_scripts: Vec::new(),
                 body_js: None,
             };
             execute_request_spec_limited(&client, &spec, Some(limit))
@@ -233,6 +260,14 @@ fn render_webview_output(
                 .execute(Method::GET, url, &headers, None, Some(limit))
                 .map_err(map_http_client_error)?
         };
+        // Preview should not render HTTP error pages as successful content.
+        // Keep java.webView's existing response behavior unchanged.
+        if reject_http_errors && !(200..300).contains(&response.status) {
+            return Err(FetchError::HttpStatus {
+                status: response.status,
+                url: response.url,
+            });
+        }
         let content_type = response
             .headers
             .get("content-type")
@@ -253,6 +288,7 @@ fn render_webview_output(
         limit,
         BROWSER_TIMEOUTS.with(|cell| *cell.borrow()),
         async_http,
+        blocked_scripts,
     )?;
     Ok((output, page_url))
 }
@@ -264,12 +300,14 @@ pub(super) fn java_request_simple(
     headers_json: &str,
 ) -> anyhow::Result<String> {
     let method = Method::from_bytes(method.as_bytes()).unwrap_or(Method::GET);
-    Ok(active_js_http_client().request_text(
+    let response = active_js_http_client().execute(
         method,
         url.trim(),
         &java_request_headers(headers_json),
         body.as_deref(),
-    )?)
+        Some(active_js_max_response_bytes()),
+    )?;
+    Ok(String::from_utf8_lossy(&response.body).into_owned())
 }
 
 pub(super) fn java_request_simple_response(
@@ -284,6 +322,7 @@ pub(super) fn java_request_simple_response(
         body,
         headers_json,
         &active_js_http_client(),
+        active_js_max_response_bytes(),
         false,
     )
 }
@@ -294,6 +333,7 @@ fn java_request_simple_response_with_client(
     body: Option<String>,
     headers_json: &str,
     client: &HttpClient,
+    max_response_bytes: usize,
     sniff_charset: bool,
 ) -> String {
     let method = Method::from_bytes(method.as_bytes()).unwrap_or(Method::GET);
@@ -308,7 +348,13 @@ fn java_request_simple_response_with_client(
             "application/x-www-form-urlencoded".to_owned(),
         ));
     }
-    let response = client.execute_once(method, url.trim(), &headers, body.as_deref(), None);
+    let response = client.execute_once(
+        method,
+        url.trim(),
+        &headers,
+        body.as_deref(),
+        Some(max_response_bytes),
+    );
     let payload = match response {
         Ok(response) => {
             let headers = response
@@ -424,8 +470,15 @@ pub(super) fn java_analyzed_request_response(url: &str, headers_json: &str) -> S
     let client = active_js_http_client();
     let source = ACTIVE_JS_BOOK_SOURCE.with(|cell| cell.borrow().clone());
     let Some(source) = source else {
-        let payload =
-            java_request_simple_response_with_client("GET", url, None, headers_json, &client, true);
+        let payload = java_request_simple_response_with_client(
+            "GET",
+            url,
+            None,
+            headers_json,
+            &client,
+            active_js_max_response_bytes(),
+            true,
+        );
         if let Ok(value) = serde_json::from_str::<JsonValue>(&payload) {
             if value.get("code").and_then(JsonValue::as_u64) == Some(0) {
                 let error = value
@@ -451,7 +504,11 @@ pub(super) fn java_analyzed_request_response(url: &str, headers_json: &str) -> S
         Err(error) => return java_error_response(url, &error),
     };
 
-    let response = match execute_request_spec(&client, &spec) {
+    let response = match execute_request_spec_limited(
+        &client,
+        &spec,
+        Some(active_js_max_response_bytes()),
+    ) {
         Ok(response) => response,
         Err(error) => return java_error_response(&spec.url, &error.to_string()),
     };
@@ -609,8 +666,8 @@ mod conversion_tests {
             Err(FetchError::ResponseTooLarge { limit: 2, .. })
         ));
         assert_eq!(java_web_view("", "", ""), None);
-        // Unlike optional preview extjs, java.webView's explicit JS still requires
-        // a result; a throwing script must not silently fall back to page HTML.
+        // java.webView's explicit JS still requires a result;
+        // a throwing script must not silently fall back to page HTML.
         assert!(matches!(
             try_render_webview("<p>page</p>", "", "throw new Error('bad')", 1024),
             Err(FetchError::Rule(_))

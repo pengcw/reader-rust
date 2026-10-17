@@ -1,4 +1,6 @@
 use crate::runtime::SharedCookieStore;
+use super::script_cache::ScriptCache;
+use std::sync::Arc;
 use std::fmt;
 use std::io::Read;
 use std::time::Duration;
@@ -52,6 +54,7 @@ pub(crate) struct HttpClient {
     agent: Agent,
     cookies: Option<SharedCookieStore>,
     timeout_ms: u64,
+    script_cache: Option<Arc<ScriptCache>>,
 }
 
 impl HttpClient {
@@ -91,6 +94,7 @@ impl HttpClient {
             agent: Agent::new_with_config(config.build()),
             cookies,
             timeout_ms,
+            script_cache: ScriptCache::from_host().map(Arc::new),
         })
     }
 
@@ -109,6 +113,7 @@ impl HttpClient {
             agent: Agent::new_with_config(config),
             cookies: Some(SharedCookieStore::default()),
             timeout_ms: 15_000,
+            script_cache: None,
         }
     }
 
@@ -124,15 +129,27 @@ impl HttpClient {
         true
     }
 
-    pub(crate) fn request_text(
+    pub(crate) fn execute_script(
         &self,
         method: Method,
         url: &str,
         headers: &[(String, String)],
         body: Option<&str>,
-    ) -> Result<String, HttpClientError> {
-        let response = self.execute(method, url, headers, body, None)?;
-        Ok(String::from_utf8_lossy(&response.body).into_owned())
+        max_response_bytes: Option<usize>,
+    ) -> Result<RawHttpResponse, HttpClientError> {
+        // Do not let a cached script bypass the offline policy or an invalid URL.
+        if crate::host_services::is_offline() {
+            return self.execute(method, url, headers, body, max_response_bytes);
+        }
+        let Some(cache) = self.script_cache.as_ref().filter(|_| method == Method::GET && body.is_none()) else {
+            return self.execute(method, url, headers, body, max_response_bytes);
+        };
+        if let Some(hit) = cache.get(url, max_response_bytes.unwrap_or(usize::MAX)) {
+            return Ok(hit);
+        }
+        let response = self.execute(method, url, headers, body, max_response_bytes)?;
+        cache.put(url, &response);
+        Ok(response)
     }
 
     pub(crate) fn execute(

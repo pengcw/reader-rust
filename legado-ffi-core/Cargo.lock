@@ -1159,6 +1159,7 @@ dependencies = [
  "anyhow",
  "html5ever",
  "markup5ever_rcdom",
+ "regex",
  "rquickjs",
  "scraper",
  "serde_json",

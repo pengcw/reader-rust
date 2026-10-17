@@ -253,6 +253,7 @@ fn execute_inner(source_json: &str, request_json: &str) -> ExecuteResult<Value> 
                         script_ms: options.script_timeout_ms,
                         render_ms: options.render_timeout_ms,
                     },
+                    options.max_response_bytes,
                     || match operation {
                         Operation::Search => {
                             execute_search(&source, &engine, &http_session, &params, &options)
@@ -293,12 +294,16 @@ fn execute_inner(source_json: &str, request_json: &str) -> ExecuteResult<Value> 
     );
     let (result, unknown_method_fallback) = result;
     let succeeded = result.is_ok();
+    // Login is transactional: a failed login must not publish partially written
+    // credentials or headers. Other operations keep state already observed in-run.
+    let error_has_session_delta =
+        result.is_err() && operation != Operation::Login && session_delta.is_some();
     let mut response = match result {
         Ok(response) => response,
-        Err(error) if unknown_method_fallback => error.into_json(),
+        Err(error) if unknown_method_fallback || error_has_session_delta => error.into_json(),
         Err(error) => return Err(error),
     };
-    if succeeded {
+    if succeeded || error_has_session_delta {
         if let Some(object) = response.as_object_mut() {
             object.insert("session".to_string(), json!(session_delta));
         }
@@ -962,12 +967,14 @@ fn execute_toc(
         rule.format_js = None;
     }
     let mut pending = VecDeque::from([toc_url.clone()]);
+    let mut queued = HashSet::from([toc_url.clone()]);
     let mut visited_pages = HashSet::new();
     let mut chapters = Vec::new();
     let mut final_response = None;
     let mut truncated = false;
 
     while let Some(url) = pending.pop_front() {
+        queued.remove(&url);
         if visited_pages.contains(&url) {
             continue;
         }
@@ -1025,9 +1032,18 @@ fn execute_toc(
         }
         chapters.extend(page.chapters);
         for next_url in page.next_urls {
-            if !next_url.trim().is_empty() && !visited_pages.contains(&next_url) {
-                pending.push_back(next_url);
+            if next_url.trim().is_empty()
+                || visited_pages.contains(&next_url)
+                || queued.contains(&next_url)
+            {
+                continue;
             }
+            if visited_pages.len().saturating_add(queued.len()) >= options.max_pages {
+                truncated = true;
+                continue;
+            }
+            queued.insert(next_url.clone());
+            pending.push_back(next_url);
         }
         final_response = Some(response);
     }
@@ -1054,7 +1070,12 @@ fn execute_toc(
         .map(|chapter| chapter.title.clone())
         .collect::<Vec<_>>();
     let mut transform_diagnostics = text_transform::TransformDiagnostics::new(options.debug);
-    text_transform::apply_from_params(&mut titles, params, &mut transform_diagnostics);
+    text_transform::apply_from_params(
+        &mut titles,
+        params,
+        text_transform::TITLE_TRANSFORM_MIN_BYTES,
+        &mut transform_diagnostics,
+    );
     for (chapter, title) in chapters.iter_mut().zip(titles) {
         chapter.title = title;
     }
@@ -1173,17 +1194,24 @@ fn uses_js_ajax_content_rule(source: &BookSource) -> bool {
             }
 
             let code = js_code_only(rule);
-            let references = |name: &str| {
-                code.split(|character: char| {
+            let references = |text: &str, name: &str| {
+                text.split(|character: char| {
                     !(character.is_ascii_alphanumeric() || matches!(character, '_' | '$'))
                 })
                 .any(|identifier| identifier == name)
             };
+            // Template contents are masked above; a body reference there makes
+            // skipping the initial chapter fetch unsafe.
+            let template_uses_input = rule.contains('`')
+                && ["input", "result", "src"]
+                    .iter()
+                    .any(|name| references(rule, name));
             js_has_call(&code, "java.ajax")
-                && references("baseUrl")
-                && !references("input")
-                && !references("result")
-                && !references("src")
+                && references(&code, "baseUrl")
+                && !references(&code, "input")
+                && !references(&code, "result")
+                && !references(&code, "src")
+                && !template_uses_input
         })
 }
 
@@ -1195,6 +1223,17 @@ fn execute_content(
     options: &ValidatedOptions,
 ) -> ExecuteResult<Value> {
     let initial_url = required_string(params, "url")?;
+    let html_output = match params.get("output") {
+        None => false,
+        Some(Value::String(value)) if value == "html" => true,
+        _ => return Err(ExecuteError::invalid_request("params.output must be 'html'")),
+    };
+    let provided_html = match params.get("html") {
+        None => None,
+        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.as_str()),
+        Some(Value::String(_)) => None,
+        _ => return Err(ExecuteError::invalid_request("params.html must be a string")),
+    };
     let (mut book_variable, book_name) = input_book_state(params);
     let mut book_fields = input_book_fields(params);
     if let Some(name_str) = &book_name {
@@ -1205,7 +1244,7 @@ fn execute_content(
     let (mut chapter_variable, mut chapter_title) = input_chapter_state(params);
     let is_volume = input_chapter_is_volume(params);
 
-    let self_fetch = uses_js_ajax_content_rule(source)
+    let self_fetch = provided_html.is_none() && uses_js_ajax_content_rule(source)
         && !strip_url_options(&initial_url).trim().starts_with("data:");
 
     // Source replaceRegex is applied once after all content fragments are joined.
@@ -1239,7 +1278,8 @@ fn execute_content(
             truncated = true;
             break;
         }
-        let response = if self_fetch {
+        let using_supplied_html = first_page.is_none() && provided_html.is_some();
+        let response = if self_fetch || using_supplied_html {
             None
         } else {
             let mut request_context = url_rule_context_with_fields(
@@ -1261,12 +1301,29 @@ fn execute_content(
                 Some(&request_context),
             )?)
         };
-        let body = response
-            .as_ref()
-            .map_or("", |response| response.body.as_str());
-        let response_url = response
-            .as_ref()
-            .map_or_else(|| current_url.clone(), |response| response.url.clone());
+        let supplied_page = if using_supplied_html {
+            let mut context = url_rule_context_with_fields(
+                book_variable.as_deref(), chapter_variable.as_deref(),
+                book_name.as_deref(), chapter_title.as_deref(), Some(&book_fields),
+            );
+            context.chapter_fields = chapter_fields.clone();
+            let spec = analyze_url_with_context(
+                &current_url, "", 1, &source.book_source_url, source, Some(&context),
+            ).map_err(ExecuteError::url_rule)?;
+            let rendered = session.render_supplied_html(
+                &spec, provided_html.unwrap_or_default(), options.max_response_bytes,
+                options.render_timeout_ms,
+            ).map_err(ExecuteError::from)?;
+            Some((rendered, spec.url))
+        } else {
+            None
+        };
+        let body = supplied_page.as_ref().map(|(body, _)| body.as_str())
+            .or_else(|| response.as_ref().map(|response| response.body.as_str()))
+            .unwrap_or("");
+        let response_url = supplied_page.as_ref().map(|(_, url)| url.clone())
+            .or_else(|| response.as_ref().map(|response| response.url.clone()))
+            .unwrap_or_else(|| current_url.clone());
         visited_urls.insert(current_url.clone());
         let is_first_page = first_page.is_none();
         if is_first_page {
@@ -1284,7 +1341,8 @@ fn execute_content(
                 chapter_title.as_deref(),
                 Some(&book_fields),
                 Some(&chapter_fields),
-                follow_next,
+                follow_next && !html_output,
+                html_output,
             )
         } else {
             engine.content_page_with_context_follow(
@@ -1297,7 +1355,8 @@ fn execute_content(
                 chapter_title.as_deref(),
                 Some(&book_fields),
                 Some(&chapter_fields),
-                follow_next,
+                follow_next && !html_output,
+                html_output,
             )
         };
         if !page.content.is_empty() {
@@ -1329,10 +1388,10 @@ fn execute_content(
         }
     }
 
-    if !self_fetch && final_response.is_none() {
+    if !self_fetch && final_response.is_none() && provided_html.is_none() {
         return Err(ExecuteError::url_rule("content URL produced no request"));
     }
-    if text_book && !self_fetch {
+    if text_book && !self_fetch && !html_output {
         if let Some((body, url)) = first_page.as_ref() {
             if let Some(sub_content) = engine.sub_content_with_context(
                 source,
@@ -1397,8 +1456,14 @@ fn execute_content(
     text_transform::apply_from_params(
         std::slice::from_mut(&mut content),
         params,
+        options.max_response_bytes,
         &mut transform_diagnostics,
     );
+    let fallback = html_output && content.trim().is_empty()
+        && first_page.as_ref().is_some_and(|(html, _)| !html.trim().is_empty());
+    if fallback {
+        content = first_page.as_ref().unwrap().0.clone();
+    }
     if content.is_empty() && !is_volume {
         return Err(ExecuteError::parse("content is empty"));
     }
@@ -1427,9 +1492,15 @@ fn execute_content(
         None => {
             let mut response = success_without_http(data);
             response["meta"]["truncated"] = json!(truncated);
+            if provided_html.is_some() {
+                response["meta"]["finalUrl"] = json!(final_url);
+            }
             response
         }
     };
+    if html_output {
+        result["meta"]["fallback"] = json!(fallback);
+    }
     transform_diagnostics.attach(&mut result, "content");
     Ok(result)
 }
@@ -1560,24 +1631,8 @@ fn execute_preview(params: &Value, options: &ValidatedOptions) -> ExecuteResult<
             "preview requires URL or HTML",
         ));
     }
-    // Optional source-specific script runs after page lifecycle in the same Rakers
-    // runtime. Errors/empty results fall back to ordinary preview HTML.
-    let extjs = match params.get("extjs") {
-        None | Some(Value::Null) => "",
-        Some(Value::String(script)) if script.len() <= 64 * 1024 => script.as_str(),
-        Some(Value::String(_)) => {
-            return Err(ExecuteError::invalid_request(
-                "params.extjs must be at most 64 KiB",
-            ));
-        }
-        _ => {
-            return Err(ExecuteError::invalid_request(
-                "params.extjs must be a string",
-            ))
-        }
-    };
     let (rendered, final_url) =
-        crate::parser::js_http::try_render_preview(html, url, extjs, options.max_response_bytes)
+        crate::parser::js_http::render_preview(html, url, options.max_response_bytes)
             .map_err(ExecuteError::from)?;
     Ok(success_without_http(json!({"preview":{
         "html":rendered,"url":final_url,
@@ -1756,7 +1811,12 @@ fn fetch_rule_with_context(
     options: &ValidatedOptions,
     context: Option<&UrlRuleContext>,
 ) -> ExecuteResult<HttpResponse> {
-    fetch_rule_with_context_mode(session, source, rule, key, page, base_url, options, context, false)
+    let spec = analyze_url_with_context(rule, key, page, base_url, source, context)
+        .map_err(ExecuteError::url_rule)?;
+    let response = session
+        .fetch_with_render_timeout(&spec, options.max_response_bytes, options.render_timeout_ms)
+        .map_err(|error| map_fetch_error(error, source))?;
+    validate_login_response(source, response)
 }
 
 fn fetch_toc_rule_with_context(
@@ -1769,26 +1829,7 @@ fn fetch_toc_rule_with_context(
     options: &ValidatedOptions,
     context: Option<&UrlRuleContext>,
 ) -> ExecuteResult<HttpResponse> {
-    fetch_rule_with_context_mode(session, source, rule, key, page, base_url, options, context, true)
-}
-
-fn fetch_rule_with_context_mode(
-    session: &HttpSession,
-    source: &BookSource,
-    rule: &str,
-    key: &str,
-    page: i32,
-    base_url: &str,
-    options: &ValidatedOptions,
-    context: Option<&UrlRuleContext>,
-    webview_async: bool,
-) -> ExecuteResult<HttpResponse> {
-    let spec = analyze_url_with_context(rule, key, page, base_url, source, context)
-        .map_err(ExecuteError::url_rule)?;
-    let response = session
-        .fetch_with_webview_async(&spec, options.max_response_bytes, webview_async)
-        .map_err(|error| map_fetch_error(error, source))?;
-    validate_login_response(source, response)
+    fetch_rule_with_context(session, source, rule, key, page, base_url, options, context)
 }
 
 fn validate_login_response(
@@ -2102,97 +2143,21 @@ mod tests {
         BookSource,
     };
     use base64::Engine;
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::thread;
     use std::time::{Duration, Instant};
 
     #[test]
-    fn preview_extjs_uses_page_runtime_and_falls_back_on_script_errors() {
-        let source = serde_json::json!({
-            "bookSourceName": "preview fixture",
-            "bookSourceUrl": "https://example.test/"
-        });
-        let html = "<html><body><script>window.reviewText = 'ready'; document.body.innerHTML = '<p>original</p>';</script></body></html>";
-        let preview = |extjs: Option<Value>| -> Value {
-            let mut params = serde_json::json!({
-                "html": html,
-                "url": "https://example.test/reviews",
-            });
-            if let Some(extjs) = extjs {
-                params["extjs"] = extjs;
-            }
-            let request = serde_json::json!({"api":2,"op":"preview","params":params});
-            serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap()
-        };
-
-        let normal = preview(None);
-        assert_eq!(normal["ok"], true, "{normal}");
-        assert!(
-            normal["data"]["preview"]["html"]
-                .as_str()
-                .unwrap()
-                .contains("<p>original</p>"),
-            "{normal}"
-        );
-
-        let extracted = preview(Some(serde_json::json!(
-            "'<article>' + window.reviewText + ':' + document.readyState + '</article>'"
-        )));
-        assert_eq!(extracted["ok"], true, "{extracted}");
-        assert_eq!(
-            extracted["data"]["preview"]["html"],
-            "<article>ready:complete</article>"
-        );
-        assert_eq!(
-            extracted["data"]["preview"]["url"],
-            "https://example.test/reviews"
-        );
-
-        let statements = preview(Some(serde_json::json!(
-            "var extractedReview = window.reviewText; '<p>' + extractedReview + '</p>'"
-        )));
-        assert_eq!(statements["ok"], true, "{statements}");
-        assert_eq!(statements["data"]["preview"]["html"], "<p>ready</p>");
-
-        for bad in [
-            "throw new Error('broken extension')",
-            "const = invalid syntax",
-            "undefined",
-            "null",
-            "''",
-            "'  '",
-            "42",
-            "true",
-            "false",
-            "({})",
-            "['<p>not a string</p>']",
-            "new String('<p>not a primitive string</p>')",
-            "Promise.resolve('<p>not a string</p>')",
-        ] {
-            let fallback = preview(Some(serde_json::json!(bad)));
-            assert_eq!(fallback["ok"], true, "{bad}: {fallback}");
-            assert_eq!(
-                fallback["data"]["preview"]["html"], normal["data"]["preview"]["html"],
-                "{bad}: {fallback}"
-            );
-        }
-
-        assert_eq!(
-            preview(Some(Value::Null))["data"]["preview"]["html"],
-            normal["data"]["preview"]["html"]
-        );
-
-        for invalid in [
-            serde_json::json!(true),
-            serde_json::json!({"script":"1"}),
-            serde_json::json!("a".repeat(64 * 1024 + 1)),
-        ] {
-            let failed = preview(Some(invalid));
-            assert_eq!(failed["ok"], false, "{failed}");
-            assert_eq!(failed["error"]["kind"], "invalid_request", "{failed}");
-        }
+    fn preview_renders_supplied_html_without_extension_pipeline() {
+        let source = json!({"bookSourceUrl":"https://example.test/"});
+        let html = "<html><body><script>document.body.innerHTML = '<p>ready</p>'</script></body></html>";
+        let request = json!({"api":2,"op":"preview",
+            "params":{"url":"https://example.test/reviews","html":html}});
+        let result: Value = serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert!(result["data"]["preview"]["html"].as_str().unwrap().contains("<p>ready</p>"), "{result}");
     }
 
     #[test]
@@ -2621,6 +2586,9 @@ mod tests {
         )));
         assert!(uses_js_ajax_content_rule(&source(
             "@js: java.ajax(baseUrl)"
+        )));
+        assert!(!uses_js_ajax_content_rule(&source(
+            r#"@js: const endpoint = baseUrl; java.ajax(`${endpoint}?seed=${result}`)"#
         )));
     }
 

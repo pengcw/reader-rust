@@ -71,9 +71,14 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+/// Purpose is an internal dispatch hint, never a header or query argument.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RequestPurpose { #[default] Generic, Script }
+
 /// A host-provided HTTP request used by page scripts and external resources.
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
+    pub purpose: RequestPurpose,
     pub method: String,
     pub url: String,
     pub headers: Vec<(String, String)>,
@@ -179,6 +184,8 @@ pub struct HttpConfig {
     pub max_response_bytes: Option<usize>,
     /// Optional wall-clock deadline for the whole render, including subrequests.
     pub render_timeout: Option<Duration>,
+    /// Regexes matched against external script URL pathnames (not fetch/XHR).
+    pub blocked_scripts: Vec<regex::Regex>,
     /// Opt-in asynchronous fetch/XHR, only enabled for subprocess-based preview.
     pub async_http: bool,
 }
@@ -250,6 +257,21 @@ impl HttpConfig {
         self.execute_prepared(budget, request)
     }
 
+    pub(crate) fn execute_script(
+        &self, budget: &RequestBudget, url: &str,
+        headers: &[(String, String)], include_config_headers: bool,
+    ) -> Result<HttpResponse, String> {
+        if !self.blocked_scripts.is_empty() {
+            let path = url::Url::parse(url).map_err(|e| e.to_string())?;
+            if self.blocked_scripts.iter().any(|rule| rule.is_match(path.path())) {
+                return Err("script blocked".to_string());
+            }
+        }
+        let mut request = self.prepare_request(budget, "GET", url, headers, None, include_config_headers)?;
+        request.purpose = RequestPurpose::Script;
+        self.execute_prepared(budget, request)
+    }
+
     pub(crate) fn prepare_request(
         &self,
         budget: &RequestBudget,
@@ -279,6 +301,7 @@ impl HttpConfig {
         budget.before_request()?;
         let headers = self.request_headers(headers, include_config_headers);
         Ok(HttpRequest {
+            purpose: RequestPurpose::Generic,
             method,
             url: url.to_string(),
             headers,
@@ -291,9 +314,9 @@ impl HttpConfig {
         budget: &RequestBudget,
         request: HttpRequest,
     ) -> Result<HttpResponse, String> {
-        let HttpRequest { method, url, headers, body } = request;
+        let HttpRequest { purpose, method, url, headers, body } = request;
         let response = if let Some(transport) = &self.transport {
-            transport.execute(HttpRequest { method, url, headers, body })?
+            transport.execute(HttpRequest { purpose, method, url, headers, body })?
         } else {
             let method = ureq::http::Method::from_bytes(method.as_bytes())
                 .map_err(|error| format!("invalid HTTP method: {error}"))?;
@@ -367,7 +390,7 @@ fn resolve_url(src: &str, base: Option<&str>) -> Option<String> {
 /// Files that open with `import`/`export` are skipped — they are ES module entry
 /// points that require a full module loader with relative specifier resolution.
 fn fetch_script(url: &str, cfg: &HttpConfig, budget: &RequestBudget) -> Option<String> {
-    let response = match cfg.execute(budget, "GET", url, &[], None, true) {
+    let response = match cfg.execute_script(budget, url, &[], true) {
         Ok(response) if (200..300).contains(&response.status) => response,
         Ok(response) => {
             eprintln!("[fetch error] {url}: HTTP {}", response.status);
@@ -956,6 +979,49 @@ mod tests {
         assert!(out.contains("<li>Item 1</li>"), "first item");
         assert!(out.contains("<li>Item 2</li>"), "second item");
         assert!(out.contains("<li>Item 3</li>"), "third item");
+    }
+
+    #[test]
+    fn blocked_script_paths_skip_network_and_budget() {
+        struct ScriptTransport(Arc<std::sync::Mutex<Vec<String>>>);
+        impl HttpTransport for ScriptTransport {
+            fn execute(&self, request: HttpRequest) -> Result<HttpResponse, String> {
+                self.0.lock().unwrap().push(request.url.clone());
+                Ok(HttpResponse {
+                    url: request.url,
+                    status: 200,
+                    headers: Vec::new(),
+                    body: "document.body.setAttribute('data-script-loaded', 'yes');".into(),
+                })
+            }
+        }
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cfg = HttpConfig {
+            transport: Some(Arc::new(ScriptTransport(calls.clone()))),
+            blocked_scripts: vec![
+                regex::Regex::new(r"(?i)(?:^|/)analytics(?:\.min)?\.js$").unwrap(),
+                regex::Regex::new(r"(?i)(?:^|/)tracker\.js$").unwrap(),
+            ],
+            max_requests: Some(2),
+            ..Default::default()
+        };
+        let input = concat!(
+            "<html><body><script src='https://a.example/scripts/ANALYTICS.min.js?v=1'></script>",
+            "<script src='/main.js'></script><script>",
+            "var blocked = document.createElement('script'); blocked.src = 'https://b.example/tracker.js';",
+            "document.body.appendChild(blocked);",
+            "</script></body></html>"
+        );
+        let out = render(input, false, Some("https://example.test/page"),
+            &cfg, false, None, None).unwrap();
+        assert!(out.contains("data-script-loaded=\"yes\""), "{out}");
+        assert_eq!(calls.lock().unwrap().as_slice(), ["https://example.test/main.js"]);
+        assert_eq!(cfg.execute_script(&RequestBudget::new(&cfg),
+            "https://c.example/TRACKER.js?t=1", &[], false).unwrap_err(), "script blocked");
+        // Generic network requests are not affected by ext.block.
+        let budget = RequestBudget::new(&cfg);
+        assert!(cfg.execute(&budget, "GET", "https://c.example/tracker.js",
+            &[], None, false).is_ok());
     }
 
     #[test]

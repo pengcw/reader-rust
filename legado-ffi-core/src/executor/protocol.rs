@@ -77,11 +77,18 @@ pub(super) fn parse_request(raw: &str) -> ExecuteResult<ExecuteRequest> {
 
     let session = match object.get("session") {
         None | Some(Value::Null) => None,
-        Some(value) => Some(
-            serde_json::from_value::<ExecuteSession>(value.clone()).map_err(|error| {
-                ExecuteError::invalid_request(format!("invalid session: {error}"))
-            })?,
-        ),
+        Some(value) => {
+            let session =
+                serde_json::from_value::<ExecuteSession>(value.clone()).map_err(|error| {
+                    ExecuteError::invalid_request(format!("invalid session: {error}"))
+                })?;
+            if !session.variables_within_limits() {
+                return Err(ExecuteError::invalid_request(
+                    "session variables exceed limits",
+                ));
+            }
+            Some(session)
+        }
     };
 
     let info_map = object

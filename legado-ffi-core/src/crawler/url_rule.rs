@@ -309,6 +309,33 @@ fn compile_url_request(
         }
     }
 
+    let render_with_rakers = match options.get("webView") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+        Some(Value::String(value)) => !matches!(value.as_str(), "" | "false"),
+        Some(_) => true,
+    };
+    let mut blocked_scripts = Vec::new();
+    let mut render_timeout_ms = None;
+    if render_with_rakers {
+        if let Some(value) = options.get("renderTimeout") {
+            let timeout = value.as_u64().ok_or("URL renderTimeout must be milliseconds")?;
+            if timeout != 0 {
+                if !(3_000..=super::MAX_BROWSER_RENDER_TIMEOUT_MS).contains(&timeout) {
+                    return Err("URL renderTimeout must be between 3000 and 120000 ms".into());
+                }
+                render_timeout_ms = Some(timeout);
+            }
+        }
+        if let Some(block) = options.get("block") {
+            let patterns = block.as_array().ok_or("URL block must be an array of regex strings")?;
+            for pattern in patterns {
+                let pattern = pattern.as_str().ok_or("URL block must contain strings")?;
+                blocked_scripts.push(regex::Regex::new(pattern)
+                    .map_err(|error| format!("invalid URL block regex: {error}"))?);
+            }
+        }
+    }
+
     Ok(RequestSpec {
         url: encode_get_query(&url, charset.as_deref()),
         method,
@@ -318,11 +345,9 @@ fn compile_url_request(
         retry,
         proxy,
         response_type,
-        render_with_rakers: match options.get("webView") {
-            None | Some(Value::Null) | Some(Value::Bool(false)) => false,
-            Some(Value::String(value)) => !matches!(value.as_str(), "" | "false"),
-            Some(_) => true,
-        },
+        blocked_scripts,
+        render_with_rakers,
+        render_timeout_ms,
         body_js,
     })
 }

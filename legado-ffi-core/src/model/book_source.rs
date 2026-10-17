@@ -137,6 +137,7 @@ pub fn migrate_legacy_book_source_value(mut value: Value) -> Value {
         }
     }
 
+    let mut migrated_rule_fields = Vec::new();
     migrate_rule_object(
         obj,
         "ruleSearch",
@@ -153,6 +154,7 @@ pub fn migrate_legacy_book_source_value(mut value: Value) -> Value {
             ("ruleSearchCoverUrl", "coverUrl"),
             ("ruleSearchWordCount", "wordCount"),
         ],
+        &mut migrated_rule_fields,
     );
     migrate_rule_object(
         obj,
@@ -170,6 +172,7 @@ pub fn migrate_legacy_book_source_value(mut value: Value) -> Value {
             ("ruleFindCoverUrl", "coverUrl"),
             ("ruleFindWordCount", "wordCount"),
         ],
+        &mut migrated_rule_fields,
     );
     migrate_rule_object(
         obj,
@@ -189,6 +192,7 @@ pub fn migrate_legacy_book_source_value(mut value: Value) -> Value {
             ("ruleChapterUrl", "tocUrl"),
             ("ruleBookTocUrl", "tocUrl"),
         ],
+        &mut migrated_rule_fields,
     );
     migrate_rule_object(
         obj,
@@ -202,6 +206,7 @@ pub fn migrate_legacy_book_source_value(mut value: Value) -> Value {
             ("ruleChapterUrlNext", "nextTocUrl"),
             ("ruleTocUrlNext", "nextTocUrl"),
         ],
+        &mut migrated_rule_fields,
     );
     migrate_rule_object(
         obj,
@@ -212,7 +217,11 @@ pub fn migrate_legacy_book_source_value(mut value: Value) -> Value {
             ("ruleContentUrlNext", "nextContentUrl"),
             ("ruleContentTitle", "title"),
         ],
+        &mut migrated_rule_fields,
     );
+    for field in migrated_rule_fields {
+        obj.remove(&field);
+    }
 
     value
 }
@@ -226,24 +235,54 @@ fn move_if_absent(obj: &mut Map<String, Value>, old: &str, new: &str) {
     }
 }
 
-fn migrate_rule_object(obj: &mut Map<String, Value>, target: &str, fields: &[(&str, &str)]) {
-    let mut target_obj = obj
-        .get(target)
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    for (old, new) in fields {
-        if target_obj.contains_key(*new) {
-            continue;
+fn migrate_rule_object(
+    obj: &mut Map<String, Value>,
+    target: &str,
+    fields: &[(&str, &str)],
+    migrated_fields: &mut Vec<String>,
+) {
+    let current = obj.get(target).cloned();
+    let (mut target_obj, stringified) = match current.as_ref() {
+        Some(Value::Object(map)) => (map.clone(), false),
+        Some(Value::String(raw))
+            if raw.trim().is_empty() || raw.trim().eq_ignore_ascii_case("null") =>
+        {
+            (Map::new(), false)
         }
-        if let Some(value) = obj.remove(*old) {
-            if !value.as_str().map(str::trim).unwrap_or("x").is_empty() {
-                target_obj.insert((*new).to_string(), value);
-            }
+        Some(Value::String(raw)) => match serde_json::from_str::<Value>(raw.trim())
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+        {
+            Some(map) => (map, true),
+            None => return,
+        },
+        Some(Value::Null) | None => (Map::new(), false),
+        Some(_) => return,
+    };
+
+    let mut changed = false;
+    for (old, new) in fields {
+        let Some(value) = obj.get(*old).cloned() else {
+            continue;
+        };
+        migrated_fields.push((*old).to_string());
+        if !target_obj.contains_key(*new)
+            && !value.as_str().map(str::trim).unwrap_or("x").is_empty()
+        {
+            target_obj.insert((*new).to_string(), value);
+            changed = true;
         }
     }
-    if !target_obj.is_empty() {
-        obj.insert(target.to_string(), Value::Object(target_obj));
+    if changed {
+        let value = Value::Object(target_obj);
+        obj.insert(
+            target.to_string(),
+            if stringified {
+                Value::String(value.to_string())
+            } else {
+                value
+            },
+        );
     }
 }
 
@@ -292,11 +331,7 @@ fn convert_legacy_url_rule(raw: &str) -> String {
 
     if let Some((start, end, header)) = extract_legacy_header(&url) {
         url.replace_range(start..end, "");
-        if let Ok(value) = serde_json::from_str::<Value>(&header) {
-            option.insert("headers".to_string(), value);
-        } else {
-            option.insert("headers".to_string(), Value::String(header));
-        }
+        option.insert("headers".to_string(), header);
     }
 
     if let Some(idx) = find_legacy_url_marker(&url, "|charset=") {
@@ -339,7 +374,7 @@ fn convert_legacy_url_rule(raw: &str) -> String {
     }
 }
 
-fn extract_legacy_header(input: &str) -> Option<(usize, usize, String)> {
+fn extract_legacy_header(input: &str) -> Option<(usize, usize, Value)> {
     let start = find_legacy_url_marker(input, "@Header:")?;
     let object_start = start + "@Header:".len();
     let rest = input.get(object_start..)?.trim_start();
@@ -348,21 +383,13 @@ fn extract_legacy_header(input: &str) -> Option<(usize, usize, String)> {
     if !input.get(open..)?.starts_with('{') {
         return None;
     }
-    let mut depth = 0i32;
-    for (offset, ch) in input[open..].char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    let end = open + offset + ch.len_utf8();
-                    return Some((start, end, input[open..end].to_string()));
-                }
-            }
-            _ => {}
-        }
+
+    let mut values = serde_json::Deserializer::from_str(input.get(open..)?).into_iter::<Value>();
+    let header = values.next()?.ok()?;
+    if !header.is_object() {
+        return None;
     }
-    None
+    Some((start, open + values.byte_offset(), header))
 }
 
 // Borrow segments rather than masking templates with collision-prone placeholders.

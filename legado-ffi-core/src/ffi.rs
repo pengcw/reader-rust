@@ -570,6 +570,7 @@ fn render_rakers_html(
         max_requests: Some(32),
         max_response_bytes: Some(MAX_RAKERS_EVAL_HTML_BYTES),
         render_timeout,
+        blocked_scripts: Vec::new(),
         async_http: false,
     };
     let rendered = rakers::render(

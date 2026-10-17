@@ -250,10 +250,11 @@ fn eval_profiled_setup_script<'js>(
     ctx: rquickjs::Ctx<'js>,
     slot: BootstrapSlot,
     bucket: usize,
+    dir: Option<&std::path::Path>,
 ) -> anyhow::Result<Value<'js>> {
     let mark = (*JS_PROFILE_ENABLED).then(Instant::now);
     let mut timings = js_bytecode::BytecodeTimings::default();
-    let result = js_bytecode::eval(ctx, slot, (*JS_PROFILE_ENABLED).then_some(&mut timings));
+    let result = js_bytecode::eval(ctx, slot, dir, (*JS_PROFILE_ENABLED).then_some(&mut timings));
     if let Some(mark) = mark {
         let elapsed = mark.elapsed().as_micros();
         JS_SETUP_METRICS.with(|totals| totals.borrow_mut()[bucket] += elapsed);
@@ -272,15 +273,17 @@ fn eval_profiled_setup_script<'js>(
 fn eval_fixed_setup_script<'js>(
     ctx: rquickjs::Ctx<'js>,
     slot: BootstrapSlot,
+    dir: Option<&std::path::Path>,
 ) -> anyhow::Result<Value<'js>> {
-    eval_profiled_setup_script(ctx, slot, 0)
+    eval_profiled_setup_script(ctx, slot, 0, dir)
 }
 
 fn eval_builtin_setup_script<'js>(
     ctx: rquickjs::Ctx<'js>,
     slot: BootstrapSlot,
+    dir: Option<&std::path::Path>,
 ) -> anyhow::Result<Value<'js>> {
-    eval_profiled_setup_script(ctx, slot, 1)
+    eval_profiled_setup_script(ctx, slot, 1, dir)
 }
 
 thread_local! {
@@ -631,6 +634,7 @@ pub(super) fn eval_js_inner_with_source(
         );
     }
 
+    let bootstrap_dir = js_bytecode::disk_directory();
     JS_ENV.with(|(runtime, start_time)| {
         let mut profile_mark = (*JS_PROFILE_ENABLED).then(Instant::now);
         let mut profile_stages = [0u128; 7];
@@ -839,14 +843,18 @@ pub(super) fn eval_js_inner_with_source(
                     move |first: String, second: rquickjs::function::Opt<String>| {
                         if let Some(active) = current_active_session() {
                             match second.0 {
-                                Some(value) => active.set_variable_exact(
-                                    &first,
-                                    serde_json::Value::String(value),
-                                ),
-                                None => active.set_variable(
-                                    "",
-                                    serde_json::Value::String(first),
-                                ),
+                                Some(value) => {
+                                    let _ = active.set_variable_exact(
+                                        &first,
+                                        serde_json::Value::String(value),
+                                    );
+                                }
+                                None => {
+                                    let _ = active.set_variable(
+                                        "",
+                                        serde_json::Value::String(first),
+                                    );
+                                }
                             }
                         } else {
                             let (key, value) = match second.0 {
@@ -1021,11 +1029,8 @@ pub(super) fn eval_js_inner_with_source(
             cache_obj.set(
                 "__memoryPut",
                 Func::new(|key: String, value: String| {
-                    if let (Some(session), Ok(value)) = (
-                        current_active_session(),
-                        serde_json::from_str(&value),
-                    ) {
-                        session.memory_cache_put(key, value);
+                    if let Some(session) = current_active_session() {
+                        let _ = session.memory_cache_put_serialized(key, &value);
                     }
                 }),
             )?;
@@ -1879,7 +1884,7 @@ pub(super) fn eval_js_inner_with_source(
             globals.set("java", java_obj)?;
             js_bridge_mark(2, native_mark);
             record_js_memory(&mut memory_samples, "native_bindings", &ctx);
-            eval_fixed_setup_script(ctx.clone(), BootstrapSlot::Java)?;
+            eval_fixed_setup_script(ctx.clone(), BootstrapSlot::Java, bootstrap_dir.as_deref())?;
             record_js_memory(&mut memory_samples, "java", &ctx);
 
             globals.set(
@@ -1932,9 +1937,9 @@ pub(super) fn eval_js_inner_with_source(
                     globals.set(key.as_str(), js_value)?;
                 }
             }
-            eval_fixed_setup_script(ctx.clone(), BootstrapSlot::Source)?;
+            eval_fixed_setup_script(ctx.clone(), BootstrapSlot::Source, bootstrap_dir.as_deref())?;
 
-            eval_fixed_setup_script(ctx.clone(), BootstrapSlot::XPath)?;
+            eval_fixed_setup_script(ctx.clone(), BootstrapSlot::XPath, bootstrap_dir.as_deref())?;
 
             globals.get::<_, Object<'_>>("java")?.set(
                 "__jsoupRemove",
@@ -1952,10 +1957,10 @@ pub(super) fn eval_js_inner_with_source(
                         .unwrap_or_default()
                 }),
             )?;
-            eval_fixed_setup_script(ctx.clone(), BootstrapSlot::Jsoup)?;
+            eval_fixed_setup_script(ctx.clone(), BootstrapSlot::Jsoup, bootstrap_dir.as_deref())?;
 
             record_js_memory(&mut memory_samples, "before_android", &ctx);
-            eval_fixed_setup_script(ctx.clone(), BootstrapSlot::Android)?;
+            eval_fixed_setup_script(ctx.clone(), BootstrapSlot::Android, bootstrap_dir.as_deref())?;
             record_js_memory(&mut memory_samples, "android", &ctx);
 
             // Capture before source scripts can replace the helper; only marked wrappers unwrap.
@@ -1967,10 +1972,10 @@ pub(super) fn eval_js_inner_with_source(
             if let Some(dom_start) = dom_start {
                 JS_SETUP_METRICS.with(|totals| totals.borrow_mut()[2] += dom_start.elapsed().as_micros());
             }
-            eval_builtin_setup_script(ctx.clone(), BootstrapSlot::Security)?;
-            eval_builtin_setup_script(ctx.clone(), BootstrapSlot::Math)?;
-            eval_builtin_setup_script(ctx.clone(), BootstrapSlot::Des)?;
-            eval_builtin_setup_script(ctx.clone(), BootstrapSlot::Aes)?;
+            eval_builtin_setup_script(ctx.clone(), BootstrapSlot::Security, bootstrap_dir.as_deref())?;
+            eval_builtin_setup_script(ctx.clone(), BootstrapSlot::Math, bootstrap_dir.as_deref())?;
+            eval_builtin_setup_script(ctx.clone(), BootstrapSlot::Des, bootstrap_dir.as_deref())?;
+            eval_builtin_setup_script(ctx.clone(), BootstrapSlot::Aes, bootstrap_dir.as_deref())?;
 
             if let Some(state) = active_info_map_state() {
                 install_info_map(&ctx, &state)?;

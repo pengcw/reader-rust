@@ -843,6 +843,7 @@ impl RuleEngine {
             book_fields,
             None,
             true,
+            false,
         )
     }
 
@@ -858,6 +859,7 @@ impl RuleEngine {
         book_fields: Option<&HashMap<String, String>>,
         chapter_fields: Option<&serde_json::Map<String, Value>>,
         follow_next: bool,
+        html_output: bool,
     ) -> ContentPageResult {
         with_js_lib(source.js_lib.as_deref(), || {
             let mut context = RuleVariableContext::for_content_with_fields(
@@ -868,7 +870,7 @@ impl RuleEngine {
                 book_fields,
             );
             context.chapter_fields = chapter_fields.cloned().unwrap_or_default();
-            let content = self.content_with_context(source, body, base_url, &mut context);
+            let content = self.content_with_context_mode(source, body, base_url, &mut context, html_output);
             let next_urls = if follow_next {
                 self.next_content_urls_with_context(source, body, base_url, &mut context)
             } else {
@@ -896,6 +898,7 @@ impl RuleEngine {
         book_fields: Option<&HashMap<String, String>>,
         chapter_fields: Option<&serde_json::Map<String, Value>>,
         follow_next: bool,
+        html_output: bool,
     ) -> ContentPageResult {
         with_js_lib(source.js_lib.as_deref(), || {
             let mut context = RuleVariableContext::for_content_with_fields(
@@ -910,7 +913,7 @@ impl RuleEngine {
             if let Some(title) = title.as_ref() {
                 context.chapter_title = Some(title.clone());
             }
-            let content = self.content_with_context(source, body, base_url, &mut context);
+            let content = self.content_with_context_mode(source, body, base_url, &mut context, html_output);
             let next_urls = if follow_next {
                 self.next_content_urls_with_context(source, body, base_url, &mut context)
             } else {
@@ -1010,6 +1013,17 @@ impl RuleEngine {
         base_url: &str,
         context: &mut RuleVariableContext,
     ) -> String {
+        self.content_with_context_mode(source, body, base_url, context, false)
+    }
+
+    fn content_with_context_mode(
+        &self,
+        source: &BookSource,
+        body: &str,
+        base_url: &str,
+        context: &mut RuleVariableContext,
+        html_output: bool,
+    ) -> String {
         let rule = source.rule_content.clone().unwrap_or_default();
         let mut content_body = body.to_string();
 
@@ -1038,7 +1052,7 @@ impl RuleEngine {
         let content_rule =
             interpolate_common_templates(&content_rule, &content_body, base_url, context);
         if has_templates && content_rule.trim_start().starts_with('<') {
-            let content = html::format_keep_img(&content_rule, base_url);
+            let content = if html_output { content_rule } else { html::format_keep_img(&content_rule, base_url) };
             return apply_content_replacement(
                 content,
                 rule.replace_regex.as_deref(),
@@ -1059,7 +1073,7 @@ impl RuleEngine {
             if let Ok(res) =
                 eval_js_with_bindings(script, &content_body, base_url, &context.js_bindings())
             {
-                let content = html::format_keep_img(&res, base_url);
+                let content = if html_output { res } else { html::format_keep_img(&res, base_url) };
                 return apply_content_replacement(
                     content,
                     rule.replace_regex.as_deref(),
@@ -1134,7 +1148,9 @@ impl RuleEngine {
             ParseMode::Js => String::new(),
         };
 
-        content = html::format_keep_img(&content, base_url);
+        if !html_output {
+            content = html::format_keep_img(&content, base_url);
+        }
         apply_content_replacement(
             content,
             rule.replace_regex.as_deref(),
@@ -4982,6 +4998,7 @@ mod tests {
             None,
             Some(&fields),
             true,
+            false,
         );
         assert_eq!(page.content, "true|/chapter|T");
         assert_eq!(page.next_urls, vec!["https://example.com/next/7"]);
@@ -5565,6 +5582,7 @@ mod tests {
             None,
             None,
             true,
+            false,
         );
 
         assert_eq!(page.title.as_deref(), Some("Fresh"));
