@@ -110,8 +110,6 @@ jobs:
           matrix.use_cross == false
         run: cargo build --target ${{ matrix.target }} --release --lib
         working-directory: legado-ffi-core
-        env:
-          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C force-unwind-tables=no
 
       - name: Zip Artifact (Linux/Android)
         if: >-
