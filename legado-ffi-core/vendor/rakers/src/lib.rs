@@ -3,6 +3,7 @@
 //! Parses HTML, collects and executes scripts in a sandboxed JS context,
 //! then serializes the post-execution DOM back to HTML.
 
+mod browser_url;
 #[cfg(feature = "diff")]
 mod diff;
 mod dom;
@@ -17,6 +18,25 @@ pub use select::select_html;
 
 use std::borrow::Cow;
 use std::cell::Cell;
+
+thread_local! {
+    static FINAL_SCRIPT_HOST: Cell<Option<fn(String) -> String>> = const { Cell::new(None) };
+}
+
+/// Opt-in synchronous bridge for the caller's final script only. Page startup
+/// scripts do not receive it. When enabled, `final_script` must evaluate to a
+/// function accepting the private callback; without a host it remains a normal
+/// expression. The callback must not re-enter this renderer.
+pub fn with_final_script_host<T>(host: fn(String) -> String, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<fn(String) -> String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FINAL_SCRIPT_HOST.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(FINAL_SCRIPT_HOST.with(|slot| slot.replace(Some(host))));
+    run()
+}
 use std::io::Read;
 use std::sync::{
     Arc,

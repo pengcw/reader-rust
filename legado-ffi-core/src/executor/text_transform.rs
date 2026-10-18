@@ -56,9 +56,7 @@ impl TransformDiagnostics {
         let diagnostics = self
             .issues
             .iter()
-            .map(|issue| {
-                json!({"stage": stage, "ruleIndex": issue.rule_index, "kind": issue.kind})
-            })
+            .map(|issue| json!({"stage": stage, "ruleIndex": issue.rule_index, "kind": issue.kind}))
             .collect::<Vec<_>>();
         response["meta"]["debug"]["textTransformDiagnostics"] = json!(diagnostics);
     }
@@ -142,13 +140,7 @@ pub(super) fn apply_from_params(
         TextTransformDialect::Legado | TextTransformDialect::Qread => {
             for value in values {
                 let max_output_bytes = value.len().max(min_output_bytes);
-                *value = apply_java_rules(
-                    value,
-                    &rules,
-                    dialect,
-                    max_output_bytes,
-                    diagnostics,
-                );
+                *value = apply_java_rules(value, &rules, dialect, max_output_bytes, diagnostics);
             }
         }
     }

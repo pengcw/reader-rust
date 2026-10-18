@@ -157,7 +157,9 @@ fn compile_url_request(
     let mut proxy = take_proxy_header(&mut headers).filter(|value| !value.trim().is_empty());
     if !has_initial_headers {
         if let Some(active) = current_active_session() {
-            if let Some(login_header) = active.get_login_header() {
+            // Raw login tokens are script state, not HTTP header maps.
+            // Only a parsed object contributes request headers.
+            if let Some(login_header @ Value::Object(_)) = active.get_login_header() {
                 merge_headers(&mut headers, headers_from_value(&login_header));
             }
         }

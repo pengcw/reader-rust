@@ -2700,7 +2700,7 @@ const wm = new WeakMap();
 
 function dispatch(event, listener) {
   if (typeof listener === 'function')
-    listener.call(event.target, event);
+    listener.call(event.currentTarget, event);
   else
     listener.handleEvent(event);
   return event._stopImmediatePropagationFlag;

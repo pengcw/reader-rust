@@ -185,8 +185,11 @@ fn quote_unquoted_attribute_values(selector: &str) -> Option<String> {
 
 // Jsoup's :eq/:lt/:gt test the zero-based *element sibling* index, not the
 // position in the complete query result. CSS :nth-child is one-based.
-fn normalize_jsoup_eq(selector: &str) -> Option<String> {
-    let mut output = String::with_capacity(selector.len());
+fn normalize_jsoup_eq(selector: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if !selector.contains(':') {
+        return Some(std::borrow::Cow::Borrowed(selector));
+    }
+    let mut output: Option<String> = None;
     let mut cursor = 0;
     let mut quote = None;
     let mut bracket_depth = 0usize;
@@ -211,9 +214,15 @@ fn normalize_jsoup_eq(selector: &str) -> Option<String> {
             '[' => bracket_depth += 1,
             ']' => bracket_depth = bracket_depth.saturating_sub(1),
             ':' if bracket_depth == 0 => {
-                let kind = ["eq", "lt", "gt"]
-                    .into_iter()
-                    .find(|kind| selector[index..].starts_with(&format!(":{kind}(")));
+                let kind = if selector[index..].starts_with(":eq(") {
+                    Some("eq")
+                } else if selector[index..].starts_with(":lt(") {
+                    Some("lt")
+                } else if selector[index..].starts_with(":gt(") {
+                    Some("gt")
+                } else {
+                    None
+                };
                 if let Some(kind) = kind {
                     let start = index + kind.len() + 2;
                     let close = start + selector[start..].find(')')?;
@@ -226,6 +235,8 @@ fn normalize_jsoup_eq(selector: &str) -> Option<String> {
                             "gt" => format!(":nth-child(n+{})", index_value.checked_add(2)?),
                             _ => unreachable!(),
                         };
+                        let output =
+                            output.get_or_insert_with(|| String::with_capacity(selector.len()));
                         output.push_str(&selector[cursor..index]);
                         output.push_str(&css);
                         cursor = close + 1;
@@ -235,8 +246,13 @@ fn normalize_jsoup_eq(selector: &str) -> Option<String> {
             _ => {}
         }
     }
-    output.push_str(&selector[cursor..]);
-    Some(output)
+    match output {
+        Some(mut output) => {
+            output.push_str(&selector[cursor..]);
+            Some(std::borrow::Cow::Owned(output))
+        }
+        None => Some(std::borrow::Cow::Borrowed(selector)),
+    }
 }
 
 fn parse_css_selector(css_selector: &str) -> Option<Selector> {
@@ -518,16 +534,10 @@ fn split_contains_sibling(suffix: &str) -> (&str, &str) {
     (&suffix[..end], suffix[end..].trim())
 }
 
-fn css_contains_text(element: &ElementRef<'_>, needle: &str) -> bool {
+fn css_contains_text(element: &ElementRef<'_>, normalized_needle: &str) -> bool {
     let text = element.text().collect::<Vec<_>>().join(" ");
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    normalized.to_lowercase().contains(
-        &needle
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase(),
-    )
+    normalized.to_lowercase().contains(normalized_needle)
 }
 
 fn select_css_with_contains<'a>(
@@ -552,22 +562,20 @@ fn select_css_with_contains<'a>(
             unescaped.push(ch);
         }
     }
-    let needle = unescaped.as_str();
+    let needle = unescaped
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
     select(prefix)
         .into_iter()
         .filter(|el| {
             if own {
                 let text = own_text(el);
                 let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                normalized.to_lowercase().contains(
-                    &needle
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .to_lowercase(),
-                )
+                normalized.to_lowercase().contains(&needle)
             } else {
-                css_contains_text(el, needle)
+                css_contains_text(el, &needle)
             }
         })
         .flat_map(|el| {
@@ -1525,37 +1533,68 @@ fn collect_descendant_text_nodes(el: ElementRef, texts: &mut Vec<String>) {
     }
 }
 
-pub fn select_text_from_element(el: &ElementRef, rule: &str) -> Option<String> {
+// Parse once for a batch of sibling elements. Keep empty and final extractor
+// positions: a trailing '@' must still fall back to plain text.
+enum ElementTextStep {
+    Skip,
+    Select(ParsedSelector),
+    Extract(String),
+}
+
+fn parse_element_text_steps(rule: &str) -> Vec<ElementTextStep> {
     let parts = split_top_level(rule, &["@"]).parts;
+    let last = parts.len().saturating_sub(1);
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(index, part)| {
+            let part = part.trim();
+            if part.is_empty() {
+                ElementTextStep::Skip
+            } else if index == last {
+                ElementTextStep::Extract(part.to_string())
+            } else {
+                ElementTextStep::Select(parse_selector_with_index(part))
+            }
+        })
+        .collect()
+}
+
+fn select_text_from_element_with_steps(
+    el: &ElementRef,
+    steps: &[ElementTextStep],
+) -> Option<String> {
     let mut current_matches = vec![*el];
 
-    for i in 0..parts.len() {
-        let part = parts[i].trim();
-        if part.is_empty() {
-            continue;
+    for step in steps {
+        match step {
+            ElementTextStep::Skip => continue,
+            ElementTextStep::Extract(part) => {
+                return current_matches
+                    .into_iter()
+                    .find_map(|current| extract_text(&current, part));
+            }
+            ElementTextStep::Select(parsed) => {
+                let mut next_matches = Vec::new();
+                for current in current_matches {
+                    next_matches.extend(collect_matches_from_element(current, parsed));
+                }
+                if next_matches.is_empty() {
+                    return None;
+                }
+                current_matches = next_matches;
+            }
         }
-
-        if i == parts.len() - 1 {
-            return current_matches
-                .into_iter()
-                .find_map(|current| extract_text(&current, part));
-        }
-
-        let parsed = parse_selector_with_index(part);
-        let current_level = current_matches;
-        let mut next_matches = Vec::new();
-        for current in current_level {
-            next_matches.extend(collect_matches_from_element(current, &parsed));
-        }
-        if next_matches.is_empty() {
-            return None;
-        }
-        current_matches = next_matches;
     }
 
     current_matches
         .into_iter()
         .find_map(|current| extract_text(&current, "text"))
+}
+
+pub fn select_text_from_element(el: &ElementRef, rule: &str) -> Option<String> {
+    let steps = parse_element_text_steps(rule);
+    select_text_from_element_with_steps(el, &steps)
 }
 
 /// Element-relative list extraction used by composite field rules. The scalar
@@ -1720,11 +1759,11 @@ pub fn select_text_list(doc: &Html, rule: &str) -> Vec<String> {
         return vec![];
     }
 
+    let steps = (parts.len() > 1).then(|| parse_element_text_steps(&parts[1..].join("@")));
     let mut results = Vec::new();
     for el in matches {
-        if parts.len() > 1 {
-            let rest = parts[1..].join("@");
-            if let Some(v) = select_text_from_element(&el, &rest) {
+        if let Some(steps) = steps.as_deref() {
+            if let Some(v) = select_text_from_element_with_steps(&el, steps) {
                 results.push(v);
             }
         } else {
@@ -1790,9 +1829,9 @@ pub(crate) fn parse_xpath_package_with_mode(
                 if let Some(mut node) = document.tree.get_mut(id) {
                     if let scraper::Node::Element(element) = node.value() {
                         let before = element.attrs.len();
-                        element
-                            .attrs
-                            .retain(|name, _| xml_xpath_compatible_attribute_name(name.local.as_ref()));
+                        element.attrs.retain(|name, _| {
+                            xml_xpath_compatible_attribute_name(name.local.as_ref())
+                        });
                         removed_invalid_attribute |= element.attrs.len() != before;
                     }
                 }
@@ -1810,7 +1849,9 @@ pub(crate) fn parse_xpath_package_with_mode(
 
 fn xml_xpath_compatible_attribute_name(name: &str) -> bool {
     let mut chars = name.chars();
-    let Some(first) = chars.next() else { return false };
+    let Some(first) = chars.next() else {
+        return false;
+    };
     (first.is_alphabetic() || matches!(first, '_' | ':'))
         && chars.all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | ':' | '-' | '.'))
 }
@@ -2878,6 +2919,19 @@ fn append_xpath_line_break(output: &mut String) {
     }
 }
 
+static NUMERIC_HTML_ENTITY_RE: Lazy<regex::Regex> =
+    Lazy::new(|| regex::Regex::new(r"&#(?:x([0-9a-fA-F]+)|(\d+));").unwrap());
+static HTML_STRIP_RE: Lazy<regex::Regex> = Lazy::new(|| {
+    regex::Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<!--.*?-->")
+        .unwrap()
+});
+static HTML_BLOCK_RE: Lazy<regex::Regex> = Lazy::new(|| {
+    regex::Regex::new(r"(?i)<br\s*/?>|</?(?:p|div|h[1-6]|li|ul|ol|hr|article|dd|dl)\b[^>]*>")
+        .unwrap()
+});
+static HTML_TAG_RE: Lazy<regex::Regex> =
+    Lazy::new(|| regex::Regex::new(r"<[^>]+>").unwrap());
+
 /// HTML 实体反转义
 pub fn html_unescape(input: &str) -> String {
     if !input.contains('&') {
@@ -2901,26 +2955,24 @@ pub fn html_unescape(input: &str) -> String {
         .replace("&amp;", "&");
 
     if result.contains("&#") {
-        if let Ok(num_re) = regex::Regex::new(r"&#(?:x([0-9a-fA-F]+)|(\d+));") {
-            result = num_re
-                .replace_all(&result, |caps: &regex::Captures| {
-                    if let Some(hex) = caps.get(1) {
-                        if let Ok(code) = u32::from_str_radix(hex.as_str(), 16) {
-                            if let Some(c) = char::from_u32(code) {
-                                return c.to_string();
-                            }
-                        }
-                    } else if let Some(dec) = caps.get(2) {
-                        if let Ok(code) = dec.as_str().parse::<u32>() {
-                            if let Some(c) = char::from_u32(code) {
-                                return c.to_string();
-                            }
+        result = NUMERIC_HTML_ENTITY_RE
+            .replace_all(&result, |caps: &regex::Captures| {
+                if let Some(hex) = caps.get(1) {
+                    if let Ok(code) = u32::from_str_radix(hex.as_str(), 16) {
+                        if let Some(c) = char::from_u32(code) {
+                            return c.to_string();
                         }
                     }
-                    caps.get(0).unwrap().as_str().to_string()
-                })
-                .into_owned();
-        }
+                } else if let Some(dec) = caps.get(2) {
+                    if let Ok(code) = dec.as_str().parse::<u32>() {
+                        if let Some(c) = char::from_u32(code) {
+                            return c.to_string();
+                        }
+                    }
+                }
+                caps.get(0).unwrap().as_str().to_string()
+            })
+            .into_owned();
     }
     result
 }
@@ -3033,14 +3085,10 @@ fn format_keep_img_with_script_text(
     let mut text = preserve_image_metadata(content);
     static CLEAN_KEEP_SCRIPT_RE: Lazy<regex::Regex> =
         Lazy::new(|| regex::Regex::new(r"(?s)<!--.*?-->").unwrap());
-    static CLEAN_STRIP_ALL_RE: Lazy<regex::Regex> = Lazy::new(|| {
-        regex::Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<!--.*?-->")
-            .unwrap()
-    });
     let removed = if keep_script_text {
         &*CLEAN_KEEP_SCRIPT_RE
     } else {
-        &*CLEAN_STRIP_ALL_RE
+        &*HTML_STRIP_RE
     };
     text = removed.replace_all(&text, "").into_owned();
 
@@ -3081,135 +3129,131 @@ fn format_keep_img_with_script_text(
     // 2. 提取并保留 <img> 标签，补全相对 URL，使用占位符保护
     let mut img_placeholders: Vec<String> = Vec::new();
     // Attribute values may contain '>'; don't split the tag inside a quoted action.
-    if let Ok(img_re) = regex::Regex::new(r#"(?is)<img\b(?:[^"'<>]|"[^"]*"|'[^']*')*>"#) {
-        if let Ok(src_re) =
-            regex::Regex::new(r#"(?i)\b(?:src|data-src|data-original)\s*=\s*["']?([^"'\s>]+)["']?"#)
-        {
-            text = img_re
-                .replace_all(&text, |caps: &regex::Captures| {
-                    let img_tag = caps.get(0).unwrap().as_str();
-                    let mut inline_review = false;
-                    let mut dp_review = false;
-                    let mut image_meta = None;
-                    let mut full_img = if let Some(src_caps) = src_re.captures(img_tag) {
-                        let raw_src = src_caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-                        dp_review = raw_src.strip_prefix("dp:").is_some_and(|count| {
-                            !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit())
-                        });
-                        inline_review = dp_review;
-                        if !raw_src.is_empty() && !redirect_url.is_empty() && !dp_review {
-                            let abs_src =
-                                crate::parser::rule_engine::resolve_url(redirect_url, raw_src);
-                            format!(r#"<img src="{}">"#, abs_src)
-                        } else {
-                            format!(r#"<img src="{}">"#, raw_src)
+    static IMG_RE: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(r#"(?is)<img\b(?:[^"'<>]|"[^"]*"|'[^']*')*>"#).unwrap()
+    });
+    static SRC_RE: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(r#"(?i)\b(?:src|data-src|data-original)\s*=\s*["']?([^"'\s>]+)["']?"#)
+            .unwrap()
+    });
+    let src_re = &*SRC_RE;
+    text = IMG_RE
+        .replace_all(&text, |caps: &regex::Captures| {
+            let img_tag = caps.get(0).unwrap().as_str();
+            let mut inline_review = false;
+            let mut dp_review = false;
+            let mut image_meta = None;
+            let mut full_img = if let Some(src_caps) = src_re.captures(img_tag) {
+                let raw_src = src_caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+                dp_review = raw_src.strip_prefix("dp:").is_some_and(|count| {
+                    !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit())
+                });
+                inline_review = dp_review;
+                if !raw_src.is_empty() && !redirect_url.is_empty() && !dp_review {
+                    let abs_src =
+                        crate::parser::rule_engine::resolve_url(redirect_url, raw_src);
+                    format!(r#"<img src="{}">"#, abs_src)
+                } else {
+                    format!(r#"<img src="{}">"#, raw_src)
+                }
+            } else {
+                img_tag.to_string()
+            };
+            if let Some(start) = img_tag.find(" data-legado-image-meta=\"") {
+                let value_start = start + " data-legado-image-meta=\"".len();
+                if let Some(end) = img_tag[value_start..].find('"') {
+                    use base64::Engine;
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(&img_tag[value_start..value_start + end])
+                        .ok();
+                    let meta = decoded.as_deref().and_then(|bytes| {
+                        serde_json::from_slice::<serde_json::Value>(bytes).ok()
+                    });
+                    inline_review = meta.as_ref().is_some_and(|meta| {
+                        if dp_review {
+                            return meta.get("style").and_then(serde_json::Value::as_str)
+                                != Some("FULL");
                         }
-                    } else {
-                        img_tag.to_string()
-                    };
-                    if let Some(start) = img_tag.find(" data-legado-image-meta=\"") {
-                        let value_start = start + " data-legado-image-meta=\"".len();
-                        if let Some(end) = img_tag[value_start..].find('"') {
-                            use base64::Engine;
-                            let decoded = base64::engine::general_purpose::STANDARD
-                                .decode(&img_tag[value_start..value_start + end])
-                                .ok();
-                            let meta = decoded.as_deref().and_then(|bytes| {
-                                serde_json::from_slice::<serde_json::Value>(bytes).ok()
-                            });
-                            inline_review = meta.as_ref().is_some_and(|meta| {
-                                if dp_review {
-                                    return meta.get("style").and_then(serde_json::Value::as_str)
-                                        != Some("FULL");
-                                }
-                                let action = meta
-                                    .get("click")
-                                    .or_else(|| meta.get("js"))
-                                    .and_then(serde_json::Value::as_str);
-                                matches!(
-                                    meta.get("style").and_then(serde_json::Value::as_str),
-                                    Some("text" | "TEXT")
-                                ) && action.is_some_and(|action| {
-                                    !action.trim().is_empty() && action.len() <= 65536
+                        let action = meta
+                            .get("click")
+                            .or_else(|| meta.get("js"))
+                            .and_then(serde_json::Value::as_str);
+                        matches!(
+                            meta.get("style").and_then(serde_json::Value::as_str),
+                            Some("text" | "TEXT")
+                        ) && action.is_some_and(|action| {
+                            !action.trim().is_empty() && action.len() <= 65536
+                        })
+                    });
+                    image_meta = meta;
+                    full_img.pop();
+                    full_img.push_str(&img_tag[start..value_start + end + 1]);
+                    full_img.push('>');
+                }
+            }
+            // iOS book sources attach the action directly to img.onPress.
+            // Preserve it in the existing opaque image metadata contract.
+            if img_tag.to_ascii_lowercase().contains("onpress") {
+                static IMAGE_SELECTOR: Lazy<Selector> =
+                    Lazy::new(|| Selector::parse("img").unwrap());
+                let fragment = Html::parse_fragment(img_tag);
+                let onpress = fragment
+                    .select(&IMAGE_SELECTOR)
+                    .next()
+                    .and_then(|node| node.value().attr("onpress"))
+                    .filter(|action| !action.trim().is_empty() && action.len() <= 65536);
+                if let Some(action) = onpress {
+                    let mut meta = image_meta.unwrap_or_else(|| serde_json::json!({}));
+                    if let Some(object) = meta.as_object_mut() {
+                        let existing = ["click", "js"].iter().any(|key| {
+                            object
+                                .get(*key)
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|value| {
+                                    !value.trim().is_empty() && value.len() <= 65536
                                 })
-                            });
-                            image_meta = meta;
-                            full_img.pop();
-                            full_img.push_str(&img_tag[start..value_start + end + 1]);
-                            full_img.push('>');
-                        }
-                    }
-                    // iOS book sources attach the action directly to img.onPress.
-                    // Preserve it in the existing opaque image metadata contract.
-                    if img_tag.to_ascii_lowercase().contains("onpress") {
-                        static IMAGE_SELECTOR: Lazy<Selector> =
-                            Lazy::new(|| Selector::parse("img").unwrap());
-                        let fragment = Html::parse_fragment(img_tag);
-                        let onpress = fragment
-                            .select(&IMAGE_SELECTOR)
-                            .next()
-                            .and_then(|node| node.value().attr("onpress"))
-                            .filter(|action| !action.trim().is_empty() && action.len() <= 65536);
-                        if let Some(action) = onpress {
-                            let mut meta = image_meta.unwrap_or_else(|| serde_json::json!({}));
-                            if let Some(object) = meta.as_object_mut() {
-                                let existing = ["click", "js"].iter().any(|key| {
-                                    object
-                                        .get(*key)
-                                        .and_then(serde_json::Value::as_str)
-                                        .is_some_and(|value| {
-                                            !value.trim().is_empty() && value.len() <= 65536
-                                        })
-                                });
-                                if !existing {
-                                    object.insert("click".to_string(), serde_json::json!(action));
-                                    use base64::Engine;
-                                    let encoded = base64::engine::general_purpose::STANDARD
-                                        .encode(meta.to_string());
-                                    if let Some(start) = full_img.find(" data-legado-image-meta=\"")
-                                    {
-                                        full_img.truncate(start);
-                                    } else {
-                                        full_img.pop();
-                                    }
-                                    full_img.push_str(&format!(
-                                        r#" data-legado-image-meta="{}">"#,
-                                        encoded
-                                    ));
-                                }
-                                let style = meta.get("style").and_then(serde_json::Value::as_str);
-                                inline_review = if dp_review {
-                                    style != Some("FULL")
-                                } else {
-                                    matches!(style, Some("text" | "TEXT"))
-                                };
+                        });
+                        if !existing {
+                            object.insert("click".to_string(), serde_json::json!(action));
+                            use base64::Engine;
+                            let encoded = base64::engine::general_purpose::STANDARD
+                                .encode(meta.to_string());
+                            if let Some(start) = full_img.find(" data-legado-image-meta=\"")
+                            {
+                                full_img.truncate(start);
+                            } else {
+                                full_img.pop();
                             }
+                            full_img.push_str(&format!(
+                                r#" data-legado-image-meta="{}">"#,
+                                encoded
+                            ));
                         }
+                        let style = meta.get("style").and_then(serde_json::Value::as_str);
+                        inline_review = if dp_review {
+                            style != Some("FULL")
+                        } else {
+                            matches!(style, Some("text" | "TEXT"))
+                        };
                     }
-                    let placeholder =
-                        format!("__READER_IMG_PLACEHOLDER_{}__", img_placeholders.len());
-                    img_placeholders.push(full_img);
-                    if inline_review {
-                        placeholder
-                    } else {
-                        format!("\n{}\n", placeholder)
-                    }
-                })
-                .into_owned();
-        }
-    }
+                }
+            }
+            let placeholder =
+                format!("__READER_IMG_PLACEHOLDER_{}__", img_placeholders.len());
+            img_placeholders.push(full_img);
+            if inline_review {
+                placeholder
+            } else {
+                format!("\n{}\n", placeholder)
+            }
+        })
+        .into_owned();
 
     // 3. 将块级换行标签转换为换行符 \n
-    if let Ok(block_re) =
-        regex::Regex::new(r"(?i)<br\s*/?>|</?(?:p|div|h[1-6]|li|ul|ol|hr|article|dd|dl)\b[^>]*>")
-    {
-        text = block_re.replace_all(&text, "\n").into_owned();
-    }
+    text = HTML_BLOCK_RE.replace_all(&text, "\n").into_owned();
 
     // 4. 清理剩余所有 HTML 标签
-    if let Ok(tag_re) = regex::Regex::new(r"<[^>]+>") {
-        text = tag_re.replace_all(&text, "").into_owned();
-    }
+    text = HTML_TAG_RE.replace_all(&text, "").into_owned();
 
     // 5. 还原 <img> 占位符
     for (i, img_tag) in img_placeholders.into_iter().enumerate() {
@@ -3247,24 +3291,13 @@ pub fn html_to_text(html: &str) -> String {
     }
 
     // 1. 移除 script、style 与注释
-    let mut text = html.to_string();
-    if let Ok(re) =
-        regex::Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<!--.*?-->")
-    {
-        text = re.replace_all(&text, "").into_owned();
-    }
+    let mut text = HTML_STRIP_RE.replace_all(html, "").into_owned();
 
     // 2. 将块级换行标签转换为换行符 \n
-    if let Ok(block_re) =
-        regex::Regex::new(r"(?i)<br\s*/?>|</?(?:p|div|h[1-6]|li|ul|ol|hr|article|dd|dl)\b[^>]*>")
-    {
-        text = block_re.replace_all(&text, "\n").into_owned();
-    }
+    text = HTML_BLOCK_RE.replace_all(&text, "\n").into_owned();
 
     // 3. 清理剩余所有 HTML 标签
-    if let Ok(tag_re) = regex::Regex::new(r"<[^>]+>") {
-        text = tag_re.replace_all(&text, "").into_owned();
-    }
+    text = HTML_TAG_RE.replace_all(&text, "").into_owned();
 
     // 4. 若含 &，进行 HTML-unescape
     if text.contains('&') {
@@ -3286,42 +3319,38 @@ pub fn html_to_text(html: &str) -> String {
 /// 净化 HTML（保留基础排版标签，剥离属性与 CSS/脚本）。
 /// 常用于电子书阅读排版（保留 p, br, b, strong, i, em, u, h1-h6, li, ul, ol 等基础标签）。
 pub fn clean_html(html: &str) -> String {
-    use regex::Regex;
+    static SCRIPT_RE: Lazy<regex::Regex> =
+        Lazy::new(|| regex::Regex::new(r"(?is)<script[^>]*>.*?</script>").unwrap());
+    static STYLE_RE: Lazy<regex::Regex> =
+        Lazy::new(|| regex::Regex::new(r"(?is)<style[^>]*>.*?</style>").unwrap());
+    static COMMENT_RE: Lazy<regex::Regex> =
+        Lazy::new(|| regex::Regex::new(r"(?s)<!--.*?-->").unwrap());
+    static ALLOWED_TAG_RE: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(r"(?i)<(/?)(p|br|b|strong|i|em|u|h[1-6]|li|ul|ol)(?:\s+[^>]*)?/?>")
+            .unwrap()
+    });
     let mut output = html.to_string();
-    for pattern in [
-        r"(?is)<script[^>]*>.*?</script>",
-        r"(?is)<style[^>]*>.*?</style>",
-        r"(?s)<!--.*?-->",
-    ] {
-        if let Ok(regex) = Regex::new(pattern) {
-            output = regex.replace_all(&output, "").into_owned();
-        }
+    for regex in [&*SCRIPT_RE, &*STYLE_RE, &*COMMENT_RE] {
+        output = regex.replace_all(&output, "").into_owned();
     }
-    if let Ok(regex) =
-        Regex::new(r"(?i)<(/?)(p|br|b|strong|i|em|u|h[1-6]|li|ul|ol)(?:\s+[^>]*)?/?>")
-    {
-        output = regex.replace_all(&output, "<$1$2>").into_owned();
-    }
-    if let Ok(regex) = Regex::new(r"<[^>]+>") {
-        let mut cleaned = String::new();
-        let mut last_end = 0;
-        for found in regex.find_iter(&output) {
-            cleaned.push_str(&output[last_end..found.start()]);
-            match found.as_str().to_ascii_lowercase().as_str() {
-                "<p>" | "</p>" | "<br>" | "<b>" | "</b>" | "<strong>" | "</strong>" | "<i>"
-                | "</i>" | "<em>" | "</em>" | "<u>" | "</u>" | "<h1>" | "</h1>" | "<h2>"
-                | "</h2>" | "<h3>" | "</h3>" | "<h4>" | "</h4>" | "<h5>" | "</h5>" | "<h6>"
-                | "</h6>" | "<li>" | "</li>" | "<ul>" | "</ul>" | "<ol>" | "</ol>" => {
-                    cleaned.push_str(found.as_str());
-                }
-                _ => {}
+    output = ALLOWED_TAG_RE.replace_all(&output, "<$1$2>").into_owned();
+    let mut cleaned = String::new();
+    let mut last_end = 0;
+    for found in HTML_TAG_RE.find_iter(&output) {
+        cleaned.push_str(&output[last_end..found.start()]);
+        match found.as_str().to_ascii_lowercase().as_str() {
+            "<p>" | "</p>" | "<br>" | "<b>" | "</b>" | "<strong>" | "</strong>" | "<i>"
+            | "</i>" | "<em>" | "</em>" | "<u>" | "</u>" | "<h1>" | "</h1>" | "<h2>"
+            | "</h2>" | "<h3>" | "</h3>" | "<h4>" | "</h4>" | "<h5>" | "</h5>" | "<h6>"
+            | "</h6>" | "<li>" | "</li>" | "<ul>" | "</ul>" | "<ol>" | "</ol>" => {
+                cleaned.push_str(found.as_str());
             }
-            last_end = found.end();
+            _ => {}
         }
-        cleaned.push_str(&output[last_end..]);
-        output = cleaned;
+        last_end = found.end();
     }
-    output
+    cleaned.push_str(&output[last_end..]);
+    cleaned
 }
 
 #[cfg(test)]

@@ -16,13 +16,17 @@ thread_local! {
 
 // Capture only during a source click; restore the outer scope even on unwind.
 pub(crate) fn with_click_browser<T>(run: impl FnOnce() -> T) -> (T, Option<JsonValue>) {
-    CLICK_BROWSER.with(|cell| crate::util::scoped::with_scoped_value(cell, Some(None), || {
-        let result = run();
-        (result, cell.borrow().as_ref().and_then(Clone::clone))
-    }))
+    CLICK_BROWSER.with(|cell| {
+        crate::util::scoped::with_scoped_value(cell, Some(None), || {
+            let result = run();
+            (result, cell.borrow().as_ref().and_then(Clone::clone))
+        })
+    })
 }
 
-pub(crate) fn with_login_messages<T>(run: impl FnOnce() -> T) -> (T, Vec<String>, Option<JsonValue>) {
+pub(crate) fn with_login_messages<T>(
+    run: impl FnOnce() -> T,
+) -> (T, Vec<String>, Option<JsonValue>) {
     struct Restore(Option<Vec<String>>, Option<JsonValue>);
     impl Drop for Restore {
         fn drop(&mut self) {

@@ -92,34 +92,9 @@ function _r_install_event_target(target) {
 // ─── URL parser (used by element setAttribute and window.URL) ───────────────
 
 function _r_parse_url(href, base) {
-    var s = String(href || '');
-    // Resolve relative URL against base
-    if (base && !/^[a-zA-Z][a-zA-Z0-9+\-.]*:/.test(s)) {
-        var b = _r_parse_url(base);
-        if (s.charAt(0) === '/') {
-            s = b.protocol + '//' + b.host + s;
-        } else if (s.charAt(0) === '#') {
-            s = b.protocol + '//' + b.host + b.pathname + s;
-        } else {
-            var dir = b.pathname.replace(/\/[^\/]*$/, '/');
-            s = b.protocol + '//' + b.host + dir + s;
-        }
-    }
-    var m = s.match(/^([a-zA-Z][a-zA-Z0-9+\-.]*:)\/\/([^\/\?#]*)([^\?#]*)(\?[^#]*)?(#.*)?$/);
-    if (m) {
-        var protocol = m[1] || '';
-        var host     = m[2] || '';
-        var hostname = host.replace(/:\d+$/, '');
-        var port     = (host.match(/:(\d+)$/) || ['', ''])[1];
-        var pathname = m[3] || '/';
-        var search   = m[4] || '';
-        var hash     = m[5] || '';
-        return { href: s, protocol: protocol, host: host, hostname: hostname,
-                 port: port, pathname: pathname, search: search, hash: hash,
-                 origin: protocol + '//' + host };
-    }
-    return { href: s, protocol: '', host: '', hostname: '', port: '',
-             pathname: s || '/', search: '', hash: '', origin: '' };
+    var parsed = JSON.parse(_r_url_parse(String(href || ''), base == null ? '' : String(base)));
+    if (!parsed) throw new TypeError('Invalid URL');
+    return parsed;
 }
 
 

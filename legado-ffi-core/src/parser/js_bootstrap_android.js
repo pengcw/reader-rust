@@ -617,6 +617,57 @@
                     function IvParameterSpec(iv) {
                         return { iv: toBytes(iv) };
                     }
+                    // Wrap only explicitly typed Java Map bindings. Do not change
+                    // plain JSON objects or rule `result` values automatically.
+                    Object.defineProperty(java, '__asJavaMap', {
+                        value(value) {
+                            if (value === null || typeof value !== 'object' || Array.isArray(value)
+                                || (Object.getPrototypeOf(value) !== Object.prototype
+                                    && Object.getPrototypeOf(value) !== null)) {
+                                throw new TypeError('Java Map binding requires a plain object');
+                            }
+                            const data = {};
+                            for (const [key, item] of Object.entries(value)) {
+                                // defineProperty also preserves keys such as __proto__.
+                                Object.defineProperty(data, key, {
+                                    value: item, writable: true, enumerable: true, configurable: true
+                                });
+                            }
+                            const has = key => Object.prototype.hasOwnProperty.call(data, key);
+                            const methods = Object.freeze({
+                                get(key) { key = String(key); return has(key) ? data[key] : null; },
+                                put(key, item) {
+                                    key = String(key);
+                                    const previous = has(key) ? data[key] : null;
+                                    Object.defineProperty(data, key, {
+                                        value: item, writable: true, enumerable: true, configurable: true
+                                    });
+                                    return previous;
+                                },
+                                containsKey(key) { return has(String(key)); },
+                                remove(key) {
+                                    key = String(key);
+                                    const previous = has(key) ? data[key] : null;
+                                    delete data[key];
+                                    return previous;
+                                },
+                                size() { return Object.keys(data).length; },
+                                isEmpty() { return Object.keys(data).length === 0; }
+                            });
+                            return new Proxy(data, {
+                                get(target, key, receiver) {
+                                    // JSON must serialize raw entries, including names of Map methods.
+                                    if (key === 'toJSON') return () => Object.fromEntries(Object.entries(data));
+                                    // Java methods win over same-named map keys; use get('get') for data.
+                                    if (typeof key === 'string' && Object.prototype.hasOwnProperty.call(methods, key)) {
+                                        return methods[key];
+                                    }
+                                    return Reflect.get(target, key, receiver);
+                                }
+                            });
+                        },
+                        configurable: false, enumerable: false, writable: false
+                    });
                     class JavaHashMap extends Map {
                         get(key) { return this.has(key) ? super.get(key) : null; }
                         put(key, value) {
@@ -905,6 +956,11 @@
                     Packages.java.security = Packages.java.security || {};
                     Packages.java.security.SecureRandom = markClass('SecureRandom', SecureRandom);
                     Packages.java.lang.String = markClass('String', JavaString);
+                    // Source libraries sometimes cache Thread.sleep without calling it.
+                    // Keep that reference loadable without blocking the parser thread.
+                    Packages.java.lang.Thread = markClass('Thread', {
+                        sleep() { throw new Error('Thread.sleep is not supported by this nonblocking parser'); }
+                    });
                     // Deliberately limited to the string overloads used by source rules.
                     function JavaStringBuilder(initial) {
                         if (arguments.length > 1 || (arguments.length === 1 && typeof initial !== 'string')) {
@@ -968,6 +1024,74 @@
                     Packages.javax.xml.bind.DatatypeConverter =
                         markClass('DatatypeConverter', DatatypeConverter);
                     Packages.android.util.Base64 = markClass('Base64', base64);
+                    // Small Hutool 5.x facade for the methods used by real book sources.
+                    // Reuse existing host codecs; do not emulate the full Hutool library.
+                    const hutoolBytes = value => {
+                        if (Array.isArray(value) || value instanceof Uint8Array) return toBytes(value);
+                        if (typeof value === 'string' || value instanceof JsString) {
+                            return java.strToBytes(String(value), 'UTF-8');
+                        }
+                        throw new TypeError('Hutool codec requires text or byte array');
+                    };
+                    Packages.cn = Packages.cn || {};
+                    Packages.cn.hutool = Packages.cn.hutool || {};
+                    Packages.cn.hutool.core = Packages.cn.hutool.core || {};
+                    Packages.cn.hutool.core.codec = Packages.cn.hutool.core.codec || {};
+                    Packages.cn.hutool.core.util = Packages.cn.hutool.core.util || {};
+                    Packages.cn.hutool.crypto = Packages.cn.hutool.crypto || {};
+                    Packages.cn.hutool.crypto.digest = Packages.cn.hutool.crypto.digest || {};
+                    Packages.cn.hutool.core.codec.Base64 = markClass('Base64', {
+                        encode(value) { return base64.encodeToString(hutoolBytes(value), base64.NO_WRAP); },
+                        encodeUrlSafe(value) {
+                            return base64.encodeToString(hutoolBytes(value),
+                                base64.NO_WRAP | base64.URL_SAFE | base64.NO_PADDING);
+                        },
+                        encodeWithoutPadding(value) {
+                            return base64.encodeToString(hutoolBytes(value), base64.NO_WRAP | base64.NO_PADDING);
+                        },
+                        decode(value) { return base64.decode(value, /[-_]/.test(String(value)) ? base64.URL_SAFE : 0); },
+                        decodeStr(value) { return java.bytesToStr(this.decode(value), 'UTF-8'); }
+                    });
+                    Packages.cn.hutool.core.util.HexUtil = markClass('HexUtil', {
+                        decodeHex(value) {
+                            const hex = String(value);
+                            if (hex.length % 2 || !/^[0-9a-f]*$/i.test(hex)) {
+                                throw new TypeError('HexUtil.decodeHex: invalid hex');
+                            }
+                            return java.hexDecodeToByteArray(hex);
+                        },
+                        encodeHexStr(value) {
+                            return typeof value === 'string' || value instanceof JsString
+                                ? java.hexEncodeToString(String(value))
+                                : DatatypeConverter.printHexBinary(hutoolBytes(value)).toLowerCase();
+                        }
+                    });
+                    Packages.cn.hutool.crypto.digest.DigestUtil = markClass('DigestUtil', {
+                        md5Hex(value) {
+                            if (typeof value !== 'string' && !(value instanceof JsString)) {
+                                throw new TypeError('DigestUtil.md5Hex: unsupported non-text input');
+                            }
+                            return java.md5Encode(String(value));
+                        }
+                    });
+                    // Pixiv login sources use only Digester(SHA256).digest(byte[]).
+                    Packages.cn.hutool.crypto.digest.DigestAlgorithm = markClass('DigestAlgorithm', {
+                        SHA256: 'SHA-256'
+                    });
+                    function HutoolDigester(algorithm) {
+                        if (!new.target || arguments.length !== 1 || algorithm !== 'SHA-256') {
+                            throw new TypeError('Digester: only SHA256 is supported');
+                        }
+                    }
+                    HutoolDigester.prototype.digest = function(value) {
+                        if (!Array.isArray(value) && !(value instanceof Uint8Array)) {
+                            throw new TypeError('Digester.digest: byte array required');
+                        }
+                        const output = java.__digestBytes(toBytes(value), 'SHA-256');
+                        if (output == null) throw new Error('Digester.digest: digest failed');
+                        return output;
+                    };
+                    Packages.cn.hutool.crypto.digest.Digester = markClass('Digester', HutoolDigester);
                     Packages.android.text = Packages.android.text || {};
                     Packages.android.text.TextUtils = markClass('TextUtils', {
                         isEmpty(value) {

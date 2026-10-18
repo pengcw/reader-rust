@@ -504,14 +504,11 @@ pub(super) fn java_analyzed_request_response(url: &str, headers_json: &str) -> S
         Err(error) => return java_error_response(url, &error),
     };
 
-    let response = match execute_request_spec_limited(
-        &client,
-        &spec,
-        Some(active_js_max_response_bytes()),
-    ) {
-        Ok(response) => response,
-        Err(error) => return java_error_response(&spec.url, &error.to_string()),
-    };
+    let response =
+        match execute_request_spec_limited(&client, &spec, Some(active_js_max_response_bytes())) {
+            Ok(response) => response,
+            Err(error) => return java_error_response(&spec.url, &error.to_string()),
+        };
 
     let headers = response
         .headers

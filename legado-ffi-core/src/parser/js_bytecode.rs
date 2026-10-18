@@ -65,7 +65,11 @@ fn bootstrap_cache_file(dir: &std::path::Path, slot: BootstrapSlot) -> std::path
         std::env::consts::OS,
         std::env::consts::ARCH,
         std::mem::size_of::<usize>(),
-        if cfg!(target_endian = "little") { "le" } else { "be" },
+        if cfg!(target_endian = "little") {
+            "le"
+        } else {
+            "be"
+        },
         cfg!(feature = "kindle-eglibc-2-12"),
         cfg!(debug_assertions),
     );
@@ -77,15 +81,21 @@ fn bootstrap_cache_file(dir: &std::path::Path, slot: BootstrapSlot) -> std::path
 
 fn load_bootstrap(file: &std::path::Path) -> Option<Arc<[u8]>> {
     let data = crate::crawler::script_cache::read_limited(file, BOOTSTRAP_FILE_LIMIT)?;
-    if data.len() <= 36 || &data[..4] != b"QBC1" { return None; }
+    if data.len() <= 36 || &data[..4] != b"QBC1" {
+        return None;
+    }
     let payload = &data[36..];
     let actual = ring::digest::digest(&ring::digest::SHA256, payload);
     (actual.as_ref() == &data[4..36]).then(|| Arc::from(payload))
 }
 
 fn save_bootstrap(file: &std::path::Path, bytes: &[u8]) {
-    if bytes.len() + 36 > BOOTSTRAP_FILE_LIMIT as usize { return; }
-    let Some(dir) = file.parent() else { return; };
+    if bytes.len() + 36 > BOOTSTRAP_FILE_LIMIT as usize {
+        return;
+    }
+    let Some(dir) = file.parent() else {
+        return;
+    };
     let mut data = Vec::with_capacity(bytes.len() + 36);
     data.extend_from_slice(b"QBC1");
     data.extend_from_slice(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref());
@@ -96,8 +106,10 @@ fn save_bootstrap(file: &std::path::Path, bytes: &[u8]) {
 // Query the Lua host at most once per fresh set of fixed bootstraps.
 pub(super) fn disk_directory() -> Option<std::path::PathBuf> {
     let missing = COMPILED.with(|cache| cache.borrow().iter().any(Option::is_none));
-    missing.then(crate::crawler::script_cache::ScriptCache::from_host)
-        .flatten()?.directory(true)
+    missing
+        .then(crate::crawler::script_cache::ScriptCache::from_host)
+        .flatten()?
+        .directory(true)
 }
 
 fn js_error(ctx: &Ctx<'_>) -> anyhow::Error {

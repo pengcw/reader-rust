@@ -3,6 +3,9 @@
 use rquickjs::{module::WriteOptions, qjs, Context, Ctx, Function, Module, Object, Runtime, Value};
 use std::{env, ffi::CString, fs, path::PathBuf};
 
+#[path = "src/browser_url.rs"]
+mod browser_url;
+
 fn compile_global(ctx: &Ctx<'_>, source: &[u8]) -> Vec<u8> {
     let input = CString::new(source).expect("fixed JS source must not contain NUL");
     // SAFETY: The input and filename remain valid during compile-only JS_Eval.
@@ -63,6 +66,7 @@ fn main() {
     for source in [
         "src/linkedom/worker.min.js",
         "src/bootstrap_common.js",
+        "src/browser_url.rs",
         "src/linkedom_adapter.js",
     ] {
         println!("cargo:rerun-if-changed={source}");
@@ -101,6 +105,7 @@ fn main() {
         globals.set("document", Object::new(ctx.clone()).unwrap()).unwrap();
         globals.set("__r_initial_href", "https://rakers.test/").unwrap();
         globals.set("__r_initial_ua", "rakers-build-test").unwrap();
+        browser_url::install(&ctx).expect("install build-time URL bridge");
         eval_global(&ctx, &fs::read(output.join("browser-bootstrap.qbc")).unwrap());
         globals.remove("__r_initial_href").unwrap();
         globals.remove("__r_initial_ua").unwrap();
@@ -108,6 +113,8 @@ fn main() {
         let user_agent: String = ctx.eval("navigator.userAgent").unwrap();
         assert_eq!(href, "https://rakers.test/");
         assert_eq!(user_agent, "rakers-build-test");
+        let query_url: String = ctx.eval("new URL('?api=1', 'https://rakers.test/page?old=1#before').href").unwrap();
+        assert_eq!(query_url, "https://rakers.test/page?api=1");
 
         let module = unsafe { Module::load(ctx.clone(), &module_bytes) }
             .expect("load precompiled LinkeDOM module");

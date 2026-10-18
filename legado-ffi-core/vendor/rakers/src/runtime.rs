@@ -281,6 +281,19 @@ mod quickjs_rt {
         set_deadline(None);
     }
 
+    // Only installed for the explicitly opted-in final-script bridge. Never
+    // used by fetch/XHR or page JavaScript work. Preserve the remaining budget.
+    struct FinalHostWait(Instant);
+    impl Drop for FinalHostWait {
+        fn drop(&mut self) {
+            let waited = self.0.elapsed();
+            SCRIPT_DEADLINE.with(|slot| {
+                let mut deadline = slot.borrow_mut();
+                *deadline = deadline.and_then(|value| value.checked_add(waited));
+            });
+        }
+    }
+
     fn interrupt_deadline_exceeded() -> bool {
         // QuickJS itself invokes the callback about every 10,000 opcodes.
         // Do not throttle it a second time: that delays runaway-script timeouts.
@@ -387,6 +400,8 @@ mod quickjs_rt {
                 setup_document(&ctx)?;
                 setup_console(&ctx)?;
                 setup_http_bridge(&ctx)?;
+                crate::browser_url::install(&ctx)
+                    .map_err(|e| anyhow!("URL bridge setup: {e:?}"))?;
 
                 let sloppy = || {
                     let mut options = EvalOptions::default();
@@ -536,9 +551,33 @@ mod quickjs_rt {
                 let final_result = if let Some(script) = final_script {
                     let task_deadline = bounded_deadline(self.timeout, render_deadline);
                     set_deadline(task_deadline);
-                    let result = match ctx
-                        .eval_with_options::<rquickjs::Coerced<String>, _>(script, sloppy())
-                    {
+                    let evaluated = if let Some(host) = crate::FINAL_SCRIPT_HOST.with(|slot| slot.get()) {
+                        let waited = std::cell::Cell::new(Duration::ZERO);
+                        let callback = Function::new(ctx.clone(), move |request: String| {
+                            const EXPIRED: &str = r#"{"ok":false,"error":{"message":"interaction budget expired"}}"#;
+                            if interrupt_deadline_exceeded() || waited.get() >= Duration::from_secs(120) {
+                                return EXPIRED.to_string();
+                            }
+                            let guard = FinalHostWait(Instant::now());
+                            let result = host(request);
+                            waited.set(waited.get().saturating_add(guard.0.elapsed()));
+                            drop(guard);
+                            if waited.get() >= Duration::from_secs(120) {
+                                EXPIRED.to_string()
+                            } else {
+                                result
+                            }
+                        });
+                        // Evaluate a private driver function, then pass the native
+                        // callback as an argument. Page globals are never assigned it.
+                        callback.and_then(|callback| {
+                            let driver: Function = ctx.eval_with_options(script, sloppy())?;
+                            driver.call::<_, rquickjs::Coerced<String>>((callback,))
+                        })
+                    } else {
+                        ctx.eval_with_options::<rquickjs::Coerced<String>, _>(script, sloppy())
+                    };
+                    let result = match evaluated {
                         Ok(value) => Some(value.0),
                         Err(_) => {
                             let exc = ctx.catch();
@@ -551,8 +590,9 @@ mod quickjs_rt {
                             None
                         }
                     };
+                    let effective_deadline = SCRIPT_DEADLINE.with(|slot| *slot.borrow());
                     clear_deadline();
-                    drain_pending_jobs(&ctx, task_deadline);
+                    drain_pending_jobs(&ctx, effective_deadline);
                     result
                 } else {
                     None

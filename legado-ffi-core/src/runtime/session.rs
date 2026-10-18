@@ -18,7 +18,7 @@ use url::Url;
 
 const JS_CACHE_STATE_KEY: &str = "__reader_js_cache_v1";
 const JS_CACHE_MAX_ENTRIES: usize = 64;
-const JS_CACHE_MAX_VALUE_BYTES: usize = 16 * 1024;
+const JS_CACHE_MAX_VALUE_BYTES: usize = 256 * 1024;
 
 const SESSION_VARIABLE_MAX_ENTRIES: usize = 64;
 const SESSION_VARIABLE_MAX_KEY_BYTES: usize = 256;
@@ -520,6 +520,16 @@ impl ActiveSession {
         Ok(())
     }
 
+    // Legado also allows a raw login token in putLoginHeader(). It is stored
+    // for scripts to read, but is not itself a map of HTTP request headers.
+    pub fn put_login_header_raw(&self, value: String) -> Result<(), String> {
+        if value.is_empty() || value.chars().any(char::is_control) {
+            return Err("invalid raw login token".into());
+        }
+        *self.header.lock().unwrap_or_else(|e| e.into_inner()) = Some(Value::String(value));
+        Ok(())
+    }
+
     pub fn remove_login_header(&self) {
         self.remove_cookie(&self.source_url);
         let mut h = self.header.lock().unwrap_or_else(|e| e.into_inner());
@@ -866,10 +876,17 @@ mod tests {
                 assert!(session.js_cache_put(&format!("key-{index}"), "v".into(), None));
             }
             assert!(!session.js_cache_put("one-more", "v".into(), None));
+            assert!(session.js_cache_put("key-0", "x".repeat(JS_CACHE_MAX_VALUE_BYTES), None));
             assert!(!session.js_cache_put("huge", "x".repeat(JS_CACHE_MAX_VALUE_BYTES + 1), None));
             assert!(session.js_cache_delete("key-0"));
             assert!(session.js_cache_put("replacement", "v".into(), None));
         });
-        assert!(delta.is_some());
+        let saved = delta.expect("updated cache must be persisted");
+        assert!(saved.variables_within_limits());
+        let (_, restored) = with_active_session(Some(&saved), "https://example.com", |session| {
+            assert_eq!(session.js_cache_get("replacement").as_deref(), Some("v"));
+            assert_eq!(session.js_cache_get("key-0"), None);
+        });
+        assert!(restored.is_none());
     }
 }

@@ -42,8 +42,7 @@ fn execute(req: Request) -> anyhow::Result<Vec<u8>> {
     anyhow::ensure!(valid_size, "invalid AES-GCM input size");
 
     let key = LessSafeKey::new(
-        UnboundKey::new(algorithm, &req.key)
-            .map_err(|_| anyhow::anyhow!("invalid AES-GCM key"))?,
+        UnboundKey::new(algorithm, &req.key).map_err(|_| anyhow::anyhow!("invalid AES-GCM key"))?,
     );
     let nonce = Nonce::try_assume_unique_for_key(&req.nonce)
         .map_err(|_| anyhow::anyhow!("invalid AES-GCM nonce"))?;
@@ -79,7 +78,9 @@ mod tests {
             key: vec![0; 16],
             nonce: vec![0; 12],
             data: tag.clone(),
-        }).unwrap().is_empty());
+        })
+        .unwrap()
+        .is_empty());
         let mut modified = tag;
         modified[0] ^= 1;
         assert!(execute(Request {
@@ -87,20 +88,33 @@ mod tests {
             key: vec![0; 16],
             nonce: vec![0; 12],
             data: modified,
-        }).is_err());
+        })
+        .is_err());
     }
 
     #[test]
     fn invalid_parameters_and_native_json_boundary() {
         assert!(execute(Request {
-            mode: 1, key: vec![0; 24], nonce: vec![0; 12], data: vec![1]
-        }).is_err());
+            mode: 1,
+            key: vec![0; 24],
+            nonce: vec![0; 12],
+            data: vec![1]
+        })
+        .is_err());
         assert!(execute(Request {
-            mode: 2, key: vec![0; 32], nonce: vec![0; 12], data: vec![0; 15]
-        }).is_err());
+            mode: 2,
+            key: vec![0; 32],
+            nonce: vec![0; 12],
+            data: vec![0; 15]
+        })
+        .is_err());
         assert!(execute(Request {
-            mode: 1, key: vec![0; 32], nonce: vec![0; 11], data: vec![1]
-        }).is_err());
+            mode: 1,
+            key: vec![0; 32],
+            nonce: vec![0; 11],
+            data: vec![1]
+        })
+        .is_err());
         assert!(execute_json(r#"{"mode":1,"key":[256],"nonce":[],"data":[]}"#).is_err());
         assert!(execute_json(&"x".repeat(2 * 1024 * 1024 + 1)).is_err());
     }

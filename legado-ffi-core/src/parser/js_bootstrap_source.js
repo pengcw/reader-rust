@@ -57,11 +57,16 @@
                         }
                     }
                     const map = new NativeMap(Object.entries(value).map(([key, item]) => [key, String(item)]));
-                    // Config keys supplement, never shadow, native Map members.
+                    // Preserve the native Map identity and methods. JSON also includes
+                    // new properties assigned directly by book-source login scripts.
+                    Object.defineProperty(map, 'toJSON', {
+                        value: () => Object.fromEntries([...map, ...Object.entries(map)])
+                    });
                     for (const key of map.keys()) {
                         if (key in map) continue;
                         Object.defineProperty(map, key, {
                             get: () => map.get(key),
+                            set: item => map.set(key, String(item)),
                             configurable: true
                         });
                     }

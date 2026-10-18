@@ -1,3 +1,5 @@
+use crate::parser::js_budget::Budget;
+use crate::parser::js_bytecode::{self, BootstrapSlot};
 use crate::parser::js_compat::{
     java_base64_decode, java_base64_decode_bytes, java_base64_encode_bytes, java_bytes_to_str,
     java_digest_bytes, java_encode_uri, java_hmac_bytes, java_hmac_string_bytes, java_str_to_bytes,
@@ -26,7 +28,6 @@ pub use crate::parser::js_url::{
     eval_js_url_template_with_headers, eval_js_url_with_bindings, eval_js_url_with_headers,
 };
 use crate::parser::jsonpath;
-use crate::parser::js_bytecode::{self, BootstrapSlot};
 use crate::parser::rule_analyzer;
 use crate::parser::rule_engine;
 use crate::parser::source_regex;
@@ -49,7 +50,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock as Lazy;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 static JS_KV: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static JS_CACHE: Lazy<Mutex<HashMap<String, JsCacheEntry>>> =
@@ -75,11 +76,50 @@ static JS_DEVICE_ID: Lazy<String> = Lazy::new(|| {
 type Aes128CbcDecryptor = cbc::Decryptor<Aes128>;
 type Aes128CbcEncryptor = cbc::Encryptor<Aes128>;
 
-struct TimerGuard(Arc<AtomicU64>);
+type SharedJsBudget = Arc<Mutex<Option<Budget>>>;
+static BUDGET_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+struct TimerGuard(SharedJsBudget);
 impl Drop for TimerGuard {
     fn drop(&mut self) {
-        self.0.store(0, Ordering::Relaxed);
+        *self.0.lock().unwrap() = None;
     }
+}
+
+// Only the fixed native browser driver uses this; ordinary hostCall cannot pause.
+pub(super) fn with_browser_host_wait<T>(run: impl FnOnce() -> T) -> anyhow::Result<T> {
+    JS_ENV.with(|(_, budget)| {
+        let token = {
+            let mut state = budget.lock().unwrap();
+            match state.as_mut() {
+                Some(state) => Some(
+                    state
+                        .begin_wait(Instant::now())
+                        .map_err(|error| anyhow::anyhow!("browser wait budget: {error:?}"))?,
+                ),
+                None => None,
+            }
+        };
+        struct Resume(SharedJsBudget, Option<crate::parser::js_budget::WaitToken>);
+        impl Drop for Resume {
+            fn drop(&mut self) {
+                if let Some(token) = self.1 {
+                    if let Some(state) = self.0.lock().unwrap().as_mut() {
+                        let _ = state.end_wait(Instant::now(), token);
+                    }
+                }
+            }
+        }
+        let guard = Resume(budget.clone(), token);
+        let result = run();
+        drop(guard);
+        if let Some(state) = budget.lock().unwrap().as_mut() {
+            state
+                .check(Instant::now())
+                .map_err(|error| anyhow::anyhow!("browser wait budget: {error:?}"))?;
+        }
+        Ok(result)
+    })
 }
 
 // Opt-in timing of the ordinary JS evaluator. No script contents, URLs, or
@@ -150,7 +190,7 @@ struct JsProfileTotals {
     cleanup_micros: [u128; 2],
     slots_micros: [u128; 9],
     bytecode_phase_micros: [[u128; 9]; 3], // ReadObject, EvalFunction, cold compile
-    lib_split_micros: [u128; 3], // compile/serialize, bytecode read, execute
+    lib_split_micros: [u128; 3],           // compile/serialize, bytecode read, execute
     lib_cache_hits: u64,
     lib_bytecode_bytes: usize,
     // Per JS invocation: native source, cookie/cache, java, then host parse/call/encode.
@@ -159,7 +199,17 @@ struct JsProfileTotals {
 }
 
 impl JsProfileTotals {
-    fn add(&mut self, stages: [u128; 7], setup: [u128; 3], cleanup: [u128; 2], slots: [u128; 9], phases: [[u128; 9]; 3], lib_split: [u128; 3], lib_cache: (u64, usize), bridge: ([u128; 6], u64)) {
+    fn add(
+        &mut self,
+        stages: [u128; 7],
+        setup: [u128; 3],
+        cleanup: [u128; 2],
+        slots: [u128; 9],
+        phases: [[u128; 9]; 3],
+        lib_split: [u128; 3],
+        lib_cache: (u64, usize),
+        bridge: ([u128; 6], u64),
+    ) {
         self.count += 1;
         for (total, elapsed) in self.micros.iter_mut().zip(stages) {
             *total += elapsed;
@@ -204,10 +254,14 @@ impl JsProfileTotals {
             // Additional numeric-only line splits each fixed bootstrap phase.
             let mut line = format!("[legado::js_bytecode] calls={} avg_us", self.count);
             for (phase, values) in ["read", "eval", "compile"]
-                .into_iter().zip(&self.bytecode_phase_micros)
+                .into_iter()
+                .zip(&self.bytecode_phase_micros)
             {
-                for (name, elapsed) in ["java", "source", "xpath", "jsoup", "android",
-                    "security", "math", "des", "aes"].into_iter().zip(values)
+                for (name, elapsed) in [
+                    "java", "source", "xpath", "jsoup", "android", "security", "math", "des", "aes",
+                ]
+                .into_iter()
+                .zip(values)
                 {
                     use std::fmt::Write;
                     let _ = write!(line, " {phase}_{name}={}", elapsed / self.count as u128);
@@ -235,7 +289,8 @@ impl JsProfileTotals {
 
 fn js_bridge_mark(index: usize, started: Option<Instant>) {
     if let Some(started) = started {
-        JS_BRIDGE_METRICS.with(|metrics| metrics.borrow_mut().0[index] += started.elapsed().as_micros());
+        JS_BRIDGE_METRICS
+            .with(|metrics| metrics.borrow_mut().0[index] += started.elapsed().as_micros());
     }
 }
 
@@ -254,7 +309,12 @@ fn eval_profiled_setup_script<'js>(
 ) -> anyhow::Result<Value<'js>> {
     let mark = (*JS_PROFILE_ENABLED).then(Instant::now);
     let mut timings = js_bytecode::BytecodeTimings::default();
-    let result = js_bytecode::eval(ctx, slot, dir, (*JS_PROFILE_ENABLED).then_some(&mut timings));
+    let result = js_bytecode::eval(
+        ctx,
+        slot,
+        dir,
+        (*JS_PROFILE_ENABLED).then_some(&mut timings),
+    );
     if let Some(mark) = mark {
         let elapsed = mark.elapsed().as_micros();
         JS_SETUP_METRICS.with(|totals| totals.borrow_mut()[bucket] += elapsed);
@@ -303,25 +363,17 @@ thread_local! {
     // Populated only while running an explicitly requested TOC pre-update hook.
     static PRE_UPDATE_TOC_SNAPSHOT: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
 
-    static JS_ENV: (Runtime, Arc<AtomicU64>) = {
+    static JS_ENV: (Runtime, SharedJsBudget) = {
         let rt = Runtime::new().expect("Failed to create JS Runtime");
         rt.set_max_stack_size(512 * 1024);
         rt.set_memory_limit(30 * 1024 * 1024);
 
-        let start_time = Arc::new(AtomicU64::new(0));
+        let start_time: SharedJsBudget = Arc::new(Mutex::new(None));
         let st_clone = start_time.clone();
 
         rt.set_interrupt_handler(Some(Box::new(move || {
-            let st = st_clone.load(Ordering::Relaxed);
-            if st == 0 {
-                return false;
-            }
-            if let Ok(elapsed) = SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-                if elapsed.as_secs() > st + 4 {
-                    return true;
-                }
-            }
-            false
+            st_clone.lock().unwrap().as_mut()
+                .is_some_and(|budget| budget.check(Instant::now()).is_err())
         })));
 
         (rt, start_time)
@@ -336,6 +388,10 @@ fn with_js_reentrant_ctx<T>(ctx: &rquickjs::Ctx<'_>, f: impl FnOnce() -> T) -> T
 pub fn eval_js(script: &str, input: &str, base_url: &str) -> anyhow::Result<String> {
     eval_js_inner(script, Some(input), Some(base_url), None, None, None)
 }
+
+// Internal type metadata, never installed as a JavaScript global.
+// Only execution paths that know an input is a Java Map may set it.
+pub(crate) const JAVA_MAP_BINDINGS_KEY: &str = "__legadoJavaMapBindings";
 
 pub fn eval_js_with_bindings(
     script: &str,
@@ -568,6 +624,37 @@ fn collect_header_map(ctx: &rquickjs::Ctx<'_>) -> anyhow::Result<Vec<(String, St
         .collect())
 }
 
+// Convert only source bindings explicitly tagged by the executor as Java Maps.
+// Keep the tag private to Rust; do not expose it to book-source JavaScript.
+fn install_explicit_java_map_bindings<'js>(
+    ctx: &rquickjs::Ctx<'js>,
+    bindings: Option<&HashMap<String, JsonValue>>,
+) -> anyhow::Result<()> {
+    let Some(bindings) = bindings else {
+        return Ok(());
+    };
+    let Some(names) = bindings.get(JAVA_MAP_BINDINGS_KEY) else {
+        return Ok(());
+    };
+    let names = names
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("invalid Java Map binding metadata"))?;
+    let globals = ctx.globals();
+    let adapter: rquickjs::Function<'js> =
+        globals.get::<_, Object<'js>>("java")?.get("__asJavaMap")?;
+    for name in names {
+        let name = name
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid Java Map binding name"))?;
+        if !bindings.get(name).is_some_and(JsonValue::is_object) {
+            anyhow::bail!("Java Map binding must be an object: {name}");
+        }
+        let value: Value<'js> = globals.get(name)?;
+        globals.set(name, adapter.call::<_, Value<'js>>((value,))?)?;
+    }
+    Ok(())
+}
+
 type HeaderMapContext<'a> = (
     &'a serde_json::Map<String, JsonValue>,
     &'a std::cell::RefCell<Option<Vec<(String, String)>>>,
@@ -661,11 +748,10 @@ pub(super) fn eval_js_inner_with_source(
             memory_samples.push(("context", runtime.memory_usage()));
         }
         js_profile_mark(&mut profile_mark, &mut profile_stages, 0);
-        let now = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        start_time.store(now, Ordering::Relaxed);
+        *start_time.lock().unwrap() = Some(Budget::new(
+            BUDGET_GENERATION.fetch_add(1, Ordering::Relaxed), Instant::now(),
+            Duration::from_secs(4), Duration::from_secs(120),
+        ));
         let _guard = TimerGuard(start_time.clone());
         let eval_result = ctx.with(|ctx| {
             let globals = ctx.globals();
@@ -900,8 +986,12 @@ pub(super) fn eval_js_inner_with_source(
                 "putLoginHeader",
                 Func::new(|ctx: rquickjs::Ctx<'_>, val: String| -> rquickjs::Result<()> {
                     if let Some(active) = current_active_session() {
-                        active.put_login_header(serde_json::Value::String(val))
-                            .map_err(|message| rquickjs::Exception::throw_type(&ctx, &message))?;
+                        let update = if val.trim_start().starts_with(['{', '[']) {
+                            active.put_login_header(serde_json::Value::String(val))
+                        } else {
+                            active.put_login_header_raw(val)
+                        };
+                        update.map_err(|message| rquickjs::Exception::throw_type(&ctx, &message))?;
                     }
                     Ok(())
                 }),
@@ -1267,7 +1357,21 @@ pub(super) fn eval_js_inner_with_source(
                     md5_hex(id)[..16].to_string()
                 }),
             )?;
-            java_obj.set("deviceID", Func::new(|| -> String { JS_DEVICE_ID.clone() }))?;
+            java_obj.set("deviceID", Func::new(|| -> String {
+                // 宿主已持久化标识；不能缓存于进程中，否则子进程/重启会产生新设备。
+                let response = crate::host_services::call("device.android_id", &serde_json::json!({}));
+                let Some(id) = response.get("data").and_then(JsonValue::as_str)
+                    .filter(|id| response["ok"] == true && !id.is_empty()) else {
+                    // 无宿主的独立核心调用保留原有兼容行为。
+                    return JS_DEVICE_ID.clone();
+                };
+                // KOReader 默认 UUID 无连字符；保留原位值及 deviceID 的 UUID 外形。
+                if id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    format!("{}-{}-{}-{}-{}", &id[..8], &id[8..12], &id[12..16], &id[16..20], &id[20..])
+                } else {
+                    id.to_owned()
+                }
+            }))?;
             java_obj.set("randomUUID", Func::new(|| -> String { generate_uuid_v4() }))?;
             java_obj.set(
                 "__secureRandomNextInt",
@@ -1836,6 +1940,9 @@ pub(super) fn eval_js_inner_with_source(
                 "longToast",
                 Func::new(|msg: rquickjs::function::Opt<rquickjs::Coerced<String>>| capture_login_message(msg.0)),
             )?;
+            java_obj.set("__browserAwait", Func::new(|url: String, title: String| -> String {
+                crate::parser::browser_interaction::await_uri(&url, &title).to_string()
+            }))?;
             java_obj.set("__browserPreview", Func::new(|url: String, title: String, html: String| -> bool {
                 let captured = CLICK_BROWSER.with(|slot| {
                     let mut slot = slot.borrow_mut();
@@ -1933,6 +2040,7 @@ pub(super) fn eval_js_inner_with_source(
 
             if let Some(bindings) = bindings {
                 for (key, value) in bindings {
+                    if key == JAVA_MAP_BINDINGS_KEY { continue; }
                     let js_value = ctx.json_parse(value.to_string())?;
                     globals.set(key.as_str(), js_value)?;
                 }
@@ -1961,6 +2069,9 @@ pub(super) fn eval_js_inner_with_source(
 
             record_js_memory(&mut memory_samples, "before_android", &ctx);
             eval_fixed_setup_script(ctx.clone(), BootstrapSlot::Android, bootstrap_dir.as_deref())?;
+            // Android installs the reusable Map adapter. Wrap explicitly typed
+            // bindings before evaluating source jsLib (which may read result.get()).
+            install_explicit_java_map_bindings(&ctx, bindings)?;
             record_js_memory(&mut memory_samples, "android", &ctx);
 
             // Capture before source scripts can replace the helper; only marked wrappers unwrap.
@@ -2266,7 +2377,9 @@ fn eval_js_reentrant<'js>(
     }
     if let Some(bindings) = bindings {
         for name in bindings.keys() {
-            save_global(name)?;
+            if name != JAVA_MAP_BINDINGS_KEY {
+                save_global(name)?;
+            }
         }
     }
 
@@ -2287,9 +2400,13 @@ fn eval_js_reentrant<'js>(
         }
         if let Some(bindings) = bindings {
             for (name, value) in bindings {
+                if name == JAVA_MAP_BINDINGS_KEY {
+                    continue;
+                }
                 globals.set(name.as_str(), ctx.json_parse(value.to_string())?)?;
             }
         }
+        install_explicit_java_map_bindings(&ctx, bindings)?;
 
         let dom_string_result = dom::install(&ctx)?;
         let dom_string = |value: Value<'js>| -> rquickjs::Result<Option<String>> {
@@ -3010,7 +3127,10 @@ fn eval_js_lib_split<'js>(
     // eval_script's non-strict global mode and eval_script filename.
     let compiled = unsafe {
         rquickjs::qjs::JS_Eval(
-            raw_ctx, source.as_ptr(), script.len() as _, c"eval_script".as_ptr(),
+            raw_ctx,
+            source.as_ptr(),
+            script.len() as _,
+            c"eval_script".as_ptr(),
             (rquickjs::qjs::JS_EVAL_TYPE_GLOBAL | rquickjs::qjs::JS_EVAL_FLAG_COMPILE_ONLY) as _,
         )
     };
@@ -3871,8 +3991,22 @@ mod tests {
         });
         assert_eq!(kv_restored, "user-a");
 
+        let (large_page, state) = with_active_session(None, url, |_| {
+            eval_js(
+                &format!("cache.put('{key}', 'x'.repeat(126057)); cache.get('{key}').length"),
+                "",
+                url,
+            )
+            .unwrap()
+        });
+        assert_eq!(large_page, "126057");
+        let (restored, _) = with_active_session(state.as_ref(), url, |_| {
+            eval_js(&format!("cache.get('{key}').length"), "", url).unwrap()
+        });
+        assert_eq!(restored, "126057");
+
         let (oversized, _) = with_active_session(None, url, |_| {
-            eval_js(&format!("cache.put('{key}', 'x'.repeat(16385))"), "", url)
+            eval_js(&format!("cache.put('{key}', 'x'.repeat(262145))"), "", url)
         });
         assert!(oversized
             .unwrap_err()
@@ -4828,7 +4962,10 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
              java.getString('@@a@href')].join('|')
         "#;
         let result = eval_js(script, "", "https://fixture.invalid").unwrap();
-        assert_eq!(result, vec!["https://fixture.invalid/book.txt"; 4].join("|"));
+        assert_eq!(
+            result,
+            vec!["https://fixture.invalid/book.txt"; 4].join("|")
+        );
     }
 
     #[test]

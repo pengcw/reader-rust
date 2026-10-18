@@ -11,8 +11,16 @@
                             throw new Error('网页只读预览失败或当前执行入口不支持预览');
                         }
                     };
-                    java.startBrowserAwait = function() {
-                        throw new Error('当前仅支持网页只读预览，不支持等待网页交互验证');
+                    java.startBrowserAwait = function(url, title) {
+                        const response = JSON.parse(java.__browserAwait(
+                            String(url || ''), String(title || '')));
+                        if (!response.ok) {
+                            const error = new Error(response.error.message);
+                            error.kind = response.error.kind;
+                            throw error;
+                        }
+                        const body = String(response.data.html || '');
+                        return {body: () => body};
                     };
                     if (java.__clickCaptureActive) {
                         java.showReadingBrowser = java.startBrowser;

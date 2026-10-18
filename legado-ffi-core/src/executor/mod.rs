@@ -10,8 +10,7 @@ use crate::crawler::{
 use crate::model::book_source::{book_source_from_value, BookSource};
 use crate::parser::js::{
     eval_js, eval_js_toc_pre_update, eval_js_with_bindings, with_click_browser, with_js_info_map,
-    with_js_lib,
-    with_login_messages, InfoMapState,
+    with_js_lib, with_login_messages, InfoMapState,
 };
 use crate::parser::rule_engine::{dedupe_chapters_last_wins, normalize_list_rule, RuleEngine};
 use crate::runtime::session::with_active_session;
@@ -1226,13 +1225,21 @@ fn execute_content(
     let html_output = match params.get("output") {
         None => false,
         Some(Value::String(value)) if value == "html" => true,
-        _ => return Err(ExecuteError::invalid_request("params.output must be 'html'")),
+        _ => {
+            return Err(ExecuteError::invalid_request(
+                "params.output must be 'html'",
+            ))
+        }
     };
     let provided_html = match params.get("html") {
         None => None,
         Some(Value::String(value)) if !value.trim().is_empty() => Some(value.as_str()),
         Some(Value::String(_)) => None,
-        _ => return Err(ExecuteError::invalid_request("params.html must be a string")),
+        _ => {
+            return Err(ExecuteError::invalid_request(
+                "params.html must be a string",
+            ))
+        }
     };
     let (mut book_variable, book_name) = input_book_state(params);
     let mut book_fields = input_book_fields(params);
@@ -1244,7 +1251,8 @@ fn execute_content(
     let (mut chapter_variable, mut chapter_title) = input_chapter_state(params);
     let is_volume = input_chapter_is_volume(params);
 
-    let self_fetch = provided_html.is_none() && uses_js_ajax_content_rule(source)
+    let self_fetch = provided_html.is_none()
+        && uses_js_ajax_content_rule(source)
         && !strip_url_options(&initial_url).trim().starts_with("data:");
 
     // Source replaceRegex is applied once after all content fragments are joined.
@@ -1256,6 +1264,7 @@ fn execute_content(
     let mut pending = VecDeque::from([(initial_url.clone(), true)]);
     let mut visited_urls = HashSet::new();
     let mut fragments = Vec::new();
+    let mut content_rule_error = None;
     let mut initial_response_url = None;
     let mut first_page = None;
     let mut final_response = None;
@@ -1303,25 +1312,42 @@ fn execute_content(
         };
         let supplied_page = if using_supplied_html {
             let mut context = url_rule_context_with_fields(
-                book_variable.as_deref(), chapter_variable.as_deref(),
-                book_name.as_deref(), chapter_title.as_deref(), Some(&book_fields),
+                book_variable.as_deref(),
+                chapter_variable.as_deref(),
+                book_name.as_deref(),
+                chapter_title.as_deref(),
+                Some(&book_fields),
             );
             context.chapter_fields = chapter_fields.clone();
             let spec = analyze_url_with_context(
-                &current_url, "", 1, &source.book_source_url, source, Some(&context),
-            ).map_err(ExecuteError::url_rule)?;
-            let rendered = session.render_supplied_html(
-                &spec, provided_html.unwrap_or_default(), options.max_response_bytes,
-                options.render_timeout_ms,
-            ).map_err(ExecuteError::from)?;
+                &current_url,
+                "",
+                1,
+                &source.book_source_url,
+                source,
+                Some(&context),
+            )
+            .map_err(ExecuteError::url_rule)?;
+            let rendered = session
+                .render_supplied_html(
+                    &spec,
+                    provided_html.unwrap_or_default(),
+                    options.max_response_bytes,
+                    options.render_timeout_ms,
+                )
+                .map_err(ExecuteError::from)?;
             Some((rendered, spec.url))
         } else {
             None
         };
-        let body = supplied_page.as_ref().map(|(body, _)| body.as_str())
+        let body = supplied_page
+            .as_ref()
+            .map(|(body, _)| body.as_str())
             .or_else(|| response.as_ref().map(|response| response.body.as_str()))
             .unwrap_or("");
-        let response_url = supplied_page.as_ref().map(|(_, url)| url.clone())
+        let response_url = supplied_page
+            .as_ref()
+            .map(|(_, url)| url.clone())
             .or_else(|| response.as_ref().map(|response| response.url.clone()))
             .unwrap_or_else(|| current_url.clone());
         visited_urls.insert(current_url.clone());
@@ -1361,6 +1387,8 @@ fn execute_content(
         };
         if !page.content.is_empty() {
             fragments.push(page.content);
+        } else if content_rule_error.is_none() {
+            content_rule_error = page.content_rule_error;
         }
         if let Some(parsed_title) = page.title.as_ref() {
             chapter_title = Some(parsed_title.clone());
@@ -1459,13 +1487,19 @@ fn execute_content(
         options.max_response_bytes,
         &mut transform_diagnostics,
     );
-    let fallback = html_output && content.trim().is_empty()
-        && first_page.as_ref().is_some_and(|(html, _)| !html.trim().is_empty());
+    let fallback = html_output
+        && content.trim().is_empty()
+        && first_page
+            .as_ref()
+            .is_some_and(|(html, _)| !html.trim().is_empty());
     if fallback {
         content = first_page.as_ref().unwrap().0.clone();
     }
     if content.is_empty() && !is_volume {
-        return Err(ExecuteError::parse("content is empty"));
+        return Err(ExecuteError::parse(match content_rule_error {
+            Some(error) => format!("content rule JavaScript failed: {error}"),
+            None => "content is empty".to_string(),
+        }));
     }
     let mut data = json!({"content": content});
     if !self_fetch {
@@ -1505,6 +1539,33 @@ fn execute_content(
     Ok(result)
 }
 
+// Gson-style loginUi arrays may contain literal newlines inside quoted
+// string values. QuickJS rejects those, so escape only that lexical case.
+// Backtick templates and explicitly prefixed scripts retain JS semantics.
+fn normalize_login_ui_strings(raw: &str) -> String {
+    let mut output = String::with_capacity(raw.len());
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active {
+                quote = None;
+            } else if active != '`' && (ch == '\n' || ch == '\r') {
+                output.push_str(if ch == '\n' { "\\n" } else { "\\r" });
+                continue;
+            }
+        } else if matches!(ch, '"' | '\'' | '`') {
+            quote = Some(ch);
+        }
+        output.push(ch);
+    }
+    output
+}
+
 fn execute_login_ui(source: &BookSource) -> ExecuteResult<Value> {
     let raw = source.login_ui.as_deref().unwrap_or("").trim();
     let ui = if raw.is_empty() {
@@ -1513,9 +1574,18 @@ fn execute_login_ui(source: &BookSource) -> ExecuteResult<Value> {
         value
     } else {
         let script = strip_js_prefix(raw).unwrap_or(raw);
-        let output = with_js_lib(source.js_lib.as_deref(), || {
-            eval_js(script, "", &source.book_source_url)
-        })
+        let static_array = script == raw && raw.starts_with('[');
+        let normalized = static_array.then(|| normalize_login_ui_strings(raw));
+        let script = normalized.as_deref().unwrap_or(script);
+        // Plain loginUi arrays are form data, not scripts needing jsLib.
+        // Only explicit/dynamic JS configurations require the source library.
+        let bindings = login_result_map_bindings(&json!({}));
+        let evaluate = || eval_js_with_bindings(script, "", &source.book_source_url, &bindings);
+        let output = if static_array {
+            evaluate()
+        } else {
+            with_js_lib(source.js_lib.as_deref(), evaluate)
+        }
         .map_err(|error| ExecuteError::parse(format!("loginUi JavaScript failed: {error}")))?;
         serde_json::from_str::<Value>(&output).map_err(|error| {
             ExecuteError::parse(format!("loginUi must return a JSON array: {error}"))
@@ -1689,11 +1759,21 @@ fn execute_click(source: &BookSource, params: &Value) -> ExecuteResult<Value> {
     Ok(success_without_http(json!({"browser":browser})))
 }
 
+fn login_result_map_bindings(values: &Value) -> HashMap<String, Value> {
+    HashMap::from([
+        ("result".to_string(), values.clone()),
+        (
+            crate::parser::js::JAVA_MAP_BINDINGS_KEY.to_string(),
+            json!(["result"]),
+        ),
+    ])
+}
+
 fn login_bindings(values: &Value) -> HashMap<String, Value> {
-    let mut bindings = HashMap::new();
+    let mut bindings = login_result_map_bindings(values);
+    // Keep loginInfo and values as plain objects; only result is a Java MutableMap.
     bindings.insert("loginInfo".to_string(), values.clone());
     bindings.insert("values".to_string(), values.clone());
-    bindings.insert("result".to_string(), values.clone());
     bindings
 }
 
@@ -1890,8 +1970,8 @@ fn validate_login_response(
         return Ok(response);
     }
 
-    let value = parsed
-        .ok_or_else(|| ExecuteError::parse("loginCheckJs must return a StrResponse"))?;
+    let value =
+        parsed.ok_or_else(|| ExecuteError::parse("loginCheckJs must return a StrResponse"))?;
     if !value.is_object() {
         return Err(ExecuteError::parse(
             "loginCheckJs must return a StrResponse",
@@ -2152,12 +2232,20 @@ mod tests {
     #[test]
     fn preview_renders_supplied_html_without_extension_pipeline() {
         let source = json!({"bookSourceUrl":"https://example.test/"});
-        let html = "<html><body><script>document.body.innerHTML = '<p>ready</p>'</script></body></html>";
+        let html =
+            "<html><body><script>document.body.innerHTML = '<p>ready</p>'</script></body></html>";
         let request = json!({"api":2,"op":"preview",
             "params":{"url":"https://example.test/reviews","html":html}});
-        let result: Value = serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+        let result: Value =
+            serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
         assert_eq!(result["ok"], true, "{result}");
-        assert!(result["data"]["preview"]["html"].as_str().unwrap().contains("<p>ready</p>"), "{result}");
+        assert!(
+            result["data"]["preview"]["html"]
+                .as_str()
+                .unwrap()
+                .contains("<p>ready</p>"),
+            "{result}"
+        );
     }
 
     #[test]
@@ -2320,6 +2408,29 @@ mod tests {
     }
 
     #[test]
+    fn execute_reports_content_rule_javascript_failure_instead_of_empty_content() {
+        let url = serve_once("ignored");
+        let source = serde_json::json!({
+            "bookSourceName": "invalid content JavaScript",
+            "bookSourceUrl": url,
+            "ruleContent": {"content": "<js>java.put('sources', sources); let sources = 'test'; 'text'</js>"}
+        });
+        let result: serde_json::Value = serde_json::from_str(&execute(
+            &source.to_string(),
+            &serde_json::json!({"api": 2, "op": "content", "params": {"url": url}}).to_string(),
+        ))
+        .unwrap();
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["error"]["kind"], "parse");
+        let message = result["error"]["message"].as_str().unwrap();
+        assert!(
+            message.starts_with("content rule JavaScript failed:"),
+            "{message}"
+        );
+        assert!(message.contains("sources"), "{message}");
+    }
+
+    #[test]
     fn execute_rejects_empty_content_except_for_volume_chapters() {
         let source_for = |base_url: String| {
             serde_json::json!({
@@ -2420,11 +2531,8 @@ mod tests {
                 },
                 "options": {"debug": debug}
             });
-            let response: Value = serde_json::from_str(&execute(
-                &source.to_string(),
-                &request.to_string(),
-            ))
-            .unwrap();
+            let response: Value =
+                serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
             assert_eq!(response["ok"], true, "{response}");
             assert_eq!(response["data"]["chapters"][0]["title"], "clean");
             if debug {
@@ -2461,11 +2569,8 @@ mod tests {
                 },
                 "options": {"debug": debug}
             });
-            let response: Value = serde_json::from_str(&execute(
-                &source.to_string(),
-                &request.to_string(),
-            ))
-            .unwrap();
+            let response: Value =
+                serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
             assert_eq!(response["ok"], true, "{response}");
             assert_eq!(response["data"]["content"], "clean");
             if debug {

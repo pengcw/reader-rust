@@ -26,6 +26,7 @@ pub(crate) struct TocPageResult {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ContentPageResult {
     pub content: String,
+    pub content_rule_error: Option<String>,
     pub next_urls: Vec<String>,
     pub title: Option<String>,
     pub book_variable: Option<String>,
@@ -870,7 +871,15 @@ impl RuleEngine {
                 book_fields,
             );
             context.chapter_fields = chapter_fields.cloned().unwrap_or_default();
-            let content = self.content_with_context_mode(source, body, base_url, &mut context, html_output);
+            let mut content_rule_error = None;
+            let content = self.content_with_context_mode_diagnostic(
+                source,
+                body,
+                base_url,
+                &mut context,
+                html_output,
+                &mut content_rule_error,
+            );
             let next_urls = if follow_next {
                 self.next_content_urls_with_context(source, body, base_url, &mut context)
             } else {
@@ -878,6 +887,7 @@ impl RuleEngine {
             };
             ContentPageResult {
                 content,
+                content_rule_error,
                 next_urls,
                 title: None,
                 book_variable: context.book_variable(),
@@ -913,7 +923,15 @@ impl RuleEngine {
             if let Some(title) = title.as_ref() {
                 context.chapter_title = Some(title.clone());
             }
-            let content = self.content_with_context_mode(source, body, base_url, &mut context, html_output);
+            let mut content_rule_error = None;
+            let content = self.content_with_context_mode_diagnostic(
+                source,
+                body,
+                base_url,
+                &mut context,
+                html_output,
+                &mut content_rule_error,
+            );
             let next_urls = if follow_next {
                 self.next_content_urls_with_context(source, body, base_url, &mut context)
             } else {
@@ -921,6 +939,7 @@ impl RuleEngine {
             };
             ContentPageResult {
                 content,
+                content_rule_error,
                 next_urls,
                 title,
                 book_variable: context.book_variable(),
@@ -1024,6 +1043,25 @@ impl RuleEngine {
         context: &mut RuleVariableContext,
         html_output: bool,
     ) -> String {
+        self.content_with_context_mode_diagnostic(
+            source,
+            body,
+            base_url,
+            context,
+            html_output,
+            &mut None,
+        )
+    }
+
+    fn content_with_context_mode_diagnostic(
+        &self,
+        source: &BookSource,
+        body: &str,
+        base_url: &str,
+        context: &mut RuleVariableContext,
+        html_output: bool,
+        content_rule_error: &mut Option<String>,
+    ) -> String {
         let rule = source.rule_content.clone().unwrap_or_default();
         let mut content_body = body.to_string();
 
@@ -1052,7 +1090,11 @@ impl RuleEngine {
         let content_rule =
             interpolate_common_templates(&content_rule, &content_body, base_url, context);
         if has_templates && content_rule.trim_start().starts_with('<') {
-            let content = if html_output { content_rule } else { html::format_keep_img(&content_rule, base_url) };
+            let content = if html_output {
+                content_rule
+            } else {
+                html::format_keep_img(&content_rule, base_url)
+            };
             return apply_content_replacement(
                 content,
                 rule.replace_regex.as_deref(),
@@ -1070,17 +1112,22 @@ impl RuleEngine {
         );
         if matches!(self.detect_mode(content_rule, &content_body), ParseMode::Js) {
             let script = self.strip_mode_prefix(content_rule);
-            if let Ok(res) =
-                eval_js_with_bindings(script, &content_body, base_url, &context.js_bindings())
-            {
-                let content = if html_output { res } else { html::format_keep_img(&res, base_url) };
-                return apply_content_replacement(
-                    content,
-                    rule.replace_regex.as_deref(),
-                    &content_body,
-                    base_url,
-                    context,
-                );
+            match eval_js_with_bindings(script, &content_body, base_url, &context.js_bindings()) {
+                Ok(res) => {
+                    let content = if html_output {
+                        res
+                    } else {
+                        html::format_keep_img(&res, base_url)
+                    };
+                    return apply_content_replacement(
+                        content,
+                        rule.replace_regex.as_deref(),
+                        &content_body,
+                        base_url,
+                        context,
+                    );
+                }
+                Err(error) => *content_rule_error = Some(error.to_string()),
             }
         }
 
@@ -2141,8 +2188,7 @@ fn parse_book_info_html(
     if let Some(val) = &update_time {
         ctx.set_book_field("updateTime", val);
     }
-    let cover_url = eval_field(rule.cover_url.as_ref(), ctx)
-        .map(|u| resolve_url(base_url, &u));
+    let cover_url = eval_field(rule.cover_url.as_ref(), ctx).map(|u| resolve_url(base_url, &u));
     if let Some(val) = &cover_url {
         ctx.set_book_field("coverUrl", val);
     }
@@ -2150,8 +2196,26 @@ fn parse_book_info_html(
     if let Some(val) = &word_count {
         ctx.set_book_field("wordCount", val);
     }
-    let toc_url = eval_field(rule.toc_url.as_ref(), ctx)
-        .map(|u| resolve_url(base_url, &u));
+    let toc_url = rule
+        .toc_url
+        .as_ref()
+        .and_then(|rule| {
+            if let Some(script) = strip_prefix_ascii_case(rule.trim(), "@js:") {
+                // Unlike text extraction, an undefined URL-script result must not
+                // fall back to the original HTML page (the JS result binding).
+                let input = serialized.get_or_init(|| doc.html());
+                let script = interpolate_common_templates(script, input, base_url, ctx);
+                Some(
+                    eval_js_template_with_bindings(&script, input, base_url, &ctx.js_bindings())
+                        .ok()
+                        .filter(|url| !url.trim().is_empty())
+                        .unwrap_or_else(|| base_url.to_string()),
+                )
+            } else {
+                eval_field(Some(rule), ctx)
+            }
+        })
+        .map(|url| resolve_url(base_url, &url));
     if let Some(val) = &toc_url {
         ctx.set_book_field("tocUrl", val);
     }
@@ -2170,9 +2234,8 @@ fn parse_book_info_html(
         let input = serialized.get_or_init(|| doc.html());
         // A leading <js> stage transforms the *document* before selection;
         // an inline <js> stage transforms a selected list instead.
-        let (body, list_rule) = prepare_list_rule_and_body(
-            Cow::Borrowed(input.as_str()), download_rule, base_url, ctx,
-        );
+        let (body, list_rule) =
+            prepare_list_rule_and_body(Cow::Borrowed(input.as_str()), download_rule, base_url, ctx);
         let json = serde_json::from_str::<Value>(&body).ok();
         let values =
             eval_collection_with_context(&body, json.as_ref(), list_rule, base_url, ctx).ok()?;
@@ -3262,7 +3325,13 @@ fn eval_list_js_checked(
 /// Standalone directives, regex and JS remain the responsibility of reader_eval.
 pub(crate) fn eval_rule_collection(input: &str, rule: &str) -> anyhow::Result<Vec<Value>> {
     let json = serde_json::from_str::<Value>(input).ok();
-    eval_collection_with_context(input, json.as_ref(), rule, "", &RuleVariableContext::default())
+    eval_collection_with_context(
+        input,
+        json.as_ref(),
+        rule,
+        "",
+        &RuleVariableContext::default(),
+    )
 }
 
 fn eval_collection_with_context(
@@ -3764,7 +3833,8 @@ impl FieldInput<'_> {
                 Self::Json(value) => interpolate_json_templates(script, value, base_url, ctx),
                 _ => script.to_string(),
             };
-            if let Ok(result) = eval_js_with_bindings(&script, &text, base_url, &ctx.js_bindings()) {
+            if let Ok(result) = eval_js_with_bindings(&script, &text, base_url, &ctx.js_bindings())
+            {
                 text = result;
             }
         }
@@ -3923,13 +3993,7 @@ fn eval_field_html_doc_with_ctx(
     base_url: &str,
     ctx: &mut RuleVariableContext,
 ) -> Option<String> {
-    eval_field_html_doc_with_cached_input(
-        rule,
-        doc,
-        &std::cell::OnceCell::new(),
-        base_url,
-        ctx,
-    )
+    eval_field_html_doc_with_cached_input(rule, doc, &std::cell::OnceCell::new(), base_url, ctx)
 }
 
 fn eval_field_html_doc_with_cached_input(
@@ -4114,15 +4178,13 @@ fn eval_field_xpath_with_ctx(
         ParseMode::Regex => regex_capture_first(pure.trim_start_matches(':').trim(), &input)
             .and_then(|row| row.get(1).or_else(|| row.first()).and_then(Clone::clone))
             .unwrap_or_default(),
-        ParseMode::Js => {
-            eval_js_with_bindings(
-                strip_js_rule(pure),
-                &xpath_js_input(node, html_mode),
-                base_url,
-                &ctx.js_bindings(),
-            )
-            .unwrap_or_default()
-        }
+        ParseMode::Js => eval_js_with_bindings(
+            strip_js_rule(pure),
+            &xpath_js_input(node, html_mode),
+            base_url,
+            &ctx.js_bindings(),
+        )
+        .unwrap_or_default(),
         ParseMode::Css if html_mode => xpath_css_field_values(node, pure)
             .into_iter()
             .next()

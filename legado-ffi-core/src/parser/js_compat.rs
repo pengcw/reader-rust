@@ -283,15 +283,20 @@ fn charset_encoding(charset: Option<&str>) -> &'static encoding_rs::Encoding {
 
 fn is_java_latin1(charset: Option<&str>) -> bool {
     charset.is_some_and(|name| {
-        matches!(name.trim().to_ascii_uppercase().replace('_', "-").as_str(),
-            "ISO-8859-1" | "ISO8859-1" | "LATIN1" | "LATIN-1")
+        matches!(
+            name.trim().to_ascii_uppercase().replace('_', "-").as_str(),
+            "ISO-8859-1" | "ISO8859-1" | "LATIN1" | "LATIN-1"
+        )
     })
 }
 
 pub(super) fn java_str_to_bytes(input: &str, charset: Option<&str>) -> Vec<u8> {
     // WHATWG's encoding_rs resolves ISO-8859-1 to Windows-1252; Java does not.
     if is_java_latin1(charset) {
-        return input.chars().map(|c| u8::try_from(c as u32).unwrap_or(b'?')).collect();
+        return input
+            .chars()
+            .map(|c| u8::try_from(c as u32).unwrap_or(b'?'))
+            .collect();
     }
     charset_encoding(charset).encode(input).0.into_owned()
 }

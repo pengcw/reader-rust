@@ -78,6 +78,17 @@ pub fn reader_eval(input: char_p::Ref<'_>, rule: char_p::Ref<'_>) -> char_p::Box
         return ffi_string(result.to_string());
     }
 
+    // Experimental, caller-driven offline interaction; no production login routing.
+    if rule == "@browser_interaction" {
+        return ffi_string(match crate::parser::browser_interaction::run(input) {
+            Ok(value) => json!({"ok":true,"data":value}).to_string(),
+            Err(_) => json!({"ok":false,"error":{
+                "kind":"interaction_failed","message":"offline interaction failed"
+            }})
+            .to_string(),
+        });
+    }
+
     if rule == "@version" {
         return ffi_string(env!("CARGO_PKG_VERSION").to_string());
     }
