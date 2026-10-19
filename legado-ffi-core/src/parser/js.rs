@@ -1884,6 +1884,19 @@ pub(super) fn eval_js_inner_with_source(
                 }),
             )?;
 
+            let object_scope_id = bindings
+                .and_then(|values| values.get(crate::parser::rule_engine::OBJECT_SCOPE_BINDING))
+                .and_then(JsonValue::as_u64);
+            java_obj.set(
+                "__readerObjectVariablePut",
+                Func::new(move |scope: String, key: String, value: String, removed: bool| {
+                    if let Some(scope_id) = object_scope_id {
+                        crate::parser::rule_engine::record_js_object_variable(
+                            scope_id, &scope, &key, (!removed).then_some(value),
+                        );
+                    }
+                }),
+            )?;
             let variable_overrides_for_put = variable_overrides.clone();
             java_obj.set(
                 "put",
@@ -2040,7 +2053,11 @@ pub(super) fn eval_js_inner_with_source(
 
             if let Some(bindings) = bindings {
                 for (key, value) in bindings {
-                    if key == JAVA_MAP_BINDINGS_KEY { continue; }
+                    if key == JAVA_MAP_BINDINGS_KEY
+                        || key == crate::parser::rule_engine::OBJECT_SCOPE_BINDING
+                    {
+                        continue;
+                    }
                     let js_value = ctx.json_parse(value.to_string())?;
                     globals.set(key.as_str(), js_value)?;
                 }

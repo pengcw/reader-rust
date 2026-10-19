@@ -4,6 +4,18 @@
                     globalThis.org = asObject(globalThis.org);
                     globalThis.org.jsoup = asObject(globalThis.org.jsoup);
                     globalThis.org.jsoup.Jsoup = asObject(globalThis.org.jsoup.Jsoup);
+                    globalThis.org.jsoup.select = asObject(globalThis.org.jsoup.select);
+                    if (typeof globalThis.org.jsoup.select.Elements !== 'function') {
+                        globalThis.org.jsoup.select.Elements = class Elements extends Array {
+                            add(element) { this.push(element); return true; }
+                            size() { return this.length; }
+                            get(index) { return this[Number(index)] ?? null; }
+                            first() { return this.length ? this[0] : null; }
+                            last() { return this.length ? this[this.length - 1] : null; }
+                            isEmpty() { return this.length === 0; }
+                            toArray() { return Array.from(this); }
+                        };
+                    }
                     globalThis.org.jsoup.parser = asObject(globalThis.org.jsoup.parser);
                     globalThis.org.jsoup.parser.Parser = asObject(globalThis.org.jsoup.parser.Parser);
                     if (typeof globalThis.org.jsoup.parser.Parser.unescapeEntities !== 'function') {
@@ -83,29 +95,64 @@
                                     const html = item.html.bind(item);
                                     const outerHtml = item.outerHtml.bind(item);
                                     let innerHtml;
+                                    let changedAttrs;
+                                    const originalToJSON = item.toJSON;
+                                    item.toJSON = () => {
+                                        if (innerHtml === undefined && !changedAttrs) {
+                                            return originalToJSON ? originalToJSON.call(item) : item;
+                                        }
+                                        // A mutated Jsoup element is a detached HTML carrier.
+                                        // Never serialize the stale original node descriptor.
+                                        return {
+                                            __readerHtmlElement: true,
+                                            outerHtml: item.outerHtml(),
+                                        };
+                                    };
                                     item.html = () => innerHtml === undefined ? html() : innerHtml;
                                     item.outerHtml = () => {
                                         const original = outerHtml();
-                                        if (innerHtml === undefined) return original;
-                                        // Retain the original start/end tags, including attributes
-                                        // containing '>', but serialize the current child markup.
+                                        if (innerHtml === undefined && !changedAttrs) return original;
                                         const opening = /^<([a-z][\w:-]*)\b(?:[^>"']|"[^"]*"|'[^']*')*>/i.exec(original);
                                         if (!opening) return original;
+                                        let start = opening[0];
+                                        for (const [name, value] of changedAttrs || []) {
+                                            const escaped = escapeHtml(value).replace(/"/g, '&quot;');
+                                            const key = name.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
+                                            const pattern = new RegExp('\\s' + key +
+                                                '\\s*=\\s*(?:"[^"]*"|\\x27[^\\x27]*\\x27|[^\\s>]+)', 'i');
+                                            const replacement = ' ' + name + '="' + escaped + '"';
+                                            start = pattern.test(start)
+                                                ? start.replace(pattern, replacement)
+                                                : start.slice(0, -1) + replacement + '>';
+                                        }
                                         const closing = new RegExp('</' + opening[1] + '\\s*>$', 'i').exec(original);
-                                        return closing ? opening[0] + innerHtml + closing[0] : original;
+                                        return closing ? start + (innerHtml === undefined ? html() : innerHtml) + closing[0] : start;
                                     };
-                                    item.attr = name => {
+                                    item.attr = function(name, value) {
                                         name = String(name);
-                                        if (!name.startsWith('abs:')) return attr(name);
-                                        const key = name.slice(4);
-                                        return hasAttr(key) ? java.__jsoupAbsUrl(attr(key), base) : '';
+                                        if (arguments.length > 1) {
+                                            if (!/^[a-z_:][a-z0-9_:.-]*$/i.test(name)) throw new TypeError('invalid attribute name');
+                                            if (!changedAttrs) changedAttrs = new Map();
+                                            changedAttrs.set(name, String(value));
+                                            return item;
+                                        }
+                                        if (name.startsWith('abs:')) {
+                                            const key = name.slice(4);
+                                            return item.hasAttr(key) ? java.__jsoupAbsUrl(item.attr(key), base) : '';
+                                        }
+                                        return changedAttrs && changedAttrs.has(name) ? changedAttrs.get(name) : attr(name);
                                     };
                                     item.hasAttr = name => {
                                         name = String(name);
-                                        return name.startsWith('abs:') ? item.attr(name) !== '' : hasAttr(name);
+                                        return name.startsWith('abs:') ? item.attr(name) !== ''
+                                            : (changedAttrs && changedAttrs.has(name)) || hasAttr(name);
                                     };
                                     const originalText = item.text.bind(item);
-                                    item.text = () => {
+                                    item.text = function(value) {
+                                        if (arguments.length > 0) {
+                                            innerHtml = escapeHtml(value);
+                                            return item;
+                                        }
                                         if (innerHtml === undefined) return originalText();
                                         const body = java.getElements('body', innerHtml, true).first();
                                         return body ? body.text() : '';
@@ -185,6 +232,7 @@
                                         };
                                         return selected;
                                     };
+                                    item.child = index => item.children().get(Number(index));
                                     item.absUrl = name => item.attr('abs:' + String(name));
                                     item.baseUri = () => base;
                                 }

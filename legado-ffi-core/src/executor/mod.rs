@@ -746,6 +746,11 @@ fn input_chapter_fields(params: &Value, url: &str) -> serde_json::Map<String, Va
         .cloned()
         .unwrap_or_default();
     fields.entry("url").or_insert_with(|| json!(url));
+    if let Some(next_url) = params.get("nextChapterUrl").and_then(Value::as_str) {
+        fields
+            .entry("nextChapterUrl")
+            .or_insert_with(|| json!(next_url));
+    }
     if let Some(is_volume) = params.get("isVolume") {
         fields
             .entry("isVolume")
@@ -761,6 +766,18 @@ fn input_chapter_is_volume(params: &Value) -> bool {
         .or_else(|| params.get("isVolume"))
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+// BookChapter.putLyric / putDanmaku store metadata in chapter.variableMap.
+fn set_chapter_metadata(variable: Option<&str>, key: &str, value: &str) -> Option<String> {
+    let mut values: HashMap<String, Value> = variable
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default();
+    if values.get(key).and_then(Value::as_str) == Some(value) {
+        return variable.map(str::to_owned);
+    }
+    values.insert(key.to_owned(), Value::String(value.to_owned()));
+    serde_json::to_string(&values).ok()
 }
 
 fn execute_info(
@@ -966,15 +983,16 @@ fn execute_toc(
         rule.format_js = None;
     }
     let mut pending = VecDeque::from([toc_url.clone()]);
-    let mut queued = HashSet::from([toc_url.clone()]);
+    let mut queued = HashSet::from([toc_page_identity(&toc_url)]);
     let mut visited_pages = HashSet::new();
     let mut chapters = Vec::new();
     let mut final_response = None;
     let mut truncated = false;
 
     while let Some(url) = pending.pop_front() {
-        queued.remove(&url);
-        if visited_pages.contains(&url) {
+        let identity = toc_page_identity(&url);
+        queued.remove(&identity);
+        if visited_pages.contains(&identity) {
             continue;
         }
         if visited_pages.len() >= options.max_pages {
@@ -1015,7 +1033,7 @@ fn execute_toc(
                 Some(&toc_context),
             )?
         };
-        visited_pages.insert(url);
+        visited_pages.insert(identity);
         let mut page = engine.chapter_list_page_with_context(
             &page_source,
             &response.body,
@@ -1031,9 +1049,10 @@ fn execute_toc(
         }
         chapters.extend(page.chapters);
         for next_url in page.next_urls {
+            let next_identity = toc_page_identity(&next_url);
             if next_url.trim().is_empty()
-                || visited_pages.contains(&next_url)
-                || queued.contains(&next_url)
+                || visited_pages.contains(&next_identity)
+                || queued.contains(&next_identity)
             {
                 continue;
             }
@@ -1041,7 +1060,7 @@ fn execute_toc(
                 truncated = true;
                 continue;
             }
-            queued.insert(next_url.clone());
+            queued.insert(next_identity);
             pending.push_back(next_url);
         }
         final_response = Some(response);
@@ -1086,6 +1105,24 @@ fn execute_toc(
     let mut result = success(data, visited_pages.len(), truncated, &response, options);
     transform_diagnostics.attach(&mut result, "toc");
     Ok(result)
+}
+
+// Fragments are not sent in HTTP requests, but URL query parameters and
+// Legado request options can affect the response and must remain distinct.
+fn toc_page_identity(url: &str) -> String {
+    let (address, options) = crate::crawler::split_url_options(url);
+    let mut normalized = match url::Url::parse(address) {
+        Ok(mut parsed) => {
+            parsed.set_fragment(None);
+            parsed.to_string()
+        }
+        Err(_) => address.to_string(),
+    };
+    if let Some(options) = options {
+        normalized.push(',');
+        normalized.push_str(options);
+    }
+    normalized
 }
 
 fn same_resource_url(left: &str, right: &str) -> bool {
@@ -1248,7 +1285,7 @@ fn execute_content(
             .entry("name".to_string())
             .or_insert_with(|| name_str.clone());
     }
-    let (mut chapter_variable, mut chapter_title) = input_chapter_state(params);
+    let (mut chapter_variable, chapter_title) = input_chapter_state(params);
     let is_volume = input_chapter_is_volume(params);
 
     let self_fetch = provided_html.is_none()
@@ -1261,6 +1298,10 @@ fn execute_content(
         rule.replace_regex = None;
     }
     let chapter_fields = input_chapter_fields(params, &initial_url);
+    let known_next_chapter = chapter_fields
+        .get("nextChapterUrl")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
     let mut pending = VecDeque::from([(initial_url.clone(), true)]);
     let mut visited_urls = HashSet::new();
     let mut fragments = Vec::new();
@@ -1269,14 +1310,24 @@ fn execute_content(
     let mut first_page = None;
     let mut final_response = None;
     let mut final_url = initial_url.clone();
-    let mut title = None;
-    let mut sub_requests = 0;
-    let text_book = params
+    let explicit_book_type = params
         .get("book")
         .and_then(|book| book.get("type"))
-        .and_then(Value::as_i64)
+        .and_then(Value::as_i64);
+    let text_book = explicit_book_type
         .map(|kind| kind == 0 || kind & 8 != 0 && kind & 256 == 0)
         .unwrap_or_else(|| source.book_source_type.unwrap_or(0) == 0);
+    // Do not reinterpret KOReader's bookSourceType 0/1/2/3 classification
+    // as Android's BookType bitmask. Only explicit BookType flags qualify.
+    let sub_metadata_key = explicit_book_type.and_then(|kind| {
+        if kind & 32 != 0 {
+            Some("lyric")
+        } else if kind & 4 != 0 {
+            Some("danmaku")
+        } else {
+            None
+        }
+    });
     let mut truncated = false;
 
     while let Some((current_url, follow_next)) = pending.pop_front() {
@@ -1390,10 +1441,6 @@ fn execute_content(
         } else if content_rule_error.is_none() {
             content_rule_error = page.content_rule_error;
         }
-        if let Some(parsed_title) = page.title.as_ref() {
-            chapter_title = Some(parsed_title.clone());
-            title = Some(parsed_title.clone());
-        }
         book_variable = page.book_variable;
         chapter_variable = page.chapter_variable;
         final_url = response_url.clone();
@@ -1402,7 +1449,14 @@ fn execute_content(
         let recursive = page.next_urls.len() == 1;
         for next_url in page.next_urls {
             let allowed =
-                !recursive || should_follow_content_page(chapter_url, &response_url, &next_url);
+                !recursive
+                    || should_follow_content_page(
+                        chapter_url,
+                        &current_url,
+                        &response_url,
+                        &next_url,
+                        known_next_chapter,
+                    );
             if allowed
                 && !visited_urls.contains(&next_url)
                 && !pending.iter().any(|(url, _)| url == &next_url)
@@ -1419,9 +1473,9 @@ fn execute_content(
     if !self_fetch && final_response.is_none() && provided_html.is_none() {
         return Err(ExecuteError::url_rule("content URL produced no request"));
     }
-    if text_book && !self_fetch && !html_output {
+    if !html_output {
         if let Some((body, url)) = first_page.as_ref() {
-            if let Some(sub_content) = engine.sub_content_with_context(
+            let (sub_content, updated_book, updated_chapter) = engine.sub_content_with_context(
                 source,
                 body,
                 url,
@@ -1431,14 +1485,28 @@ fn execute_content(
                 chapter_title.as_deref(),
                 Some(&book_fields),
                 Some(&chapter_fields),
-            ) {
-                let sub_content = if sub_content.to_ascii_lowercase().starts_with("http") {
-                    if visited_urls.len() >= options.max_pages {
-                        truncated = true;
-                        String::new()
-                    } else {
-                        sub_requests += 1;
-                        let sub_context = url_rule_context_with_fields(
+            );
+            if let Some(updated) = updated_book {
+                book_variable = Some(updated);
+            }
+            if let Some(updated) = updated_chapter {
+                chapter_variable = Some(updated);
+            }
+            // BookContent.kt appends the *raw* subContent only for online
+            // text books. URL-shaped subContent is not fetched for text.
+            if let Some(sub_content) = sub_content {
+                if text_book {
+                    if !sub_content.is_empty() {
+                        fragments.push(sub_content);
+                    }
+                } else if let Some(key) = sub_metadata_key {
+                    // Android trims non-text subContent before resolving URLs
+                    // or writing lyric/danmaku chapter metadata.
+                    let sub_content = sub_content.trim();
+                    // On Android, non-text subContent may be an URL. Failed
+                    // auxiliary requests are non-fatal (BookContent.runCatching).
+                    let metadata = if sub_content.to_ascii_lowercase().starts_with("http") {
+                        let request_context = url_rule_context_with_fields(
                             book_variable.as_deref(),
                             None,
                             book_name.as_deref(),
@@ -1453,15 +1521,20 @@ fn execute_content(
                             1,
                             url,
                             options,
-                            Some(&sub_context),
-                        )?
-                        .body
+                            Some(&request_context),
+                        )
+                        .ok()
+                        .map(|response| response.body)
+                    } else {
+                        Some(sub_content.to_owned())
+                    };
+                    if let Some(metadata) = metadata {
+                        chapter_variable = set_chapter_metadata(
+                            chapter_variable.as_deref(),
+                            key,
+                            metadata.as_str(),
+                        );
                     }
-                } else {
-                    sub_content
-                };
-                if !sub_content.trim().is_empty() {
-                    fragments.push(sub_content);
                 }
             }
         }
@@ -1473,13 +1546,51 @@ fn execute_content(
         chapter_title.as_deref(),
         Some(&book_fields),
     );
-    replacement_context.chapter_fields = chapter_fields;
-    let mut content = engine.replace_content_with_context(
-        source,
-        &fragments.join("\n"),
-        &final_url,
-        &replacement_context,
-    );
+    replacement_context.chapter_fields = chapter_fields.clone();
+    let (mut content, replacement_book_variable, replacement_chapter_variable) =
+        engine.replace_content_with_context(
+            source,
+            &fragments.join("\n"),
+            &final_url,
+            &replacement_context,
+        );
+    if let Some(updated) = replacement_book_variable {
+        book_variable = Some(updated);
+    }
+    if let Some(updated) = replacement_chapter_variable {
+        chapter_variable = Some(updated);
+    }
+    // Legado resolves ruleContent.title only after all pages and replaceRegex,
+    // while the title selector still receives the original first response.
+    let title = if source
+        .rule_content
+        .as_ref()
+        .and_then(|rule| rule.title.as_deref())
+        .is_some_and(|rule| !rule.trim().is_empty())
+    {
+        first_page.as_ref().and_then(|(body, url)| {
+            let (title, updated_book, updated_chapter) = engine.content_title_after_pages(
+                source,
+                body,
+                url,
+                book_variable.as_deref(),
+                chapter_variable.as_deref(),
+                book_name.as_deref(),
+                chapter_title.as_deref(),
+                Some(&book_fields),
+                Some(&chapter_fields),
+            );
+            if let Some(updated) = updated_book {
+                book_variable = Some(updated);
+            }
+            if let Some(updated) = updated_chapter {
+                chapter_variable = Some(updated);
+            }
+            title
+        })
+    } else {
+        None
+    };
     let mut transform_diagnostics = text_transform::TransformDiagnostics::new(options.debug);
     text_transform::apply_from_params(
         std::slice::from_mut(&mut content),
@@ -1503,7 +1614,7 @@ fn execute_content(
     }
     let mut data = json!({"content": content});
     if !self_fetch {
-        data["pages"] = json!(visited_urls.len() + sub_requests);
+        data["pages"] = json!(visited_urls.len());
         data["truncated"] = json!(truncated);
     }
     if let Some(variable) = book_variable {
@@ -1518,7 +1629,7 @@ fn execute_content(
     let mut result = match final_response {
         Some(response) => success(
             data,
-            visited_urls.len() + sub_requests,
+            visited_urls.len(),
             truncated,
             &response,
             options,
@@ -2161,7 +2272,39 @@ fn success(
 }
 
 // 复用主分支 BookService 的启发式，避免把章节翻页规则误判为下一章。
-fn should_follow_content_page(chapter_url: &str, current_url: &str, next_url: &str) -> bool {
+fn should_follow_content_page(
+    chapter_url: &str,
+    current_request_url: &str,
+    current_url: &str,
+    next_url: &str,
+    known_next_chapter: Option<&str>,
+) -> bool {
+    // Android follows a single nextContentUrl until it reaches the actual
+    // next chapter. Without that identity, preserve the prior path guard.
+    if let Some(next_chapter) = known_next_chapter {
+        let resolved_next = crate::parser::rule_engine::resolve_url(current_url, next_url);
+        let resolved_chapter = crate::parser::rule_engine::resolve_url(chapter_url, next_chapter);
+        return !resolved_next.is_empty() && resolved_next != resolved_chapter;
+    }
+    // Legado permits another request to the same endpoint when its URL
+    // options differ. Compare body/headers before stripping those options.
+    let (current_address, current_options) =
+        crate::crawler::split_url_options(current_request_url);
+    let (next_address, next_options) = crate::crawler::split_url_options(next_url);
+    if current_address == next_address
+        && matches!(url::Url::parse(next_address), Ok(url) if matches!(url.scheme(), "http" | "https"))
+    {
+        if let Some(next) = next_options.and_then(|raw| crate::crawler::parse_url_options(raw).ok()) {
+            let current = current_options.and_then(|raw| crate::crawler::parse_url_options(raw).ok());
+            let changed = ["body", "headers"].iter().any(|key| {
+                next.get(*key) != current.as_ref().and_then(|options| options.get(*key))
+            });
+            if changed {
+                return true;
+            }
+        }
+    }
+
     let chapter_url = strip_fragment(strip_url_options(chapter_url));
     let current_url = strip_fragment(strip_url_options(current_url));
     let next_url = strip_fragment(strip_url_options(next_url));
@@ -2185,10 +2328,20 @@ fn should_follow_content_page(chapter_url: &str, current_url: &str, next_url: &s
             let current_base = content_path_base(current.path(), false);
             let next_base = content_path_base(next.path(), false);
             let next_page_base = content_path_base(next.path(), true);
+            // Some book sources put numbered content pages under the chapter
+            // URL itself: /novel/123/456 -> /novel/123/456/2.html.
+            let child_page = next.path()
+                .strip_prefix(chapter.path().trim_end_matches('/'))
+                .and_then(|suffix| suffix.strip_prefix('/'))
+                .and_then(|suffix| suffix.strip_suffix(".html"))
+                .is_some_and(|number| {
+                    number.parse::<u32>().is_ok_and(|page| page >= 2)
+                });
             next_base == chapter_base
                 || next_base == current_base
                 || next_page_base == chapter_base
                 || next_page_base == current_base
+                || child_page
         }
         _ => false,
     }
@@ -2202,8 +2355,12 @@ fn content_path_base(path: &str, strip_page_suffix: bool) -> String {
     let (directory, filename) = path.rsplit_once('/').unwrap_or(("", path));
     let (stem, _) = filename.rsplit_once('.').unwrap_or((filename, ""));
     let stem = if strip_page_suffix {
-        match stem.rsplit_once('-') {
-            Some((prefix, suffix)) if suffix.chars().all(|ch| ch.is_ascii_digit()) => prefix,
+        match stem.rsplit_once(|ch| ch == '-' || ch == '_') {
+            Some((prefix, suffix))
+                if !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()) =>
+            {
+                prefix
+            }
             _ => stem,
         }
     } else {
@@ -3048,13 +3205,13 @@ mod tests {
     }
 
     #[test]
-    fn sub_content_uses_original_page_after_pagination_and_fetches_once() {
+    fn sub_content_uses_original_page_and_keeps_url_literal() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let append_url = format!("{base}/append");
         let server = thread::spawn(move || {
             let mut paths = Vec::new();
-            for _ in 0..3 {
+            for _ in 0..2 {
                 let (mut stream, _) = accept_with_timeout(&listener);
                 let mut request = [0u8; 2048];
                 let size = stream.read(&mut request).unwrap();
@@ -3092,16 +3249,19 @@ mod tests {
         let result: Value =
             serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
         assert_eq!(result["ok"], true, "{result}");
-        assert_eq!(result["data"]["content"], "first\nsecond\nsupplement");
-        assert_eq!(result["data"]["pages"], 3);
+        let expected = format!(
+            "first\nsecond\n{append_url},{{\"js\":\"result + '?name=' + book.name\"}}"
+        );
+        assert_eq!(result["data"]["content"], expected);
+        assert_eq!(result["data"]["pages"], 2);
         assert_eq!(
             server.join().unwrap(),
-            ["/chapter/1", "/chapter/1-2", "/append?name=Book"]
+            ["/chapter/1", "/chapter/1-2"]
         );
     }
 
     #[test]
-    fn sub_content_url_respects_page_budget() {
+    fn sub_content_url_does_not_consume_page_budget() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
@@ -3122,8 +3282,11 @@ mod tests {
         let result: Value =
             serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
         assert_eq!(result["ok"], true, "{result}");
-        assert_eq!(result["data"]["content"], "main");
-        assert_eq!(result["data"]["truncated"], true);
+        assert_eq!(
+            result["data"]["content"],
+            "main\nhttp://127.0.0.1:1/should-not-fetch"
+        );
+        assert_eq!(result["data"]["truncated"], false);
         server.join().unwrap();
     }
 

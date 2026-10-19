@@ -11,11 +11,18 @@
         const outerHtml = () => paths.map(path => query('outerHtml', path)).join('');
         collections.set(items, paths);
         items.first = () => items.length ? items[0] : null;
+        items.last = () => items.length ? items[items.length - 1] : null;
+        items.isEmpty = () => items.length === 0;
+        items.attr = name => {
+            const item = items.find(node => node.hasAttr(name));
+            return item ? item.attr(name) : '';
+        };
         items.get = index => Number.isInteger(Number(index)) && Number(index) >= 0
             && Number(index) < items.length ? items[Number(index)] : null;
         items.size = () => items.length;
         items.toArray = () => Array.from(items);
         items.outerHtml = outerHtml;
+        items.text = () => items.map(item => item.text()).join(' ');
         items.toString = outerHtml;
         return items;
     };

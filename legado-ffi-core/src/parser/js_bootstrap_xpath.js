@@ -149,7 +149,7 @@ if (globalThis.java && globalThis.java.getString) {
                     if (Array.isArray(globalThis.result)) {
                         globalThis.result = _decorateItems(globalThis.result, false);
                     }
-                    const _attachVariableMap = value => {
+                    const _attachVariableMap = (value, scope) => {
                         if (!value || typeof value !== 'object') return;
                         if (typeof value.getVariable !== 'function') {
                             value.getVariable = function(key) {
@@ -158,9 +158,25 @@ if (globalThis.java && globalThis.java.getString) {
                                 return found == null ? '' : String(found);
                             };
                         }
+                        if (typeof value.putVariable !== 'function') {
+                            value.putVariable = function(key, val) {
+                                const name = String(key);
+                                if (!this.variableMap || typeof this.variableMap !== 'object') {
+                                    this.variableMap = {};
+                                }
+                                const existed = Object.prototype.hasOwnProperty.call(this.variableMap, name);
+                                const removed = val == null;
+                                const text = removed ? '' : String(val);
+                                if (removed) delete this.variableMap[name];
+                                else this.variableMap[name] = text;
+                                this.variable = JSON.stringify(this.variableMap);
+                                java.__readerObjectVariablePut(scope, name, text, removed);
+                                return existed;
+                            };
+                        }
                     };
-                    _attachVariableMap(globalThis.book);
-                    _attachVariableMap(globalThis.chapter);
+                    _attachVariableMap(globalThis.book, 'book');
+                    _attachVariableMap(globalThis.chapter, 'chapter');
                     globalThis.java.getElements = _wrapElements;
                     globalThis.java.getElement = function(rule, content) {
                         const jsonValue = _nativeGetElement(rule, _readerNodeContent(rule, content, false));

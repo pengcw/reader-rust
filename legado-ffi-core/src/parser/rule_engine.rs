@@ -12,7 +12,9 @@ use crate::runtime::session::current_active_session;
 use crate::util::text::{find_template_close, normalize_source_url};
 use serde_json::{json, Value};
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::{Rc, Weak};
 
 #[derive(Clone, Default)]
 pub struct RuleEngine;
@@ -28,7 +30,6 @@ pub(crate) struct ContentPageResult {
     pub content: String,
     pub content_rule_error: Option<String>,
     pub next_urls: Vec<String>,
-    pub title: Option<String>,
     pub book_variable: Option<String>,
     pub chapter_variable: Option<String>,
 }
@@ -50,6 +51,59 @@ struct HtmlCarrierScope {
     shared: dom::SharedDocument,
 }
 
+pub(crate) const OBJECT_SCOPE_BINDING: &str = "__readerRuleObjectScope";
+
+#[derive(Debug, Default)]
+struct ObjectVariableChanges {
+    book: Rc<RefCell<HashMap<String, Option<String>>>>,
+    chapter: Rc<RefCell<HashMap<String, Option<String>>>>,
+}
+
+#[derive(Debug, Default)]
+struct ObjectVariableScope(Rc<RefCell<ObjectVariableChanges>>);
+
+impl Clone for ObjectVariableScope {
+    fn clone(&self) -> Self {
+        let (book, chapter) = {
+            let changes = self.0.borrow();
+            let book = changes.book.borrow().clone();
+            let chapter = changes.chapter.borrow().clone();
+            (book, chapter)
+        };
+        Self(Rc::new(RefCell::new(ObjectVariableChanges {
+            book: Rc::new(RefCell::new(book)),
+            chapter: Rc::new(RefCell::new(chapter)),
+        })))
+    }
+}
+
+impl ObjectVariableScope {
+    fn for_chapter(&self) -> Self {
+        Self(Rc::new(RefCell::new(ObjectVariableChanges {
+            book: self.0.borrow().book.clone(),
+            chapter: Rc::default(),
+        })))
+    }
+}
+
+thread_local! {
+    static OBJECT_VARIABLE_SCOPES: RefCell<HashMap<u64, Weak<RefCell<ObjectVariableChanges>>>> =
+        RefCell::new(HashMap::new());
+}
+
+pub(crate) fn record_js_object_variable(scope_id: u64, kind: &str, key: &str, value: Option<String>) {
+    OBJECT_VARIABLE_SCOPES.with(|scopes| {
+        if let Some(scope) = scopes.borrow().get(&scope_id).and_then(Weak::upgrade) {
+            let changes = scope.borrow();
+            match kind {
+                "book" => { changes.book.borrow_mut().insert(key.to_string(), value); }
+                "chapter" => { changes.chapter.borrow_mut().insert(key.to_string(), value); }
+                _ => {}
+            }
+        }
+    });
+}
+
 #[derive(Debug, Clone, Default)]
 struct RuleVariableContext {
     html_document: dom::SharedDocument,
@@ -61,6 +115,7 @@ struct RuleVariableContext {
     chapter_fields: serde_json::Map<String, Value>,
     book_name: Option<String>,
     chapter_title: Option<String>,
+    object_changes: ObjectVariableScope,
 }
 
 impl RuleVariableContext {
@@ -102,12 +157,13 @@ impl RuleVariableContext {
             rule_data: self.rule_data.clone(),
             html_document: self.html_document.clone(),
             html_carrier: None,
-            book: self.book.clone(),
+            book: Some(parse_variable_map(self.book_variable().as_deref())),
             book_fields: self.book_fields.clone(),
             chapter: Some(parse_variable_map(variable)),
             chapter_fields: serde_json::Map::new(),
             book_name: self.book_name.clone(),
             chapter_title: Some(title.to_string()),
+            object_changes: self.object_changes.for_chapter(),
         }
     }
 
@@ -191,7 +247,13 @@ impl RuleVariableContext {
     }
 
     fn get(&self, key: &str) -> Option<String> {
+        let changes = self.object_changes.0.borrow();
+        let book_changes = changes.book.borrow();
+        let chapter_changes = changes.chapter.borrow();
         if let Some(prop) = key.strip_prefix("book.") {
+            if let Some(value) = book_changes.get(prop) {
+                return value.clone();
+            }
             if let Some(val) = self.book_fields.get(prop) {
                 return Some(val.clone());
             }
@@ -205,14 +267,10 @@ impl RuleVariableContext {
                 .clone()
                 .or_else(|| self.book_fields.get("name").cloned()),
             "title" => self.chapter_title.clone(),
-            _ => self
-                .chapter
-                .as_ref()
-                .and_then(|values| values.get(key))
-                .or_else(|| self.book.as_ref().and_then(|values| values.get(key)))
-                .or_else(|| self.book_fields.get(key))
-                .or_else(|| self.rule_data.as_ref().and_then(|values| values.get(key)))
-                .cloned()
+            _ => variable_value(self.chapter.as_ref(), &chapter_changes, key)
+                .or_else(|| variable_value(self.book.as_ref(), &book_changes, key))
+                .or_else(|| self.book_fields.get(key).cloned())
+                .or_else(|| self.rule_data.as_ref().and_then(|values| values.get(key)).cloned())
                 .or_else(|| {
                     current_active_session()
                         .and_then(|session| session.get_variable(key))
@@ -223,8 +281,10 @@ impl RuleVariableContext {
 
     fn insert(&mut self, key: String, value: String) {
         if let Some(chapter) = self.chapter.as_mut() {
+            self.object_changes.0.borrow().chapter.borrow_mut().remove(&key);
             chapter.insert(key, value);
         } else if let Some(book) = self.book.as_mut() {
+            self.object_changes.0.borrow().book.borrow_mut().remove(&key);
             book.insert(key, value);
         } else if let Some(rule_data) = self.rule_data.as_mut() {
             rule_data.insert(key, value);
@@ -234,11 +294,35 @@ impl RuleVariableContext {
     }
 
     fn book_variable(&self) -> Option<String> {
-        serialize_variable_map(self.book.as_ref())
+        let mut values = self.book.clone()?;
+        apply_object_changes(&mut values, &self.object_changes.0.borrow().book.borrow());
+        serialize_variable_map(Some(&values))
     }
 
     fn chapter_variable(&self) -> Option<String> {
-        serialize_variable_map(self.chapter.as_ref())
+        let mut values = self.chapter.clone()?;
+        apply_object_changes(&mut values, &self.object_changes.0.borrow().chapter.borrow());
+        serialize_variable_map(Some(&values))
+    }
+
+    fn changed_variables(
+        &self,
+        original_book: Option<&str>,
+        original_chapter: Option<&str>,
+    ) -> (Option<String>, Option<String>) {
+        let book = self.book_variable();
+        let chapter = self.chapter_variable();
+        // Compare maps, not serialized JSON: key reordering does not change
+        // state, and @put is as important as book/chapter.putVariable.
+        let book_changed = parse_variable_map(original_book)
+            != parse_variable_map(book.as_deref());
+        let chapter_changed = parse_variable_map(original_chapter)
+            != parse_variable_map(chapter.as_deref());
+        // Deleting the final key must explicitly clear the stored map.
+        (
+            book_changed.then(|| book.unwrap_or_else(|| "{}".into())),
+            chapter_changed.then(|| chapter.unwrap_or_else(|| "{}".into())),
+        )
     }
 
     fn js_bindings(&self) -> HashMap<String, Value> {
@@ -252,6 +336,21 @@ impl RuleVariableContext {
                 book_variables.insert(key.clone(), Value::String(value.clone()));
             }
         }
+        for (key, value) in &*self.object_changes.0.borrow().book.borrow() {
+            if let Some(value) = value {
+                book_variables.insert(key.clone(), Value::String(value.clone()));
+            } else {
+                book_variables.remove(key);
+            }
+        }
+        book.insert(
+            "variable".to_string(),
+            Value::String(
+                (!book_variables.is_empty())
+                    .then(|| serde_json::to_string(&book_variables).unwrap_or_default())
+                    .unwrap_or_default(),
+            ),
+        );
         book.insert("variableMap".to_string(), Value::Object(book_variables));
         if let Some(name) = &self.book_name {
             book.insert("name".to_string(), Value::String(name.clone()));
@@ -267,20 +366,75 @@ impl RuleVariableContext {
                 chapter_variables.insert(key.clone(), value);
             }
         }
+        for (key, value) in &*self.object_changes.0.borrow().chapter.borrow() {
+            if let Some(value) = value {
+                chapter.insert(key.clone(), Value::String(value.clone()));
+                chapter_variables.insert(key.clone(), Value::String(value.clone()));
+            } else {
+                chapter.remove(key);
+                chapter_variables.remove(key);
+            }
+        }
         chapter.extend(self.chapter_fields.clone());
+        chapter.insert(
+            "variable".to_string(),
+            Value::String(
+                (!chapter_variables.is_empty())
+                    .then(|| serde_json::to_string(&chapter_variables).unwrap_or_default())
+                    .unwrap_or_default(),
+            ),
+        );
         chapter.insert("variableMap".to_string(), Value::Object(chapter_variables));
         if let Some(title) = &self.chapter_title {
             chapter.insert("title".to_string(), Value::String(title.clone()));
         }
 
+        let scope_id = Rc::as_ptr(&self.object_changes.0) as usize as u64;
+        OBJECT_VARIABLE_SCOPES.with(|scopes| {
+            let mut scopes = scopes.borrow_mut();
+            scopes.retain(|_, value| value.strong_count() > 0);
+            scopes.insert(scope_id, Rc::downgrade(&self.object_changes.0));
+        });
         HashMap::from([
+            (OBJECT_SCOPE_BINDING.to_string(), json!(scope_id)),
             ("book".to_string(), Value::Object(book)),
             ("chapter".to_string(), Value::Object(chapter)),
             (
                 "title".to_string(),
                 Value::String(self.chapter_title.clone().unwrap_or_default()),
             ),
+            (
+                "nextChapterUrl".to_string(),
+                self.chapter_fields
+                    .get("nextChapterUrl")
+                    .cloned()
+                    .unwrap_or_else(|| json!("")),
+            ),
         ])
+    }
+}
+
+fn apply_object_changes(
+    values: &mut HashMap<String, String>,
+    changes: &HashMap<String, Option<String>>,
+) {
+    for (key, value) in changes {
+        if let Some(value) = value {
+            values.insert(key.clone(), value.clone());
+        } else {
+            values.remove(key);
+        }
+    }
+}
+
+fn variable_value(
+    values: Option<&HashMap<String, String>>,
+    changes: &HashMap<String, Option<String>>,
+    key: &str,
+) -> Option<String> {
+    match changes.get(key) {
+        Some(value) => value.clone(),
+        None => values.and_then(|values| values.get(key).cloned()),
     }
 }
 
@@ -701,6 +855,7 @@ impl RuleEngine {
             let mode = self.detect_mode(list_rule, &prepared_body);
             let (chapters, next_urls) = match mode {
                 ParseMode::JsonPath => parse_chapter_list_json(
+                    self,
                     &prepared_body,
                     base_url,
                     &rule,
@@ -708,6 +863,7 @@ impl RuleEngine {
                     &mut context,
                 ),
                 ParseMode::XPath => parse_chapter_list_xpath(
+                    self,
                     &prepared_body,
                     base_url,
                     &rule,
@@ -729,6 +885,7 @@ impl RuleEngine {
                     &mut context,
                 ),
                 ParseMode::Css => parse_chapter_list_html(
+                    self,
                     &prepared_body,
                     base_url,
                     &rule,
@@ -889,7 +1046,6 @@ impl RuleEngine {
                 content,
                 content_rule_error,
                 next_urls,
-                title: None,
                 book_variable: context.book_variable(),
                 chapter_variable: context.chapter_variable(),
             }
@@ -919,10 +1075,8 @@ impl RuleEngine {
                 book_fields,
             );
             context.chapter_fields = chapter_fields.cloned().unwrap_or_default();
-            let title = self.content_title_in_context(source, body, base_url, &mut context);
-            if let Some(title) = title.as_ref() {
-                context.chapter_title = Some(title.clone());
-            }
+            // Legado resolves ruleContent.title only after the complete
+            // chapter (and its replaceRegex phase), not before this page.
             let mut content_rule_error = None;
             let content = self.content_with_context_mode_diagnostic(
                 source,
@@ -941,10 +1095,42 @@ impl RuleEngine {
                 content,
                 content_rule_error,
                 next_urls,
-                title,
                 book_variable: context.book_variable(),
                 chapter_variable: context.chapter_variable(),
             }
+        })
+    }
+
+    pub(crate) fn content_title_after_pages(
+        &self,
+        source: &BookSource,
+        first_body: &str,
+        first_url: &str,
+        book_variable: Option<&str>,
+        chapter_variable: Option<&str>,
+        book_name: Option<&str>,
+        chapter_title: Option<&str>,
+        book_fields: Option<&HashMap<String, String>>,
+        chapter_fields: Option<&serde_json::Map<String, Value>>,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        with_js_lib(source.js_lib.as_deref(), || {
+            let mut context = RuleVariableContext::for_content_with_fields(
+                book_variable,
+                chapter_variable,
+                book_name,
+                chapter_title,
+                book_fields,
+            );
+            context.chapter_fields = chapter_fields.cloned().unwrap_or_default();
+            let title = self.content_title_in_context(
+                source,
+                first_body,
+                first_url,
+                &mut context,
+            );
+            let (book_update, chapter_update) =
+                context.changed_variables(book_variable, chapter_variable);
+            (title, book_update, chapter_update)
         })
     }
 
@@ -976,10 +1162,12 @@ impl RuleEngine {
         chapter_title: Option<&str>,
         book_fields: Option<&HashMap<String, String>>,
         chapter_fields: Option<&serde_json::Map<String, Value>>,
-    ) -> Option<String> {
-        let rule = source.rule_content.as_ref()?.sub_content.as_deref()?.trim();
-        if rule.is_empty() {
-            return None;
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        let Some(rule) = source.rule_content.as_ref().and_then(|r| r.sub_content.as_deref()) else {
+            return (None, None, None);
+        };
+        if rule.trim().is_empty() {
+            return (None, None, None);
         }
         with_js_lib(source.js_lib.as_deref(), || {
             let mut context = RuleVariableContext::for_content_with_fields(
@@ -990,8 +1178,12 @@ impl RuleEngine {
                 book_fields,
             );
             context.chapter_fields = chapter_fields.cloned().unwrap_or_default();
-            self.eval_body_rule_with_context(rule, body, base_url, &mut context)
-                .map(|value| value.trim().to_string())
+            let value = self
+                .eval_body_rule_with_context(rule, body, base_url, &mut context)
+                .unwrap_or_default();
+            let (book_update, chapter_update) =
+                context.changed_variables(book_variable, chapter_variable);
+            (Some(value), book_update, chapter_update)
         })
     }
 
@@ -1000,19 +1192,19 @@ impl RuleEngine {
         source: &BookSource,
         content: &str,
         base_url: &str,
-        context: &UrlRuleContext,
-    ) -> String {
-        let chapter_fields = context.chapter_fields.clone();
+        fields: &UrlRuleContext,
+    ) -> (String, Option<String>, Option<String>) {
+        let chapter_fields = fields.chapter_fields.clone();
         let mut context = RuleVariableContext::for_content_with_fields(
-            context.book_variable.as_deref(),
-            context.chapter_variable.as_deref(),
-            context.book_name.as_deref(),
-            context.chapter_title.as_deref(),
-            Some(&context.book_fields),
+            fields.book_variable.as_deref(),
+            fields.chapter_variable.as_deref(),
+            fields.book_name.as_deref(),
+            fields.chapter_title.as_deref(),
+            Some(&fields.book_fields),
         );
         context.chapter_fields = chapter_fields;
         with_js_lib(source.js_lib.as_deref(), || {
-            apply_content_replacement(
+            let replaced = apply_content_replacement(
                 content.to_string(),
                 source
                     .rule_content
@@ -1021,7 +1213,13 @@ impl RuleEngine {
                 content,
                 base_url,
                 &context,
-            )
+            );
+            // Unmodified variables keep their original serialization.
+            let (book_update, chapter_update) = context.changed_variables(
+                fields.book_variable.as_deref(),
+                fields.chapter_variable.as_deref(),
+            );
+            (replaced, book_update, chapter_update)
         })
     }
 
@@ -1272,12 +1470,44 @@ impl RuleEngine {
         else {
             return Vec::new();
         };
+        // A selector followed by JS consumes a collection, not the first
+        // extracted string. Keep `src` bound to the original response body.
+        let (selection, post_js) = extract_js(next_rule);
+        // Stateful @put/@get and template directives need the mutable field
+        // evaluator; the collection adapter cannot propagate those writes.
+        let post_processed = post_js
+            .filter(|_| {
+                !selection.is_empty()
+                    && !selection.contains("@put:")
+                    && !selection.contains("@get:")
+                    && !selection.contains("{{")
+            })
+            .map(|script| {
+            let json = serde_json::from_str::<Value>(body).ok();
+            let selected = eval_collection_with_context(
+                body, json.as_ref(), selection, base_url, context,
+            ).unwrap_or_default();
+            match eval_list_js_checked_with_source(selected, script, base_url, context, body) {
+                Ok(Value::Array(items)) => items.iter().filter_map(jsonpath::value_to_string).collect(),
+                Ok(Value::Null) | Err(_) => Vec::new(),
+                Ok(Value::String(text)) => {
+                    if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&text) {
+                        items.iter().filter_map(jsonpath::value_to_string).collect()
+                    } else {
+                        text.lines().map(str::to_owned).collect()
+                    }
+                }
+                Ok(value) => jsonpath::value_to_string(&value).into_iter().collect(),
+            }
+        });
         let simple_rule = !next_rule.contains("{{")
             && !next_rule.contains("@js")
             && !next_rule.contains("##")
             && !next_rule.contains("@put:")
             && !next_rule.contains("@get:");
-        let values = if simple_rule && next_rule.starts_with('$') {
+        let values = if post_processed.is_some() {
+            post_processed
+        } else if simple_rule && next_rule.starts_with('$') {
             serde_json::from_str::<Value>(body).ok().map(|value| {
                 jsonpath::jsonpath_query(&value, next_rule)
                     .into_iter()
@@ -1544,21 +1774,30 @@ impl RuleEngine {
         }
 
         let expanded = interpolate_common_templates(next_rule, body, base_url, ctx);
-        let (pure_rule, regex_part) = split_legado_regex(&expanded);
-        let mode = self.detect_mode(&pure_rule, body);
+        // Split JS before "##": those regex directives belong to the
+        // selector output and must run before the JS list transformation.
+        let (before_js, post_js) = extract_js(&expanded);
+        let (selection, regex_part) = split_legado_regex(before_js);
+        // A pure @js: rule still receives the complete original response.
+        let (selection, post_js) = if selection.is_empty() {
+            (expanded.as_str(), None)
+        } else {
+            (selection.as_str(), post_js)
+        };
+        let mode = self.detect_mode(selection, body);
         let raw_urls = match mode {
             ParseMode::JsonPath => serde_json::from_str::<Value>(body)
                 .ok()
                 .map(|value| {
-                    jsonpath::jsonpath_query(&value, self.strip_mode_prefix(&pure_rule))
+                    jsonpath::jsonpath_query(&value, self.strip_mode_prefix(selection))
                         .iter()
                         .filter_map(jsonpath::value_to_string)
                         .collect()
                 })
                 .unwrap_or_default(),
-            ParseMode::XPath => html::select_xpath(body, self.strip_mode_prefix(&pure_rule)),
+            ParseMode::XPath => html::select_xpath(body, self.strip_mode_prefix(selection)),
             ParseMode::Js => eval_js_with_bindings(
-                self.strip_mode_prefix(&pure_rule),
+                self.strip_mode_prefix(selection),
                 body,
                 base_url,
                 &ctx.js_bindings(),
@@ -1570,7 +1809,7 @@ impl RuleEngine {
             })
             .unwrap_or_default(),
             ParseMode::Regex => regex_capture_all(
-                self.strip_mode_prefix(&pure_rule)
+                self.strip_mode_prefix(selection)
                     .trim_start_matches(':')
                     .trim(),
                 body,
@@ -1580,7 +1819,7 @@ impl RuleEngine {
             .collect(),
             ParseMode::Css => {
                 let doc = html::parse_document(body);
-                html::select_text_list(&doc, self.strip_mode_prefix(&pure_rule))
+                html::select_text_list(&doc, self.strip_mode_prefix(selection))
             }
         };
         let raw_urls = if let Some(reg) = regex_part {
@@ -1588,6 +1827,19 @@ impl RuleEngine {
                 .into_iter()
                 .map(|u| apply_legado_regex(&u, reg))
                 .collect()
+        } else {
+            raw_urls
+        };
+        let raw_urls = if let Some(script) = post_js {
+            let values = raw_urls.into_iter().map(Value::String).collect();
+            match eval_list_js_checked_with_source(values, script, base_url, ctx, body) {
+                Ok(Value::Array(items)) => items.iter().filter_map(jsonpath::value_to_string).collect(),
+                Ok(Value::String(output)) => parse_js_output_items(&output)
+                    .map(|items| items.iter().filter_map(jsonpath::value_to_string).collect())
+                    .unwrap_or_else(|| vec![output]),
+                Ok(value) => jsonpath::value_to_string(&value).into_iter().collect(),
+                Err(_) => vec![],
+            }
         } else {
             raw_urls
         };
@@ -1602,7 +1854,6 @@ impl RuleEngine {
         list_rule: &str,
         ctx: &mut RuleVariableContext,
     ) -> (Vec<BookChapter>, Vec<String>) {
-        let next_urls = self.parse_next_toc_urls(body, base_url, rule, ctx);
         let output = match eval_js_with_bindings(
             self.strip_mode_prefix(list_rule),
             body,
@@ -1625,6 +1876,7 @@ impl RuleEngine {
                     out.push(chapter);
                 }
             }
+            let next_urls = self.parse_next_toc_urls(body, base_url, rule, ctx);
             return (out, next_urls);
         }
 
@@ -1685,6 +1937,7 @@ impl RuleEngine {
                 variable: chapter_ctx.chapter_variable(),
             });
         }
+        let next_urls = self.parse_next_toc_urls(body, base_url, rule, ctx);
         (out, next_urls)
     }
 
@@ -1696,7 +1949,6 @@ impl RuleEngine {
         list_rule: &str,
         ctx: &mut RuleVariableContext,
     ) -> (Vec<BookChapter>, Vec<String>) {
-        let next_urls = self.parse_next_toc_urls(body, base_url, rule, ctx);
         let (list_rule, list_js) = extract_js(list_rule);
         let rows = apply_regex_list_js(
             regex_capture_all(self.strip_mode_prefix(list_rule), body),
@@ -1767,6 +2019,7 @@ impl RuleEngine {
                 variable: chapter_ctx.chapter_variable(),
             });
         }
+        let next_urls = self.parse_next_toc_urls(body, base_url, rule, ctx);
         (out, next_urls)
     }
 
@@ -2529,6 +2782,7 @@ fn parse_book_info_json(
 }
 
 fn parse_chapter_list_html(
+    engine: &RuleEngine,
     body: &str,
     base_url: &str,
     rule: &TocRule,
@@ -2590,24 +2844,13 @@ fn parse_chapter_list_html(
         });
     }
 
-    // Extract next_toc_url(s)
-    let rule_str = rule.next_toc_url.as_deref().unwrap_or("");
-    let (pure_rule, regex_part) = split_legado_regex(rule_str);
-    let raw_urls: Vec<String> = html::select_text_list(&doc, &pure_rule);
-    let raw_urls = if let Some(reg) = regex_part {
-        raw_urls
-            .into_iter()
-            .map(|u| apply_legado_regex(&u, reg))
-            .collect()
-    } else {
-        raw_urls
-    };
-    let next_urls = normalize_toc_next_urls(base_url, raw_urls);
+    let next_urls = engine.parse_next_toc_urls(body, base_url, rule, ctx);
 
     (out, next_urls)
 }
 
 fn parse_chapter_list_xpath(
+    engine: &RuleEngine,
     body: &str,
     base_url: &str,
     rule: &TocRule,
@@ -2616,7 +2859,7 @@ fn parse_chapter_list_xpath(
 ) -> (Vec<BookChapter>, Vec<String>) {
     let (package, html_mode) = match html::parse_xpath_package_with_mode(body) {
         Ok(parsed) => parsed,
-        Err(_) => return parse_chapter_list_html(body, base_url, rule, list_rule, ctx),
+        Err(_) => return parse_chapter_list_html(engine, body, base_url, rule, list_rule, ctx),
     };
     let document = package.as_document();
     let scope = select_xpath_scope(
@@ -2711,6 +2954,7 @@ fn parse_chapter_list_xpath(
 }
 
 fn parse_chapter_list_json(
+    engine: &RuleEngine,
     body: &str,
     base_url: &str,
     rule: &TocRule,
@@ -2803,17 +3047,27 @@ fn parse_chapter_list_json(
         });
     }
 
-    let next_urls = rule
+    let next_urls = if rule
         .next_toc_url
-        .as_ref()
-        .map(|r| {
-            jsonpath::jsonpath_query(&scope, r)
-                .into_iter()
-                .filter_map(|value| value.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    let next_urls = normalize_toc_next_urls(base_url, next_urls);
+        .as_deref()
+        .is_some_and(|next_rule| extract_js(next_rule).1.is_some())
+    {
+        // Mixed JSONPath/JS and pure JS rules use the same staged evaluator
+        // as HTML TOCs. Pure JSONPath keeps the existing init-relative scope.
+        engine.parse_next_toc_urls(body, base_url, rule, ctx)
+    } else {
+        let raw_urls = rule
+            .next_toc_url
+            .as_ref()
+            .map(|r| {
+                jsonpath::jsonpath_query(&scope, r)
+                    .into_iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        normalize_toc_next_urls(base_url, raw_urls)
+    };
 
     (out, next_urls)
 }
@@ -3309,6 +3563,16 @@ fn eval_list_js_checked(
     base_url: &str,
     ctx: &RuleVariableContext,
 ) -> anyhow::Result<Value> {
+    eval_list_js_checked_with_source(values, script, base_url, ctx, "")
+}
+
+fn eval_list_js_checked_with_source(
+    values: Vec<Value>,
+    script: &str,
+    base_url: &str,
+    ctx: &RuleVariableContext,
+    source_html: &str,
+) -> anyhow::Result<Value> {
     let mut bindings = ctx.js_bindings();
     bindings.insert("result".to_string(), Value::Array(values));
     let script_literal = serde_json::to_string(script).unwrap_or_else(|_| "\"\"".to_string());
@@ -3317,7 +3581,7 @@ fn eval_list_js_checked(
          const __readerList = __readerOut == null ? globalThis.result : __readerOut;\
          JSON.stringify(__readerList);"
     );
-    let output = eval_js_with_bindings(&wrapped, "", base_url, &bindings)?;
+    let output = eval_js_with_bindings(&wrapped, source_html, base_url, &bindings)?;
     Ok(serde_json::from_str(&output)?)
 }
 
@@ -3866,12 +4130,9 @@ fn eval_html_node_js(
     dom::evaluate(element, &context.html_document, |descriptor| {
         let mut bindings = context.js_bindings();
         bindings.insert("result".to_string(), descriptor);
-        eval_js_with_bindings(
-            script,
-            &html::get_descendant_text_nodes(&element),
-            base_url,
-            &bindings,
-        )
+        // Legado's nested java.getString() evaluates against the current HTML
+        // element, not its flattened text. Keep the element descriptor in result.
+        eval_js_with_bindings(script, &element.html(), base_url, &bindings)
     })
 }
 
@@ -4627,6 +4888,9 @@ fn apply_toc_format_js(
                 }
             }
         }
+        if !chapter_ctx.object_changes.0.borrow().chapter.borrow().is_empty() {
+            chapter.variable = chapter_ctx.chapter_variable();
+        }
     }
 }
 
@@ -5075,7 +5339,7 @@ mod tests {
                 "Title7 body",
                 "https://example.com",
                 &context
-            ),
+            ).0,
             " body"
         );
     }
@@ -5618,16 +5882,16 @@ mod tests {
     }
 
     #[test]
-    fn content_first_page_evaluates_title_before_content_and_next_url() {
+    fn content_first_page_defers_title_until_after_content() {
         let source = BookSource {
             rule_content: Some(ContentRule {
                 title: Some("@put:{pageToken:.token@text}.title@text".to_string()),
                 content: Some(
-                    "@js:[title, chapter.title, chapter.variableMap.pageToken].join('|')"
+                    "@js:[title, chapter.title, chapter.getVariable('pageToken')].join('|')"
                         .to_string(),
                 ),
                 next_content_url: Some(
-                    "@js:'/next/' + title + '/' + chapter.variableMap.pageToken".to_string(),
+                    "@js:'/next/' + title + '/' + chapter.getVariable('pageToken')".to_string(),
                 ),
                 ..Default::default()
             }),
@@ -5647,17 +5911,34 @@ mod tests {
             false,
         );
 
-        assert_eq!(page.title.as_deref(), Some("Fresh"));
-        assert_eq!(page.content, "Fresh|Fresh|NEXT");
+        assert_eq!(page.content, "Old|Old|");
         assert_eq!(
             page.next_urls.first().map(String::as_str),
-            Some("https://books.example/next/Fresh/NEXT")
+            Some("https://books.example/next/Old/")
         );
         let chapter_vars = serde_json::from_str::<HashMap<String, String>>(
             page.chapter_variable.as_deref().unwrap(),
         )
         .unwrap();
-        assert_eq!(chapter_vars["pageToken"], "NEXT");
+        assert!(!chapter_vars.contains_key("pageToken"));
+
+        let (title, _, chapter_variable) = RuleEngine::new()
+            .unwrap()
+            .content_title_after_pages(
+                &source,
+                r#"<span class="token">NEXT</span><h1 class="title">Fresh</h1>"#,
+                "https://books.example/chapter/1",
+                page.book_variable.as_deref(),
+                page.chapter_variable.as_deref(),
+                Some("Book"),
+                Some("Old"),
+                None,
+                None,
+            );
+        assert_eq!(title.as_deref(), Some("Fresh"));
+        let final_vars: HashMap<String, String> =
+            serde_json::from_str(chapter_variable.as_deref().unwrap()).unwrap();
+        assert_eq!(final_vars["pageToken"], "NEXT");
     }
 
     #[test]
