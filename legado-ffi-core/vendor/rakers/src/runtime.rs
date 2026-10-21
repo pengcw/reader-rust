@@ -572,7 +572,10 @@ mod quickjs_rt {
                         // callback as an argument. Page globals are never assigned it.
                         callback.and_then(|callback| {
                             let driver: Function = ctx.eval_with_options(script, sloppy())?;
-                            driver.call::<_, rquickjs::Coerced<String>>((callback,))
+                            // Preserve synchronous drivers while driving async
+                            // Promise jobs within the existing script budget.
+                            let pending: rquickjs::promise::MaybePromise = driver.call((callback,))?;
+                            pending.finish::<rquickjs::Coerced<String>>()
                         })
                     } else {
                         ctx.eval_with_options::<rquickjs::Coerced<String>, _>(script, sloppy())

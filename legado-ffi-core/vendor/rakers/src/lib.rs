@@ -25,8 +25,9 @@ thread_local! {
 
 /// Opt-in synchronous bridge for the caller's final script only. Page startup
 /// scripts do not receive it. When enabled, `final_script` must evaluate to a
-/// function accepting the private callback; without a host it remains a normal
-/// expression. The callback must not re-enter this renderer.
+/// function accepting the private callback and returning a value or a Promise;
+/// without a host it remains a normal expression. The callback must not re-enter
+/// this renderer.
 pub fn with_final_script_host<T>(host: fn(String) -> String, run: impl FnOnce() -> T) -> T {
     struct Restore(Option<fn(String) -> String>);
     impl Drop for Restore {

@@ -2150,6 +2150,9 @@ pub(super) fn eval_js_inner_with_source(
             eval_script(
                 ctx.clone(),
                 r#"if (globalThis.result && globalThis.result.__ffiStrResponse === true) {
+                    // AnalyzeUrl exposes its request URL as java.url to
+                    // loginCheckJs, including StrResponse reconstruction.
+                    globalThis.java.url = globalThis.baseUrl;
                     globalThis.result = globalThis.__readerMakeStrResponse(globalThis.result);
                 }"#,
             )?;

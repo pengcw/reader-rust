@@ -982,14 +982,14 @@ fn execute_toc(
     if let Some(rule) = &mut page_source.rule_toc {
         rule.format_js = None;
     }
-    let mut pending = VecDeque::from([toc_url.clone()]);
+    let mut pending = VecDeque::from([(toc_url.clone(), true)]);
     let mut queued = HashSet::from([toc_page_identity(&toc_url)]);
     let mut visited_pages = HashSet::new();
     let mut chapters = Vec::new();
     let mut final_response = None;
     let mut truncated = false;
 
-    while let Some(url) = pending.pop_front() {
+    while let Some((url, follow_next)) = pending.pop_front() {
         let identity = toc_page_identity(&url);
         queued.remove(&identity);
         if visited_pages.contains(&identity) {
@@ -1041,6 +1041,7 @@ fn execute_toc(
             book_variable.as_deref(),
             Some(&book_info.name),
             Some(&book_fields),
+            follow_next,
         );
         book_variable = page.book_variable;
         // Keep the single-page parser contract; reverse the complete TOC below.
@@ -1048,6 +1049,7 @@ fn execute_toc(
             page.chapters.reverse();
         }
         chapters.extend(page.chapters);
+        let recursive = page.next_urls.len() == 1;
         for next_url in page.next_urls {
             let next_identity = toc_page_identity(&next_url);
             if next_url.trim().is_empty()
@@ -1061,7 +1063,7 @@ fn execute_toc(
                 continue;
             }
             queued.insert(next_identity);
-            pending.push_back(next_url);
+            pending.push_back((next_url, recursive));
         }
         final_response = Some(response);
     }
@@ -1075,14 +1077,16 @@ fn execute_toc(
             chapter.index = index as i32;
         }
     }
-    engine.format_chapter_list_with_context(
+    if let Some(updated) = engine.format_chapter_list_with_context(
         source,
         &mut chapters,
         &toc_url,
         book_variable.as_deref(),
         Some(&book_info.name),
         Some(&book_fields),
-    );
+    ) {
+        book_variable = Some(updated);
+    }
     let mut titles = chapters
         .iter()
         .map(|chapter| chapter.title.clone())
@@ -3209,6 +3213,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let append_url = format!("{base}/append");
+        let server_append_url = append_url.clone();
         let server = thread::spawn(move || {
             let mut paths = Vec::new();
             for _ in 0..2 {
@@ -3223,7 +3228,7 @@ mod tests {
                 let body = match path.as_str() {
                     "/chapter/1" => serde_json::json!({
                         "content":"first","next":"/chapter/1-2",
-                        "append":format!(r#"{append_url},{{"js":"result + '?name=' + book.name"}}"#)
+                        "append":format!(r#"{server_append_url},{{"js":"result + '?name=' + book.name"}}"#)
                     })
                     .to_string(),
                     "/chapter/1-2" => r#"{"content":"second","append":"ignored"}"#.to_string(),

@@ -83,8 +83,12 @@ fn run_titled(html: &str, title: &str) -> anyhow::Result<Value> {
     let title = serde_json::to_string(title)?;
     let script = format!(
         r#"
-(function(host) {{
+(async function(host) {{
     const page = ({projection})('{page_id}');
+    // Permit short nested Promise chains to settle before the next snapshot.
+    async function flushMicrotasks() {{
+        for (let i = 0; i < 8; i++) await Promise.resolve();
+    }}
     for (let step = 0; step < 32; step++) {{
         const snapshot = page.snapshot();
         snapshot.title = {title};
@@ -96,6 +100,7 @@ fn run_titled(html: &str, title: &str) -> anyhow::Result<Value> {
         if (event.kind === 'finish') return JSON.stringify({{cancelled: false, html: page.body()}});
         if (event.kind === 'input') page.apply(event.uri, event.value, 'input');
         if (event.kind === 'click') page.apply(event.uri, undefined, 'click');
+        await flushMicrotasks();
     }}
     throw new Error('interaction step limit exceeded');
 }})

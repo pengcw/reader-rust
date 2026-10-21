@@ -13,7 +13,7 @@ use crate::util::text::{find_template_close, normalize_source_url};
 use serde_json::{json, Value};
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 
 #[derive(Clone, Default)]
@@ -477,6 +477,23 @@ struct SourceRule {
     put_entries: Vec<PutEntry>,
 }
 
+// Explicit JS blocks are opaque to Legado's ## replacement syntax.
+// Keep the existing scanner for selectors and for @js: (which has no end marker).
+fn find_replacement_marker(rule: &str) -> Option<usize> {
+    let mut start = 0;
+    while let Some((index, marker)) =
+        rule_analyzer::find_next_delimiter(&rule[start..], &["##", "<js>"], 0)
+    {
+        let index = start + index;
+        if marker == "##" {
+            return Some(index);
+        }
+        let close = index + 4 + rule[index + 4..].find("</js>")?;
+        start = close + "</js>".len();
+    }
+    None
+}
+
 impl SourceRule {
     fn compile(rule: &str, fallback: ParseMode, content_is_json: bool) -> Self {
         let (without_put, put_entries) = extract_put_entries(rule);
@@ -494,7 +511,7 @@ impl SourceRule {
     }
 
     fn make_up_rule(&mut self, expanded_rule: &str) {
-        let Some(index) = expanded_rule.find("##") else {
+        let Some(index) = find_replacement_marker(expanded_rule) else {
             self.rule = expanded_rule.trim().to_string();
             return;
         };
@@ -830,6 +847,7 @@ impl RuleEngine {
             variable,
             book_name,
             book_fields,
+            true,
         );
         (page.chapters, page.next_urls)
     }
@@ -842,9 +860,15 @@ impl RuleEngine {
         variable: Option<&str>,
         book_name: Option<&str>,
         book_fields: Option<&HashMap<String, String>>,
+        follow_next: bool,
     ) -> TocPageResult {
         with_js_lib(source.js_lib.as_deref(), || {
-            let rule = source.rule_toc.clone().unwrap_or_default();
+            let mut rule = source.rule_toc.clone().unwrap_or_default();
+            // BookChapterList: a batch of multiple TOC URLs is one-shot.
+            // Do not evaluate nextTocUrl on its additional pages.
+            if !follow_next {
+                rule.next_toc_url = None;
+            }
             let mut context =
                 RuleVariableContext::for_book_with_fields(variable, book_name, book_fields);
             let (list_rule, reverse) =
@@ -917,7 +941,7 @@ impl RuleEngine {
         variable: Option<&str>,
         book_name: Option<&str>,
         book_fields: Option<&HashMap<String, String>>,
-    ) {
+    ) -> Option<String> {
         let context = RuleVariableContext::for_book_with_fields(variable, book_name, book_fields);
         with_js_lib(source.js_lib.as_deref(), || {
             apply_toc_format_js(
@@ -929,7 +953,8 @@ impl RuleEngine {
                 base_url,
                 &context,
             );
-        });
+            context.changed_variables(variable, None).0
+        })
     }
 
     pub fn content(&self, source: &BookSource, body: &str, base_url: &str) -> String {
@@ -1536,12 +1561,16 @@ impl RuleEngine {
                 raw.lines().map(str::to_owned).collect()
             }
         });
+        // AnalyzeRule.getStringList(isUrl=true) resolves URLs, then keeps
+        // only the first occurrence. Do this before BookContent chooses
+        // recursive (one link) versus one-shot (multiple links) paging.
+        let mut seen = HashSet::new();
         values
             .into_iter()
             .map(|url| url.trim().to_string())
             .filter(|url| !url.is_empty())
             .map(|url| resolve_content_page_url(base_url, &url))
-            .filter(|url| !url.is_empty())
+            .filter(|url| !url.is_empty() && seen.insert(url.clone()))
             .collect()
     }
 
@@ -1805,7 +1834,7 @@ impl RuleEngine {
             .map(|output| {
                 parse_js_output_items(&output)
                     .map(|items| items.iter().filter_map(jsonpath::value_to_string).collect())
-                    .unwrap_or_else(|| vec![output])
+                    .unwrap_or_else(|| output.lines().map(str::to_owned).collect())
             })
             .unwrap_or_default(),
             ParseMode::Regex => regex_capture_all(
@@ -1836,7 +1865,7 @@ impl RuleEngine {
                 Ok(Value::Array(items)) => items.iter().filter_map(jsonpath::value_to_string).collect(),
                 Ok(Value::String(output)) => parse_js_output_items(&output)
                     .map(|items| items.iter().filter_map(jsonpath::value_to_string).collect())
-                    .unwrap_or_else(|| vec![output]),
+                    .unwrap_or_else(|| output.lines().map(str::to_owned).collect()),
                 Ok(value) => jsonpath::value_to_string(&value).into_iter().collect(),
                 Err(_) => vec![],
             }
@@ -4171,7 +4200,11 @@ fn eval_field_html_with_cached_text(
     evaluate_put_entries(&source_rule.put_entries, ctx, |put_rule, ctx| {
         eval_field_html_with_cached_text(put_rule, el, text_cache, base_url, ctx)
     });
-    let expanded = interpolate_common_templates(&source_rule.rule, input, base_url, ctx);
+    // Legado evaluates element-relative template selectors against the
+    // chapter node (including links and attributes), not its text alone.
+    let element_html = source_rule.rule.contains("{{@@").then(|| el.html());
+    let template_input = element_html.as_deref().unwrap_or(input);
+    let expanded = interpolate_common_templates(&source_rule.rule, template_input, base_url, ctx);
     let had_templates = expanded != source_rule.rule;
     source_rule.make_up_rule(&expanded);
     let (pure, js) = extract_js(&source_rule.rule);
@@ -4642,7 +4675,7 @@ fn eval_field_json_with_ctx(
 }
 
 pub(crate) fn split_legado_regex(rule: &str) -> (String, Option<&str>) {
-    if let Some(idx) = rule.find("##") {
+    if let Some((idx, _)) = rule_analyzer::find_next_delimiter(rule, &["##"], 0) {
         let (pure, reg) = rule.split_at(idx);
         return (pure.trim().to_string(), Some(reg));
     }
@@ -5584,6 +5617,7 @@ mod tests {
         };
         let body = "<chapter><name>One&nbsp;Chapter</name><url>/1</url></chapter><chapter><name>Two</name><url>/2</url></chapter>";
         let (chapters, next_urls) = parse_chapter_list_xpath(
+            &RuleEngine::new().unwrap(),
             body,
             "https://books.example/toc",
             &rule,
@@ -5916,11 +5950,7 @@ mod tests {
             page.next_urls.first().map(String::as_str),
             Some("https://books.example/next/Old/")
         );
-        let chapter_vars = serde_json::from_str::<HashMap<String, String>>(
-            page.chapter_variable.as_deref().unwrap(),
-        )
-        .unwrap();
-        assert!(!chapter_vars.contains_key("pageToken"));
+        assert_eq!(page.chapter_variable, None);
 
         let (title, _, chapter_variable) = RuleEngine::new()
             .unwrap()

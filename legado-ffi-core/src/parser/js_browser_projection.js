@@ -49,7 +49,8 @@
             revision++;
             targets = new Map();
             const copy = document.documentElement.cloneNode(true);
-            const originals = Array.from(document.querySelectorAll(selector));
+            // Both queries must exclude the <html> root, or indices diverge.
+            const originals = Array.from(document.documentElement.querySelectorAll(selector));
             const projected = Array.from(copy.querySelectorAll(selector));
             // Property-assigned onclick is not reflected as an [onclick] attribute.
             // Append those candidates after normal controls to preserve their IDs.

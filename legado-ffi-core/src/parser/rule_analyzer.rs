@@ -77,7 +77,7 @@ pub(crate) fn find_next_delimiter<'a>(
         }
 
         match ch {
-            '"' | '\'' => {
+            '"' | '\'' | '`' => {
                 quote = Some(ch);
                 continue;
             }
@@ -126,6 +126,17 @@ mod tests {
             vec![r"A\&&B", "C"]
         );
         assert_eq!(split_top_level(r"A\\&&B", &["&&"]).parts, vec![r"A\\", "B"]);
+    }
+
+    #[test]
+    fn js_literal_hashes_are_not_rule_separators() {
+        for (rule, expected_suffix) in [
+            ("div@text@js:result.replace('##','x')##x##y", "##x##y"),
+            ("div@text<js>`a##${result}`</js>##a##b", "##a##b"),
+        ] {
+            let (pos, _) = find_next_delimiter(rule, &["##"], 0).unwrap();
+            assert_eq!(&rule[pos..], expected_suffix);
+        }
     }
 
     #[test]
