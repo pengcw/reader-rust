@@ -54,6 +54,10 @@ pub struct BookSource {
 #[serde(default, rename_all = "camelCase")]
 pub struct ExploreKind {
     pub title: String,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
     pub url: Option<String>,
     pub style: Option<Value>,
 }

@@ -161,6 +161,11 @@ impl Regex {
 
     /// Returns true if the pattern matches the entire input.
     pub fn matches(&self, input: &str) -> bool {
+        self.try_matches(input).unwrap_or(false)
+    }
+
+    /// Whole-input matching with explicit step-budget exhaustion.
+    pub fn try_matches(&self, input: &str) -> Result<bool, MatchError> {
         let input_chars: Vec<char> = input.chars().collect();
         let mut engine = Engine::new(
             &input_chars,
@@ -170,7 +175,12 @@ impl Regex {
         );
         let mut state = State::new(self.group_count);
         let end_anchor = vec![Node::Anchor(AnchorKind::EndOfInput)];
-        engine.match_pattern(&self.pattern, &end_anchor, 0, &mut state)
+        let matched = engine.match_pattern(&self.pattern, &end_anchor, 0, &mut state);
+        if engine.budget_exhausted() {
+            Err(MatchError::BudgetExceeded)
+        } else {
+            Ok(matched)
+        }
     }
 
     /// Returns true if the pattern matches the beginning of the input.
@@ -666,6 +676,16 @@ impl Regex {
     /// - limit == 0: no limit, trailing empty strings removed (Java default)
     /// - limit < 0: no limit, trailing empty strings preserved
     pub fn split_with_limit(&self, input: &str, limit: i32) -> Vec<String> {
+        // Preserve the legacy entry point's behavior, including exhausted scans.
+        self.split_internal(input, limit, false).unwrap_or_else(|_| vec![input.to_string()])
+    }
+
+    /// Split without publishing partial results after step-budget exhaustion.
+    pub fn try_split_with_limit(&self, input: &str, limit: i32) -> Result<Vec<String>, MatchError> {
+        self.split_internal(input, limit, true)
+    }
+
+    fn split_internal(&self, input: &str, limit: i32, checked: bool) -> Result<Vec<String>, MatchError> {
         let input_chars: Vec<char> = input.chars().collect();
         let input_len = input_chars.len();
         let mut parts: Vec<String> = Vec::new();
@@ -691,9 +711,11 @@ impl Regex {
 
             engine.search_start = prev_match_end;
 
-            if let Some(end_pos) =
-                engine.try_match_at_persistent(&self.pattern, search_pos, &mut state)
-            {
+            let matched = engine.try_match_at_persistent(&self.pattern, search_pos, &mut state);
+            if checked && engine.budget_exhausted() {
+                return Err(MatchError::BudgetExceeded);
+            }
+            if let Some(end_pos) = matched {
                 // Java quirk: a zero-width match at position 0 produces NO leading
                 // empty substring. OpenJDK's Pattern.split has the explicit check:
                 //     if (index == 0 && index == m.start() && m.start() == m.end()) continue;
@@ -730,7 +752,7 @@ impl Regex {
             parts.push(input.to_string());
         }
 
-        parts
+        Ok(parts)
     }
 }
 

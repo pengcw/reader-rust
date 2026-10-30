@@ -115,7 +115,7 @@ pub fn analyze_url_with_context(
     context: Option<&UrlRuleContext>,
 ) -> Result<RequestSpec, String> {
     with_js_lib(source.js_lib.as_deref(), || {
-        compile_url_request(raw_rule, key, page, base_url, source, context, None)
+        compile_url_request(raw_rule, key, page, base_url, source, context, None, None)
     })
 }
 
@@ -128,8 +128,33 @@ pub(crate) fn analyze_url_with_headers(
     headers: Option<Vec<(String, String)>>,
 ) -> Result<RequestSpec, String> {
     with_js_lib(source.js_lib.as_deref(), || {
-        compile_url_request(raw_rule, key, page, base_url, source, None, headers)
+        compile_url_request(raw_rule, key, page, base_url, source, None, headers, None)
     })
+}
+
+/// Reinitialize one existing AnalyzeUrl request, including its intermediate ruleUrl.
+pub(crate) fn recompile_login_url(
+    raw_rule: &str,
+    key: &str,
+    page: i32,
+    base_url: &str,
+    source: &BookSource,
+    context: Option<&UrlRuleContext>,
+) -> Result<(RequestSpec, String), String> {
+    let mut rule_url = String::new();
+    let spec = with_js_lib(source.js_lib.as_deref(), || {
+        compile_url_request(
+            raw_rule,
+            key,
+            page,
+            base_url,
+            source,
+            context,
+            None,
+            Some(&mut rule_url),
+        )
+    })?;
+    Ok((spec, rule_url))
 }
 
 fn compile_url_request(
@@ -140,6 +165,7 @@ fn compile_url_request(
     source: &BookSource,
     context: Option<&UrlRuleContext>,
     initial_headers: Option<Vec<(String, String)>>,
+    rule_output: Option<&mut String>,
 ) -> Result<RequestSpec, String> {
     let raw_rule = raw_rule.trim();
     if raw_rule.is_empty() {
@@ -320,7 +346,9 @@ fn compile_url_request(
     let mut render_timeout_ms = None;
     if render_with_rakers {
         if let Some(value) = options.get("renderTimeout") {
-            let timeout = value.as_u64().ok_or("URL renderTimeout must be milliseconds")?;
+            let timeout = value
+                .as_u64()
+                .ok_or("URL renderTimeout must be milliseconds")?;
             if timeout != 0 {
                 if !(3_000..=super::MAX_BROWSER_RENDER_TIMEOUT_MS).contains(&timeout) {
                     return Err("URL renderTimeout must be between 3000 and 120000 ms".into());
@@ -329,15 +357,22 @@ fn compile_url_request(
             }
         }
         if let Some(block) = options.get("block") {
-            let patterns = block.as_array().ok_or("URL block must be an array of regex strings")?;
+            let patterns = block
+                .as_array()
+                .ok_or("URL block must be an array of regex strings")?;
             for pattern in patterns {
                 let pattern = pattern.as_str().ok_or("URL block must contain strings")?;
-                blocked_scripts.push(regex::Regex::new(pattern)
-                    .map_err(|error| format!("invalid URL block regex: {error}"))?);
+                blocked_scripts.push(
+                    regex::Regex::new(pattern)
+                        .map_err(|error| format!("invalid URL block regex: {error}"))?,
+                );
             }
         }
     }
 
+    if let Some(out) = rule_output {
+        *out = rule;
+    }
     Ok(RequestSpec {
         url: encode_get_query(&url, charset.as_deref()),
         method,
@@ -657,6 +692,26 @@ fn source_headers(source: &BookSource) -> Result<Vec<(String, String)>, String> 
         raw.to_string()
     };
     Ok(parse_source_headers(&raw))
+}
+
+// Expose the same source-header evaluation to the JS source.getHeaderMap()
+// bridge without compiling a URL or changing request-local headers.
+pub(crate) fn source_header_map(source: &BookSource, include_login: bool) -> Vec<(String, String)> {
+    let mut headers = source_headers(source).unwrap_or_else(|error| {
+        // BaseSource.getHeaderMap logs invalid source-header JS and still
+        // returns the default headers; normal HTTP compilation stays strict.
+        eprintln!("[legado::js] source header evaluation failed: {error}");
+        Vec::new()
+    });
+    ensure_user_agent(&mut headers);
+    if include_login {
+        if let Some(active) = current_active_session() {
+            if let Some(login_header @ Value::Object(_)) = active.get_login_header() {
+                merge_headers(&mut headers, headers_from_value(&login_header));
+            }
+        }
+    }
+    headers
 }
 
 pub(super) fn parse_source_headers(raw: &str) -> Vec<(String, String)> {

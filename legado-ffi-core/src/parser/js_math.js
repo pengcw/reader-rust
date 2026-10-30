@@ -70,11 +70,61 @@
                     throw new RangeError('zero signum with nonzero magnitude');
                 }
                 this._number = bounded(BigInt(value) * magnitude);
+            } else if (Number.isInteger(value)
+                && radix instanceof Packages.java.security.SecureRandom) {
+                if (value < 0 || value > MAX_BITS) throw new RangeError('invalid random BigInteger bit length');
+                const bytes = radix.generateSeed(Math.ceil(value / 8));
+                if (value % 8) bytes[0] &= (1 << (value % 8)) - 1;
+                this._number = fromMagnitude(bytes);
             } else if (typeof value === 'bigint' && radix === undefined) {
                 this._number = bounded(value);
             } else {
                 throw new TypeError('unsupported BigInteger constructor');
             }
+        }
+        add(other) { return new JavaBigInteger(bounded(this._number + asBigInt(other))); }
+        subtract(other) { return new JavaBigInteger(bounded(this._number - asBigInt(other))); }
+        multiply(other) { return new JavaBigInteger(bounded(this._number * asBigInt(other))); }
+        divide(other) {
+            const divisor = asBigInt(other);
+            if (divisor === 0n) throw new RangeError('division by zero');
+            return new JavaBigInteger(this._number / divisor);
+        }
+        remainder(other) {
+            const divisor = asBigInt(other);
+            if (divisor === 0n) throw new RangeError('division by zero');
+            return new JavaBigInteger(this._number % divisor);
+        }
+        mod(other) {
+            const modulus = asBigInt(other);
+            if (modulus <= 0n) throw new RangeError('modulus must be positive');
+            const remainder = this._number % modulus;
+            return new JavaBigInteger(remainder < 0n ? remainder + modulus : remainder);
+        }
+        compareTo(other) {
+            const value = asBigInt(other);
+            return this._number < value ? -1 : this._number > value ? 1 : 0;
+        }
+        equals(other) { return other instanceof JavaBigInteger && this._number === other._number; }
+        bitLength() {
+            const value = this._number < 0n ? ~this._number : this._number;
+            return value === 0n ? 0 : value.toString(2).length;
+        }
+        modPow(exponent, modulus) {
+            let power = asBigInt(exponent);
+            const mod = asBigInt(modulus);
+            if (mod <= 0n) throw new RangeError('modulus must be positive');
+            // Negative exponents require modular inverse; do not silently return an incorrect key.
+            if (power < 0n) throw new RangeError('negative modular exponent unsupported');
+            let base = this._number % mod;
+            if (base < 0n) base += mod;
+            let result = 1n % mod;
+            while (power > 0n) {
+                if (power & 1n) result = (result * base) % mod;
+                power >>= 1n;
+                if (power > 0n) base = (base * base) % mod;
+            }
+            return new JavaBigInteger(result);
         }
         and(other) { return new JavaBigInteger(bounded(this._number & asBigInt(other))); }
         or(other) { return new JavaBigInteger(bounded(this._number | asBigInt(other))); }
@@ -133,6 +183,8 @@
         }
         return new JavaBigInteger(value);
     };
+    JavaBigInteger.ZERO = Object.freeze(new JavaBigInteger(0n));
+    JavaBigInteger.ONE = Object.freeze(new JavaBigInteger(1n));
     Object.defineProperty(JavaBigInteger, '__javaName', {value: 'BigInteger'});
     Packages.java.math = Packages.java.math || {};
     Packages.java.math.BigInteger = JavaBigInteger;

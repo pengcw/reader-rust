@@ -9,8 +9,10 @@ use serde_json::Value as JsonValue;
 use std::cell::RefCell;
 
 thread_local! {
+    pub(super) static RELOGIN_REQUEST: RefCell<Option<Option<bool>>> = const { RefCell::new(None) };
     pub(super) static LOGIN_MESSAGES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
     pub(super) static LOGIN_PREVIEW: RefCell<Option<JsonValue>> = const { RefCell::new(None) };
+    pub(super) static LOGIN_OPEN_URLS: RefCell<Option<Vec<JsonValue>>> = const { RefCell::new(None) };
     pub(super) static CLICK_BROWSER: RefCell<Option<Option<JsonValue>>> = const { RefCell::new(None) };
 }
 
@@ -24,26 +26,72 @@ pub(crate) fn with_click_browser<T>(run: impl FnOnce() -> T) -> (T, Option<JsonV
     })
 }
 
+pub(crate) fn with_relogin_request<T>(run: impl FnOnce() -> T) -> (T, Option<bool>) {
+    RELOGIN_REQUEST.with(|cell| {
+        crate::util::scoped::with_scoped_value(cell, Some(None), || {
+            let result = run();
+            (result, cell.borrow().as_ref().copied().flatten())
+        })
+    })
+}
+
+pub(super) fn request_relogin(delta: bool) -> bool {
+    RELOGIN_REQUEST.with(|cell| {
+        let mut state = cell.borrow_mut();
+        if let Some(request) = state.as_mut() {
+            // Full rebuild wins when one action requests both update modes.
+            *request = Some(request.unwrap_or(true) && delta);
+            true
+        } else {
+            false
+        }
+    })
+}
+
 pub(crate) fn with_login_messages<T>(
     run: impl FnOnce() -> T,
-) -> (T, Vec<String>, Option<JsonValue>) {
-    struct Restore(Option<Vec<String>>, Option<JsonValue>);
+) -> (T, Vec<String>, Option<JsonValue>, Vec<JsonValue>) {
+    struct Restore(
+        Option<Vec<String>>,
+        Option<JsonValue>,
+        Option<Vec<JsonValue>>,
+    );
     impl Drop for Restore {
         fn drop(&mut self) {
             LOGIN_MESSAGES.with(|slot| *slot.borrow_mut() = self.0.take());
             LOGIN_PREVIEW.with(|slot| *slot.borrow_mut() = self.1.take());
+            LOGIN_OPEN_URLS.with(|slot| *slot.borrow_mut() = self.2.take());
         }
     }
 
     let restore = Restore(
         LOGIN_MESSAGES.with(|slot| slot.replace(Some(Vec::new()))),
         LOGIN_PREVIEW.with(|slot| slot.replace(None)),
+        LOGIN_OPEN_URLS.with(|slot| slot.replace(Some(Vec::new()))),
     );
     let result = run();
     let messages = LOGIN_MESSAGES.with(|slot| slot.borrow_mut().take().unwrap_or_default());
     let preview = LOGIN_PREVIEW.with(|slot| slot.borrow_mut().take());
+    let open_urls = LOGIN_OPEN_URLS.with(|slot| slot.borrow_mut().take().unwrap_or_default());
     drop(restore);
-    (result, messages, preview)
+    (result, messages, preview, open_urls)
+}
+
+pub(super) fn capture_open_url(url: &str, mime_type: Option<&str>) -> Result<(), &'static str> {
+    LOGIN_OPEN_URLS.with(|slot| {
+        let mut scope = slot.borrow_mut();
+        let urls = scope
+            .as_mut()
+            .ok_or("openUrl requires an interactive login action")?;
+        // Limited support: only the first request from this login action matters.
+        if urls.is_empty() {
+            if url.encode_utf16().count() >= 64 * 1024 {
+                return Err("openUrl parameter url too long");
+            }
+            urls.push(serde_json::json!({"url": url, "mimeType": mime_type}));
+        }
+        Ok(())
+    })
 }
 
 pub(super) fn capture_login_message(message: Option<rquickjs::Coerced<String>>) {

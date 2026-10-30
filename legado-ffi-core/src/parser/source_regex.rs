@@ -48,6 +48,16 @@ pub(crate) fn is_full_match(pattern: &str, input: &str) -> bool {
     get_cached_regex(pattern).is_some_and(|regex| regex.matches(input))
 }
 
+pub(crate) fn try_full_match(pattern: &str, input: &str) -> Result<bool, RegexError> {
+    let regex = get_cached_regex(pattern).ok_or(RegexError::InvalidPattern)?;
+    regex.try_matches(input).map_err(|_| RegexError::BudgetExceeded)
+}
+
+pub(crate) fn split(input: &str, pattern: &str, limit: i32) -> Result<Vec<String>, RegexError> {
+    let regex = get_cached_regex(pattern).ok_or(RegexError::InvalidPattern)?;
+    regex.try_split_with_limit(input, limit).map_err(|_| RegexError::BudgetExceeded)
+}
+
 fn collect_matches(regex: &Regex, input: &str) -> Result<Vec<MatchInfo>, RegexError> {
     let mut matches = regex.find_iter(input);
     let found = matches.by_ref().collect();
@@ -231,6 +241,12 @@ pub(crate) fn replace_all(
     replacement: &str,
 ) -> Result<String, RegexError> {
     replace_all_with_flags(input, pattern, replacement, "uU")
+}
+
+/// Java String.replaceFirst returns the whole input with only its first match replaced.
+pub(crate) fn replace_first(input: &str, pattern: &str, replacement: &str) -> Result<String, RegexError> {
+    let regex = get_cached_regex(pattern).ok_or(RegexError::InvalidPattern)?;
+    checked_replace(&regex, input, replacement, true)
 }
 
 pub(crate) fn replace_all_with_flags(

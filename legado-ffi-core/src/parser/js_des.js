@@ -1,8 +1,28 @@
-// Legacy DES compatibility only. EVP operations use the existing host provider.
+// Legacy DES/3DES compatibility. EVP operations use the existing host provider.
 (() => {
     // Legado JsEncodeUtils: delegate to the shared host-backed cipher.
     java.desEncodeToBase64String = (data, key, transformation, iv) =>
         java.createSymmetricCrypto(transformation, key, iv).encryptBase64(data);
+    java.desDecodeToString = (data, key, transformation, iv) =>
+        java.createSymmetricCrypto(transformation, key, iv).decryptStr(data);
+    java.desBase64DecodeToString = java.desDecodeToString;
+    // JsEncodeUtils: key and IV are UTF-8 strings, not Base64 arguments.
+    java.tripleDESEncodeBase64Str = (data, key, mode, padding, iv) =>
+        java.createSymmetricCrypto('DESede/' + mode + '/' + padding, key, iv).encryptBase64(data);
+    const tripleCipher = (data, key, mode, padding, iv, base64Key) => {
+        if (![data, key, mode, padding, iv].every(value => typeof value === 'string')) {
+            throw new TypeError('3DES wrappers require five strings');
+        }
+        // Fixed Legado-E ArgsBase64 wrappers decode only key; IV remains UTF-8.
+        return java.createSymmetricCrypto('DESede/' + mode + '/' + padding,
+            base64Key ? java.base64DecodeToByteArray(key, 2) : key, iv);
+    };
+    java.tripleDESDecodeStr = (data, key, mode, padding, iv) =>
+        tripleCipher(data, key, mode, padding, iv, false).decryptStr(data);
+    java.tripleDESDecodeArgsBase64Str = (data, key, mode, padding, iv) =>
+        tripleCipher(data, key, mode, padding, iv, true).decryptStr(data);
+    java.tripleDESEncodeArgsBase64Str = (data, key, mode, padding, iv) =>
+        tripleCipher(data, key, mode, padding, iv, true).encryptBase64(data);
     const specs = new WeakMap(), secretKeys = new WeakMap();
     const fail = message => {
         const error = new Error(message);

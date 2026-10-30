@@ -9,8 +9,8 @@ use base64::{engine::general_purpose, Engine};
 use encoding_rs::Encoding;
 use std::sync::LazyLock as Lazy;
 mod http;
-pub(crate) mod script_cache;
 mod response;
+pub(crate) mod script_cache;
 pub mod session;
 mod url_rule;
 pub(crate) use crate::runtime::SharedCookieStore;
@@ -22,7 +22,10 @@ pub use session::{current_active_session, with_active_session, ActiveSession, Ex
 #[cfg(test)]
 use url_rule::parse_source_headers;
 pub use url_rule::{analyze_url, analyze_url_with_context, UrlRuleContext};
-pub(crate) use url_rule::{analyze_url_with_headers, parse_url_options, split_url_options, strip_url_options};
+pub(crate) use url_rule::{
+    analyze_url_with_headers, parse_url_options, recompile_login_url, source_header_map,
+    split_url_options, strip_url_options,
+};
 
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
@@ -195,25 +198,40 @@ impl HttpSession {
     ) -> Result<String, FetchError> {
         if html.len() > max_response_bytes {
             return Err(FetchError::ResponseTooLarge {
-                url: spec.url.clone(), limit: max_response_bytes,
+                url: spec.url.clone(),
+                limit: max_response_bytes,
             });
         }
         if !spec.render_with_rakers {
             return Ok(html.to_string());
         }
         let client = match spec.proxy.as_deref().filter(|p| !p.trim().is_empty()) {
-            Some(proxy) => self.webview_client.with_proxy(proxy).map_err(map_http_client_error)?,
+            Some(proxy) => self
+                .webview_client
+                .with_proxy(proxy)
+                .map_err(map_http_client_error)?,
             None => self.webview_client.clone(),
         };
         if let Ok(url) = url::Url::parse(&spec.url) {
-            let cookie = spec.headers.iter()
+            let cookie = spec
+                .headers
+                .iter()
                 .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
-                .map(|(_, value)| value.as_str()).collect::<Vec<_>>().join("; ");
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
             if !cookie.is_empty() {
                 client.seed_cookie_header(&cookie, &url);
             }
         }
-        render_with_rakers(&client, spec, &spec.url, html, max_response_bytes, render_timeout_ms)
+        render_with_rakers(
+            &client,
+            spec,
+            &spec.url,
+            html,
+            max_response_bytes,
+            render_timeout_ms,
+        )
     }
 
     pub fn fetch(
@@ -230,17 +248,44 @@ impl HttpSession {
         max_response_bytes: usize,
         render_timeout_ms: u64,
     ) -> Result<HttpResponse, FetchError> {
+        self.fetch_with_status_policy(spec, max_response_bytes, render_timeout_ms, false)
+            .map(|(response, _)| response)
+    }
+
+    /// Login checks may recover an HTTP error using the original response.
+    /// This does not change the ordinary fetch policy or WebView behavior.
+    pub(crate) fn fetch_for_login_check(
+        &self,
+        spec: &RequestSpec,
+        max_response_bytes: usize,
+        render_timeout_ms: u64,
+    ) -> Result<(HttpResponse, Option<FetchError>), FetchError> {
+        self.fetch_with_status_policy(spec, max_response_bytes, render_timeout_ms, true)
+    }
+
+    fn fetch_with_status_policy(
+        &self,
+        spec: &RequestSpec,
+        max_response_bytes: usize,
+        render_timeout_ms: u64,
+        preserve_http_error: bool,
+    ) -> Result<(HttpResponse, Option<FetchError>), FetchError> {
+        // Only the non-WebView loginCheckJs path may inspect HTTP error bodies.
+        let preserve_http_error = preserve_http_error && !spec.render_with_rakers;
         if let Some(response) = data_uri_response(spec, Some(max_response_bytes)) {
             let response = response.map_err(map_http_client_error)?;
             let body =
                 format_analyzed_body(spec, &response.body, String::new(), None, &response.url)
                     .map_err(FetchError::Rule)?;
-            return Ok(HttpResponse {
-                url: response.url,
-                status: response.status,
-                headers: HashMap::new(),
-                body,
-            });
+            return Ok((
+                HttpResponse {
+                    url: response.url,
+                    status: response.status,
+                    headers: HashMap::new(),
+                    body,
+                },
+                None,
+            ));
         }
         let proxy = spec
             .proxy
@@ -313,17 +358,30 @@ impl HttpSession {
                         content_type.as_deref(),
                     );
                     let body_snippet = response_body_snippet(&decoded_body);
-                    if let Some(challenge) =
-                        detect_auth_challenge(status, &response.headers, body_snippet, &url)
-                    {
-                        return Err(challenge);
-                    }
-
-                    if !(200..300).contains(&status) {
-                        if status >= 500 && attempt < spec.retry.min(3) {
-                            continue;
+                    let challenge =
+                        detect_auth_challenge(status, &response.headers, body_snippet, &url);
+                    if !preserve_http_error {
+                        if let Some(error) = challenge.clone() {
+                            return Err(error);
                         }
-                        return Err(FetchError::HttpStatus { status, url });
+                    }
+                    if !(200..300).contains(&status)
+                        && challenge.is_none()
+                        && status >= 500
+                        && attempt < spec.retry.min(3)
+                    {
+                        continue;
+                    }
+                    let pending_error = challenge.or_else(|| {
+                        (!(200..300).contains(&status)).then(|| FetchError::HttpStatus {
+                            status,
+                            url: url.clone(),
+                        })
+                    });
+                    if !preserve_http_error {
+                        if let Some(error) = pending_error {
+                            return Err(error);
+                        }
                     }
 
                     let body = format_analyzed_body(
@@ -346,12 +404,15 @@ impl HttpSession {
                     } else {
                         body
                     };
-                    return Ok(HttpResponse {
-                        url,
-                        status,
-                        headers: response_headers,
-                        body,
-                    });
+                    return Ok((
+                        HttpResponse {
+                            url,
+                            status,
+                            headers: response_headers,
+                            body,
+                        },
+                        pending_error,
+                    ));
                 }
                 Err(HttpClientError::ResponseTooLarge { url, limit }) => {
                     return Err(FetchError::ResponseTooLarge { url, limit });
@@ -392,7 +453,10 @@ pub(crate) struct BrowserTimeouts {
 
 impl Default for BrowserTimeouts {
     fn default() -> Self {
-        Self { script_ms: DEFAULT_BROWSER_SCRIPT_TIMEOUT_MS, render_ms: DEFAULT_BROWSER_RENDER_TIMEOUT_MS }
+        Self {
+            script_ms: DEFAULT_BROWSER_SCRIPT_TIMEOUT_MS,
+            render_ms: DEFAULT_BROWSER_RENDER_TIMEOUT_MS,
+        }
     }
 }
 
@@ -408,16 +472,22 @@ impl rakers::HttpTransport for RakersHttpTransport {
             .map_err(|error| format!("invalid HTTP method: {error}"))?;
         let response = if request.purpose == rakers::RequestPurpose::Script {
             self.client.execute_script(
-                method, &request.url, &request.headers, request.body.as_deref(),
+                method,
+                &request.url,
+                &request.headers,
+                request.body.as_deref(),
                 Some(self.max_response_bytes.max(1)),
             )
         } else {
             self.client.execute(
-                method, &request.url, &request.headers, request.body.as_deref(),
+                method,
+                &request.url,
+                &request.headers,
+                request.body.as_deref(),
                 Some(self.max_response_bytes.max(1)),
             )
         }
-            .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?;
         let headers = response
             .headers
             .iter()
@@ -630,6 +700,15 @@ pub(crate) fn execute_request_spec_limited(
     spec: &RequestSpec,
     max_response_bytes: Option<usize>,
 ) -> Result<RawHttpResponse, HttpClientError> {
+    execute_request_spec_with_call_timeout(client, spec, max_response_bytes, None)
+}
+
+pub(crate) fn execute_request_spec_with_call_timeout(
+    client: &HttpClient,
+    spec: &RequestSpec,
+    max_response_bytes: Option<usize>,
+    call_timeout: Option<std::time::Duration>,
+) -> Result<RawHttpResponse, HttpClientError> {
     if let Some(response) = data_uri_response(spec, max_response_bytes) {
         return response;
     }
@@ -645,12 +724,13 @@ pub(crate) fn execute_request_spec_limited(
     let mut last_error = None;
 
     for attempt in 0..=retries {
-        match client.execute(
+        match client.execute_with_call_timeout(
             spec.method.clone(),
             &spec.url,
             &spec.headers,
             spec.body.as_deref(),
             max_response_bytes,
+            call_timeout,
         ) {
             Ok(response) if response.status >= 500 && attempt < retries => continue,
             Ok(response) => return Ok(response),
@@ -670,6 +750,29 @@ fn response_body_snippet(body: &str) -> &str {
         end -= 1;
     }
     &body[..end]
+}
+
+/// Recheck recovered responses before allowing a previously blocked challenge into content.
+pub(crate) fn response_has_auth_challenge(response: &HttpResponse) -> bool {
+    response_auth_challenge(response).is_some()
+}
+
+pub(crate) fn response_auth_challenge(response: &HttpResponse) -> Option<FetchError> {
+    let mut headers = HeaderMap::new();
+    for (name, value) in &response.headers {
+        if let (Ok(name), Ok(value)) = (
+            ureq::http::header::HeaderName::from_bytes(name.as_bytes()),
+            ureq::http::header::HeaderValue::from_str(value),
+        ) {
+            headers.append(name, value);
+        }
+    }
+    detect_auth_challenge(
+        response.status,
+        &headers,
+        response_body_snippet(&response.body),
+        &response.url,
+    )
 }
 
 fn detect_auth_challenge(
@@ -1015,12 +1118,25 @@ mod tests {
     #[test]
     fn url_block_is_validated_and_scoped_to_webview_requests() {
         let base = "https://example.test";
-        let source = BookSource { book_source_url: base.into(), ..Default::default() };
-        let spec = analyze_url(r#"/page,{"webView":true,"block":["^/beacon\\.js$"]}"#, "", 1, base, &source).unwrap();
+        let source = BookSource {
+            book_source_url: base.into(),
+            ..Default::default()
+        };
+        let spec = analyze_url(
+            r#"/page,{"webView":true,"block":["^/beacon\\.js$"]}"#,
+            "",
+            1,
+            base,
+            &source,
+        )
+        .unwrap();
         assert!(spec.render_with_rakers);
         assert!(spec.blocked_scripts[0].is_match("/beacon.js"));
         assert!(!spec.blocked_scripts[0].is_match("/beacon.js?foo=1"));
-        assert!(analyze_url("/page", "", 1, base, &source).unwrap().blocked_scripts.is_empty());
+        assert!(analyze_url("/page", "", 1, base, &source)
+            .unwrap()
+            .blocked_scripts
+            .is_empty());
         for rule in [
             r#"/page,{"webView":false,"block":["^/beacon"]}"#,
             r#"/page,{"webView":false,"block":"legacy"}"#,

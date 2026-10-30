@@ -57,7 +57,7 @@ const BOOTSTRAP_FILE_LIMIT: u64 = 4 * 1024 * 1024;
 
 fn bootstrap_cache_file(dir: &std::path::Path, slot: BootstrapSlot) -> std::path::PathBuf {
     // Keep in sync with Cargo.toml's pinned rquickjs version on upgrades.
-    const RQUICKJS_VERSION: &str = "=0.12.0";
+    const RQUICKJS_VERSION: &str = "=0.12.0|legado-string-length-v2";
     let identity = format!(
         "{}|{}|{}|{}|{}|{}|{}|{}|",
         RQUICKJS_VERSION,

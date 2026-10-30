@@ -87,12 +87,14 @@ if (globalThis.java && globalThis.java.getString) {
                         const items = values.map(item => {
                             if (!item || item.__readerHtmlElement !== true) return item;
                             const attrs = item.attrs || {};
+                            const htmlNodeId = item.__readerHtmlNodeId;
+                            delete item.__readerHtmlNodeId;
                             const node = item.__readerXPathNode;
                             const context = node ? {
                                 documentId: documentId === undefined ? node.documentId : documentId,
                                 path: node.path, htmlMode: node.htmlMode
                             } : undefined;
-                            return {
+                            const wrapped = {
                                 __readerIndex: item.__readerIndex,
                                 __readerXPathNode: context,
                                 // HTML data survives the JS return boundary without
@@ -116,8 +118,26 @@ if (globalThis.java && globalThis.java.getString) {
                                     return String(attrs.class || '').split(/\s+/).includes(String(name));
                                 },
                                 html() { return item.html || ''; },
-                                text() { return item.text || ''; },
+                                tagName() {
+                                    const opening = /^<([a-z][\w:-]*)\b/i.exec(item.outerHtml || '');
+                                    return opening ? opening[1].toLowerCase() : '';
+                                },
+                                text(value) {
+                                    if (arguments.length === 0) return item.text || '';
+                                    if (context) return item.text || ''; // Preserve existing XPath behavior.
+                                    const outer = item.outerHtml || '';
+                                    const opening = /^<([a-z][\w:-]*)\b(?:[^>"']|"[^"]*"|'[^']*')*>/i.exec(outer);
+                                    const closing = opening && new RegExp('</' + opening[1] + '\\s*>$', 'i').exec(outer);
+                                    if (!closing) return this;
+                                    const text = String(value);
+                                    const escaped = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                                    item.text = text;
+                                    item.html = escaped;
+                                    item.outerHtml = opening[0] + escaped + closing[0];
+                                    return this;
+                                },
                                 outerHtml() { return item.outerHtml || ''; },
+                                equals(other) { return this === other; },
                                 select(selector) {
                                     const rule = String(selector);
                                     const xpath = /^\s*(?:@xpath:|\/|\.\/|id\()/i.test(rule);
@@ -127,6 +147,10 @@ if (globalThis.java && globalThis.java.getString) {
                                 },
                                 toString() { return item.outerHtml || ''; }
                             };
+                            if (htmlNodeId !== undefined) {
+                                Object.defineProperty(wrapped, '__readerHtmlNodeId', {value: htmlNodeId});
+                            }
+                            return wrapped;
                         });
                         items.first = function() { return this.length ? this[0] : null; };
                         items.get = function(index) {
@@ -138,9 +162,9 @@ if (globalThis.java && globalThis.java.getString) {
                         items.toArray = function() { return Array.from(this); };
                         return items;
                     };
-                    const _wrapElements = (rule, content, rawCss = false) => {
+                    const _wrapElements = (rule, content, rawCss = false, withNodeId = false) => {
                         content = _readerNodeContent(rule, content, rawCss);
-                        const raw = _nativeGetElements(rule, content, rawCss);
+                        const raw = _nativeGetElements(rule, content, rawCss, withNodeId);
                         let values;
                         try { values = JSON.parse(raw); } catch (e) { values = []; }
                         return _decorateItems(values, rawCss);
@@ -177,6 +201,45 @@ if (globalThis.java && globalThis.java.getString) {
                     };
                     _attachVariableMap(globalThis.book, 'book');
                     _attachVariableMap(globalThis.chapter, 'chapter');
+                    const _attachGetters = (value, fields) => {
+                        if (!value || typeof value !== 'object') return;
+                        for (const field of fields) {
+                            const name = 'get' + field[0].toUpperCase() + field.slice(1);
+                            value[name] = function() { return this[field]; };
+                        }
+                    };
+                    _attachGetters(globalThis.book, ['name', 'author', 'bookUrl', 'coverUrl', 'kind', 'wordCount']);
+                    _attachGetters(globalThis.chapter, ['url', 'title', 'index']);
+                    // Project extension: despite its name, this never refreshes or searches.
+                    globalThis.java.refreshBookUrl = function() {
+                        const url = globalThis.book && globalThis.book.bookUrl;
+                        if (typeof url !== 'string' || url === '') {
+                            throw new Error('refreshBookUrl requires current book.bookUrl');
+                        }
+                        return url;
+                    };
+                    if (globalThis.book && typeof globalThis.book === 'object') {
+                        globalThis.book.getDisplayCover = function() {
+                            return this.customCoverUrl == null || this.customCoverUrl === ''
+                                ? this.coverUrl : this.customCoverUrl;
+                        };
+                        globalThis.book.getKindList = function() {
+                            const values = new Packages.java.util.ArrayList();
+                            // Kotlin Char.isWhitespace = Java whitespace or space-char;
+                            // unlike JS trim, this keeps BOM and includes U+001C..U+001F.
+                            const trimKind = text => text.replace(/^[\u0009-\u000d\u001c-\u0020\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\u0009-\u000d\u001c-\u0020\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/g, '');
+                            if (this.wordCount != null && trimKind(this.wordCount) !== '') {
+                                values.add(this.wordCount);
+                            }
+                            if (this.kind != null) {
+                                for (const item of this.kind.split(/[,\n]/)) {
+                                    const text = trimKind(item);
+                                    if (text !== '') values.add(text);
+                                }
+                            }
+                            return values;
+                        };
+                    }
                     globalThis.java.getElements = _wrapElements;
                     globalThis.java.getElement = function(rule, content) {
                         const jsonValue = _nativeGetElement(rule, _readerNodeContent(rule, content, false));

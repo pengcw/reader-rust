@@ -1,4 +1,38 @@
 (function(NativeMap) {
+                cookie.mapToCookie = function(values) {
+                    if (values == null) return null;
+                    const pairs = values instanceof NativeMap ? [...values] :
+                        (typeof values === 'object' && !Array.isArray(values) ? Object.entries(values) : null);
+                    if (pairs === null) throw new TypeError('mapToCookie expects a map');
+                    return pairs.length ? pairs.map(([key, value]) =>
+                        String(key) + '=' + String(value)).join('; ') : null;
+                };
+                source.getTag = () => java.getSource()?.bookSourceName ?? null;
+                // User-selected compatibility stub: host rate policy is unchanged.
+                source.putConcurrent = function() { return true; };
+                // Discovery kinds are recomputed per request; there is no result cache to clear.
+                source.refreshExplore = function() {};
+                let runningSourceLogin = false;
+                source.login = function() {
+                    if (arguments.length) throw new TypeError('source.login takes no arguments');
+                    if (runningSourceLogin) throw new Error('recursive source.login is not supported');
+                    runningSourceLogin = true;
+                    try {
+                        source.__runLogin();
+                    } finally {
+                        runningSourceLogin = false;
+                    }
+                };
+                let readingSourceHeaders = false;
+                source.getHeaderMap = function(hasLoginHeader = false) {
+                    if (readingSourceHeaders) throw new Error('recursive source.getHeaderMap');
+                    readingSourceHeaders = true;
+                    try {
+                        return new NativeMap(JSON.parse(source.__getHeaderMap(!!hasLoginHeader)));
+                    } finally {
+                        readingSourceHeaders = false;
+                    }
+                };
                 source.getLoginInfo = function() {
                     if (globalThis.loginInfo == null) return source.__getLoginInfo() ?? null;
                     return typeof globalThis.loginInfo === 'string'
@@ -15,12 +49,12 @@
                     const raw = source.getLoginInfo();
                     let value = {};
                     if (raw != null) {
-                        try { value = JSON.parse(raw); } catch (_) {}
+                        try { value = JSON.parse(raw); } catch {}
                         if (!value || typeof value !== 'object') value = {};
                     } else if (!initializingLoginInfo) {
                         const rule = String(source.loginUi || '').trim();
                         let ui;
-                        try { ui = JSON.parse(rule); } catch (_) {}
+                        try { ui = JSON.parse(rule); } catch {}
                         // V2 defaults belong to the interactive login state, not this Map.
                         if (!(ui && !Array.isArray(ui) && Number(ui.version) === 2) && rule) {
                             initializingLoginInfo = true;
@@ -37,7 +71,7 @@
                                     globalThis.chapter = null;
                                     const login = inlineJs(source.loginUrl) ?? String(source.loginUrl || '').trim();
                                     const output = (0, eval)(login + '\n' + script);
-                                    try { ui = JSON.parse(output == null ? '' : String(output)); } catch (_) { ui = null; }
+                                    try { ui = JSON.parse(output == null ? '' : String(output)); } catch { ui = null; }
                                 }
                                 if (Array.isArray(ui)) {
                                     const defaults = new NativeMap();

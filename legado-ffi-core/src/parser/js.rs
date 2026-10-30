@@ -8,20 +8,24 @@ use crate::parser::js_compat::{
 };
 #[cfg(test)]
 use crate::parser::js_http::with_js_http_clients;
+pub(crate) use crate::parser::js_http::with_login_check_request;
 use crate::parser::js_http::{
-    decode_archive_text, java_analyzed_request_body, java_analyzed_request_response,
-    java_archive_input, java_request_simple, java_request_simple_response,
-    java_response_decode_text, java_web_view, resolve_js_lib_entry, webview_user_agent,
+    active_login_check_request, decode_archive_text, java_analyzed_request_body,
+    java_analyzed_request_response, java_analyzed_test_request_response, java_archive_input,
+    java_init_login_url, java_login_response_headers, java_request_simple, java_request_simple_response,
+    java_response_decode_text, java_retry_login_request, java_web_view, resolve_js_lib_entry,
+    webview_user_agent,
 };
 #[cfg(test)]
 use crate::parser::js_http::{HttpClient, ACTIVE_JS_HTTP_CONTEXT};
 pub use crate::parser::js_state::with_js_lib;
 use crate::parser::js_state::{
-    active_info_map_state, capture_login_message, update_active_info_map, ACTIVE_JS_BOOK_SOURCE,
-    ACTIVE_JS_LIB, CLICK_BROWSER, LOGIN_MESSAGES, LOGIN_PREVIEW, MAX_INFO_MAP_BYTES,
+    active_info_map_state, capture_login_message, capture_open_url, update_active_info_map,
+    ACTIVE_JS_BOOK_SOURCE, ACTIVE_JS_LIB, CLICK_BROWSER, LOGIN_MESSAGES, LOGIN_PREVIEW,
+    MAX_INFO_MAP_BYTES,
 };
 pub(crate) use crate::parser::js_state::{
-    with_click_browser, with_js_info_map, with_login_messages, InfoMapState,
+    with_click_browser, with_js_info_map, with_login_messages, with_relogin_request, InfoMapState,
 };
 pub use crate::parser::js_url::{
     eval_js_url, eval_js_url_template, eval_js_url_template_with_bindings,
@@ -364,6 +368,9 @@ thread_local! {
     static PRE_UPDATE_TOC_SNAPSHOT: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
 
     static JS_ENV: (Runtime, SharedJsBudget) = {
+        // Missing preparation must fail compilation, never ship an unpatched engine.
+        const { assert!(rquickjs::qjs::LEGADO_STRING_LENGTH_PATCH == 2) };
+        let _: [(); 1] = [(); rquickjs::LEGADO_STRING_WRAPPER_PATCH];
         let rt = Runtime::new().expect("Failed to create JS Runtime");
         rt.set_max_stack_size(512 * 1024);
         rt.set_memory_limit(30 * 1024 * 1024);
@@ -378,6 +385,20 @@ thread_local! {
 
         (rt, start_time)
     };
+}
+
+fn request_call_timeout(
+    ctx: &rquickjs::Ctx<'_>,
+    timeout_ms: Option<u64>,
+) -> rquickjs::Result<Option<Duration>> {
+    match timeout_ms {
+        None => Ok(None),
+        Some(value @ 1..=120_000) => Ok(Some(Duration::from_millis(value))),
+        Some(_) => Err(rquickjs::Exception::throw_type(
+            ctx,
+            "callTimeout must be an integer from 1 to 120000 milliseconds",
+        )),
+    }
 }
 
 fn with_js_reentrant_ctx<T>(ctx: &rquickjs::Ctx<'_>, f: impl FnOnce() -> T) -> T {
@@ -798,6 +819,18 @@ pub(super) fn eval_js_inner_with_source(
             let sk_clone = source_key_val.clone();
             source_obj.set("key", source_key_val.clone())?;
             source_obj.set("getKey", Func::new(move || sk_clone.clone()))?;
+            source_obj.set(
+                "__getHeaderMap",
+                Func::new(|ctx: rquickjs::Ctx<'_>, include_login: bool| -> rquickjs::Result<String> {
+                    let source = ACTIVE_JS_BOOK_SOURCE.with(|slot| slot.borrow().clone())
+                        .unwrap_or_default();
+                    let headers = with_js_reentrant_ctx(&ctx, || {
+                        crate::crawler::source_header_map(&source, include_login)
+                    });
+                    serde_json::to_string(&headers)
+                        .map_err(|error| rquickjs::Exception::throw_type(&ctx, &error.to_string()))
+                }),
+            )?;
             if let Some(active_source) = ACTIVE_JS_BOOK_SOURCE.with(|cell| cell.borrow().clone()) {
                 source_obj.set("bookSourceUrl", active_source.book_source_url)?;
                 source_obj.set("bookSourceName", active_source.book_source_name)?;
@@ -810,6 +843,39 @@ pub(super) fn eval_js_inner_with_source(
                 source_obj.set("loginUrl", active_source.login_url.unwrap_or_default())?;
                 source_obj.set("variableComment", active_source.variable_comment.unwrap_or_default())?;
             }
+
+            source_obj.set(
+                "__runLogin",
+                Func::new(|ctx: rquickjs::Ctx<'_>| -> rquickjs::Result<()> {
+                    let source = ACTIVE_JS_BOOK_SOURCE
+                        .with(|slot| slot.borrow().clone())
+                        .unwrap_or_default();
+                    let raw = source.login_url.as_deref().unwrap_or("").trim();
+                    if raw.is_empty() {
+                        return Ok(());
+                    }
+                    let script = raw
+                        .strip_prefix("@js:")
+                        .or_else(|| raw.strip_prefix("js:"))
+                        .or_else(|| raw.strip_prefix("<js>").and_then(|js| js.strip_suffix("</js>")))
+                        .unwrap_or(raw);
+                    if url::Url::parse(script.trim()).is_ok_and(|url| {
+                        matches!(url.scheme(), "http" | "https")
+                    }) {
+                        return Err(rquickjs::Exception::throw_type(
+                            &ctx, "source.login does not support browser login URLs",
+                        ));
+                    }
+                    let login = format!(
+                        "{script}\nif (typeof login === 'function') {{ login.apply(this); }} else {{ throw new Error('Function login not implements!!!'); }}"
+                    );
+                    with_js_reentrant_ctx(&ctx, || eval_js(&login, "", &source.book_source_url))
+                        .map_err(|error| {
+                            rquickjs::Exception::throw_type(&ctx, &error.to_string())
+                        })?;
+                    Ok(())
+                }),
+            )?;
 
             let source_key_for_get = source_key_val.clone();
             source_obj.set(
@@ -1185,8 +1251,16 @@ pub(super) fn eval_js_inner_with_source(
             )?;
             java_obj.set(
                 "__nativeAjax",
-                Func::new(|ctx: rquickjs::Ctx<'_>, url: String| -> String {
-                    with_js_reentrant_ctx(&ctx, || java_analyzed_request_body(&url))
+                Func::new(|ctx: rquickjs::Ctx<'_>, url: String, timeout_ms: rquickjs::function::Opt<Option<u64>>| -> rquickjs::Result<String> {
+                    let timeout = request_call_timeout(&ctx, timeout_ms.0.flatten())?;
+                    Ok(with_js_reentrant_ctx(&ctx, || java_analyzed_request_body(&url, timeout)))
+                }),
+            )?;
+            java_obj.set(
+                "__cacheFileText",
+                Func::new(|ctx: rquickjs::Ctx<'_>, url: String| -> rquickjs::Result<String> {
+                    with_js_reentrant_ctx(&ctx, || crate::parser::js_http::java_cache_file_text(&url))
+                        .map_err(|error| rquickjs::Exception::throw_message(&ctx, &error))
                 }),
             )?;
             java_obj.set(
@@ -1262,6 +1336,12 @@ pub(super) fn eval_js_inner_with_source(
             java_obj.set(
                 "__archiveInput",
                 Func::new(|url: String| -> String { java_archive_input(&url) }),
+            )?;
+            java_obj.set(
+                "__fontInput",
+                Func::new(|ctx: rquickjs::Ctx<'_>, url: String| -> String {
+                    with_js_reentrant_ctx(&ctx, || crate::parser::js_http::java_font_input(&url))
+                }),
             )?;
             java_obj.set(
                 "__hostCall",
@@ -1381,37 +1461,98 @@ pub(super) fn eval_js_inner_with_source(
                 }),
             )?;
             java_obj.set(
+                "__secureRandomBytes",
+                Func::new(|ctx: rquickjs::Ctx<'_>, length: i32| -> rquickjs::Result<String> {
+                    let bytes = super::secure_random::bytes(length)
+                        .map_err(|error| rquickjs::Exception::throw_type(&ctx, &error.to_string()))?;
+                    Ok(serde_json::to_string(&bytes).expect("signed byte array serialization"))
+                }),
+            )?;
+            if active_login_check_request().is_some() {
+                java_obj.set(
+                    "getUserAgent",
+                    Func::new(|| -> String {
+                        active_login_check_request()
+                            .and_then(|spec| {
+                                spec.headers.iter().rev()
+                                    .find(|(name, _)| name.eq_ignore_ascii_case("User-Agent"))
+                                    .map(|(_, value)| value.clone())
+                            })
+                            .unwrap_or_else(|| crate::crawler::DEFAULT_USER_AGENT.to_string())
+                    }),
+                )?;
+                java_obj.set(
+                    "__loginGetResponseHeaders",
+                    Func::new(|ctx: rquickjs::Ctx<'_>| -> rquickjs::Result<String> {
+                        let spec = active_login_check_request().ok_or_else(|| {
+                            rquickjs::Exception::throw_type(&ctx, "login request scope expired")
+                        })?;
+                        java_login_response_headers(&spec)
+                            .map_err(|error| rquickjs::Exception::throw_type(&ctx, &error))
+                    }),
+                )?;
+                java_obj.set(
+                    "__loginGetStrResponse",
+                    Func::new(|ctx: rquickjs::Ctx<'_>, use_webview: bool| -> rquickjs::Result<String> {
+                        // initUrl may replace this spec after JS setup.
+                        let spec = active_login_check_request().ok_or_else(|| {
+                            rquickjs::Exception::throw_type(&ctx, "login request scope expired")
+                        })?;
+                        if use_webview && spec.render_with_rakers {
+                            return Err(rquickjs::Exception::throw_type(
+                                &ctx, "getStrResponse WebView retry is not supported",
+                            ));
+                        }
+                        Ok(with_js_reentrant_ctx(&ctx, || java_retry_login_request(&spec)))
+                    }),
+                )?;
+                java_obj.set(
+                    "__loginInitUrl",
+                    Func::new(|ctx: rquickjs::Ctx<'_>| -> rquickjs::Result<String> {
+                        let (url, rule_url) = with_js_reentrant_ctx(&ctx, java_init_login_url)
+                            .map_err(|error| rquickjs::Exception::throw_type(&ctx, &error))?;
+                        Ok(serde_json::json!({"url":url, "ruleUrl":rule_url}).to_string())
+                    }),
+                )?;
+            }
+            java_obj.set(
                 "__nativeConnect",
                 Func::new(
-                    |ctx: rquickjs::Ctx<'_>, url: String, headers_json: String| -> String {
-                        with_js_reentrant_ctx(&ctx, || {
-                            java_analyzed_request_response(&url, &headers_json)
-                        })
+                    |ctx: rquickjs::Ctx<'_>, url: String, headers_json: String, timeout_ms: rquickjs::function::Opt<Option<u64>>| -> rquickjs::Result<String> {
+                        let timeout = request_call_timeout(&ctx, timeout_ms.0.flatten())?;
+                        Ok(with_js_reentrant_ctx(&ctx, || {
+                            java_analyzed_request_response(&url, &headers_json, timeout)
+                        }))
                     },
                 ),
             )?;
             java_obj.set(
                 "__nativeAjaxAllItem",
                 Func::new(|ctx: rquickjs::Ctx<'_>, url: String| -> String {
-                    with_js_reentrant_ctx(&ctx, || java_analyzed_request_response(&url, ""))
+                    with_js_reentrant_ctx(&ctx, || java_analyzed_request_response(&url, "", None))
                 }),
             )?;
             java_obj.set(
-                "__nativeGet",
-                Func::new(|url: String, headers_json: String| -> String {
-                    java_request_simple_response("GET", &url, None, &headers_json)
+                "__nativeAjaxTestAllItem",
+                Func::new(|ctx: rquickjs::Ctx<'_>, url: String, timeout_ms: u64| -> rquickjs::Result<String> {
+                    let timeout = request_call_timeout(&ctx, Some(timeout_ms))?.unwrap();
+                    Ok(with_js_reentrant_ctx(&ctx, || java_analyzed_test_request_response(&url, timeout)))
                 }),
             )?;
+            for (name, method) in [("__nativeGet", "GET"), ("__nativeHead", "HEAD")] {
+                java_obj.set(
+                    name,
+                    Func::new(move |ctx: rquickjs::Ctx<'_>, url: String, headers_json: String, timeout_ms: rquickjs::function::Opt<Option<u64>>| -> rquickjs::Result<String> {
+                        let timeout = request_call_timeout(&ctx, timeout_ms.0.flatten())?;
+                        Ok(java_request_simple_response(method, &url, None, &headers_json, timeout))
+                    }),
+                )?;
+            }
             java_obj.set(
                 "__nativePost",
-                Func::new(|url: String, body: String, headers_json: String| -> String {
-                    java_request_simple_response("POST", &url, Some(body), &headers_json)
-                }),
-            )?;
-            java_obj.set(
-                "__nativeHead",
-                Func::new(|url: String, headers_json: String| -> String {
-                    java_request_simple_response("HEAD", &url, None, &headers_json)
+                Func::new(|ctx: rquickjs::Ctx<'_>, url: String, body: String, headers_json: String, timeout_ms: rquickjs::function::Opt<Option<u64>>| -> rquickjs::Result<String> {
+                    let timeout = request_call_timeout(&ctx, timeout_ms.0.flatten())?;
+                    Ok(java_request_simple_response("POST", &url, Some(body), &headers_json, timeout))
                 }),
             )?;
             java_obj.set(
@@ -1829,7 +1970,7 @@ pub(super) fn eval_js_inner_with_source(
             java_obj.set(
                 "getElements",
                 Func::new(
-                    move |ctx: rquickjs::Ctx<'_>, rule: String, content: Option<String>, raw_css: Option<bool>| -> String {
+                    move |ctx: rquickjs::Ctx<'_>, rule: String, content: Option<String>, raw_css: Option<bool>, node_identity: Option<bool>| -> String {
                         let default_content = if content.is_none() {
                             content_for_elements
                                 .lock()
@@ -1847,6 +1988,7 @@ pub(super) fn eval_js_inner_with_source(
                             content.as_deref().unwrap_or(&default_content),
                             &base_url,
                             raw_css.unwrap_or(false),
+                            node_identity.unwrap_or(false),
                         ))
                     },
                 ),
@@ -1953,6 +2095,14 @@ pub(super) fn eval_js_inner_with_source(
                 "longToast",
                 Func::new(|msg: rquickjs::function::Opt<rquickjs::Coerced<String>>| capture_login_message(msg.0)),
             )?;
+            java_obj.set(
+                "__openUrl",
+                Func::new(|ctx: rquickjs::Ctx<'_>, url: String, mime: Option<String>| -> rquickjs::Result<()> {
+                    capture_open_url(&url, mime.as_deref())
+                        .map_err(|error| rquickjs::Exception::throw_type(&ctx, error))
+                }),
+            )?;
+            java_obj.set("__reLoginView", Func::new(crate::parser::js_state::request_relogin))?;
             java_obj.set("__browserAwait", Func::new(|url: String, title: String| -> String {
                 crate::parser::browser_interaction::await_uri(&url, &title).to_string()
             }))?;
@@ -2001,6 +2151,42 @@ pub(super) fn eval_js_inner_with_source(
             java_obj.set("__responseDecodeText", Func::new(|bytes: String, charset: Option<String>, parse: bool| -> Option<String> {
                 java_response_decode_text(&bytes, charset.as_deref(), parse)
             }))?;
+            java_obj.set(
+                "__stringMatches",
+                Func::new(
+                    |ctx: rquickjs::Ctx<'_>, input: String, pattern: String| -> rquickjs::Result<bool> {
+                        source_regex::try_full_match(&pattern, &input)
+                            .map_err(|error| rquickjs::Exception::throw_type(&ctx, &error.to_string()))
+                    },
+                ),
+            )?;
+            java_obj.set(
+                "__stringSplit",
+                Func::new(
+                    |ctx: rquickjs::Ctx<'_>, input: String, pattern: String, limit: i32| -> rquickjs::Result<Vec<String>> {
+                        source_regex::split(&input, &pattern, limit)
+                            .map_err(|error| rquickjs::Exception::throw_type(&ctx, &error.to_string()))
+                    },
+                ),
+            )?;
+            java_obj.set(
+                "__stringReplaceAll",
+                Func::new(
+                    |ctx: rquickjs::Ctx<'_>, input: String, pattern: String, replace: String| -> rquickjs::Result<String> {
+                        source_regex::replace_all(&input, &pattern, &replace)
+                            .map_err(|error| rquickjs::Exception::throw_type(&ctx, &error.to_string()))
+                    },
+                ),
+            )?;
+            java_obj.set(
+                "__stringReplaceFirst",
+                Func::new(
+                    |ctx: rquickjs::Ctx<'_>, input: String, pattern: String, replace: String| -> rquickjs::Result<String> {
+                        source_regex::replace_first(&input, &pattern, &replace)
+                            .map_err(|error| rquickjs::Exception::throw_type(&ctx, &error.to_string()))
+                    },
+                ),
+            )?;
             globals.set("java", java_obj)?;
             js_bridge_mark(2, native_mark);
             record_js_memory(&mut memory_samples, "native_bindings", &ctx);
@@ -2066,6 +2252,12 @@ pub(super) fn eval_js_inner_with_source(
 
             eval_fixed_setup_script(ctx.clone(), BootstrapSlot::XPath, bootstrap_dir.as_deref())?;
 
+            globals.get::<_, Object<'_>>("java")?.set(
+                "__jsoupSiblings",
+                Func::new(|source: String, id: String| -> String {
+                    jsoup_following_siblings_json(&source, &id)
+                }),
+            )?;
             globals.get::<_, Object<'_>>("java")?.set(
                 "__jsoupRemove",
                 Func::new(|source: String, selector: String| -> Option<String> {
@@ -2920,6 +3112,7 @@ fn java_get_elements_json_with_mode(
     content: &str,
     base_url: &str,
     raw_css: bool,
+    node_identity: bool,
 ) -> String {
     let rule = rule.trim();
     if !raw_css {
@@ -3004,24 +3197,47 @@ fn java_get_elements_json_with_mode(
     };
     let values = elements
         .into_iter()
-        .map(|element| {
-            let attr_list = element
-                .value()
-                .attrs()
-                .map(|(name, value)| (name.to_string(), JsonValue::String(value.to_string())))
-                .collect::<Vec<_>>();
-            let attrs = attr_list.iter().cloned().collect::<serde_json::Map<_, _>>();
-            serde_json::json!({
-                "__readerHtmlElement": true,
-                "attrs": attrs,
-                "attrList": attr_list,
-                "html": element.inner_html(),
-                "outerHtml": element.html(),
-                "text": element.text().collect::<Vec<_>>().join(" ").trim(),
-            })
-        })
+        .map(|element| jsoup_html_element_json(element, node_identity))
         .collect::<Vec<_>>();
     serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn jsoup_html_element_json(element: scraper::ElementRef<'_>, with_identity: bool) -> JsonValue {
+    let attr_list = element
+        .value()
+        .attrs()
+        .map(|(name, value)| (name.to_string(), JsonValue::String(value.to_string())))
+        .collect::<Vec<_>>();
+    let attrs = attr_list.iter().cloned().collect::<serde_json::Map<_, _>>();
+    let mut item = serde_json::json!({
+        "__readerHtmlElement": true,
+        "attrs": attrs,
+        "attrList": attr_list,
+        "html": element.inner_html(),
+        "outerHtml": element.html(),
+        "text": element.text().collect::<Vec<_>>().join(" ").trim(),
+    });
+    if with_identity {
+        item["__readerHtmlNodeId"] = format!("{:?}", element.id()).into();
+    }
+    item
+}
+
+// Used only by Jsoup.nextElementSibling(); return the remainder in one parse.
+fn jsoup_following_siblings_json(source: &str, id: &str) -> String {
+    let document = html::parse_document(source.trim());
+    let mut next = document.tree.nodes()
+        .find(|node| format!("{:?}", node.id()) == id)
+        .and_then(|node| node.next_sibling());
+    let mut siblings = Vec::new();
+    while let Some(node) = next {
+        next = node.next_sibling();
+        if let Some(element) = scraper::ElementRef::wrap(node) {
+            siblings.push(jsoup_html_element_json(element, true));
+            if siblings.len() >= 4096 { break; }
+        }
+    }
+    serde_json::to_string(&siblings).unwrap_or_else(|_| "[]".into())
 }
 
 fn java_aes_decrypt_byte_array(input: &str) -> Vec<u8> {
@@ -3325,7 +3541,7 @@ fn java_import_script(path: &str) -> Option<String> {
     {
         return Some(cached);
     }
-    let body = java_analyzed_request_body(path);
+    let body = java_analyzed_request_body(path, None);
     if body.is_empty() {
         return None;
     }
@@ -3865,6 +4081,467 @@ mod tests {
     }
 
     #[test]
+    fn login_get_str_response_false_uses_direct_http_even_for_webview_spec() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = accept_with_timeout(&listener);
+            let first_line = crate::util::test_http::consume_request(&mut stream);
+            let body = "direct-http";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            first_line
+        });
+        let source = BookSource {
+            book_source_url: base.clone(),
+            ..Default::default()
+        };
+        let mut spec =
+            crate::crawler::analyze_url(&format!("{base}/retry"), "", 1, &base, &source).unwrap();
+        // Avoid invoking a browser in this test: directly exercise the
+        // loginCheckJs retry bridge with a prepared WebView-enabled spec.
+        spec.render_with_rakers = true;
+        let client = HttpClient::standalone();
+        let output = with_js_http_context(&client, &source, || {
+            with_login_check_request(
+                &spec,
+                &format!("{base}/retry"),
+                "",
+                1,
+                &base,
+                &source,
+                None,
+                || {
+                    eval_js(
+                        r#"let blocked = false;
+                       try { java.getStrResponse(); } catch (e) {
+                         blocked = String(e).includes('WebView retry is not supported');
+                       }
+                       const response = java.getStrResponse(null, null, false);
+                       [blocked, response.code(), response.body(), response.url()].join('|')"#,
+                        "",
+                        &base,
+                    )
+                    .unwrap()
+                },
+            )
+        });
+        assert_eq!(output, format!("true|200|direct-http|{base}/retry"));
+        assert!(server.join().unwrap().starts_with("GET /retry "));
+        assert_eq!(
+            eval_js("typeof java.getStrResponse", "", &base).unwrap(),
+            "undefined"
+        );
+    }
+
+    #[test]
+    fn login_get_user_agent_reads_prepared_request_only_in_login_scope() {
+        let base = "https://login-agent.example";
+        let source = BookSource {
+            book_source_url: base.into(),
+            header: Some(
+                r#"js:JSON.stringify({"User-Agent":source.getVariable() || "Reader-Custom/1"})"#
+                    .into(),
+            ),
+            ..Default::default()
+        };
+        let spec = crate::crawler::analyze_url(base, "", 1, base, &source).unwrap();
+        let client = HttpClient::standalone();
+        let output = with_js_http_context(&client, &source, || {
+            with_login_check_request(&spec, base, "", 1, base, &source, None, || {
+                eval_js(
+                    r#"const first = java.getUserAgent();
+                       source.setVariable("Reader-Custom/2");
+                       java.initUrl();
+                       [first, java.getUserAgent(),
+                        java.getUserAgent() !== java.getWebViewUA()].join('|')"#,
+                    "",
+                    base,
+                )
+                .unwrap()
+            })
+        });
+        assert_eq!(output, "Reader-Custom/1|Reader-Custom/2|true");
+        assert_eq!(
+            eval_js("typeof java.getUserAgent", "", base).unwrap(),
+            "undefined"
+        );
+    }
+
+    #[test]
+    fn login_init_url_failure_keeps_previous_prepared_request() {
+        let base = "https://login.example";
+        let source = BookSource {
+            book_source_url: base.into(),
+            ..Default::default()
+        };
+        let raw_rule = "@js:source.getVariable() === 'bad' ? 'mailto:failed' : baseUrl + '/ready'";
+        let spec = crate::crawler::analyze_url(raw_rule, "", 1, base, &source).unwrap();
+        let client = HttpClient::standalone();
+        with_js_http_context(&client, &source, || {
+            with_login_check_request(&spec, raw_rule, "", 1, base, &source, None, || {
+                let output = eval_js(
+                    r#"source.setVariable('good');
+                           java.initUrl();
+                           const originalUrl = java.url;
+                           const originalRule = java.ruleUrl;
+                           source.setVariable('bad');
+                           let failed = false;
+                           try { java.initUrl(); } catch (e) { failed = true; }
+                           [failed, java.url === originalUrl,
+                            java.ruleUrl === originalRule].join('|')"#,
+                    "",
+                    base,
+                )
+                .unwrap();
+                assert_eq!(output, "true|true|true");
+                assert_eq!(
+                    active_login_check_request().unwrap().url,
+                    format!("{base}/ready")
+                );
+            })
+        });
+        assert_eq!(
+            eval_js("typeof java.initUrl", "", base).unwrap(),
+            "undefined"
+        );
+    }
+
+    #[test]
+    fn source_login_runs_script_without_overwriting_outer_js() {
+        let source = BookSource {
+            book_source_url: "https://source-login.example".into(),
+            login_url: Some(
+                "function login() { source.put('login-test', 'done'); result = 'changed'; }".into(),
+            ),
+            ..Default::default()
+        };
+        let client = HttpClient::standalone();
+        let output = with_js_http_context(&client, &source, || {
+            eval_js(
+                "let original = result; let returned = source.login(); [returned === undefined, result === original, source.get('login-test'), typeof login].join('|')",
+                "outer", &source.book_source_url,
+            )
+            .unwrap()
+        });
+        assert_eq!(output, "true|true|done|undefined");
+        assert_eq!(
+            eval_js(
+                "source.login() === undefined",
+                "",
+                "https://empty-login.example"
+            )
+            .unwrap(),
+            "true"
+        );
+    }
+
+    #[test]
+    fn source_login_reuses_http_cookies_and_source_variable() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut login, _) = accept_with_timeout(&listener);
+            let first = crate::util::test_http::consume_request(&mut login);
+            let token = r#"{"token":"new-token"}"#;
+            write!(
+                login,
+                "HTTP/1.1 200 OK\r\nSet-Cookie: sid=from-login; Path=/\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{token}",
+                token.len()
+            )
+            .unwrap();
+            let (mut book, _) = accept_with_timeout(&listener);
+            let mut reader = std::io::BufReader::new(&mut book);
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                headers.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            drop(reader);
+            let content = "book-loaded";
+            write!(
+                book,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{content}",
+                content.len()
+            )
+            .unwrap();
+            (first, headers)
+        });
+        let source = BookSource {
+            book_source_url: base.clone(),
+            login_url: Some(format!(
+                "function login() {{ let response = JSON.parse(java.ajax('{base}/login')); source.setVariable(response.token); }}"
+            )),
+            ..Default::default()
+        };
+        let client = HttpClient::standalone();
+        let output = with_js_http_context(&client, &source, || {
+            eval_js(
+                &format!(
+                    "let saved = result; source.login(); let response = java.connect('{base}/book'); [result === saved, source.getVariable(), response.body()].join('|')"
+                ),
+                "original", &base,
+            )
+            .unwrap()
+        });
+        assert_eq!(output, "true|new-token|book-loaded");
+        let (first, second) = server.join().unwrap();
+        assert!(first.starts_with("GET /login "), "{first}");
+        assert!(second.starts_with("GET /book "), "{second}");
+        assert!(
+            second
+                .to_ascii_lowercase()
+                .contains("cookie: sid=from-login"),
+            "{second}"
+        );
+    }
+
+    #[test]
+    fn source_login_propagates_errors_and_resets_recursion_guard() {
+        let client = HttpClient::standalone();
+        let recursive = BookSource {
+            book_source_url: "https://recursive-login.example".into(),
+            login_url: Some("function login() { source.login(); }".into()),
+            ..Default::default()
+        };
+        let output = with_js_http_context(&client, &recursive, || {
+            eval_js(
+                "let failed = false; try { source.login() } catch(e) { failed = true }; let failedAgain = false; try { source.login() } catch(e) { failedAgain = true }; [failed, failedAgain].join('|')",
+                "", &recursive.book_source_url,
+            ).unwrap()
+        });
+        assert_eq!(output, "true|true");
+
+        let missing = BookSource {
+            book_source_url: "https://missing-login.example".into(),
+            login_url: Some("const flag = true;".into()),
+            ..Default::default()
+        };
+        let output = with_js_http_context(&client, &missing, || {
+            eval_js(
+                "try { source.login(); 'unexpected' } catch(e) { String(e).includes('login not implements') }",
+                "", &missing.book_source_url,
+            ).unwrap()
+        });
+        assert_eq!(output, "true");
+
+        let browser = BookSource {
+            book_source_url: "https://browser-login.example".into(),
+            login_url: Some("https://example.com/login".into()),
+            ..Default::default()
+        };
+        let output = with_js_http_context(&client, &browser, || {
+            eval_js(
+                "try { source.login(); 'unexpected' } catch(e) { String(e).includes('browser login URLs') }",
+                "", &browser.book_source_url,
+            ).unwrap()
+        });
+        assert_eq!(output, "true");
+    }
+
+    #[test]
+    fn source_get_header_map_uses_source_rules_and_optional_login() {
+        let url = "https://headers.example";
+        let client = HttpClient::standalone();
+        let source = BookSource {
+            book_source_url: url.to_string(),
+            header: Some(r#"{"X-Source":"source","X-Order":"source"}"#.to_string()),
+            ..Default::default()
+        };
+        let session = ExecuteSession {
+            header: Some(json!({"X-Order":"login","X-Login":"secret","User-Agent":"login-agent"})),
+            ..Default::default()
+        };
+        let (result, delta) = with_active_session(Some(&session), url, |_| {
+            with_js_http_context(&client, &source, || {
+                eval_js(
+                    r#"const base = source.getHeaderMap();
+                       const login = source.getHeaderMap(true);
+                       [base instanceof Map, base.get('X-Source'), base.get('X-Order'),
+                        base.has('X-Login'), base.has('User-Agent'),
+                        base.get('User-Agent') !== 'login-agent',
+                        login.get('X-Order'), login.get('X-Login'),
+                        login.get('User-Agent'), base.get('X-Order'), login !== base].join('|')"#,
+                    "",
+                    url,
+                )
+                .unwrap()
+            })
+        });
+        assert_eq!(
+            result,
+            "true|source|source|false|true|true|login|secret|login-agent|source|true"
+        );
+        assert!(
+            delta.is_none(),
+            "reading headers must not change session state"
+        );
+
+        let dynamic = BookSource {
+            book_source_url: url.to_string(),
+            header: Some("@js:JSON.stringify({'X-Dynamic': source.getKey()})".into()),
+            ..Default::default()
+        };
+        let result = with_js_http_context(&client, &dynamic, || {
+            eval_js("source.getHeaderMap().get('X-Dynamic')", "", url).unwrap()
+        });
+        assert_eq!(result, url);
+
+        let xml_js = BookSource {
+            book_source_url: url.to_string(),
+            header: Some("<js>JSON.stringify({'X-Tag':'yes'})</js>".into()),
+            ..Default::default()
+        };
+        let result = with_js_http_context(&client, &xml_js, || {
+            eval_js("source.getHeaderMap().get('X-Tag')", "", url).unwrap()
+        });
+        assert_eq!(result, "yes");
+
+        let invalid = BookSource {
+            book_source_url: url.to_string(),
+            header: Some("@js:throw new Error('invalid header')".into()),
+            ..Default::default()
+        };
+        let result = with_js_http_context(&client, &invalid, || {
+            eval_js(
+                "const map = source.getHeaderMap(); map instanceof Map && map.has('User-Agent') && map.size === 1",
+                "", url,
+            ).unwrap()
+        });
+        assert_eq!(result, "true");
+
+        let recursive = BookSource {
+            book_source_url: url.to_string(),
+            header: Some("@js:source.getHeaderMap()".into()),
+            ..Default::default()
+        };
+        let result = with_js_http_context(&client, &recursive, || {
+            eval_js(
+                r#"const first = source.getHeaderMap();
+                   const second = source.getHeaderMap();
+                   [first.has('User-Agent'), second.has('User-Agent'),
+                    first.size, second.size].join('|')"#,
+                "",
+                url,
+            )
+            .unwrap()
+        });
+        assert_eq!(result, "true|true|1|1");
+    }
+
+    #[test]
+    fn java_has_java_class_checks_registered_compatibility_classes() {
+        assert_eq!(
+            eval_js(
+                r#"typeof java.hasJavaClass === 'function'
+                    && java.hasJavaClass('java.lang.String') === true
+                    && java.hasJavaClass('android.util.Base64') === true
+                    && java.hasJavaClass('java.net.URL') === true
+                    && java.hasJavaClass('okhttp3.HttpUrl') === true
+                    && java.hasJavaClass('java.lang') === false
+                    && java.hasJavaClass('missing.Class') === false
+                    && java.hasJavaClass('java.lang.String.prototype') === false
+                    && java.hasJavaClass('java.lang.__proto__') === false
+                    && java.hasJavaClass('org.jsoup.Jsoup') === false
+                    && java.hasJavaClass() === false
+                    && java.hasJavaClass(null) === false
+                    && java.hasJavaClass(123) === false"#,
+                "",
+                "https://example.com"
+            )
+            .unwrap(),
+            "true"
+        );
+    }
+
+    #[test]
+    fn java_get_tag_reads_current_source_name_without_leaking_context() {
+        let url = "https://example.com";
+        assert_eq!(eval_js("java.getTag() === null", "", url).unwrap(), "true");
+
+        let source = BookSource {
+            book_source_url: url.to_string(),
+            book_source_name: "测试书源".to_string(),
+            ..Default::default()
+        };
+        let client = HttpClient::standalone();
+        assert_eq!(
+            with_js_http_context(&client, &source, || {
+                eval_js("java.getTag()", "", url).unwrap()
+            }),
+            "测试书源"
+        );
+
+        let other = BookSource {
+            book_source_url: "https://other.example".to_string(),
+            book_source_name: "Other".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            with_js_http_context(&client, &other, || {
+                eval_js("java.getTag()", "", &other.book_source_url).unwrap()
+            }),
+            "Other"
+        );
+        assert_eq!(eval_js("java.getTag() === null", "", url).unwrap(), "true");
+    }
+
+    #[test]
+    fn source_get_tag_uses_name_without_url_fallback() {
+        let url = "https://example.com";
+        assert_eq!(
+            eval_js("source.getTag() === null", "", url).unwrap(),
+            "true"
+        );
+
+        let source = BookSource {
+            book_source_url: url.to_string(),
+            book_source_name: "测试书源".to_string(),
+            ..Default::default()
+        };
+        let client = HttpClient::standalone();
+        assert_eq!(
+            with_js_http_context(&client, &source, || {
+                eval_js(
+                    "source.getTag() === '测试书源' && source.getTag() === java.getTag()",
+                    "",
+                    url,
+                )
+                .unwrap()
+            }),
+            "true"
+        );
+
+        let unnamed = BookSource {
+            book_source_url: url.to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            with_js_http_context(&client, &unnamed, || {
+                eval_js(
+                    "source.getTag() === '' && source.getTag() !== source.getKey()",
+                    "",
+                    url,
+                )
+                .unwrap()
+            }),
+            "true"
+        );
+        assert_eq!(
+            eval_js("source.getTag() === null", "", url).unwrap(),
+            "true"
+        );
+    }
+
+    #[test]
     fn audit_log_preserves_input_type_and_object_identity() {
         assert_eq!(eval_js(
             "const obj = {value: 1}; [java.log(obj) === obj, java.log(42) === 42, java.log(true) === true, java.log(null) === null, java.log() === undefined, java.log('text') === 'text'].join('|')",
@@ -4192,6 +4869,143 @@ mod tests {
     }
 
     #[test]
+    fn p2_ajax_test_all_preserves_batch_shape_and_validates_timeout() {
+        let result = eval_js(
+            r#"
+            const calls = [];
+            java.__nativeAjaxTestAllItem = (url, timeout) => {
+                calls.push([url, timeout]);
+                return JSON.stringify({url, body: url, code: 201, callTime: 12, errorBody: null});
+            };
+            const responses = java.ajaxTestAll(['one', 'two'], 1500, true);
+            let rejected = 0;
+            for (const timeout of [undefined, null, 0, -1, 120001, '1500']) {
+                try { java.ajaxTestAll([], timeout); }
+                catch (error) { if (error instanceof TypeError) rejected++; }
+            }
+            JSON.stringify([responses.map(r => [r.code(), r.body(), r.callTime(), r.errorBody()]),
+                calls, java.ajaxTestAll([], 1).length, rejected])
+            "#,
+            "",
+            "https://example.test",
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&result).unwrap(),
+            json!([
+                [[201, "one", 12, null], [201, "two", 12, null]],
+                [["one", 1500], ["two", 1500]],
+                0,
+                6
+            ])
+        );
+    }
+
+    #[test]
+    fn p2_ajax_test_all_reuses_http_and_isolates_timeout_and_invalid_url() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for (delay, body) in [(0, "ok"), (160, "slow")] {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut request = [0; 2048];
+                stream.read(&mut request).unwrap();
+                thread::sleep(Duration::from_millis(delay));
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let source = BookSource {
+            book_source_url: base.clone(),
+            ..Default::default()
+        };
+        let client = HttpClient::new(1000, None, None).unwrap();
+        let good = format!("{base}/good");
+        let slow = format!("{base}/slow");
+        let script = format!(
+            r#"
+            const items = java.ajaxTestAll([{good:?}, {slow:?}, 'ftp://invalid'], 30, true);
+            const normal = java.ajaxAll(['ftp://invalid'])[0];
+            [items.length, items[0].code(), items[0].body(),
+                items[0].callTime() >= 0, items[0].errorBody() === null,
+                items[1].callTime(), !!items[1].errorBody(),
+                items[2].callTime(), !!items[2].errorBody(),
+                normal.callTime(), normal.errorBody() === null, normal.body().length > 0].join('|')
+            "#
+        );
+        let result =
+            with_js_http_context(&client, &source, || eval_js(&script, "", &base).unwrap());
+        server.join().unwrap();
+        assert_eq!(result, "3|200|ok|true|true|-1|true|-7|true|0|true|true");
+    }
+
+    #[test]
+    fn p2_ajax_test_all_reuses_url_options_and_restores_js_scope() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = accept_with_timeout(&listener);
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length: ") {
+                    content_length = value.trim().parse().unwrap();
+                }
+                request.push_str(&line);
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 422 Test\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+            (
+                request.to_ascii_lowercase(),
+                String::from_utf8(body).unwrap(),
+            )
+        });
+
+        let source = BookSource {
+            book_source_url: format!("http://{address}/source"),
+            ..Default::default()
+        };
+        let target = format!(
+            "/check,{}",
+            json!({
+                "method": "POST",
+                "headers": {"X-Url": "configured"},
+                "body": "payload",
+                "js": "java.headerMap.put('X-Option','yes'); result",
+                "bodyJs": "result.toUpperCase()"
+            })
+        );
+        let script = format!(
+            r#"const responses = java.ajaxTestAll([{target:?}], 1000);
+            [responses.length, responses[0].code(), responses[0].body(),
+                responses[0].callTime() >= 0, responses[0].errorBody() === null,
+                !Object.prototype.hasOwnProperty.call(java, 'headerMap')].join('|')"#
+        );
+        let client = HttpClient::standalone();
+        let result = with_js_http_context(&client, &source, || {
+            eval_js(&script, "", &source.book_source_url).unwrap()
+        });
+        let (request, body) = server.join().unwrap();
+        assert_eq!(result, "1|422|OK|true|true|true");
+        assert!(request.starts_with("post /check "));
+        assert!(request.contains("x-url: configured"));
+        assert!(request.contains("x-option: yes"));
+        assert_eq!(body, "payload");
+    }
+
+    #[test]
     fn java_ajax_all_runs_sequentially_preserves_order_and_isolates_errors() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -4257,6 +5071,310 @@ mod tests {
         assert!(requests[0].starts_with("get /first "));
         assert!(requests[1].starts_with("get /last "));
         assert!(requests[1].contains("cookie: sid=ordered"));
+    }
+
+    #[test]
+    fn p2_call_timeout_validates_before_native_request() {
+        let result = eval_js(r#"
+            const calls = [];
+            java.__nativeAjax = (url, timeout) => { calls.push([url, timeout]); return 'ok'; };
+            java.__nativeConnect = (url, headers, timeout) => {
+                calls.push([url, timeout]); return JSON.stringify({body: 'ok', code: 201});
+            };
+            for (const timeout of [undefined, null, 1, 120000]) {
+                if (java.ajax(['http://example.test'], timeout) !== 'ok'
+                    || java.connect('http://example.test', {}, timeout).code() !== 201) throw new Error('valid timeout failed');
+            }
+            let rejected = 0;
+            for (const value of [0, -1, 120001, 0.5, NaN, Infinity, -Infinity, '20', {}, [], true]) {
+                for (const invoke of [() => java.ajax('http://example.test', value),
+                    () => java.connect('http://example.test', {}, value)]) {
+                    try { invoke(); } catch (error) { if (error instanceof TypeError) rejected++; }
+                }
+            }
+            JSON.stringify([calls.map(call => call[1]), rejected])
+        "#, "", "https://example.test").unwrap();
+        assert_eq!(result, "[[null,null,null,null,1,1,120000,120000],22]");
+        assert_eq!(eval_js(r#"
+            let rejected = 0;
+            for (const timeout of [0, 120001]) {
+                try { java.__nativeAjax('http://example.test', timeout); } catch (_) { rejected++; }
+                try { java.__nativeConnect('http://example.test', '', timeout); } catch (_) { rejected++; }
+            }
+            rejected
+        "#, "", "https://example.test").unwrap(), "4");
+    }
+
+    #[test]
+    fn p2_call_timeout_bounds_headers_and_body_without_leaking_defaults() {
+        for analyzed in [false, true] {
+            for slow_body in [false, true] {
+                for connect in [false, true] {
+                    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                    let url = format!("http://{}/slow", listener.local_addr().unwrap());
+                    let server = thread::spawn(move || {
+                        for delay in [150, 70] {
+                            let (mut stream, _) = accept_with_timeout(&listener);
+                            let mut request = [0; 2048];
+                            stream.read(&mut request).unwrap();
+                            if slow_body {
+                                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n").unwrap();
+                            }
+                            thread::sleep(Duration::from_millis(delay));
+                            let response = if slow_body {
+                                "ok"
+                            } else {
+                                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                            };
+                            let _ = stream.write_all(response.as_bytes());
+                        }
+                    });
+                    let client = HttpClient::new(1000, None, None).unwrap();
+                    let source = BookSource {
+                        book_source_url: url.clone(),
+                        ..Default::default()
+                    };
+                    let call = if connect {
+                        format!("java.connect({url:?}, {{}}, 30).body()")
+                    } else {
+                        format!("java.ajax({url:?}, 30)")
+                    };
+                    let default_call = if connect {
+                        format!("java.connect({url:?}, {{}}, null).body()")
+                    } else {
+                        format!("java.ajax({url:?})")
+                    };
+                    let script = format!("const started = Date.now(); const failed = {call}; const elapsed = Date.now() - started; [/timeout|timed out/i.test(failed), elapsed < 1000, {default_call}].join('|')");
+                    let run = || eval_js(&script, "", &url).unwrap();
+                    let result = if analyzed {
+                        with_js_http_context(&client, &source, run)
+                    } else {
+                        with_js_http_client(&client, run)
+                    };
+                    server.join().unwrap();
+                    assert_eq!(
+                        result, "true|true|ok",
+                        "analyzed={analyzed} body={slow_body} connect={connect}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn p2_call_timeout_can_extend_defaults_including_proxy_requests() {
+        for proxy in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let url = if proxy {
+                "http://offline-target.invalid/slow".to_string()
+            } else {
+                format!("http://{address}/slow")
+            };
+            let server = thread::spawn(move || {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    request.push_str(&line);
+                }
+                if proxy {
+                    // ureq's HTTP proxy is a CONNECT tunnel, even for HTTP targets.
+                    stream
+                        .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                        .unwrap();
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        if line == "\r\n" || line.is_empty() {
+                            break;
+                        }
+                        request.push_str(&line);
+                    }
+                }
+                thread::sleep(Duration::from_millis(100));
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .unwrap();
+                request.to_ascii_lowercase()
+            });
+            let client = HttpClient::new(30, None, None).unwrap();
+            let source = BookSource {
+                book_source_url: url.clone(),
+                ..Default::default()
+            };
+            let target = if proxy {
+                format!(r#"{url},{{"proxy":"http://{address}"}}"#)
+            } else {
+                url.clone()
+            };
+            let script = format!("java.connect({target:?}, {{}}, 500).body()");
+            let result = if proxy {
+                with_js_http_context(&client, &source, || eval_js(&script, "", &url).unwrap())
+            } else {
+                with_js_http_client(&client, || eval_js(&script, "", &url).unwrap())
+            };
+            assert_eq!(result, "ok", "proxy={proxy}");
+            let request = server.join().unwrap();
+            if proxy {
+                assert!(request.starts_with("connect offline-target.invalid:80 "));
+                assert!(request.contains("get /slow "));
+            }
+        }
+    }
+
+    #[test]
+    fn p2_call_timeout_retries_transport_timeouts_and_keeps_data_uri_local() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/retry", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for delay in [150, 0] {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut request = [0; 2048];
+                stream.read(&mut request).unwrap();
+                thread::sleep(Duration::from_millis(delay));
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            }
+        });
+        let client = HttpClient::standalone();
+        let source = BookSource {
+            book_source_url: url.clone(),
+            ..Default::default()
+        };
+        let target = format!(r#"{url},{{"retry":1}}"#);
+        let data_uri = r#"data:text/plain;base64,bG9jYWw=,{"type":"chapter"}"#;
+        let result = with_js_http_context(&client, &source, || {
+            eval_js(
+            &format!("[java.ajax({target:?}, 100), java.connect({data_uri:?}, {{}}, 1).body()].join('|')"),
+            "", &url).unwrap()
+        });
+        server.join().unwrap();
+        assert_eq!(result, "ok|6c6f63616c");
+    }
+
+    #[test]
+    fn p2_call_timeout_spans_redirects_and_keeps_cookie_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/start", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for index in 0..6 {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    request.push_str(&line);
+                }
+                requests.push(request.to_ascii_lowercase());
+                thread::sleep(Duration::from_millis(90));
+                let response = if index % 2 == 0 {
+                    "HTTP/1.1 302 Found\r\nLocation: /end\r\nSet-Cookie: sid=kept; Path=/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+            requests
+        });
+        let client = HttpClient::standalone();
+        let error = client
+            .execute_with_call_timeout(
+                ureq::http::Method::GET,
+                &url,
+                &[],
+                None,
+                Some(1024),
+                Some(Duration::from_millis(150)),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::crawler::HttpClientError::Timeout(_)),
+            "{error}"
+        );
+        // No override on this call: the first call's deadline must not leak.
+        let response = client
+            .execute(ureq::http::Method::GET, &url, &[], None, Some(1024))
+            .unwrap();
+        assert_eq!(response.body, b"ok");
+        let source = BookSource {
+            book_source_url: url.clone(),
+            ..Default::default()
+        };
+        let result = with_js_http_context(&client, &source, || {
+            eval_js(
+                &format!("/timeout|timed out/i.test(java.connect({url:?}, {{}}, 150).body())"),
+                "",
+                &url,
+            )
+            .unwrap()
+        });
+        assert_eq!(result, "true");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 6);
+        assert!(requests[1].starts_with("get /end "));
+        assert!(requests[1].contains("cookie: sid=kept"));
+        assert!(requests[2].contains("cookie: sid=kept"));
+    }
+
+    #[test]
+    fn p2_call_timeout_restarts_for_retry_and_preserves_body_js_and_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/retry", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for status in [503, 200] {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    request.push_str(&line);
+                }
+                requests.push(request.to_ascii_lowercase());
+                thread::sleep(Duration::from_millis(90));
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Test\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                )
+                .unwrap();
+            }
+            requests
+        });
+        let source = BookSource {
+            book_source_url: url.clone(),
+            ..Default::default()
+        };
+        let client = HttpClient::new(1000, None, None).unwrap();
+        let spec = format!(r#"{url},{{"retry":1,"bodyJs":"result + '!'"}}"#);
+        let result = with_js_http_context(&client, &source, || {
+            eval_js(
+            &format!("const response = java.connect({spec:?}, {{'X-Timeout-Test':'kept'}}, 150); [response.code(), response.body()].join('|')"),
+            "", &url).unwrap()
+        });
+        assert_eq!(result, "200|ok!");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|request| request.contains("x-timeout-test: kept")));
     }
 
     #[test]
@@ -4624,6 +5742,376 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
     }
 
     #[test]
+    fn p2_str_response_defaults_and_json_roundtrip_preserve_new_fields() {
+        let result = eval_js(r#"
+            const legacy = __readerMakeStrResponse({body: 'legacy', code: 201});
+            const restored = __readerMakeStrResponse(JSON.stringify(legacy));
+            const timed = __readerMakeStrResponse({body: 'timed', code: 200, callTime: 37, errorBody: null});
+            const timedCopy = __readerMakeStrResponse(JSON.stringify(timed));
+            [legacy.callTime(), legacy.errorBody() === null, restored.callTime(),
+                restored.body(), timedCopy.callTime(), timedCopy.errorBody() === null,
+                timedCopy.raw().body().string(), JSON.parse(JSON.stringify(timed)).callTime].join('|')
+        "#, "", "https://example.test").unwrap();
+        assert_eq!(result, "0|true|0|legacy|37|true|timed|37");
+    }
+
+    #[test]
+    fn p2_str_response_measures_success_and_http_errors_without_error_body() {
+        for analyzed in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/timed", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                for status in [200, 404, 503] {
+                    let (mut stream, _) = accept_with_timeout(&listener);
+                    let mut request = [0; 2048];
+                    stream.read(&mut request).unwrap();
+                    thread::sleep(Duration::from_millis(50));
+                    write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody").unwrap();
+                }
+            });
+            let source = BookSource {
+                book_source_url: url.clone(),
+                ..Default::default()
+            };
+            let client = HttpClient::standalone();
+            let script = format!(
+                r#"
+                JSON.stringify([200,404,503].map(status => {{
+                    const response = java.connect({url:?});
+                    const copy = __readerMakeStrResponse(JSON.stringify(response));
+                    return [response.code(), response.body(), response.raw().body().string(),
+                        Number.isInteger(response.callTime()) && response.callTime() >= 30 && response.callTime() < 2000,
+                        response.errorBody() === null, copy.callTime() === response.callTime(),
+                        response.isSuccessful() === (status === 200)];
+                }}))
+            "#
+            );
+            let run = || eval_js(&script, "", &url).unwrap();
+            let result = if analyzed {
+                with_js_http_context(&client, &source, run)
+            } else {
+                with_js_http_client(&client, run)
+            };
+            server.join().unwrap();
+            assert_eq!(
+                serde_json::from_str::<JsonValue>(&result).unwrap(),
+                json!([
+                    [200, "body", "body", true, true, true, true],
+                    [404, "body", "body", true, true, true, true],
+                    [503, "body", "body", true, true, true, true]
+                ]),
+                "analyzed={analyzed}"
+            );
+        }
+    }
+
+    #[test]
+    fn p2_str_response_time_includes_body_js_and_keeps_failure_defaults() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/timed", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for (status, delay) in [(404, 30), (200, 50), (404, 30)] {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut request = [0; 2048];
+                stream.read(&mut request).unwrap();
+                thread::sleep(Duration::from_millis(delay));
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Test\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                )
+                .unwrap();
+            }
+        });
+        let client = HttpClient::standalone();
+        let source = BookSource {
+            book_source_url: url.clone(),
+            ..Default::default()
+        };
+        let target = format!(
+            "{url},{}",
+            json!({"bodyJs": format!("java.connect({url:?}).body() + result")})
+        );
+        let failure = format!(
+            "{url},{}",
+            json!({"bodyJs": "throw new Error('body-js-failed')"})
+        );
+        let result = with_js_http_context(&client, &source, || {
+            eval_js(&format!(r#"
+            const response = java.connect({target:?});
+            const failed = java.connect({failure:?});
+            const typed = java.connect('data:;base64,bG9jYWw=,{{"type":"chapter"}}');
+            [response.code(), response.body(), response.callTime() >= 60 && response.callTime() < 2000,
+                response.errorBody() === null, failed.callTime(), failed.errorBody() === null,
+                failed.body().includes('body-js-failed'), failed.code(),
+                typed.callTime(), typed.body()].join('|')
+        "#), "", &url).unwrap()
+        });
+        server.join().unwrap();
+        assert_eq!(result, "404|okok|true|true|0|true|true|200|0|6c6f63616c");
+    }
+
+    #[test]
+    fn p2_str_response_call_time_includes_business_retries() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/retry", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for status in [503, 200] {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut request = [0; 2048];
+                stream.read(&mut request).unwrap();
+                thread::sleep(Duration::from_millis(75));
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Test\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                )
+                .unwrap();
+            }
+        });
+        let source = BookSource {
+            book_source_url: url.clone(),
+            ..Default::default()
+        };
+        let target = format!("{url},{}", json!({"retry": 1}));
+        let client = HttpClient::standalone();
+        let result = with_js_http_context(&client, &source, || {
+            eval_js(
+                &format!(
+                    "const r = java.connect({target:?}); [r.code(), r.body(), r.callTime() >= 120 && r.callTime() < 2000, r.errorBody() === null].join('|')"
+                ),
+                "",
+                &url,
+            )
+            .unwrap()
+        });
+        server.join().unwrap();
+        assert_eq!(result, "200|ok|true|true");
+    }
+
+    #[test]
+    fn p2_str_response_call_time_excludes_url_rule_initialization() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/init", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = accept_with_timeout(&listener);
+            let mut request = [0; 2048];
+            stream.read(&mut request).unwrap();
+            thread::sleep(Duration::from_millis(20));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let source = BookSource {
+            book_source_url: url.clone(),
+            ..Default::default()
+        };
+        let target = format!(
+            "{url},{}",
+            json!({"js": "const started = Date.now(); while (Date.now() - started < 120) {} result"})
+        );
+        let client = HttpClient::standalone();
+        let result = with_js_http_context(&client, &source, || {
+            eval_js(
+                &format!(
+                    "const started = Date.now(); const r = java.connect({target:?}); const elapsed = Date.now() - started; [r.code(), r.body(), elapsed - r.callTime() >= 80, r.callTime() >= 10 && r.callTime() < 2000].join('|')"
+                ),
+                "",
+                &url,
+            )
+            .unwrap()
+        });
+        server.join().unwrap();
+        assert_eq!(result, "200|ok|true|true");
+    }
+
+    #[test]
+    fn p2_str_response_transport_timeout_and_ajax_all_keep_zero_defaults() {
+        for analyzed in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/timeout", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                for delay in [100, 50] {
+                    let (mut stream, _) = accept_with_timeout(&listener);
+                    let mut request = [0; 2048];
+                    stream.read(&mut request).unwrap();
+                    thread::sleep(Duration::from_millis(delay));
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    );
+                }
+            });
+            let client = HttpClient::standalone();
+            let source = BookSource {
+                book_source_url: url.clone(),
+                ..Default::default()
+            };
+            let script = format!(
+                r#"
+                const failed = java.connect({url:?}, {{}}, 20);
+                const all = java.ajaxAll(['ftp://invalid', {url:?}]);
+                [failed.callTime(), failed.errorBody() === null, /timeout|timed out/i.test(failed.body()),
+                    failed.code(), failed.isSuccessful(), all[0].callTime(), all[0].errorBody() === null,
+                    all[1].callTime() >= 30 && all[1].callTime() < 2000, all[1].errorBody() === null,
+                    all[1].body()].join('|')
+            "#
+            );
+            let run = || eval_js(&script, "", &url).unwrap();
+            let result = if analyzed {
+                with_js_http_context(&client, &source, run)
+            } else {
+                with_js_http_client(&client, run)
+            };
+            server.join().unwrap();
+            assert_eq!(result, "0|true|true|200|true|0|true|true|true|ok");
+        }
+    }
+
+    #[test]
+    fn p2_simple_timeout_validates_parameters_and_preserves_variable_get() {
+        let result = eval_js(r#"
+            const calls = [];
+            const response = (method, timeout) => {
+                calls.push([method, timeout]); return JSON.stringify({body: 'ok', code: 200});
+            };
+            java.__nativeGet = (_, headers, timeout) => response('GET', timeout);
+            java.__nativeHead = (_, headers, timeout) => response('HEAD', timeout);
+            java.__nativePost = (_, body, headers, timeout) => response('POST', timeout);
+            const invoke = timeout => [java.get('http://example.test', {}, timeout),
+                java.head('http://example.test', {}, timeout), java.post('http://example.test', 'body', {}, timeout)];
+            for (const timeout of [undefined, null, 1, 120000]) {
+                if (!invoke(timeout).every(item => item.body() === 'ok' && item.statusCode() === 200)) throw new Error('valid timeout failed');
+            }
+            let rejected = 0;
+            for (const timeout of [0, -1, 120001, 0.5, NaN, Infinity, -Infinity, '20', {}, [], true]) {
+                for (const call of [() => java.get('http://example.test', {}, timeout),
+                    () => java.head('http://example.test', {}, timeout), () => java.post('http://example.test', 'body', {}, timeout)]) {
+                    try { call(); } catch (error) { if (error instanceof TypeError) rejected++; }
+                }
+            }
+            java.put('p2-simple-token', 'retained');
+            JSON.stringify([calls.map(call => call[1]), rejected, java.get('p2-simple-token')])
+        "#, "", "https://example.test").unwrap();
+        assert_eq!(
+            result,
+            r#"[[null,null,null,null,null,null,1,1,1,120000,120000,120000],33,"retained"]"#
+        );
+    }
+
+    #[test]
+    fn p2_simple_timeout_bounds_io_and_does_not_leak_into_defaults() {
+        for method in ["GET", "HEAD", "POST"] {
+            for slow_body in [false, true] {
+                if method == "HEAD" && slow_body {
+                    continue;
+                }
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let url = format!("http://{}/simple", listener.local_addr().unwrap());
+                let server = thread::spawn(move || {
+                    let mut requests = Vec::new();
+                    for delay in [150, 70] {
+                        let (mut stream, _) = accept_with_timeout(&listener);
+                        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                        let mut request = String::new();
+                        let mut length = 0;
+                        loop {
+                            let mut line = String::new();
+                            reader.read_line(&mut line).unwrap();
+                            if line == "\r\n" || line.is_empty() {
+                                break;
+                            }
+                            if let Some(value) =
+                                line.to_ascii_lowercase().strip_prefix("content-length:")
+                            {
+                                length = value.trim().parse::<usize>().unwrap();
+                            }
+                            request.push_str(&line);
+                        }
+                        let mut body = vec![0; length];
+                        reader.read_exact(&mut body).unwrap();
+                        request.push_str(&String::from_utf8(body).unwrap());
+                        requests.push(request.to_ascii_lowercase());
+                        if slow_body {
+                            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n").unwrap();
+                        }
+                        thread::sleep(Duration::from_millis(delay));
+                        let body = if method == "HEAD" { "" } else { "ok" };
+                        let response = if slow_body {
+                            body.to_string()
+                        } else {
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{body}")
+                        };
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    requests
+                });
+                let call = |timeout: &str| match method {
+                    "POST" => {
+                        format!("java.post({url:?}, 'bid=42', {{'X-Test':'kept'}}, {timeout})")
+                    }
+                    "HEAD" => format!("java.head({url:?}, {{'X-Test':'kept'}}, {timeout})"),
+                    _ => format!("java.get({url:?}, {{'X-Test':'kept'}}, {timeout})"),
+                };
+                let script = format!("const started = Date.now(); const failed = {}; const elapsed = Date.now() - started; const ok = {}; [failed.statusCode() === 0, /timeout|timed out/i.test(failed.body()), elapsed < 1000, ok.statusCode(), ok.body()].join('|')", call("30"), call("null"));
+                let client = HttpClient::new(1000, None, None).unwrap();
+                let result = with_js_http_client(&client, || eval_js(&script, "", &url).unwrap());
+                assert_eq!(
+                    result,
+                    if method == "HEAD" {
+                        "true|true|true|200|"
+                    } else {
+                        "true|true|true|200|ok"
+                    },
+                    "method={method} slow_body={slow_body}"
+                );
+                let requests = server.join().unwrap();
+                assert!(requests.iter().all(|request| request
+                    .starts_with(&format!("{} /simple ", method.to_ascii_lowercase()))
+                    && request.contains("x-test: kept")));
+                if method == "POST" {
+                    assert!(requests.iter().all(|request| request.ends_with("bid=42")
+                        && request.contains("content-type: application/x-www-form-urlencoded")));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn p2_simple_timeout_extends_default_without_following_redirects() {
+        for method in ["GET", "HEAD", "POST"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/redirect", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                thread::sleep(Duration::from_millis(100));
+                stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            });
+            let client = HttpClient::new(30, None, None).unwrap();
+            let call = match method {
+                "POST" => format!("java.post({url:?}, '', {{}}, 500)"),
+                "HEAD" => format!("java.head({url:?}, {{}}, 500)"),
+                _ => format!("java.get({url:?}, {{}}, 500)"),
+            };
+            let source = BookSource {
+                book_source_url: url.clone(),
+                ..Default::default()
+            };
+            let result = with_js_http_context(&client, &source, || {
+                eval_js(
+                &format!("const response = {call}; [response.statusCode(), response.header('location'), response.url()].join('|')"), "", &url).unwrap()
+            });
+            server.join().unwrap();
+            assert_eq!(result, format!("302|/final|{url}"), "method={method}");
+        }
+    }
+
+    #[test]
     fn simple_http_methods_forward_optional_headers() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -4973,6 +6461,76 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
     }
 
     #[test]
+    fn jsoup_text_supports_java_string_is_empty() {
+        let script = r#"
+            java.setContent('<div id="list-chapterAll"><dl><dd><a href="/a"></a></dd><dd><a href="/b">Chapter</a></dd></dl></div>');
+            const links = java.getElements('#list-chapterAll dl dd a');
+            [links.size(), links.get(0).text().isEmpty(),
+             links.get(1).text().isEmpty(), ''.isEmpty(),
+             'text'.isEmpty(), Object.prototype.propertyIsEnumerable.call(String.prototype, 'isEmpty')].join('|')
+        "#;
+        assert_eq!(
+            eval_js(script, "", "https://fixture.test").unwrap(),
+            "2|true|false|true|false|false"
+        );
+    }
+
+    #[test]
+    fn java_get_elements_html_text_setter_updates_serialized_carrier() {
+        let script = r#"
+            java.setContent('<div id="list-chapterAll"><dl><dd><a href="/one"></a></dd></dl></div>');
+            const item = java.getElements('#list-chapterAll dl dd a').first();
+            const initial = item.text();
+            const ret = item.text('第1章 & 下一章');
+            const carrier = JSON.parse(JSON.stringify(item));
+            [initial, ret === item, item.text(), item.html(),
+             carrier.__readerHtmlElement, carrier.text, carrier.outerHtml,
+             item.attr('href')].join('|')
+        "#;
+        assert_eq!(
+            eval_js(script, "", "https://fixture.test").unwrap(),
+            "|true|第1章 & 下一章|第1章 &amp; 下一章|true|第1章 & 下一章|<a href=\"/one\">第1章 &amp; 下一章</a>|/one",
+        );
+    }
+
+    #[test]
+    fn jsoup_parsed_elements_expose_tag_name_for_source_rules() {
+        let output = eval_js(
+            r#"const doc = org.jsoup.Jsoup.parse('<div class="media"><h4>Book</h4></div>');
+               const parsed = doc.select('div.media').first();
+               const direct = java.getElements('div.media', '<div class="media"></div>').first();
+               [parsed.tagName(), direct.tagName()].join('|')"#,
+            "",
+            "https://fixture.test",
+        )
+        .unwrap();
+        assert_eq!(output, "div|div");
+    }
+
+    #[test]
+    fn jsoup_constructed_elements_support_source_book_cards() {
+        let output = eval_js(
+            r#"const div = new org.jsoup.nodes.Element('div');
+               const h3 = new org.jsoup.nodes.Element('h3');
+               const a = new org.jsoup.nodes.Element('a');
+               a.attr('href', '/ciwei/1_2/').text('Book & One');
+               h3.appendChild(a);
+               div.appendChild(h3);
+               const parsed = org.jsoup.Jsoup.parse(div.outerHtml());
+               const cards = new org.jsoup.select.Elements();
+               cards.add(div);
+               const carrier = JSON.parse(JSON.stringify(cards))[0];
+               [parsed.select('h3 a').first().text(),
+                parsed.select('h3 a').first().attr('href'),
+                carrier.__readerHtmlElement, carrier.outerHtml.includes('Book &amp; One')].join('|')"#,
+            "",
+            "https://fixture.test",
+        )
+        .unwrap();
+        assert_eq!(output, "Book & One|/ciwei/1_2/|true|true");
+    }
+
+    #[test]
     fn java_get_string_css_prefix_matches_plain_rules() {
         let script = r#"
             java.setContent('<a href="https://fixture.invalid/book.txt">第一下载地址(首选)</a>');
@@ -5069,6 +6627,182 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
     }
 
     #[test]
+    fn p1_entity_getters_read_live_fields_and_java_kind_list() {
+        let bindings = HashMap::from([
+            (
+                "book".to_string(),
+                json!({
+                    "name": "Book", "author": "Author", "bookUrl": "book-url",
+                    "coverUrl": null, "customCoverUrl": "custom",
+                    "wordCount": " 12万 ", "kind": " 玄幻, ,奇幻\n冒险,玄幻 "
+                }),
+            ),
+            (
+                "chapter".to_string(),
+                json!({"url": "chapter-url", "title": "Chapter", "index": 0}),
+            ),
+        ]);
+        let script = r#"
+            const kinds = book.getKindList();
+            const initial = [book.getName(), book.getAuthor(), book.getBookUrl(),
+                book.getCoverUrl(), book.getDisplayCover(), chapter.getUrl(),
+                chapter.getTitle(), chapter.getIndex(), kinds.size(), kinds.get(0),
+                Array.from(kinds), book.getKind(), book.getWordCount()];
+            book.name = 'Updated'; book.coverUrl = ''; book.customCoverUrl = '';
+            chapter.index = 7; chapter.title = 'New';
+            book.kind = null; book.wordCount = '  ';
+            JSON.stringify([initial, book.getName(), book.getCoverUrl(), book.getDisplayCover(),
+                chapter.getIndex(), chapter.getTitle(), book.getKindList().size()])
+        "#;
+        let result = eval_js_with_bindings(script, "", "https://example.com", &bindings).unwrap();
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&result).unwrap(),
+            json!([
+                [
+                    "Book",
+                    "Author",
+                    "book-url",
+                    null,
+                    "custom",
+                    "chapter-url",
+                    "Chapter",
+                    0,
+                    5,
+                    " 12万 ",
+                    [" 12万 ", "玄幻", "奇幻", "冒险", "玄幻"],
+                    " 玄幻, ,奇幻\n冒险,玄幻 ",
+                    " 12万 "
+                ],
+                "Updated",
+                "",
+                "",
+                7,
+                "New",
+                0
+            ])
+        );
+        // A new QuickJS Context must see the original bindings, not mutated fields.
+        assert_eq!(
+            eval_js_with_bindings(
+                "book.getName() + '|' + chapter.getIndex()",
+                "",
+                "https://example.com",
+                &bindings
+            )
+            .unwrap(),
+            "Book|0"
+        );
+    }
+
+    #[test]
+    fn p1_entity_getters_preserve_absent_and_null_bindings() {
+        assert_eq!(
+            eval_js(
+                "book.getName() === undefined && chapter.getIndex() === undefined",
+                "",
+                "https://example.com"
+            )
+            .unwrap(),
+            "true"
+        );
+        let unicode = HashMap::from([(
+            "book".to_string(),
+            json!({"wordCount": "\u{FEFF}", "kind": "\u{001c}玄幻\u{001f},\u{FEFF}"}),
+        )]);
+        assert_eq!(
+            eval_js_with_bindings(
+                "JSON.stringify(Array.from(book.getKindList()))",
+                "",
+                "https://example.com",
+                &unicode
+            )
+            .unwrap(),
+            "[\"\u{FEFF}\",\"玄幻\",\"\u{FEFF}\"]"
+        );
+        for value in [JsonValue::Null, json!({})] {
+            let bindings = HashMap::from([
+                ("book".to_string(), value.clone()),
+                ("chapter".to_string(), value.clone()),
+            ]);
+            let script = if value.is_null() {
+                "book === null && chapter === null"
+            } else {
+                "book.getCoverUrl() === undefined && chapter.getIndex() === undefined && book.getKindList().size() === 0"
+            };
+            assert_eq!(
+                eval_js_with_bindings(script, "", "https://example.com", &bindings).unwrap(),
+                "true"
+            );
+        }
+    }
+
+    #[test]
+    fn p1_source_put_variable_deletes_single_value_without_removing_keyed_values() {
+        let source = BookSource {
+            book_source_url: "https://p1-source.example".to_string(),
+            ..Default::default()
+        };
+        let client = HttpClient::standalone();
+        let initial = ExecuteSession {
+            variables: Some(HashMap::from([
+                ("sourceVariable".to_string(), json!("initial")),
+                ("keyed".to_string(), json!("retained")),
+            ])),
+            ..Default::default()
+        };
+        for (script, expected) in [
+            ("source.putVariable(null)", None),
+            ("source.putVariable('')", Some(json!(""))),
+        ] {
+            let (_, delta) = with_active_session(Some(&initial), &source.book_source_url, |_| {
+                with_js_http_context(&client, &source, || {
+                    eval_js(script, "", &source.book_source_url).unwrap()
+                })
+            });
+            let variables = delta.unwrap().variables.unwrap();
+            assert_eq!(variables.get("sourceVariable"), expected.as_ref());
+            assert_eq!(variables.get("keyed"), Some(&json!("retained")));
+        }
+    }
+
+    #[test]
+    fn p1_des_decode_aliases_forward_known_vector_and_reject_invalid_input() {
+        // OpenSSL DES-CBC/PKCS5: UTF-8 中文reader, key 12345678, iv abcdefgh.
+        // Offline host fixture checks the wrapper protocol, not the real Lua DES provider.
+        let result = eval_js(r#"
+            let calls = 0;
+            java.hostCall = (operation, args) => {
+                if (operation === 'crypto.capabilities') return {
+                    protocol: 1, maxInputBytes: 1024,
+                    symmetric: {'DES/CBC/PKCS5PADDING': {keyBytes: [8]}}
+                };
+                if (operation !== 'crypto.symmetric' || args.action !== 'decrypt'
+                    || args.transformation !== 'DES/CBC/PKCS5PADDING'
+                    || JSON.stringify(args.key) !== '[49,50,51,52,53,54,55,56]'
+                    || JSON.stringify(args.iv) !== '[97,98,99,100,101,102,103,104]') {
+                    throw new Error('unexpected DES request');
+                }
+                if (JSON.stringify(args.data) !== '[10,202,54,28,91,177,252,241,21,163,20,134,45,192,129,27]') {
+                    throw new Error('invalid ciphertext');
+                }
+                calls++;
+                return [228,184,173,230,150,135,114,101,97,100,101,114];
+            };
+            const values = [java.desDecodeToString('Cso2HFux/PEVoxSGLcCBGw==', '12345678', 'DES/CBC/PKCS5Padding', 'abcdefgh'),
+                java.desBase64DecodeToString('0aca361c5bb1fcf115a314862dc0811b', '12345678', 'DES/CBC/PKCS5Padding', 'abcdefgh')];
+            let rejected = 0;
+            for (const [data, key, iv] of [['bad!', '12345678', 'abcdefgh'],
+                ['Cso2HFux/PEVoxSGLcCBGw==', 'short', 'abcdefgh'],
+                ['Cso2HFux/PEVoxSGLcCBGw==', '12345678', '短']]) {
+                try { java.desDecodeToString(data, key, 'DES/CBC/PKCS5Padding', iv); }
+                catch (_) { rejected++; }
+            }
+            JSON.stringify([values, calls, rejected, typeof values[0]])
+        "#, "", "https://example.com").unwrap();
+        assert_eq!(result, r#"[["中文reader","中文reader"],2,3,"string"]"#);
+    }
+
+    #[test]
     fn source_contract_uses_book_source_key_and_single_source_variable() {
         let source = BookSource {
             book_source_url: "https://source.example".to_string(),
@@ -5096,6 +6830,13 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
                             const initialValue = source.getVariable();
                             const setResult = source.setVariable('saved');
                             const saved = source.getVariable();
+                            const aliasResult = source.putVariable('alias');
+                            if (source.getVariable() !== 'alias' || aliasResult !== undefined) throw new Error('single variable alias failed');
+                            source.setVariable('keyed', 'retained');
+                            source.putVariable(null);
+                            if (source.getVariable() !== '' || source.getVariable('keyed') !== 'retained') throw new Error('alias deletion changed keyed variables');
+                            source.putVariable('');
+                            if (source.getVariable() !== '') throw new Error('empty source variable failed');
                             const putResult = source.put('token', 'value');
                             const sourceValue = source.get('token');
                             const removeLoginResult = source.removeLoginInfo();
@@ -5333,6 +7074,21 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
     }
 
     #[test]
+    fn cookie_map_to_cookie_converts_maps_without_changing_cookie_store() {
+        let input = r#"[
+            cookie.mapToCookie(null) === null,
+            cookie.mapToCookie(new Map()) === null,
+            cookie.mapToCookie(new Map([['sid','a=b'], ['token','new']])) === 'sid=a=b; token=new',
+            cookie.mapToCookie({sid:'value'}) === 'sid=value',
+            cookie.getCookie('https://example.invalid/') === ''
+        ].join('|')"#;
+        assert_eq!(
+            eval_js(input, "", "https://example.invalid/").unwrap(),
+            "true|true|true|true|true",
+        );
+    }
+
+    #[test]
     fn audit_simple_response_preserves_duplicate_headers_and_response_cookies() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/cookies", listener.local_addr().unwrap());
@@ -5353,11 +7109,11 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
             ..Default::default()
         };
         let (result, _) = with_active_session(Some(&initial), &url, |_| {
-            eval_js(&format!("const r=java.get('{}', {{}}); [r.cookie('sid'),r.cookie('token'),r.cookie('missing') === null,r.hasCookie('token'),r.hasCookie('unrelated'),r.cookies().get('sid'),r.multiHeaders().get('set-cookie').length,r.multiHeaders().get('x-multi').join(','),r.body()].join('|')", url), "", &url).unwrap()
+            eval_js(&format!("const r=java.get('{}', {{}}); [r.cookie('sid'),r.cookie('token'),r.cookie('missing') === null,r.hasCookie('token'),r.hasCookie('unrelated'),r.cookies().get('sid'),r.multiHeaders().get('set-cookie').length,r.multiHeaders().get('x-multi').join(','),r.body(),cookie.mapToCookie(r.cookies())].join('|')", url), "", &url).unwrap()
         });
         assert_eq!(
             result,
-            "first|a=b=c|true|true|false|first|2|first,second|ok"
+            "first|a=b=c|true|true|false|first|2|first,second|ok|sid=first; token=a=b=c"
         );
         server.join().unwrap();
     }

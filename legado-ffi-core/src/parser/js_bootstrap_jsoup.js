@@ -1,10 +1,29 @@
 (function() {
+                    let wrapText;
+                    java.__installJsoupStringWrapper = wrapper => {
+                        wrapText = wrapper;
+                        delete java.__installJsoupStringWrapper;
+                    };
+                    const wrapStringMethods = (target, names) => {
+                        for (const name of names) {
+                            const original = target[name];
+                            if (typeof original !== 'function') continue;
+                            target[name] = function(...args) {
+                                const value = original.apply(this, args);
+                                return typeof value === 'string' ? wrapText(value) : value;
+                            };
+                        }
+                        return target;
+                    };
+                    const elementStringMethods = ['html', 'outerHtml', 'text', 'ownText',
+                        'data', 'attr', 'absUrl', 'tagName'];
                     const asObject = value => value && (typeof value === 'object' || typeof value === 'function')
                         ? value : {};
                     globalThis.org = asObject(globalThis.org);
                     globalThis.org.jsoup = asObject(globalThis.org.jsoup);
                     globalThis.org.jsoup.Jsoup = asObject(globalThis.org.jsoup.Jsoup);
                     globalThis.org.jsoup.select = asObject(globalThis.org.jsoup.select);
+                    globalThis.org.jsoup.nodes = asObject(globalThis.org.jsoup.nodes);
                     if (typeof globalThis.org.jsoup.select.Elements !== 'function') {
                         globalThis.org.jsoup.select.Elements = class Elements extends Array {
                             add(element) { this.push(element); return true; }
@@ -39,6 +58,12 @@
                     if (typeof globalThis.org.jsoup.Jsoup.parse !== 'function') {
                         globalThis.org.jsoup.Jsoup.parse = function(html, baseUri) {
                             let source = String(html == null ? '' : html);
+                            const identity = { nodes: new Map(), next: new Map(), revision: 0 };
+                            const invalidate = () => {
+                                identity.nodes.clear();
+                                identity.next.clear();
+                                identity.revision++;
+                            };
                             let base = String(baseUri == null ? '' : baseUri);
                             // Jsoup HtmlTreeBuilder uses the first resolvable base href
                             // and keeps that document base after later DOM removal.
@@ -57,7 +82,7 @@
                                 if (!/^[a-z][a-z0-9:-]*$/i.test(tag)) throw new TypeError('invalid tag name');
                                 const attributes = Object.create(null);
                                 let children = '';
-                                return {
+                                return wrapStringMethods({
                                     attr(name, value) {
                                         name = String(name);
                                         if (arguments.length === 1) return attributes[name] || '';
@@ -71,6 +96,16 @@
                                         return this;
                                     },
                                     appendText(value) { children += escapeHtml(value); return this; },
+                                    text(value) {
+                                        if (arguments.length === 0) return globalThis.org.jsoup.Jsoup.parse(children).text();
+                                        children = escapeHtml(value);
+                                        return this;
+                                    },
+                                    tagName() { return tag.toLowerCase(); },
+                                    equals(other) { return this === other; },
+                                    toJSON() {
+                                        return { __readerHtmlElement: true, outerHtml: this.outerHtml() };
+                                    },
                                     html() { return children; },
                                     outerHtml() {
                                         const attrs = Object.keys(attributes).map(name =>
@@ -79,16 +114,41 @@
                                             (/^(?:img|br|hr|input|meta|link)$/i.test(tag)
                                                 ? '' : children + '</' + tag + '>');
                                     }
-                                };
+                                }, elementStringMethods);
                             };
                             // Jsoup accepts unquoted dotted attribute values, e.g.
                             // a[href*=.html], which a CSS parser requires to be quoted.
                             const normalizeSelector = selector => String(selector).replace(
                                 /\[([a-z_][\w:-]*\s*[*^$~|]?=)\s*(\.[\w.-]+)(\s*)\]/gi,
                                 '[$1"$2"$3]');
-                            const decorate = (items, parent) => {
+                            const decorate = (items, parent, scope) => {
                                 let replacementCursor = 0;
-                                for (const item of items) {
+                                for (let i = 0; i < items.length; i++) {
+                                    const item = items[i];
+                                    const nodeId = scope && item.__readerHtmlNodeId;
+                                    if (nodeId && scope.nodes.has(nodeId)) {
+                                        items[i] = scope.nodes.get(nodeId);
+                                        continue;
+                                    }
+                                    item.equals = other => item === other;
+                                    if (nodeId) {
+                                        scope.nodes.set(nodeId, item);
+                                        const revision = scope.revision;
+                                        item.nextElementSibling = () => {
+                                            if (revision !== scope.revision) return null;
+                                            if (scope.next.has(nodeId)) return scope.next.get(nodeId);
+                                            const siblings = decorate(
+                                                globalThis.__wrapReaderElements(JSON.parse(
+                                                    java.__jsoupSiblings(source, nodeId))), parent, scope);
+                                            let previous = item;
+                                            for (const sibling of siblings) {
+                                                scope.next.set(previous.__readerHtmlNodeId, sibling);
+                                                previous = sibling;
+                                            }
+                                            scope.next.set(previous.__readerHtmlNodeId, null);
+                                            return siblings[0] || null;
+                                        };
+                                    }
                                     const attr = item.attr.bind(item);
                                     const hasAttr = item.hasAttr.bind(item);
                                     const select = item.select.bind(item);
@@ -144,7 +204,7 @@
                                     };
                                     item.hasAttr = name => {
                                         name = String(name);
-                                        return name.startsWith('abs:') ? item.attr(name) !== ''
+                                        return name.startsWith('abs:') ? String(item.attr(name)) !== ''
                                             : (changedAttrs && changedAttrs.has(name)) || hasAttr(name);
                                     };
                                     const originalText = item.text.bind(item);
@@ -167,6 +227,10 @@
                                         if (!copy) throw new Error('failed to clone jsoup element');
                                         return copy;
                                     };
+                                    // Jsoup data() reads raw DataNode content (script/style),
+                                    // not the normalized visible text of ordinary elements.
+                                    item.data = () => /^(?:script|style)$/i.test(item.tagName())
+                                        ? item.html() : '';
                                     item.ownText = () => {
                                         const match = /^<([a-z][\w:-]*)\b/i.exec(item.outerHtml());
                                         if (!match) return '';
@@ -234,6 +298,7 @@
                                     };
                                     item.child = index => item.children().get(Number(index));
                                     item.absUrl = name => item.attr('abs:' + String(name));
+                                    wrapStringMethods(item, elementStringMethods);
                                     item.baseUri = () => base;
                                 }
                                 items.attr = name => {
@@ -246,9 +311,9 @@
                                 items.html = () => items.map(item => item.html()).join('\n');
                                 items.isEmpty = () => items.length === 0;
                                 items.last = () => items.length ? items[items.length - 1] : null;
-                                return items;
+                                return wrapStringMethods(items, ['attr', 'text', 'html']);
                             };
-                            return {
+                            return wrapStringMethods({
                                 createElement,
                                 baseUri() { return base; },
                                 title() {
@@ -263,19 +328,27 @@
                                 selectFirst(selector) { return this.select(selector).first(); },
                                 select(selector) {
                                     const rule = normalizeSelector(selector);
-                                    const items = decorate(globalThis.java.getElements(rule, source, true), {
+                                    const items = decorate(globalThis.java.getElements(rule, source, true, true), {
                                         read: () => source,
-                                        write: html => { source = html; }
-                                    });
+                                        write: html => { source = html; invalidate(); }
+                                    }, identity);
                                     items.remove = function() {
                                         const updated = globalThis.java.__jsoupRemove(source, rule);
                                         if (updated == null) throw new Error('invalid jsoup remove selector');
                                         source = updated;
+                                        invalidate();
                                         return items;
                                     };
                                     return items;
                                 }
-                            };
+                            }, ['baseUri', 'title', 'text']);
+                        };
+                    }
+                    if (typeof globalThis.org.jsoup.nodes.Element !== 'function') {
+                        let createElement;
+                        globalThis.org.jsoup.nodes.Element = function(tag) {
+                            if (!createElement) createElement = globalThis.org.jsoup.Jsoup.parse('').createElement;
+                            return createElement(tag);
                         };
                     }
                     if (typeof globalThis.org.jsoup.Jsoup.parseBodyFragment !== 'function') {
@@ -285,4 +358,5 @@
                             return globalThis.org.jsoup.Jsoup.parse(html, baseUri);
                         };
                     }
+                    wrapStringMethods(globalThis.org.jsoup.parser.Parser, ['unescapeEntities']);
                 })();

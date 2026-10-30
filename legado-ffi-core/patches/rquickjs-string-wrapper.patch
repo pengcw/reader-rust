@@ -1,0 +1,20 @@
+--- a/src/value/convert/from.rs
++++ b/src/value/convert/from.rs
+@@ -40,1 +40,10 @@
+-    fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
++    fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
++        if value.is_object() {
++            if let Some(unwrap) = ctx.globals()
++                .get::<_, Option<crate::Function>>("__rquickjs_string_from_object__")? {
++                let text: Value = unwrap.call((value.clone(),))?;
++                if text.is_string() {
++                    return String::from_value(text).and_then(|s| s.to_string());
++                }
++            }
++        }
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -147,0 +148,3 @@
++
++/// Legado's opt-in, strict string-object conversion hook.
++pub const LEGADO_STRING_WRAPPER_PATCH: usize = 1;

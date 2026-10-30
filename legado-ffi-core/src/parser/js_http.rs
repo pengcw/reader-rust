@@ -5,9 +5,10 @@
 
 pub(crate) use crate::crawler::HttpClient;
 use crate::crawler::{
-    analyze_url_with_headers, decode_body, execute_request_spec_limited, format_analyzed_body,
-    map_http_client_error, render_webview_with_rakers, BrowserTimeouts, FetchError,
-    HttpClientError, RequestSpec, DEFAULT_WEBVIEW_USER_AGENT,
+    analyze_url_with_headers, decode_body, execute_request_spec_limited,
+    execute_request_spec_with_call_timeout, format_analyzed_body, map_http_client_error,
+    recompile_login_url, render_webview_with_rakers, BrowserTimeouts, FetchError, HttpClientError,
+    RequestSpec, UrlRuleContext, DEFAULT_WEBVIEW_USER_AGENT,
 };
 use crate::model::book_source::BookSource;
 use crate::parser::js_compat::json_value_to_string;
@@ -17,6 +18,7 @@ use encoding_rs::{Encoding, UTF_8};
 use serde_json::Value as JsonValue;
 use std::cell::RefCell;
 use std::sync::LazyLock as Lazy;
+use std::time::{Duration, Instant};
 use ureq::http::Method;
 
 #[derive(Clone)]
@@ -26,8 +28,70 @@ pub(super) struct JsHttpContext {
     max_response_bytes: usize,
 }
 
+#[derive(Clone)]
+struct LoginCheckRequest {
+    spec: RequestSpec,
+    raw_rule: String,
+    key: String,
+    page: i32,
+    base_url: String,
+    source: BookSource,
+    context: Option<UrlRuleContext>,
+}
+
 thread_local! {
     static BROWSER_TIMEOUTS: RefCell<BrowserTimeouts> = RefCell::new(BrowserTimeouts::default());
+    // Scoped only to loginCheckJs, not the entire URL parser or reader process.
+    static LOGIN_CHECK_REQUEST: RefCell<Option<LoginCheckRequest>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn with_login_check_request<T>(
+    spec: &RequestSpec,
+    raw_rule: &str,
+    key: &str,
+    page: i32,
+    base_url: &str,
+    source: &BookSource,
+    context: Option<&UrlRuleContext>,
+    run: impl FnOnce() -> T,
+) -> T {
+    let state = LoginCheckRequest {
+        spec: spec.clone(),
+        raw_rule: raw_rule.to_owned(),
+        key: key.to_owned(),
+        page,
+        base_url: base_url.to_owned(),
+        source: source.clone(),
+        context: context.cloned(),
+    };
+    LOGIN_CHECK_REQUEST.with(|cell| crate::util::scoped::with_scoped_value(cell, Some(state), run))
+}
+
+pub(super) fn active_login_check_request() -> Option<RequestSpec> {
+    LOGIN_CHECK_REQUEST.with(|cell| cell.borrow().as_ref().map(|state| state.spec.clone()))
+}
+
+/// Prepare the replacement without holding a RefCell borrow during nested URL JavaScript.
+pub(super) fn java_init_login_url() -> Result<(String, String), String> {
+    let state = LOGIN_CHECK_REQUEST
+        .with(|cell| cell.borrow().clone())
+        .ok_or("initUrl requires loginCheckJs")?;
+    let (spec, rule_url) = recompile_login_url(
+        &state.raw_rule,
+        &state.key,
+        state.page,
+        &state.base_url,
+        &state.source,
+        state.context.as_ref(),
+    )?;
+    let url = spec.url.clone();
+    LOGIN_CHECK_REQUEST.with(|cell| {
+        let mut scope = cell.borrow_mut();
+        let current = scope.as_mut().ok_or("initUrl login context expired")?;
+        current.spec = spec;
+        Ok::<(), String>(())
+    })?;
+    Ok((url, rule_url))
 }
 
 pub(crate) fn with_browser_http_clients<T>(
@@ -315,6 +379,7 @@ pub(super) fn java_request_simple_response(
     url: &str,
     body: Option<String>,
     headers_json: &str,
+    call_timeout: Option<Duration>,
 ) -> String {
     java_request_simple_response_with_client(
         method,
@@ -324,6 +389,7 @@ pub(super) fn java_request_simple_response(
         &active_js_http_client(),
         active_js_max_response_bytes(),
         false,
+        call_timeout,
     )
 }
 
@@ -335,6 +401,7 @@ fn java_request_simple_response_with_client(
     client: &HttpClient,
     max_response_bytes: usize,
     sniff_charset: bool,
+    call_timeout: Option<Duration>,
 ) -> String {
     let method = Method::from_bytes(method.as_bytes()).unwrap_or(Method::GET);
     let mut headers = java_request_headers(headers_json);
@@ -348,12 +415,13 @@ fn java_request_simple_response_with_client(
             "application/x-www-form-urlencoded".to_owned(),
         ));
     }
-    let response = client.execute_once(
+    let response = client.execute_once_with_call_timeout(
         method,
         url.trim(),
         &headers,
         body.as_deref(),
         Some(max_response_bytes),
+        call_timeout,
     );
     let payload = match response {
         Ok(response) => {
@@ -423,7 +491,14 @@ fn java_request_simple_response_with_client(
 }
 
 pub(super) fn java_archive_input(url: &str) -> String {
-    const LIMIT: usize = 512 * 1024;
+    java_binary_input(url, 512 * 1024)
+}
+
+pub(super) fn java_font_input(url: &str) -> String {
+    java_binary_input(url, active_js_max_response_bytes().min(512 * 1024))
+}
+
+fn java_binary_input(url: &str, limit: usize) -> String {
     let result = (|| {
         if url.len() > 8192 {
             return Err(("invalid_argument", "archive URL too long"));
@@ -433,9 +508,9 @@ pub(super) fn java_archive_input(url: &str) -> String {
         let response = if let Some(source) = source {
             let spec = analyze_url_with_headers(url, "", 0, &source.book_source_url, &source, None)
                 .map_err(|_| ("invalid_argument", "invalid archive request"))?;
-            execute_request_spec_limited(&client, &spec, Some(LIMIT))
+            execute_request_spec_limited(&client, &spec, Some(limit))
         } else {
-            client.execute(Method::GET, url, &[], None, Some(LIMIT))
+            client.execute(Method::GET, url, &[], None, Some(limit))
         }
         .map_err(|error| match error {
             HttpClientError::ResponseTooLarge { .. } => {
@@ -458,18 +533,68 @@ pub(super) fn java_archive_input(url: &str) -> String {
     .to_string()
 }
 
-pub(super) fn java_analyzed_request_body(url: &str) -> String {
-    let payload = java_analyzed_request_response(url, "");
+pub(super) fn java_analyzed_request_body(url: &str, call_timeout: Option<Duration>) -> String {
+    let payload = java_analyzed_request_response(url, "", call_timeout);
     serde_json::from_str::<JsonValue>(&payload)
         .ok()
         .and_then(|value| value.get("body").map(json_value_to_string))
         .unwrap_or_default()
 }
 
-pub(super) fn java_analyzed_request_response(url: &str, headers_json: &str) -> String {
+pub(super) fn java_analyzed_request_response(
+    url: &str,
+    headers_json: &str,
+    call_timeout: Option<Duration>,
+) -> String {
+    java_analyzed_request_response_mode(url, headers_json, call_timeout, false)
+}
+
+/// Download text like AnalyzeUrl.getInputStream + readTxtFile, not StrResponse.
+/// Deliberate bounded compatibility: HTTP errors are never cached as file text.
+pub(super) fn java_cache_file_text(url: &str) -> Result<String, String> {
+    let source = ACTIVE_JS_BOOK_SOURCE
+        .with(|cell| cell.borrow().clone())
+        .ok_or("cacheFile requires a source context")?;
+    let spec = analyze_url_with_headers(url, "", 0, &source.book_source_url, &source, None)?;
+    if !url::Url::parse(&spec.url).is_ok_and(|url| matches!(url.scheme(), "http" | "https")) {
+        return Err("cacheFile supports HTTP(S) downloads only".into());
+    }
+    let response = execute_request_spec_with_call_timeout(
+        &active_js_http_client(),
+        &spec,
+        Some(active_js_max_response_bytes().min(262_144)),
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    if !(200..300).contains(&response.status) {
+        return Err(format!(
+            "cacheFile download returned HTTP {}",
+            response.status
+        ));
+    }
+    // Android reads the downloaded file with detected encoding, ignoring HTTP
+    // charset, response type and bodyJs. Reuse our existing byte-text decoder.
+    let text = decode_body(&response.body, None, None);
+    if text.len() > 262_144 {
+        return Err("cacheFile text exceeds 256 KiB".into());
+    }
+    Ok(text)
+}
+
+pub(super) fn java_analyzed_test_request_response(url: &str, timeout: Duration) -> String {
+    java_analyzed_request_response_mode(url, "", Some(timeout), true)
+}
+
+fn java_analyzed_request_response_mode(
+    url: &str,
+    headers_json: &str,
+    call_timeout: Option<Duration>,
+    is_test: bool,
+) -> String {
     let client = active_js_http_client();
     let source = ACTIVE_JS_BOOK_SOURCE.with(|cell| cell.borrow().clone());
     let Some(source) = source else {
+        let started = Instant::now();
         let payload = java_request_simple_response_with_client(
             "GET",
             url,
@@ -478,15 +603,19 @@ pub(super) fn java_analyzed_request_response(url: &str, headers_json: &str) -> S
             &client,
             active_js_max_response_bytes(),
             true,
+            call_timeout,
         );
-        if let Ok(value) = serde_json::from_str::<JsonValue>(&payload) {
+        if let Ok(mut value) = serde_json::from_str::<JsonValue>(&payload) {
             if value.get("code").and_then(JsonValue::as_u64) == Some(0) {
                 let error = value
                     .get("body")
                     .and_then(JsonValue::as_str)
                     .unwrap_or("request failed");
-                return java_error_response(url, error);
+                return java_analyzed_error_response(url, error, is_test, false);
             }
+            value["callTime"] = JsonValue::from(started.elapsed().as_millis() as i32);
+            value["errorBody"] = JsonValue::Null;
+            return value.to_string();
         }
         return payload;
     };
@@ -501,14 +630,59 @@ pub(super) fn java_analyzed_request_response(url: &str, headers_json: &str) -> S
         explicit_headers,
     ) {
         Ok(spec) => spec,
-        Err(error) => return java_error_response(url, &error),
+        Err(error) => return java_analyzed_error_response(url, &error, is_test, false),
     };
 
-    let response =
-        match execute_request_spec_limited(&client, &spec, Some(active_js_max_response_bytes())) {
-            Ok(response) => response,
-            Err(error) => return java_error_response(&spec.url, &error.to_string()),
-        };
+    execute_prepared_str_response(&client, &spec, call_timeout, is_test)
+}
+
+/// A fresh native request, without StrResponse/bodyJs/type conversion.
+/// Only the response headers are exposed by the finite loginCheckJs facade.
+pub(super) fn java_login_response_headers(spec: &RequestSpec) -> Result<String, String> {
+    if spec.method != Method::GET && spec.method != Method::POST {
+        return Err("getResponse supports only GET/POST requests".to_owned());
+    }
+    let response = execute_request_spec_limited(
+        &active_js_http_client(),
+        spec,
+        Some(active_js_max_response_bytes()),
+    )
+    .map_err(|error| error.to_string())?;
+    // Preserve duplicate value order; OkHttp Headers.get returns the last value.
+    let headers = response
+        .headers
+        .iter()
+        .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.as_str(), value)))
+        .collect::<Vec<_>>();
+    Ok(serde_json::to_string(&headers).expect("string header pairs serialize"))
+}
+
+/// Reissue the current loginCheckJs request without re-evaluating its URL rule.
+pub(super) fn java_retry_login_request(spec: &RequestSpec) -> String {
+    execute_prepared_str_response(&active_js_http_client(), spec, None, false)
+}
+
+fn execute_prepared_str_response(
+    client: &HttpClient,
+    spec: &RequestSpec,
+    call_timeout: Option<Duration>,
+    is_test: bool,
+) -> String {
+    // Match AnalyzeUrl: exclude URL-rule initialization, include bodyJs and retries.
+    // Typed byte responses bypass executeStrRequest's timing on Android.
+    let started = Instant::now();
+    let response = match execute_request_spec_with_call_timeout(
+        client,
+        spec,
+        Some(active_js_max_response_bytes()),
+        call_timeout,
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            let timed_out = matches!(&error, HttpClientError::Timeout(_));
+            return java_analyzed_error_response(&spec.url, &error.to_string(), is_test, timed_out);
+        }
+    };
 
     let headers = response
         .headers
@@ -528,19 +702,21 @@ pub(super) fn java_analyzed_request_response(url: &str, headers_json: &str) -> S
         .and_then(|value| value.to_str().ok());
     let decoded_body = decode_body(&response.body, spec.charset.as_deref(), content_type);
     let body = match format_analyzed_body(
-        &spec,
+        spec,
         &response.body,
         decoded_body,
         content_type,
         &response.url,
     ) {
         Ok(body) => body,
-        Err(error) => return java_error_response(&response.url, &error),
+        Err(error) => return java_analyzed_error_response(&response.url, &error, is_test, false),
     };
 
     serde_json::json!({
         "__ffiStrResponse": true,
         "body": body,
+        "callTime": if spec.response_type.is_some() { 0 } else { started.elapsed().as_millis() as i32 },
+        "errorBody": null,
         "url": response.url,
         "code": response.status,
         "message": http_status_message(response.status),
@@ -558,9 +734,9 @@ fn http_status_message(status: u16) -> String {
         .to_string()
 }
 
-fn java_error_response(url: &str, error: &str) -> String {
-    // Android returns a JVM stack trace for request failures; preserve the
-    // string/StrResponse contract without inventing a Java stack in the SO.
+fn java_analyzed_error_response(url: &str, error: &str, is_test: bool, timed_out: bool) -> String {
+    // Preserve ordinary StrResponse errors. Test mode exposes the error separately,
+    // but the current HTTP abstraction can only distinguish timeouts from others.
     let raw_url = split_ajax_spec(url).0.trim();
     let response_url = url::Url::parse(raw_url)
         .ok()
@@ -569,7 +745,9 @@ fn java_error_response(url: &str, error: &str) -> String {
         .unwrap_or_else(|| "http://localhost/".to_string());
     serde_json::json!({
         "__ffiStrResponse": true,
-        "body": error,
+        "body": if is_test { None } else { Some(error) },
+        "callTime": if is_test { if timed_out { -1 } else { -7 } } else { 0 },
+        "errorBody": if is_test { Some(error) } else { None },
         "url": response_url,
         "code": 200,
         "message": "OK",

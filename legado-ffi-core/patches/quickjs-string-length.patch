@@ -1,0 +1,105 @@
+--- a/quickjs/quickjs.c
++++ b/quickjs/quickjs.c
+@@ -504,0 +505 @@
++    JSValue legado_string_length;
+@@ -2514,0 +2516 @@
++    ctx->legado_string_length = JS_UNDEFINED;
+@@ -2658,0 +2661 @@
++    JS_MarkValue(rt, ctx->legado_string_length, mark_func);
+@@ -2741,0 +2745 @@
++    JS_FreeValue(ctx, ctx->legado_string_length);
+@@ -17536,0 +17541,26 @@
++/* Legado extension: property reads stay numeric; only member-call reads adapt. */
++static bool legado_is_string(JSValueConst value)
++{
++    return JS_IsString(value) ||
++        (JS_IsObject(value) && JS_VALUE_GET_OBJ(value)->class_id == JS_CLASS_STRING);
++}
++
++static JSValue legado_string_length(JSContext *ctx, JSValueConst this_val,
++                                    int argc, JSValueConst *argv)
++{
++    if (argc != 0 || !legado_is_string(this_val))
++        return JS_ThrowTypeError(ctx, "String.length() requires a string and no arguments");
++    return JS_GetProperty(ctx, this_val, JS_ATOM_length);
++}
++
++static JSValue legado_get_string_length(JSContext *ctx)
++{
++    if (JS_IsUndefined(ctx->legado_string_length)) {
++        JSValue method = JS_NewCFunction(ctx, legado_string_length, "length", 0);
++        if (JS_IsException(method))
++            return method;
++        ctx->legado_string_length = method;
++    }
++    return JS_DupValue(ctx, ctx->legado_string_length);
++}
++
+@@ -19102,0 +19133 @@
++        CASE(OP_legado_get_field_call):
+@@ -19104,0 +19136,9 @@
++                JSValueConst receiver = sp[-1];
++                if (opcode == OP_legado_get_field_call && legado_is_string(receiver)) {
++                    sf->cur_pc = pc + 4;
++                    JSValue method = legado_get_string_length(ctx);
++                    if (JS_IsException(method)) goto exception;
++                    pc += 4;
++                    *sp++ = method;
++                    BREAK;
++                }
+@@ -19381,0 +19422 @@
++        CASE(OP_legado_get_array_call):
+@@ -19387 +19428,12 @@
+-                val = JS_GetPropertyValue(ctx, sp[-2], sp[-1]);
++                if (opcode == OP_legado_get_array_call && legado_is_string(sp[-2])) {
++                    JSAtom atom = JS_ValueToAtom(ctx, sp[-1]);
++                    if (atom == JS_ATOM_NULL) goto exception;
++                    if (atom == JS_ATOM_length)
++                        val = legado_get_string_length(ctx);
++                    else
++                        val = JS_GetProperty(ctx, sp[-2], atom);
++                    JS_FreeAtom(ctx, atom);
++                    JS_FreeValue(ctx, sp[-1]);
++                } else {
++                    val = JS_GetPropertyValue(ctx, sp[-2], sp[-1]);
++                }
+@@ -26761,2 +26813,4 @@
+-                    /* keep the object on the stack */
+-                    fd->byte_code.buf[fd->last_opcode_pos] = OP_get_field2;
++                    /* Only method calls adapt length; update expressions must not. */
++                    fd->byte_code.buf[fd->last_opcode_pos] =
++                        get_u32(fd->byte_code.buf + fd->last_opcode_pos + 1) == JS_ATOM_length
++                        ? OP_legado_get_field_call : OP_get_field2;
+@@ -26770,2 +26824,4 @@
+-                        /* keep the object on the stack */
+-                        fd->byte_code.buf[fd->last_opcode_pos] = OP_get_field2;
++                        /* Keep optional member-call behavior separate from updates. */
++                        fd->byte_code.buf[fd->last_opcode_pos] =
++                            get_u32(fd->byte_code.buf + fd->last_opcode_pos + 1) == JS_ATOM_length
++                            ? OP_legado_get_field_call : OP_get_field2;
+@@ -26790,2 +26846,2 @@
+-                    /* keep the object on the stack */
+-                    fd->byte_code.buf[fd->last_opcode_pos] = OP_get_array_el2;
++                    /* Computed call: check the property key once at execution. */
++                    fd->byte_code.buf[fd->last_opcode_pos] = OP_legado_get_array_call;
+@@ -26799,2 +26855,2 @@
+-                        /* keep the object on the stack */
+-                        fd->byte_code.buf[fd->last_opcode_pos] = OP_get_array_el2;
++                        /* Computed optional call, not a property update. */
++                        fd->byte_code.buf[fd->last_opcode_pos] = OP_legado_get_array_call;
+@@ -37656 +37712 @@
+-#define BC_VERSION 26
++#define BC_VERSION (26 | 128) /* Private Legado opcode layout. */
+--- a/quickjs/quickjs-opcode.h
++++ b/quickjs/quickjs-opcode.h
+@@ -138,0 +139,4 @@
++/* Legado-only member-call reads; ordinary property updates remain untouched. */
++DEF(legado_get_field_call, 5, 1, 2, atom)
++DEF(legado_get_array_call, 1, 2, 2, none)
++
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -9,0 +10,3 @@
++/// Compile-time marker for the Legado member-call String.length() extension.
++pub const LEGADO_STRING_LENGTH_PATCH: u32 = 2;
++

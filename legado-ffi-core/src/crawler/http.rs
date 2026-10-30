@@ -1,9 +1,9 @@
-use crate::runtime::SharedCookieStore;
 use super::script_cache::ScriptCache;
-use std::sync::Arc;
+use crate::runtime::SharedCookieStore;
 use std::fmt;
 use std::io::Read;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use ureq::http::header::{
     AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, LOCATION,
     PROXY_AUTHORIZATION, TRANSFER_ENCODING, WWW_AUTHENTICATE,
@@ -141,7 +141,11 @@ impl HttpClient {
         if crate::host_services::is_offline() {
             return self.execute(method, url, headers, body, max_response_bytes);
         }
-        let Some(cache) = self.script_cache.as_ref().filter(|_| method == Method::GET && body.is_none()) else {
+        let Some(cache) = self
+            .script_cache
+            .as_ref()
+            .filter(|_| method == Method::GET && body.is_none())
+        else {
             return self.execute(method, url, headers, body, max_response_bytes);
         };
         if let Some(hit) = cache.get(url, max_response_bytes.unwrap_or(usize::MAX)) {
@@ -170,6 +174,28 @@ impl HttpClient {
         )
     }
 
+    /// One explicit call budget spans redirects, but not the caller's retry loop.
+    pub(crate) fn execute_with_call_timeout(
+        &self,
+        method: Method,
+        url: &str,
+        headers: &[(String, String)],
+        body: Option<&str>,
+        max_response_bytes: Option<usize>,
+        call_timeout: Option<Duration>,
+    ) -> Result<RawHttpResponse, HttpClientError> {
+        self.execute_with_redirects(
+            method,
+            url,
+            headers,
+            body,
+            max_response_bytes,
+            true,
+            MAX_REDIRECTS,
+            call_timeout,
+        )
+    }
+
     pub(crate) fn execute_with_redirect_limit(
         &self,
         method: Method,
@@ -187,6 +213,7 @@ impl HttpClient {
             max_response_bytes,
             true,
             max_redirects,
+            None,
         )
     }
 
@@ -198,7 +225,28 @@ impl HttpClient {
         body: Option<&str>,
         max_response_bytes: Option<usize>,
     ) -> Result<RawHttpResponse, HttpClientError> {
-        self.execute_with_redirects(method, url, headers, body, max_response_bytes, false, 0)
+        self.execute_once_with_call_timeout(method, url, headers, body, max_response_bytes, None)
+    }
+
+    pub(crate) fn execute_once_with_call_timeout(
+        &self,
+        method: Method,
+        url: &str,
+        headers: &[(String, String)],
+        body: Option<&str>,
+        max_response_bytes: Option<usize>,
+        call_timeout: Option<Duration>,
+    ) -> Result<RawHttpResponse, HttpClientError> {
+        self.execute_with_redirects(
+            method,
+            url,
+            headers,
+            body,
+            max_response_bytes,
+            false,
+            0,
+            call_timeout,
+        )
     }
 
     fn execute_with_redirects(
@@ -210,7 +258,9 @@ impl HttpClient {
         max_response_bytes: Option<usize>,
         follow_redirects: bool,
         max_redirects: usize,
+        call_timeout: Option<Duration>,
     ) -> Result<RawHttpResponse, HttpClientError> {
+        let deadline = call_timeout.map(|timeout| Instant::now() + timeout);
         if crate::host_services::is_offline() {
             return Err(HttpClientError::Network(
                 "network is disabled in offline diagnostics".to_string(),
@@ -242,6 +292,7 @@ impl HttpClient {
                 &current_url,
                 &request_headers,
                 body.as_deref(),
+                deadline,
             )?;
 
             if let Some(cookies) = &self.cookies {
@@ -315,6 +366,7 @@ impl HttpClient {
         url: &Url,
         headers: &HeaderMap,
         body: Option<&str>,
+        deadline: Option<Instant>,
     ) -> Result<ureq::http::Response<ureq::Body>, HttpClientError> {
         let mut builder = Request::builder().method(method).uri(url.as_str());
         let Some(target_headers) = builder.headers_mut() else {
@@ -322,19 +374,37 @@ impl HttpClient {
         };
         *target_headers = headers.clone();
 
-        let result = if let Some(body) = body {
+        if let Some(body) = body {
             let request = builder
                 .body(body.to_string())
                 .map_err(|error| HttpClientError::Network(error.to_string()))?;
-            self.agent.run(request)
+            self.run_request(request, deadline)
         } else {
             let request = builder
                 .body(())
                 .map_err(|error| HttpClientError::Network(error.to_string()))?;
-            self.agent.run(request)
-        };
+            self.run_request(request, deadline)
+        }
+    }
 
-        result.map_err(map_ureq_error)
+    fn run_request(
+        &self,
+        request: Request<impl ureq::AsSendBody>,
+        deadline: Option<Instant>,
+    ) -> Result<ureq::http::Response<ureq::Body>, HttpClientError> {
+        let request = if let Some(deadline) = deadline {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| HttpClientError::Timeout("request call timeout".to_string()))?;
+            self.agent
+                .configure_request(request)
+                .timeout_global(Some(remaining))
+                .build()
+        } else {
+            request
+        };
+        self.agent.run(request).map_err(map_ureq_error)
     }
 }
 
@@ -458,7 +528,10 @@ mod tests {
                 "offline mode must block before network I/O: {error}"
             );
         });
-        assert!(!crate::host_services::is_offline(), "offline scope must restore TLS");
+        assert!(
+            !crate::host_services::is_offline(),
+            "offline scope must restore TLS"
+        );
     }
 
     #[test]
@@ -473,7 +546,9 @@ mod tests {
                 if slow_body {
                     // Respond with headers, then stall before the declared body.
                     stream
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n")
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n",
+                        )
                         .unwrap();
                 }
                 thread::sleep(Duration::from_millis(200));
@@ -481,7 +556,13 @@ mod tests {
             let client = HttpClient::new(50, None, None).unwrap();
             let started = std::time::Instant::now();
             let error = client
-                .execute(Method::GET, &format!("http://{address}/slow"), &[], None, Some(1024))
+                .execute(
+                    Method::GET,
+                    &format!("http://{address}/slow"),
+                    &[],
+                    None,
+                    Some(1024),
+                )
                 .unwrap_err();
             eprintln!(
                 "P0 slow_{}: elapsed_ms={} error={error}",

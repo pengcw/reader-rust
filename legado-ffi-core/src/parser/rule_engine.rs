@@ -346,9 +346,7 @@ impl RuleVariableContext {
         book.insert(
             "variable".to_string(),
             Value::String(
-                (!book_variables.is_empty())
-                    .then(|| serde_json::to_string(&book_variables).unwrap_or_default())
-                    .unwrap_or_default(),
+                if !book_variables.is_empty() { serde_json::to_string(&book_variables).unwrap_or_default() } else { Default::default() },
             ),
         );
         book.insert("variableMap".to_string(), Value::Object(book_variables));
@@ -379,9 +377,7 @@ impl RuleVariableContext {
         chapter.insert(
             "variable".to_string(),
             Value::String(
-                (!chapter_variables.is_empty())
-                    .then(|| serde_json::to_string(&chapter_variables).unwrap_or_default())
-                    .unwrap_or_default(),
+                if !chapter_variables.is_empty() { serde_json::to_string(&chapter_variables).unwrap_or_default() } else { Default::default() },
             ),
         );
         chapter.insert("variableMap".to_string(), Value::Object(chapter_variables));
@@ -780,6 +776,7 @@ impl RuleEngine {
             let rule = source.rule_book_info.clone().unwrap_or_default();
             let mut context =
                 RuleVariableContext::for_book_with_fields(variable, book_name, book_fields);
+            context.book_fields.entry("bookUrl".into()).or_insert_with(|| book_url.to_owned());
 
             let mode = self.detect_mode(rule.name.as_deref().unwrap_or(""), body);
             match mode {
@@ -2414,6 +2411,15 @@ fn looks_like_html_fragment(value: &str) -> bool {
             .is_some_and(|end| end > 1 && value[1..end].chars().any(char::is_alphabetic))
 }
 
+// Project extension: only this exact tocUrl marker reads the current entity field.
+fn current_book_url_marker(rule: Option<&str>, ctx: &RuleVariableContext) -> Option<String> {
+    if rule.is_some_and(|value| value.trim() == "java.refreshBookUrl()") {
+        ctx.book_fields.get("bookUrl").cloned()
+    } else {
+        None
+    }
+}
+
 fn parse_book_info_html(
     source: &BookSource,
     body: &str,
@@ -2478,7 +2484,7 @@ fn parse_book_info_html(
     if let Some(val) = &word_count {
         ctx.set_book_field("wordCount", val);
     }
-    let toc_url = rule
+    let toc_url = current_book_url_marker(rule.toc_url.as_deref(), ctx).or_else(|| rule
         .toc_url
         .as_ref()
         .and_then(|rule| {
@@ -2497,7 +2503,7 @@ fn parse_book_info_html(
                 eval_field(Some(rule), ctx)
             }
         })
-        .map(|url| resolve_url(base_url, &url));
+        .map(|url| resolve_url(base_url, &url)));
     if let Some(val) = &toc_url {
         ctx.set_book_field("tocUrl", val);
     }
@@ -2656,14 +2662,11 @@ fn parse_book_info_xpath(
     if let Some(val) = &word_count {
         ctx.set_book_field("wordCount", val);
     }
-    let toc_url = eval_field_xpath_with_ctx(
-        rule.toc_url.as_deref().unwrap_or(""),
-        scope,
-        base_url,
-        ctx,
-        html_mode,
-    )
-    .map(|u| resolve_url(base_url, &u));
+    let toc_url = current_book_url_marker(rule.toc_url.as_deref(), ctx).or_else(|| {
+        eval_field_xpath_with_ctx(
+            rule.toc_url.as_deref().unwrap_or(""), scope, base_url, ctx, html_mode,
+        ).map(|u| resolve_url(base_url, &u))
+    });
     if let Some(val) = &toc_url {
         ctx.set_book_field("tocUrl", val);
     }
@@ -2770,9 +2773,10 @@ fn parse_book_info_json(
     if let Some(val) = &word_count {
         ctx.set_book_field("wordCount", val);
     }
-    let toc_url =
+    let toc_url = current_book_url_marker(rule.toc_url.as_deref(), ctx).or_else(|| {
         eval_field_json_with_ctx(rule.toc_url.as_deref().unwrap_or(""), &scope, base_url, ctx)
-            .map(|u| resolve_url(base_url, &u));
+            .map(|u| resolve_url(base_url, &u))
+    });
     if let Some(val) = &toc_url {
         ctx.set_book_field("tocUrl", val);
     }
@@ -6081,6 +6085,38 @@ html;"#
     }
 
     #[test]
+    fn js_toc_uses_mutated_html_elements_from_java_get_elements() {
+        let source = BookSource {
+            book_source_name: "Mutable HTML TOC".to_string(),
+            book_source_url: "https://fixture.invalid".to_string(),
+            rule_toc: Some(TocRule {
+                chapter_list: Some(
+                    r#"@js:
+const links = java.getElements('#list-chapterAll dl dd a');
+for (const a of links) {
+    if (a.text().isEmpty()) a.text('第1章');
+}
+links"#
+                        .to_string(),
+                ),
+                chapter_name: Some("text".to_string()),
+                chapter_url: Some("href".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let html = "<div id='list-chapterAll'><dl><dd><a href='/one'></a></dd><dd><a href='/two'>Chapter 2</a></dd></dl></div>";
+        let (chapters, _) = RuleEngine::new()
+            .unwrap()
+            .chapter_list(&source, html, "https://fixture.invalid/book");
+        assert_eq!(chapters.len(), 2);
+        assert_eq!(chapters[0].title, "第1章");
+        assert_eq!(chapters[0].url, "https://fixture.invalid/one");
+        assert_eq!(chapters[1].title, "Chapter 2");
+        assert_eq!(chapters[1].url, "https://fixture.invalid/two");
+    }
+
+    #[test]
     fn compat_js_toc_parses_stringified_json_items_from_jsoup_rules() {
         let source = BookSource {
             book_source_name: "Jsoup TOC".to_string(),
@@ -6409,6 +6445,45 @@ arr;"#
     }
 
     #[test]
+    fn jsoup_constructed_book_cards_survive_search_fields() {
+        let source = BookSource {
+            book_source_name: "Constructed Jsoup cards".to_string(),
+            book_source_url: "https://source.example".to_string(),
+            rule_search: Some(SearchRule {
+                book_list: Some(
+                    r#"@js:
+const card = new org.jsoup.nodes.Element('div');
+const h3 = new org.jsoup.nodes.Element('h3');
+const a = new org.jsoup.nodes.Element('a');
+a.attr('href', '/ciwei/12_34/').text('Book & One');
+h3.appendChild(a);
+card.appendChild(h3);
+const author = new org.jsoup.nodes.Element('span');
+author.attr('class', 'au').text('Tester');
+card.appendChild(author);
+const cards = new org.jsoup.select.Elements();
+cards.add(card);
+cards"#
+                        .to_string(),
+                ),
+                name: Some("h3 a@text".to_string()),
+                author: Some("span.au@text".to_string()),
+                book_url: Some("h3 a@href".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let results = RuleEngine::new()
+            .unwrap()
+            .search_books(&source, "<html></html>", "https://source.example");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "Book & One");
+        assert_eq!(results[0].author, "Tester");
+        assert_eq!(results[0].book_url, "https://source.example/ciwei/12_34/");
+    }
+
+    #[test]
     fn test_chapter_list_js_and_format_js() {
         let engine = RuleEngine::new().unwrap();
         let source = BookSource {
@@ -6576,6 +6651,66 @@ arr;"#
         let results = engine.search_books(&source, "<html></html>", "https://books.example");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "Alpha-lib");
+    }
+
+    #[test]
+    fn jsoup_constructed_search_cards_preserve_fields() {
+        let source = BookSource {
+            book_source_name: "Constructed cards".to_string(),
+            book_source_url: "https://books.example".to_string(),
+            js_lib: Some(
+                r#"
+function mkCard(name, author, url) {
+    const div = new org.jsoup.nodes.Element('div');
+    const h3 = new org.jsoup.nodes.Element('h3');
+    const a = new org.jsoup.nodes.Element('a');
+    a.attr('href', url).text(name);
+    h3.appendChild(a);
+    div.appendChild(h3);
+    const span = new org.jsoup.nodes.Element('span');
+    span.attr('class', 'au').text(author);
+    div.appendChild(span);
+    return div;
+}"#
+                .to_string(),
+            ),
+            rule_search: Some(SearchRule {
+                book_list: Some(
+                    r#"@js:
+const doc = org.jsoup.Jsoup.parse(result, baseUrl);
+const cards = new org.jsoup.select.Elements();
+for (const entry of doc.select('div.media, li.list-group-item')) {
+    if (entry.tagName() === 'li') {
+        const link = entry.select('a').first();
+        cards.add(mkCard(link.text(), '', link.attr('abs:href')));
+    } else {
+        const link = entry.select('h4 a').first();
+        const author = entry.select('.book_author a').first();
+        cards.add(mkCard(link.text(), author.text(), link.attr('abs:href')));
+    }
+}
+cards"#
+                        .to_string(),
+                ),
+                name: Some("h3 a@text".to_string()),
+                author: Some("span.au@text".to_string()),
+                book_url: Some("h3 a@href".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let html = r#"<div class="media"><h4><a href="/ciwei/1_2/">Book &amp; One</a></h4><div class="book_author"><a>Writer</a></div></div><li class="list-group-item"><a href="/ciwei/3_4/">Second</a></li>"#;
+        let books = RuleEngine::new().unwrap().search_books(
+            &source,
+            html,
+            "https://books.example/search.html",
+        );
+        assert_eq!(books.len(), 2);
+        assert_eq!(books[0].name, "Book & One");
+        assert_eq!(books[0].author, "Writer");
+        assert_eq!(books[0].book_url, "https://books.example/ciwei/1_2/");
+        assert_eq!(books[1].name, "Second");
+        assert_eq!(books[1].book_url, "https://books.example/ciwei/3_4/");
     }
 
     #[test]
@@ -7549,6 +7684,7 @@ chapter_id='{{$.chapter_id}}'
         let carrier = json!({"__readerHtmlElement":true,"outerHtml":"<a href='/one'>Inner</a>"});
         for (rule, expected) in [
             ("@js:result.text()", Some("Inner")),
+            ("text", Some("Inner")),
             ("@js:throw new Error('carrier failure')", None),
         ] {
             assert_eq!(

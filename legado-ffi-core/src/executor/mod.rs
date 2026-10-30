@@ -10,7 +10,7 @@ use crate::crawler::{
 use crate::model::book_source::{book_source_from_value, BookSource};
 use crate::parser::js::{
     eval_js, eval_js_toc_pre_update, eval_js_with_bindings, with_click_browser, with_js_info_map,
-    with_js_lib, with_login_messages, InfoMapState,
+    with_js_lib, with_login_check_request, with_login_messages, with_relogin_request, InfoMapState,
 };
 use crate::parser::rule_engine::{dedupe_chapters_last_wins, normalize_list_rule, RuleEngine};
 use crate::runtime::session::with_active_session;
@@ -269,6 +269,9 @@ fn execute_inner(source_json: &str, request_json: &str) -> ExecuteResult<Value> 
                             &source,
                             &options,
                             request_info_map.clone(),
+                        ),
+                        Operation::ExploreAction => execute_explore_action(
+                            &source, &params, request_info_map.clone(),
                         ),
                         Operation::Info => {
                             execute_info(&source, &engine, &http_session, &params, &options)
@@ -542,6 +545,35 @@ fn execute_explore(
 }
 
 // Classification flushes pending saves; exploration only carries state forward.
+// A discovery button is source-scoped; refresh is deferred until state publication.
+fn execute_explore_action(
+    source: &BookSource,
+    params: &Value,
+    supplied: Option<InfoMapState>,
+) -> ExecuteResult<Value> {
+    let action = params.get("action").and_then(Value::as_str)
+        .filter(|action| !action.trim().is_empty() && action.len() <= 64 * 1024)
+        .ok_or_else(|| ExecuteError::invalid_request("explore action must be a nonempty string up to 64 KiB"))?;
+    let script = format!(
+        "(()=>{{let refresh=false;java.refreshExplore=()=>{{refresh=true;}};(0,eval)({});return JSON.stringify({{refreshExplore:refresh}});}})()",
+        serde_json::to_string(action).map_err(|error| ExecuteError::internal(error.to_string()))?
+    );
+    let state = load_info_map_state(supplied)?;
+    let (((output, messages, _, _), relogin), state) = with_js_info_map(state, || {
+        with_relogin_request(|| with_login_messages(|| with_js_lib(source.js_lib.as_deref(), || {
+            eval_js(&script, "", &source.book_source_url)
+        })))
+    });
+    let output = output.map_err(|error| ExecuteError::parse(format!("explore action failed: {error}")))?;
+    let mut data: Value = serde_json::from_str(&output)
+        .map_err(|error| ExecuteError::parse(format!("invalid explore action result: {error}")))?;
+    if relogin.is_some() { data["refreshExplore"] = json!(true); }
+    data["message"] = json!(messages.join("\n"));
+    let mut response = success_without_http(data);
+    publish_info_map_state(&mut response, state, true)?;
+    Ok(response)
+}
+
 fn execute_explore_kinds_with_state(
     source: &BookSource,
     options: &ValidatedOptions,
@@ -639,6 +671,8 @@ fn execute_explore_kinds(source: &BookSource, options: &ValidatedOptions) -> Exe
                     title: title.trim().to_string(),
                     url: (!url.trim().is_empty()).then(|| url.trim().to_string()),
                     style: None,
+                    kind_type: None,
+                    action: None,
                 }
             })
             .collect()
@@ -1520,7 +1554,7 @@ fn execute_content(
                         fetch_rule_with_context(
                             session,
                             source,
-                            &sub_content,
+                            sub_content,
                             "",
                             1,
                             url,
@@ -1761,11 +1795,11 @@ fn execute_login(
             script.push_str("\n;\nlogin();");
         }
         let bindings = login_bindings(&values);
-        let (output, messages, preview) = with_login_messages(|| {
+        let ((output, messages, preview, open_urls), relogin) = with_relogin_request(|| with_login_messages(|| {
             with_js_lib(source.js_lib.as_deref(), || {
                 eval_js_with_bindings(&script, "", &source.book_source_url, &bindings)
             })
-        });
+        }));
         let output = output.map_err(|error| {
             auth_required_error(
                 source,
@@ -1785,6 +1819,8 @@ fn execute_login(
         return Ok(success_without_http(json!({
             "result": output,
             "preview": preview,
+            "openUrls": open_urls,
+            "reLoginView": relogin.map(|delta| json!({"deltaUp": delta})),
             // 原生书源用 toast/longToast 反馈状态；仅展示，不推断认证结果。
             "message": if messages.is_empty() { "登录脚本执行成功".to_string() } else { messages.join("\n") },
         })));
@@ -2008,10 +2044,19 @@ fn fetch_rule_with_context(
 ) -> ExecuteResult<HttpResponse> {
     let spec = analyze_url_with_context(rule, key, page, base_url, source, context)
         .map_err(ExecuteError::url_rule)?;
-    let response = session
-        .fetch_with_render_timeout(&spec, options.max_response_bytes, options.render_timeout_ms)
-        .map_err(|error| map_fetch_error(error, source))?;
-    validate_login_response(source, response)
+    if source.login_check_js.as_deref().is_some_and(|script| !script.trim().is_empty()) {
+        let (response, pending_error) = session
+            .fetch_for_login_check(&spec, options.max_response_bytes, options.render_timeout_ms)
+            .map_err(|error| map_fetch_error(error, source))?;
+        with_login_check_request(
+            &spec, rule, key, page, base_url, source, context,
+            || validate_login_response(source, response, pending_error),
+        )
+    } else {
+        session
+            .fetch_with_render_timeout(&spec, options.max_response_bytes, options.render_timeout_ms)
+            .map_err(|error| map_fetch_error(error, source))
+    }
 }
 
 fn fetch_toc_rule_with_context(
@@ -2030,6 +2075,7 @@ fn fetch_toc_rule_with_context(
 fn validate_login_response(
     source: &BookSource,
     response: HttpResponse,
+    pending_error: Option<FetchError>,
 ) -> ExecuteResult<HttpResponse> {
     let Some(script) = source
         .login_check_js
@@ -2082,7 +2128,10 @@ fn validate_login_response(
         ));
     }
     if trimmed.eq_ignore_ascii_case("true") {
-        return Ok(response);
+        return match pending_error {
+            Some(error) => Err(map_fetch_error(error, source)),
+            None => Ok(response),
+        };
     }
 
     let value =
@@ -2092,14 +2141,30 @@ fn validate_login_response(
             "loginCheckJs must return a StrResponse",
         ));
     }
-    response_from_login_check(value, response).ok_or_else(|| {
+    let recovered = response_from_login_check(value, response.clone());
+    if let Some(error) = pending_error {
+        // A script must actually recover an HTTP error/challenge. Returning the
+        // original response, a non-2xx response, or another challenge is not recovery.
+        return match recovered {
+            Some(next) if (200..300).contains(&next.status)
+                && (next.url != response.url || next.body != response.body)
+                && !crate::crawler::response_has_auth_challenge(&next) => Ok(next),
+            _ => Err(map_fetch_error(error, source)),
+        };
+    }
+    let recovered = recovered.ok_or_else(|| {
         auth_required_error(
             source,
             None,
             &source.book_source_url,
             "loginCheckJs must return a StrResponse".to_string(),
         )
-    })
+    })?;
+    // A healthy first response does not make a later script retry trustworthy.
+    if let Some(error) = crate::crawler::response_auth_challenge(&recovered) {
+        return Err(map_fetch_error(error, source));
+    }
+    Ok(recovered)
 }
 
 fn response_from_login_check(value: Value, original: HttpResponse) -> Option<HttpResponse> {
@@ -2359,7 +2424,7 @@ fn content_path_base(path: &str, strip_page_suffix: bool) -> String {
     let (directory, filename) = path.rsplit_once('/').unwrap_or(("", path));
     let (stem, _) = filename.rsplit_once('.').unwrap_or((filename, ""));
     let stem = if strip_page_suffix {
-        match stem.rsplit_once(|ch| ch == '-' || ch == '_') {
+        match stem.rsplit_once(['-', '_']) {
             Some((prefix, suffix))
                 if !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()) =>
             {
@@ -3892,6 +3957,463 @@ mod tests {
     }
 
     #[test]
+    fn login_check_js_retries_prepared_post_without_reparsing() {
+        use std::io::{BufRead, BufReader};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for index in 0..3 {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut reader = BufReader::new(&mut stream);
+                let mut raw = String::new();
+                let mut line = String::new();
+                let mut content_length = 0usize;
+                loop {
+                    line.clear();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = value.trim().parse().unwrap();
+                    }
+                    raw.push_str(&line);
+                }
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body).unwrap();
+                raw.push_str(&String::from_utf8(body).unwrap());
+                requests.push(raw.to_ascii_lowercase());
+                let (status, body) = match index {
+                    0 => ("200 OK", r#"{"message":"before"}"#),
+                    1 => ("503 Service Unavailable", r#"{"message":"retry"}"#),
+                    _ => ("200 OK", r#"{"message":"after"}"#),
+                };
+                let cookie = if index == 0 {
+                    "Set-Cookie: token=fresh; Path=/\r\n"
+                } else {
+                    ""
+                };
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{cookie}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        let source = json!({
+            "bookSourceUrl": base,
+            "bookSourceName": "login retry fixture",
+            "loginCheckJs": "if (typeof java.getStrResponse !== 'function') throw new Error('missing login retry'); var temporary = java.getStrResponse(); if (temporary.code() !== 503) throw new Error('expected retry status'); java.getStrResponse(null, null, false)",
+            "ruleBookInfo": {"name": "$.message"}
+        });
+        let url = format!("{base}/book,{}", json!({
+            "method":"POST", "body":"action=1", "headers":{"X-Request":"preserved"}
+        }));
+        let request = json!({"api":2,"op":"info","params":{"url":url}});
+        let result: Value =
+            serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["name"], "after", "{result}");
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        for raw in &requests {
+            assert!(raw.starts_with("post /book http/1.1"), "{raw}");
+            assert!(raw.contains("x-request: preserved"), "{raw}");
+            assert!(raw.ends_with("action=1"), "{raw}");
+        }
+        assert!(requests[1].contains("cookie: token=fresh"), "{:?}", requests);
+        assert!(requests[2].contains("cookie: token=fresh"), "{:?}", requests);
+        assert_eq!(
+            crate::parser::js::eval_js(
+                "typeof java.getStrResponse", "", &base,
+            ).unwrap(),
+            "undefined",
+            "getStrResponse must not leak outside loginCheckJs",
+        );
+    }
+
+    #[test]
+    fn login_check_401_source_login_can_refresh_cookie_before_retry() {
+        use std::io::{BufRead, BufReader};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body, cookie) in [
+                ("401 Unauthorized", "denied", ""),
+                ("200 OK", "logged-in", "Set-Cookie: sid=new; Path=/\r\n"),
+                ("200 OK", r#"{"name":"logged-in-book"}"#, ""),
+            ] {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut reader = BufReader::new(&mut stream);
+                let mut request = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    request.push_str(&line);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                drop(reader);
+                requests.push(request);
+                write!(stream, "HTTP/1.1 {status}\r\n{cookie}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        let source = json!({
+            "bookSourceUrl": base,
+            "bookSourceName": "login and retry fixture",
+            "loginUrl": format!(
+                "function login() {{ java.ajax('{base}/login'); source.setVariable('logged-in'); }}"
+            ),
+            "loginCheckJs": "if (result.code() === 401) { source.login(); java.getStrResponse(); } else { result; }",
+            "ruleBookInfo": {"name": "$.name"}
+        });
+        let request = json!({"api": 2, "op": "info", "params": {"url": "/book"}});
+        let output: Value =
+            serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+        assert_eq!(output["ok"], true, "{output}");
+        assert_eq!(output["data"]["name"], "logged-in-book", "{output}");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].starts_with("GET /book "), "{requests:?}");
+        assert!(requests[1].starts_with("GET /login "), "{requests:?}");
+        assert!(requests[2].starts_with("GET /book "), "{requests:?}");
+        assert!(requests[2].to_ascii_lowercase().contains("cookie: sid=new"), "{requests:?}");
+    }
+
+    #[test]
+    fn login_check_source_login_keeps_prepared_authorization_header() {
+        use std::io::{BufRead, BufReader};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in [
+                ("401 Unauthorized", r#"{"error":"expired"}"#),
+                ("200 OK", r#"{"token":"fresh"}"#),
+                ("200 OK", r#"{"name":"recovered"}"#),
+            ] {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut reader = BufReader::new(&mut stream);
+                let mut request = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    request.push_str(&line);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                drop(reader);
+                requests.push(request);
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+            requests
+        });
+        let source = json!({
+            "bookSourceUrl": base,
+            "bookSourceName": "source header snapshot fixture",
+            "header": "@js:var v = JSON.parse(source.getVariable() || '{}'); JSON.stringify({'Authorization': 'Bearer ' + (v.token || 'old')});",
+            "loginUrl": format!("function login() {{ let data = JSON.parse(java.ajax('{base}/login')); source.setVariable(JSON.stringify({{token:data.token}})); }}"),
+            "loginCheckJs": "if (result.code() == 401) { source.login(); java.getStrResponse(); } else { result; }",
+            "ruleBookInfo": {"name": "$.name"}
+        });
+        let request = json!({"api": 2, "op": "info", "params": {"url": "/book"}});
+        let output: Value =
+            serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+        assert_eq!(output["ok"], true, "{output}");
+        assert_eq!(output["data"]["name"], "recovered", "{output}");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].starts_with("GET /book "), "{requests:?}");
+        assert!(requests[1].starts_with("GET /login "), "{requests:?}");
+        assert!(requests[2].starts_with("GET /book "), "{requests:?}");
+        for i in [0, 2] {
+            assert!(
+                requests[i].to_ascii_lowercase().contains("authorization: bearer old"),
+                "getStrResponse should reuse prepared headers: {requests:?}"
+            );
+            assert!(
+                !requests[i].to_ascii_lowercase().contains("authorization: bearer fresh"),
+                "header was unexpectedly reinitialized: {requests:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn login_check_initial_503_can_retry_without_losing_request_or_body_js() {
+        use std::io::{BufRead, BufReader};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in [
+                ("503 Service Unavailable", r#"{"message":"before"}"#),
+                ("200 OK", r#"{"message":"after"}"#),
+            ] {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                let mut reader = BufReader::new(&mut stream);
+                let mut request = String::new();
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = value.trim().parse().unwrap();
+                    }
+                    request.push_str(&line);
+                }
+                let mut payload = vec![0; content_length];
+                reader.read_exact(&mut payload).unwrap();
+                request.push_str(&String::from_utf8(payload).unwrap());
+                requests.push(request);
+                let cookie = if status.starts_with("503") {
+                    "Set-Cookie: token=updated; Path=/\r\n"
+                } else {
+                    ""
+                };
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{cookie}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        let source = json!({
+            "bookSourceUrl": base,
+            "bookSourceName": "initial status retry fixture",
+            "loginCheckJs": r#"if (result.code() !== 503 || !result.body().includes('decoded-before')) {
+                throw Error('first HTTP response or bodyJs missing');
+            }
+            java.getStrResponse()"#,
+            "ruleBookInfo": {"name": "$.message"}
+        });
+        let url = format!("{base}/book,{}", json!({
+            "method": "POST",
+            "body": "q=hello",
+            "headers": {"X-Request": "kept"},
+            "bodyJs": "result.replace('before','decoded-before')"
+        }));
+        let request = json!({"api": 2, "op": "info", "params": {"url": url}});
+        let result: Value =
+            serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["name"], "after", "{result}");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        for raw in &requests {
+            assert!(raw.starts_with("POST /book "), "{raw}");
+            assert!(raw.to_ascii_lowercase().contains("x-request: kept"), "{raw}");
+            assert!(raw.ends_with("q=hello"), "{raw}");
+        }
+        assert!(requests[1].to_ascii_lowercase().contains("cookie: token=updated"));
+    }
+
+    #[test]
+    fn login_check_unrecovered_http_error_preserves_original_classification() {
+        fn check(status: &str, headers: &str, body: &str, script: Option<&str>, kind: &str) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let status_text = status.to_string();
+            let headers = headers.to_string();
+            let body = body.to_string();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                crate::util::test_http::consume_request(&mut stream);
+                write!(stream, "HTTP/1.1 {status_text}\r\n{headers}Content-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            });
+            let mut source = json!({
+                "bookSourceUrl": base,
+                "bookSourceName": "original status fixture",
+                "ruleBookInfo": {"name": "body"}
+            });
+            if let Some(script) = script {
+                source["loginCheckJs"] = json!(script);
+            }
+            let request = json!({"api": 2, "op": "info", "params": {"url": "/book"}});
+            let result: Value =
+                serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+            server.join().unwrap();
+            assert_eq!(result["ok"], false, "{status} {script:?}: {result}");
+            assert_eq!(result["error"]["kind"], kind, "{status} {script:?}: {result}");
+        }
+        for script in [Some("result"), Some("true")] {
+            check("401 Unauthorized", "", "authentication failed", script, "auth_required");
+            check("503 Service Unavailable", "", "temporarily unavailable", script, "http_status");
+        }
+        check("401 Unauthorized", "", "authentication failed", None, "auth_required");
+        check("403 Forbidden", "", "access denied", None, "http_status");
+        check("503 Service Unavailable", "", "temporarily unavailable", None, "http_status");
+        check("401 Unauthorized", "", "authentication failed", Some("false"), "auth_required");
+        check(
+            "401 Unauthorized", "", "authentication failed",
+            Some("let r = result.toJSON(); r.code = 200; r.isSuccessful = true; r"),
+            "auth_required",
+        );
+        check("503 Service Unavailable", "", "temporarily unavailable", Some("throw Error('script failed')"), "parse");
+        check("403 Forbidden", "cf-mitigated: challenge\r\n", "Just a moment...", Some("result"), "waf_challenge");
+        check("200 OK", "cf-mitigated: challenge\r\n", "Just a moment...", Some("true"), "waf_challenge");
+        check("200 OK", "cf-mitigated: challenge\r\n", "Just a moment...", None, "waf_challenge");
+        check("403 Forbidden", "", "geetest captcha required", Some("result"), "waf_challenge");
+        check(
+            "200 OK", "cf-mitigated: challenge\r\n", "Just a moment...",
+            Some("let r = result.toJSON(); r.code = 200; r.isSuccessful = true; r"),
+            "waf_challenge",
+        );
+    }
+
+    #[test]
+    fn login_check_get_response_reads_fresh_headers_without_replacing_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for index in 0..2 {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                crate::util::test_http::consume_request(&mut stream);
+                let extra_headers = if index == 0 {
+                    "X-Userid: initial\r\n"
+                } else {
+                    "X-Userid: outdated\r\nx-userID: fresh\r\n"
+                };
+                let body = if index == 0 {
+                    r#"{"name":"Original"}"#
+                } else {
+                    r#"{"name":"Not the parsed body"}"#
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\n{extra_headers}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let source = json!({
+            "bookSourceUrl": base,
+            "bookSourceName": "login headers fixture",
+            "loginCheckJs": r#"
+                const headers = java.getResponse().headers();
+                if (headers.get('X-USERID') !== 'fresh') throw Error('stale response headers');
+                if (headers.get('not-present') !== null) throw Error('missing header must be null');
+                result
+            "#,
+            "ruleBookInfo": {"name": "$.name"}
+        });
+        let request = json!({
+            "api": 2, "op": "info", "params": {"url": "/book"}
+        });
+        let result: Value =
+            serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+        server.join().unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["name"], "Original", "{result}");
+    }
+
+    #[test]
+    fn login_check_retry_rejects_challenges_after_successful_first_response() {
+        for (extra_headers, retried_body, expected_kind) in [
+            ("cf-mitigated: challenge\r\n", "Verify", Some("waf_challenge")),
+            ("", "<title>Just a moment...</title>", Some("waf_challenge")),
+            ("", r#"{"name":"Recovered"}"#, None),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let headers = extra_headers.to_owned();
+            let body = retried_body.to_owned();
+            let server = thread::spawn(move || {
+                for (headers, body) in [
+                    ("", r#"{"name":"Original"}"#),
+                    (headers.as_str(), body.as_str()),
+                ] {
+                    let (mut stream, _) = accept_with_timeout(&listener);
+                    crate::util::test_http::consume_request(&mut stream);
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\n{headers}Content-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                }
+            });
+            let source = json!({
+                "bookSourceUrl": base,
+                "bookSourceName": "retry challenge fixture",
+                "loginCheckJs": "java.getStrResponse()",
+                "ruleBookInfo": {"name": "$.name"}
+            });
+            let request = json!({
+                "api": 2, "op": "info", "params": {"url": "/book"}
+            });
+            let result: Value =
+                serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+            server.join().unwrap();
+            if let Some(kind) = expected_kind {
+                assert_eq!(result["ok"], false, "{result}");
+                assert_eq!(result["error"]["kind"], kind, "{result}");
+            } else {
+                assert_eq!(result["ok"], true, "{result}");
+                assert_eq!(result["data"]["name"], "Recovered", "{result}");
+            }
+        }
+    }
+
+    #[test]
+    fn login_check_init_url_recompiles_updated_rule_without_fetching() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut paths = Vec::new();
+            for index in 0..2 {
+                let (mut stream, _) = accept_with_timeout(&listener);
+                paths.push(crate::util::test_http::consume_request(&mut stream));
+                let body = if index == 0 {
+                    r#"{"message":"before"}"#
+                } else {
+                    r#"{"message":"after"}"#
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ).unwrap();
+            }
+            paths
+        });
+        let source = json!({
+            "bookSourceUrl": base,
+            "bookSourceName": "initUrl fixture",
+            "loginCheckJs": r#"if (typeof java.initUrl !== 'function') throw Error('initUrl not installed');
+                source.setVariable('next');
+                if (java.initUrl() !== undefined) throw Error('initUrl must return undefined');
+                if (!java.url.endsWith('/book/next')) throw Error('new java.url not published');
+                if (!java.ruleUrl.includes('/book/next,')) throw Error('intermediate ruleUrl missing');
+                java.getStrResponse(null, null, false)"#,
+            "ruleBookInfo": {"name": "$.message"}
+        });
+        let url = format!("{base}/book/{{{{source.getVariable() || 'old'}}}},{}", json!({
+            "method":"POST", "body":"action=1", "headers":{"X-Request":"preserved"}
+        }));
+        let request = json!({"api":2,"op":"info","params":{"url":url}});
+        let result: Value =
+            serde_json::from_str(&execute(&source.to_string(), &request.to_string())).unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["name"], "after", "{result}");
+        let paths = server.join().unwrap();
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert!(paths[0].starts_with("POST /book/old "), "{paths:?}");
+        assert!(paths[1].starts_with("POST /book/next "), "{paths:?}");
+    }
+
+    #[test]
     fn login_script_exposes_credentials_through_source_helpers() {
         let source = serde_json::json!({
             "bookSourceName": "login script fixture",
@@ -3919,6 +4441,76 @@ mod tests {
         .unwrap();
         assert_eq!(form["ok"], true, "{form}");
         assert_eq!(form["data"][1]["type"], "password");
+    }
+
+    #[test]
+    fn login_open_url_is_scoped_and_returns_host_actions() {
+        let source = serde_json::json!({
+            "bookSourceUrl": "https://source.example", "bookSourceName": "openUrl fixture",
+            "loginUi": r#"[{"name":"打开","type":"button","action":"login()"}]"#,
+            "loginUrl": "function login(){java.openUrl('https://example.com/path', 'text/plain');java.openUrl('https://ignored.example');java.openUrl('x'.repeat(65536));return 'done';}"
+        });
+        let login = serde_json::json!({"api":2,"op":"login","params":{"values":{}}});
+        let result: Value =
+            serde_json::from_str(&execute(&source.to_string(), &login.to_string())).unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["result"], "done");
+        assert_eq!(
+            result["data"]["openUrls"],
+            serde_json::json!([{"url":"https://example.com/path","mimeType":"text/plain"}])
+        );
+        assert_eq!(result["data"]["preview"], Value::Null);
+
+        let next_source = serde_json::json!({"bookSourceUrl":"https://other.example"});
+        let next: Value = serde_json::from_str(&execute(
+            &next_source.to_string(),
+            &serde_json::json!({"api":2,"op":"login","params":{
+                "values":{}, "action":"java.toast('no link'); 'done'"
+            }}).to_string(),
+        )).unwrap();
+        assert_eq!(next["ok"], true, "{next}");
+        assert_eq!(next["data"]["openUrls"], serde_json::json!([]),
+            "openUrl actions must not leak between login requests");
+
+        let ordinary = crate::parser::js::eval_js(
+            "try { java.openUrl('https://example.com'); 'unexpected' } catch(e) { String(e).includes('interactive login action') }",
+            "", "https://source.example",
+        ).unwrap();
+        assert_eq!(ordinary, "true");
+    }
+
+    #[test]
+    fn login_open_url_does_not_survive_failed_script() {
+        let source = serde_json::json!({"bookSourceUrl":"https://source.example"});
+        let fail: Value = serde_json::from_str(&execute(
+            &source.to_string(),
+            &serde_json::json!({"api":2,"op":"login","params":{
+                "values":{}, "action":"java.openUrl('https://stale.example');throw new Error('boom');"
+            }}).to_string(),
+        )).unwrap();
+        assert_eq!(fail["ok"], false, "{fail}");
+
+        let next: Value = serde_json::from_str(&execute(
+            &source.to_string(),
+            &serde_json::json!({"api":2,"op":"login","params":{
+                "values":{}, "action":"java.toast('still alive'); 'done'"
+            }}).to_string(),
+        )).unwrap();
+        assert_eq!(next["ok"], true, "{next}");
+        assert_eq!(next["data"]["openUrls"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn login_open_url_rejects_oversize_without_returning_an_action() {
+        let source = serde_json::json!({"bookSourceUrl":"https://source.example"});
+        let login = serde_json::json!({"api":2,"op":"login","params":{
+            "values":{}, "action": "try { java.openUrl('x'.repeat(65536)); 'unexpected' } catch(e) { String(e).includes('openUrl parameter url too long') }"
+        }});
+        let response: Value =
+            serde_json::from_str(&execute(&source.to_string(), &login.to_string())).unwrap();
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["data"]["result"], "true");
+        assert_eq!(response["data"]["openUrls"], serde_json::json!([]));
     }
 
     #[test]

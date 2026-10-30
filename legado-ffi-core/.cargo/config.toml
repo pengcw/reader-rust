@@ -1,0 +1,3 @@
+# Prepared by: python3 scripts/prepare-quickjs.py
+# Cargo path overrides preserve the registry dependency graph and Cargo.lock.
+paths = ["target/patched-quickjs/rquickjs-sys-0.12.2", "target/patched-quickjs/rquickjs-core-0.12.2"]

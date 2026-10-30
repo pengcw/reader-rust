@@ -8,6 +8,14 @@
                             configurable: true
                         });
                     }
+                    // Rhino exposes java.lang.String.isEmpty() on Jsoup text/attributes.
+                    if (typeof String.prototype.isEmpty !== 'function') {
+                        Object.defineProperty(String.prototype, 'isEmpty', {
+                            value: function() { return String(this).length === 0; },
+                            writable: true,
+                            configurable: true
+                        });
+                    }
                     const preferenceKey = (name, key) => `__prefs:${String(name)}:${String(key)}`;
                     const sharedPreferences = name => ({
                         getString(key, defaultValue) {
@@ -49,11 +57,12 @@
                         // JCA 简写 AES/DES 使用 ECB + PKCS5Padding，复用现有完整实现。
                         const normalized = /^(AES|DES)$/.test(upper)
                             ? upper + '/ECB/PKCS5PADDING' : upper;
-                        if (!/^(AES|DES)\/(CBC|ECB)\/(PKCS5PADDING|PKCS7PADDING|NOPADDING)$/.test(normalized)) {
+                        if (!/^(AES|DES|DESEDE)\/(CBC|ECB)\/(PKCS5PADDING|PKCS7PADDING|NOPADDING)$/.test(normalized)) {
                             throw new Error(
                                 'createSymmetricCrypto: unsupported transformation ' + algorithm);
                         }
                         const des = normalized.startsWith('DES/');
+                        const tripleDes = normalized.startsWith('DESEDE/');
                         const symmetricBytes = value => {
                             if (Array.isArray(value) || value instanceof Uint8Array) {
                                 return Array.from(value, byte => {
@@ -68,12 +77,12 @@
                         const keyBytes = symmetricBytes(key);
                         const ivBytes = iv == null ? [] : symmetricBytes(iv);
                         const cbc = normalized.split('/')[1] === 'CBC';
-                        const blockSize = des ? 8 : 16;
-                        if (!(des ? keyBytes.length === 8 : [16, 24, 32].includes(keyBytes.length))
+                        const blockSize = des || tripleDes ? 8 : 16;
+                        if (!(des ? keyBytes.length === 8 : tripleDes ? keyBytes.length === 24 : [16, 24, 32].includes(keyBytes.length))
                             || (cbc ? ivBytes.length !== blockSize : ivBytes.length !== 0)) {
                             throw new Error('createSymmetricCrypto: invalid key or iv');
                         }
-                        const native = !des;
+                        const native = !des && !tripleDes;
                         let capabilities;
                         if (!native) {
                             capabilities = java.hostCall('crypto.capabilities', {});
@@ -367,7 +376,24 @@
                         getUrlDecoder() { return { decode: value => base64.decode(value, base64.URL_SAFE) }; }
                     };
                     globalThis.System = Object.assign(globalThis.System || {}, {
-                        currentTimeMillis: () => java.now()
+                        currentTimeMillis: () => java.now(),
+                        arraycopy(source, sourcePos, destination, destinationPos, length) {
+                            const arrayLike = value => Array.isArray(value)
+                                || value instanceof Int8Array || value instanceof Uint8Array;
+                            if (!arrayLike(source) || !arrayLike(destination)
+                                || !Number.isInteger(sourcePos) || !Number.isInteger(destinationPos)
+                                || !Number.isInteger(length) || sourcePos < 0 || destinationPos < 0
+                                || length < 0 || length > 524288
+                                || sourcePos + length > source.length
+                                || destinationPos + length > destination.length) {
+                                throw new RangeError('invalid arraycopy range');
+                            }
+                            const data = source === destination
+                                ? source.slice(sourcePos, sourcePos + length) : source;
+                            for (let i = 0; i < length; ++i) {
+                                destination[destinationPos + i] = data[source === destination ? i : sourcePos + i];
+                            }
+                        }
                     });
                     const randomUuid = () => {
                         const value = java.randomUUID();
@@ -388,18 +414,98 @@
                     }
 
                     const JsString = globalThis.String;
+                    const nativeStringReplace = JsString.prototype.replace;
+                    const nativeStringReplaceAll = JsString.prototype.replaceAll;
                     const javaStrings = new WeakMap();
+                    function wrapJavaString(text) {
+                        const wrapped = new JsString(text);
+                        Object.setPrototypeOf(wrapped, JavaString.prototype);
+                        javaStrings.set(wrapped, text);
+                        return wrapped;
+                    }
+                    function javaStringText(value) {
+                        if (!javaStrings.has(value)) throw new TypeError('JavaString receiver required');
+                        return javaStrings.get(value);
+                    }
                     function JavaString(value, charset) {
                         const text = Array.isArray(value) || value instanceof Uint8Array
                             ? java.bytesToStr(
                                 value, charset == null ? 'UTF-8' : JsString(charset))
                             : JsString(value == null ? '' : value);
-                        if (!new.target) return text;
-                        const wrapped = new JsString(text);
-                        javaStrings.set(wrapped, text);
-                        return wrapped;
+                        return new.target ? wrapJavaString(text) : text;
                     }
+                    JavaString.prototype = Object.create(JsString.prototype, {
+                        constructor: { value: JavaString, writable: true, configurable: true },
+                        equals: { writable: true, configurable: true, value(other) {
+                            const text = javaStringText(this);
+                            return typeof other === 'string' ? text === other
+                                : javaStrings.has(other) && text === javaStrings.get(other);
+                        } },
+                        replaceAll: { writable: true, configurable: true, value(pattern, replacement) {
+                            const text = javaStringText(this);
+                            // Keep existing JS RegExp/callback usage on explicit wrappers.
+                            if (pattern instanceof RegExp)
+                                return wrapJavaString(JsString.prototype.replaceAll.call(
+                                    text, pattern, replacement));
+                            if (pattern == null || replacement == null)
+                                throw new TypeError('JavaString.replaceAll requires pattern and replacement');
+                            return wrapJavaString(java.__stringReplaceAll(
+                                text, JsString(pattern), JsString(replacement)));
+                        } },
+                        replace: { writable: true, configurable: true, value(target, replacement) {
+                            const text = javaStringText(this);
+                            if (target instanceof RegExp)
+                                return wrapJavaString(nativeStringReplace.call(text, target, replacement));
+                            if (target == null || replacement == null)
+                                throw new TypeError('JavaString.replace requires target and replacement');
+                            const search = JsString(target), literal = JsString(replacement);
+                            return wrapJavaString(nativeStringReplaceAll.call(text, search, () => literal));
+                        } },
+                        replaceFirst: { writable: true, configurable: true, value(pattern, replacement) {
+                            const text = javaStringText(this);
+                            if (pattern == null || replacement == null)
+                                throw new TypeError('JavaString.replaceFirst requires pattern and replacement');
+                            return wrapJavaString(java.__stringReplaceFirst(
+                                text, JsString(pattern), JsString(replacement)));
+                        } },
+                        matches: { writable: true, configurable: true, value(pattern) {
+                            const text = javaStringText(this);
+                            if (pattern == null) throw new TypeError('JavaString.matches requires a pattern');
+                            return java.__stringMatches(text, JsString(pattern));
+                        } },
+                        split: { writable: true, configurable: true, value(pattern, limit) {
+                            const text = javaStringText(this);
+                            if (pattern instanceof RegExp)
+                                return JsString.prototype.split.call(text, pattern, limit)
+                                    .map(part => typeof part === 'string' ? wrapJavaString(part) : part);
+                            if (pattern == null) throw new TypeError('JavaString.split requires a pattern');
+                            const count = limit === undefined ? 0 : Number(limit);
+                            if (!Number.isInteger(count) || count < -2147483648 || count > 2147483647)
+                                throw new RangeError('JavaString.split limit must be a Java int');
+                            return java.__stringSplit(text, JsString(pattern), count).map(wrapJavaString);
+                        } },
+                        trim: { writable: true, configurable: true, value() {
+                            const text = javaStringText(this);
+                            let start = 0, end = text.length;
+                            while (start < end && text.charCodeAt(start) <= 32) start++;
+                            while (end > start && text.charCodeAt(end - 1) <= 32) end--;
+                            return wrapJavaString(text.slice(start, end));
+                        } },
+                        substring: { writable: true, configurable: true, value(start, end) {
+                            const text = javaStringText(this);
+                            start = Number(start);
+                            end = end === undefined ? text.length : Number(end);
+                            if (!Number.isInteger(start) || !Number.isInteger(end)
+                                || start < 0 || end > text.length || start > end)
+                                throw new RangeError('JavaString.substring index out of bounds');
+                            return wrapJavaString(text.slice(start, end));
+                        } }
+                    });
                     java.__javaStringResult = value => javaStrings.get(value);
+                    Object.defineProperty(globalThis, '__rquickjs_string_from_object__', {
+                        value: java.__javaStringResult
+                    });
+                    java.__installJsoupStringWrapper(wrapJavaString);
                     const streamRange = (bytes, offset, length) => {
                         if (!Array.isArray(bytes) && !(bytes instanceof Uint8Array)) {
                             throw new Error('byte array required');
@@ -596,6 +702,97 @@
                             finally { this.closed = true; this.output.close(); }
                         }
                     };
+                    // In-memory Java Readers only; no file/socket/network stream support.
+                    function InputStreamReader(stream, charset) {
+                        if (!new.target) return new InputStreamReader(stream, charset);
+                        if (arguments.length < 1 || arguments.length > 2
+                            || !(stream instanceof ByteArrayInputStream)) {
+                            throw new TypeError('InputStreamReader requires a supported byte stream');
+                        }
+                        const encoding = javaCharsetName(arguments.length === 1 ? 'UTF-8' : charset);
+                        stream.checkOpen();
+                        this.text = null;
+                        this.position = 0;
+                        this.encoding = encoding;
+                        this.stream = stream;
+                        this.closed = false;
+                    }
+                    InputStreamReader.prototype.checkOpen = function() {
+                        if (this.closed) throw new Error('reader is closed');
+                    };
+                    InputStreamReader.prototype.load = function() {
+                        if (this.text !== null) return;
+                        this.stream.checkOpen();
+                        if (this.stream.bytes.length - this.stream.position > 524288) {
+                            throw new RangeError('reader input too large');
+                        }
+                        this.text = java.bytesToStr(this.stream.readAllBytes(), this.encoding);
+                    };
+                    InputStreamReader.prototype.getEncoding = function() {
+                        return this.closed ? null : this.encoding;
+                    };
+                    InputStreamReader.prototype.read = function(buffer, offset, length) {
+                        this.checkOpen();
+                        if (arguments.length === 0) {
+                            this.load();
+                            return this.position < this.text.length
+                                ? this.text.charCodeAt(this.position++) : -1;
+                        }
+                        if (arguments.length > 3) throw new TypeError('unsupported Reader.read overload');
+                        const [start, count] = streamRange(buffer, offset, length);
+                        if (count === 0) return 0;
+                        this.load();
+                        if (this.position >= this.text.length) return -1;
+                        const n = Math.min(count, this.text.length - this.position);
+                        for (let i = 0; i < n; i++) {
+                            buffer[start + i] = this.text[this.position++];
+                        }
+                        return n;
+                    };
+                    InputStreamReader.prototype.close = function() {
+                        if (this.closed) return;
+                        this.closed = true;
+                        this.stream.close();
+                    };
+                    function BufferedReader(reader) {
+                        if (!new.target) return new BufferedReader(reader);
+                        if (arguments.length !== 1 || !(reader instanceof InputStreamReader)) {
+                            throw new TypeError('BufferedReader requires an InputStreamReader');
+                        }
+                        reader.checkOpen();
+                        this.reader = reader;
+                        this.closed = false;
+                    }
+                    BufferedReader.prototype.checkOpen = function() {
+                        if (this.closed) throw new Error('reader is closed');
+                        this.reader.checkOpen();
+                    };
+                    BufferedReader.prototype.read = function(...args) {
+                        this.checkOpen();
+                        return this.reader.read(...args);
+                    };
+                    BufferedReader.prototype.readLine = function() {
+                        this.checkOpen();
+                        const reader = this.reader;
+                        reader.load();
+                        const text = reader.text;
+                        const start = reader.position;
+                        if (start >= text.length) return null;
+                        let end = start;
+                        while (end < text.length && text[end] !== '\r' && text[end] !== '\n') end++;
+                        reader.position = end;
+                        if (end < text.length) {
+                            if (text[reader.position++] === '\r' && text[reader.position] === '\n') {
+                                reader.position++;
+                            }
+                        }
+                        return text.slice(start, end);
+                    };
+                    BufferedReader.prototype.close = function() {
+                        if (this.closed) return;
+                        this.closed = true;
+                        this.reader.close();
+                    };
                     function SecureRandom() {
                         if (arguments.length !== 0) throw new TypeError('unsupported SecureRandom constructor');
                         if (!new.target) return new SecureRandom();
@@ -606,6 +803,24 @@
                             throw new TypeError('positive Java int bound required');
                         }
                         return java.__secureRandomNextInt(bound);
+                    };
+                    const randomByteLength = length => {
+                        if (!Number.isInteger(length) || length < 0 || length > 4096) {
+                            throw new RangeError('invalid random byte length');
+                        }
+                        return length;
+                    };
+                    SecureRandom.prototype.generateSeed = function(length) {
+                        if (arguments.length !== 1) throw new TypeError('seed length required');
+                        return JSON.parse(java.__secureRandomBytes(randomByteLength(length)));
+                    };
+                    SecureRandom.prototype.nextBytes = function(target) {
+                        if (arguments.length !== 1 || !(Array.isArray(target)
+                            || target instanceof Int8Array || target instanceof Uint8Array)) {
+                            throw new TypeError('Java byte array required');
+                        }
+                        const bytes = this.generateSeed(randomByteLength(target.length));
+                        for (let i = 0; i < bytes.length; i++) target[i] = bytes[i];
                     };
                     function SecretKeySpec(key, algorithm) {
                         const name = JsString(algorithm);
@@ -874,8 +1089,30 @@
                         }
                     };
                     const URLDecoder = {
-                        decode(value) {
-                            return decodeURIComponent(String(value).replace(/\+/g, ' '));
+                        decode(value, charset) {
+                            const encoding = javaCharsetName(charset == null ? 'UTF-8' : charset);
+                            const text = String(value);
+                            let result = '';
+                            for (let i = 0; i < text.length;) {
+                                if (text[i] === '+') {
+                                    result += ' ';
+                                    i++;
+                                } else if (text[i] !== '%') {
+                                    result += text[i++];
+                                } else {
+                                    const bytes = [];
+                                    while (text[i] === '%') {
+                                        const hex = text.slice(i + 1, i + 3);
+                                        if (!/^[0-9a-fA-F]{2}$/.test(hex)) {
+                                            throw new URIError('malformed URI sequence');
+                                        }
+                                        bytes.push(parseInt(hex, 16));
+                                        i += 3;
+                                    }
+                                    result += java.bytesToStr(bytes, encoding);
+                                }
+                            }
+                            return result;
                         }
                     };
                     const DatatypeConverter = {
@@ -996,6 +1233,8 @@
                     Packages.java.lang.System = markClass('System', globalThis.System);
                     Packages.java.io.ByteArrayInputStream = markClass('ByteArrayInputStream', ByteArrayInputStream);
                     Packages.java.io.ByteArrayOutputStream = markClass('ByteArrayOutputStream', ByteArrayOutputStream);
+                    Packages.java.io.InputStreamReader = markClass('InputStreamReader', InputStreamReader);
+                    Packages.java.io.BufferedReader = markClass('BufferedReader', BufferedReader);
                     Packages.java.util.zip.GZIPInputStream = markClass('GZIPInputStream', GZIPInputStream);
                     Packages.java.util.zip.GZIPOutputStream = markClass('GZIPOutputStream', GZIPOutputStream);
                     Packages.java.util.zip.Inflater = markClass('Inflater', Inflater);

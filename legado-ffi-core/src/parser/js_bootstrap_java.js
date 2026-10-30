@@ -6,6 +6,18 @@
                     const sourceAvailable = java.__sourceAvailable;
                     delete java.__sourceAvailable;
                     java.getSource = () => sourceAvailable ? currentSource : null;
+                    java.getTag = () => java.getSource()?.bookSourceName ?? null;
+                    java.hasJavaClass = name => {
+                        if (typeof name !== 'string') return false;
+                        let obj = Packages;
+                        for (const part of name.split('.')) {
+                            if (!obj || !Object.prototype.hasOwnProperty.call(obj, part)) {
+                                return false;
+                            }
+                            obj = obj[part];
+                        }
+                        return !!obj && Object.prototype.hasOwnProperty.call(obj, '__javaName');
+                    };
                     java.startBrowser = function(url, title, html) {
                         if (!java.__browserPreview(String(url || ''), String(title || ''), String(html || ''))) {
                             throw new Error('网页只读预览失败或当前执行入口不支持预览');
@@ -42,6 +54,39 @@
                         }
                         return response.data;
                     };
+                    java.reLoginView = function(deltaUp = false) {
+                        if (typeof deltaUp !== 'boolean') throw new TypeError('reLoginView expects a boolean');
+                        if (!java.__reLoginView(deltaUp)) {
+                            throw new Error('reLoginView requires a login or discovery action');
+                        }
+                    };
+                    // Finite read-only compatibility defaults, not Android device settings.
+                    const readConfigDefaults = Object.freeze({
+                        name: 'KOReader', bgStr: '#FFFFFF', bgStrNight: '#FFFFFF', bgStrEInk: '#FFFFFF',
+                        bgAlpha: 100, bgType: 0, bgTypeNight: 0, bgTypeEInk: 0,
+                        textColor: '#000000', textColorNight: '#000000', textColorEInk: '#000000',
+                        textAccentColor: '#000000', textAccentColorNight: '#000000', textAccentColorEInk: '#000000',
+                        textFont: '', textBold: 0, textSize: 20, letterSpacing: 0,
+                        lineSpacingExtra: 0, paragraphSpacing: 0, paragraphIndent: '　　',
+                        pageAnim: 0, pageAnimEInk: 0, titleMode: 0,
+                        paddingTop: 0, paddingBottom: 0, paddingLeft: 0, paddingRight: 0
+                    });
+                    const configNightMode = () => {
+                        try {
+                            const snapshot = java.hostCall('reader.config.snapshot', null);
+                            if (!snapshot || typeof snapshot.isNightTheme !== 'boolean') {
+                                throw new TypeError('Invalid reader configuration snapshot');
+                            }
+                            return snapshot.isNightTheme;
+                        } catch (error) {
+                            if (error.kind === 'unsupported' || error.kind === 'unavailable') return false;
+                            throw error;
+                        }
+                    };
+                    java.getReadBookConfigMap = () => ({...readConfigDefaults});
+                    java.getReadBookConfig = () => JSON.stringify(java.getReadBookConfigMap());
+                    java.getThemeConfigMap = () => ({isNightTheme: configNightMode()});
+                    java.getThemeConfig = () => JSON.stringify(java.getThemeConfigMap());
                     const chineseConvert = (direction, value) => {
                         const text = String(value == null ? '' : value);
                         if (text.length > 65536) {
@@ -74,7 +119,7 @@
                         const raw = source.getLoginHeader();
                         if (raw == null) return null;
                         let value;
-                        try { value = JSON.parse(raw); } catch (_) { return null; }
+                        try { value = JSON.parse(raw); } catch { return null; }
                         return value && typeof value === 'object' && !Array.isArray(value)
                             ? new NativeMap(Object.entries(value).map(([key, item]) => [key, String(item)]))
                             : null;
@@ -91,6 +136,9 @@
                             return;
                         }
                         nativeSourceSetVariable(String(value));
+                    };
+                    globalThis.source.putVariable = function(value) {
+                        globalThis.source.setVariable(value);
                     };
                     const nativeBase64Encode = java.base64Encode;
                     const nativeBase64Decode = java.base64Decode;
@@ -165,13 +213,13 @@
                             try {
                                 const parsed = JSON.parse(headers);
                                 return JSON.stringify(parsed && typeof parsed === 'object' ? parsed : {});
-                            } catch (_) { return '{}'; }
+                            } catch { return '{}'; }
                         }
                         return typeof headers === 'object' ? JSON.stringify(headers) : '{}';
                     };
                     const responseFromJson = value => {
                         let raw;
-                        try { raw = JSON.parse(String(value || '{}')); } catch (_) { raw = {}; }
+                        try { raw = JSON.parse(String(value || '{}')); } catch { raw = {}; }
                         let body = String(raw.body == null ? '' : raw.body);
                         let charset = raw.charset == null ? null : String(raw.charset);
                         const headers = Object.assign({}, raw.headers || {});
@@ -227,10 +275,21 @@
                         };
                     };
                     const nativeVariableGet = java.__nativeVariableGet;
-                    java.ajax = value => {
-                        const target = Array.isArray(value) ? value[0] : value;
-                        return java.__nativeAjax(String(target == null ? '' : target));
+                    const requestCallTimeout = value => {
+                        if (value == null) return undefined;
+                        if (!Number.isInteger(value) || value < 1 || value > 120000) {
+                            throw new TypeError('callTimeout must be an integer from 1 to 120000 milliseconds');
+                        }
+                        return value;
                     };
+                    java.ajax = (value, callTimeout) => {
+                        const target = Array.isArray(value) ? value[0] : value;
+                        return java.__nativeAjax(String(target == null ? '' : target), requestCallTimeout(callTimeout));
+                    };
+                    // UI belongs to the host; native only collects interactive login actions.
+                    java.openUrl = (url, mimeType) => java.__openUrl(
+                        String(url == null ? '' : url),
+                        mimeType == null ? null : String(mimeType));
                     java.importScript = path => {
                         const value = java.__importScript(String(path == null ? '' : path));
                         if (value == null) {
@@ -243,17 +302,17 @@
                         String(url == null ? '' : url),
                         String(js == null ? '' : js)
                     );
-                    java.get = function(url, headers) {
+                    java.get = function(url, headers, timeout) {
                         const target = String(url == null ? '' : url);
                         if (arguments.length < 2 && !/^https?:\/\//i.test(target)) {
                             return nativeVariableGet(target);
                         }
-                        return responseFromJson(java.__nativeGet(target, headersJson(headers)));
+                        return responseFromJson(java.__nativeGet(target, headersJson(headers), requestCallTimeout(timeout)));
                     };
-                    java.post = (url, body, headers) => responseFromJson(java.__nativePost(
-                        String(url), String(body == null ? '' : body), headersJson(headers)));
-                    java.head = (url, headers) => responseFromJson(java.__nativeHead(
-                        String(url), headersJson(headers)));
+                    java.post = (url, body, headers, timeout) => responseFromJson(java.__nativePost(
+                        String(url), String(body == null ? '' : body), headersJson(headers), requestCallTimeout(timeout)));
+                    java.head = (url, headers, timeout) => responseFromJson(java.__nativeHead(
+                        String(url), headersJson(headers), requestCallTimeout(timeout)));
                     const callableString = text => new Proxy(() => text, {
                         get(target, key) {
                             if (key === Symbol.toPrimitive || key === 'toJSON') return () => text;
@@ -267,10 +326,12 @@
                     const strResponseFromJson = value => {
                         let raw;
                         try { raw = typeof value === 'string' ? JSON.parse(value) : value || {}; }
-                        catch (_) { raw = {}; }
+                        catch { raw = {}; }
                         const bodyText = String(raw.body == null ? '' : raw.body);
                         const url = String(raw.url || '');
                         const code = Number(raw.code ?? raw.status ?? 200);
+                        const callTime = Number(raw.callTime ?? 0);
+                        const errorBody = raw.errorBody ?? null;
                         const message = String(raw.message == null ? 'OK' : raw.message);
                         const headers = Object.assign({}, raw.headers || {});
                         const responseHeaders = Object.assign({}, headers, {
@@ -309,6 +370,8 @@
                             message: () => message,
                             headers: () => responseHeaders,
                             raw: () => rawResponse,
+                            callTime: () => callTime,
+                            errorBody: () => errorBody,
                             isSuccessful: () => isSuccessful,
                             toString: () => rawResponse.toString(),
                             toJSON: () => ({
@@ -318,16 +381,70 @@
                                 code,
                                 message,
                                 headers,
-                                isSuccessful
+                                isSuccessful,
+                                callTime,
+                                errorBody
                             })
                         };
                     };
                     globalThis.__readerMakeStrResponse = strResponseFromJson;
-                    java.connect = (url, headers) => strResponseFromJson(
+                    if (java.__loginGetStrResponse) {
+                        let initializingLoginUrl = false;
+                        java.initUrl = function() {
+                            if (arguments.length) throw new TypeError('initUrl takes no arguments');
+                            if (initializingLoginUrl) throw new Error('recursive initUrl is not supported');
+                            initializingLoginUrl = true;
+                            try {
+                                const updated = JSON.parse(java.__loginInitUrl());
+                                java.url = updated.url;
+                                java.ruleUrl = updated.ruleUrl;
+                            } finally {
+                                initializingLoginUrl = false;
+                            }
+                        };
+                        java.getResponse = function() {
+                            if (arguments.length) throw new TypeError('getResponse takes no arguments');
+                            const headers = JSON.parse(java.__loginGetResponseHeaders());
+                            const facade = { get(name) {
+                                const key = String(name).toLowerCase();
+                                for (let i = headers.length - 1; i >= 0; i--) {
+                                    if (headers[i][0].toLowerCase() === key) return headers[i][1];
+                                }
+                                return null;
+                            }};
+                            return { headers: () => facade };
+                        };
+                        let retryingLoginRequest = false;
+                        java.getStrResponse = function(jsStr, sourceRegex, useWebView) {
+                            const directHttp = arguments.length === 3
+                                && jsStr == null && sourceRegex == null && useWebView === false;
+                            const defaultHttp = arguments.length === 2 && jsStr == null && sourceRegex == null;
+                            if (arguments.length !== 0 && !defaultHttp && !directHttp) {
+                                throw new TypeError('getStrResponse arguments are not supported by this host');
+                            }
+                            if (retryingLoginRequest) {
+                                throw new Error('recursive getStrResponse is not supported');
+                            }
+                            retryingLoginRequest = true;
+                            try {
+                                return strResponseFromJson(java.__loginGetStrResponse(!directHttp));
+                            } finally {
+                                retryingLoginRequest = false;
+                            }
+                        };
+                    }
+                    java.connect = (url, headers, callTimeout) => strResponseFromJson(
                         java.__nativeConnect(
-                            String(url), headers == null ? '' : headersJson(headers)));
+                            String(url), headers == null ? '' : headersJson(headers), requestCallTimeout(callTimeout)));
                     java.ajaxAll = urls => Array.from(urls || [], url =>
                         strResponseFromJson(java.__nativeAjaxAllItem(String(url))));
+                    java.ajaxTestAll = (urls, timeout, _skipRateLimit) => {
+                        // Rate limiting belongs to the host; keep this batch serial like ajaxAll.
+                        const ms = requestCallTimeout(timeout);
+                        if (ms === undefined) throw new TypeError('ajaxTestAll requires a timeout');
+                        return Array.from(urls || [], url =>
+                            strResponseFromJson(java.__nativeAjaxTestAllItem(String(url), ms)));
+                    };
                     java.strToBytes = (value, charset) => JSON.parse(
                         java.__strToBytes(String(value), charset == null ? '' : String(charset)));
                     java.bytesToStr = (bytes, charset) => java.__bytesToStr(
@@ -387,6 +504,110 @@
                             error.kind = 'invalid_response'; throw error;
                         }
                     };
+                    java.cacheFile = (url, saveTime = 0) => {
+                        if (typeof url !== 'string' || !url.trim()
+                            || !Number.isInteger(saveTime) || saveTime < 0 || saveTime > 2147483647) {
+                            throw new TypeError('cacheFile requires a URL and non-negative integer TTL in seconds');
+                        }
+                        const key = 'cacheFile:' + java.md5Encode(url);
+                        const cached = globalThis.cache.getFile(key);
+                        if (cached !== null && cached.trim() !== '') return cached;
+                        const text = java.__cacheFileText(url);
+                        if (text.trim() !== '') globalThis.cache.putFile(key, text, saveTime);
+                        return text;
+                    };
+                    // Limited QueryTTF objects are private maps, never persistent native handles.
+                    const fontObjects = new WeakMap();
+                    const fontCache = new NativeMap();
+                    const fontBlanks = new Set([9,32,160,8194,8195,8199,8202,8203,8204,8205,8239,8287]);
+                    const fontFailure = (kind, message) => {
+                        const error = new Error(message); error.kind = kind; throw error;
+                    };
+                    java.queryTTF = function(data, useCache = true) {
+                        if (data == null) return null;
+                        if (typeof useCache !== 'boolean') throw new TypeError('queryTTF cache flag must be boolean');
+                        let input;
+                        if (typeof data === 'string') {
+                            if (data.length > 1048576) fontFailure('limit_exceeded', 'font input too large');
+                            input = data;
+                        } else if (Array.isArray(data) || data instanceof Uint8Array) {
+                            if (data.length > 524288) fontFailure('limit_exceeded', 'font byte input too large');
+                            input = Array.from(data, byte => {
+                                if (!Number.isInteger(byte) || byte < -128 || byte > 255) {
+                                    throw new TypeError('invalid font byte');
+                                }
+                                return (byte + 256) % 256;
+                            });
+                        } else return null;
+                        const key = useCache ? java.digestHex(JSON.stringify(input), 'SHA-256') : null;
+                        if (useCache && fontCache.has(key)) return fontCache.get(key);
+                        let bytes;
+                        if (typeof input !== 'string') bytes = input;
+                        else if (/^https?:\/\//i.test(input)) {
+                            let response;
+                            try { response = JSON.parse(java.__fontInput(input)); }
+                            catch { fontFailure('invalid_response', 'invalid font download response'); }
+                            if (!response.ok) fontFailure(response.error.kind, response.error.message);
+                            bytes = response.data;
+                        } else bytes = java.base64DecodeToByteArray(input);
+                        if (!Array.isArray(bytes) || bytes.length > 524288
+                            || !bytes.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255)) {
+                            fontFailure('invalid_response', 'invalid downloaded font bytes');
+                        }
+                        const parsed = java.hostCall('font.parse', {data: bytes});
+                        if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.entries)
+                            || parsed.entries.length > 8192) fontFailure('invalid_response', 'invalid font metadata');
+                        const characters = new NativeMap();
+                        for (const entry of parsed.entries) {
+                            if (!Array.isArray(entry) || entry.length !== 3
+                                || !Number.isInteger(entry[0]) || entry[0] < 0 || entry[0] > 65535
+                                || !Number.isInteger(entry[1]) || entry[1] < 1 || entry[1] >= 8192
+                                || characters.has(entry[0])
+                                || (entry[2] !== false && (typeof entry[2] !== 'string' || !/^[0-9a-f]{64}$/.test(entry[2])))) {
+                                fontFailure('invalid_response', 'invalid font mapping');
+                            }
+                            characters.set(entry[0], entry[2]);
+                        }
+                        const object = Object.freeze({});
+                        fontObjects.set(object, {characters, inverse: null});
+                        if (useCache) {
+                            if (fontCache.size >= 4) fontCache.delete(fontCache.keys().next().value);
+                            fontCache.set(key, object);
+                        }
+                        return object;
+                    };
+                    java.queryBase64TTF = data => java.queryTTF(data);
+                    java.replaceFont = function(text, errorFont, correctFont, filter = false) {
+                        text = String(text);
+                        if (errorFont == null || correctFont == null) return text;
+                        if (text.length > 262144) fontFailure('limit_exceeded', 'font replacement text too large');
+                        const error = fontObjects.get(errorFont), correct = fontObjects.get(correctFont);
+                        if (!error || !correct) throw new TypeError('replaceFont requires queryTTF objects from this context');
+                        if (!correct.inverse) {
+                            const inverse = new NativeMap();
+                            for (const [cp, hash] of correct.characters) {
+                                if (hash === false) continue;
+                                if (inverse.has(hash) && inverse.get(hash) !== cp) {
+                                    fontFailure('unsupported', 'reference font has ambiguous glyph mappings');
+                                }
+                                inverse.set(hash, cp);
+                            }
+                            correct.inverse = inverse;
+                        }
+                        const output = [];
+                        for (const char of text) {
+                            const cp = char.codePointAt(0);
+                            if (fontBlanks.has(cp)) { output.push(char); continue; }
+                            const hash = error.characters.get(cp);
+                            if (hash === undefined || hash === false) {
+                                if (!filter) output.push(char);
+                                continue;
+                            }
+                            const target = correct.inverse.get(hash);
+                            output.push(target && String.fromCodePoint(target) || char);
+                        }
+                        return output.join('');
+                    };
                     const nativeCacheGet = globalThis.cache.get;
                     const nativeCachePut = globalThis.cache.put;
                     const nativeCacheDelete = globalThis.cache.delete;
@@ -399,7 +620,7 @@
                         if (typeof value === 'string') stored = value;
                         else {
                             try { stored = JSON.stringify(value); }
-                            catch (_) { stored = String(value); }
+                            catch { stored = String(value); }
                         }
                         if (stored === undefined) stored = String(value);
                         const ok = saveTime == null

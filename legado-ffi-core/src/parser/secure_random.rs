@@ -1,5 +1,19 @@
 use ring::rand::{SecureRandom, SystemRandom};
 
+// Bound a single native call, including on low-memory 32-bit devices.
+const MAX_RANDOM_BYTES: usize = 4096;
+
+pub(crate) fn bytes(length: i32) -> anyhow::Result<Vec<i8>> {
+    anyhow::ensure!(length >= 0 && (length as usize) <= MAX_RANDOM_BYTES, "invalid random byte length");
+    let mut result = vec![0u8; length as usize];
+    if !result.is_empty() {
+        SystemRandom::new()
+            .fill(&mut result)
+            .map_err(|_| anyhow::anyhow!("secure random source unavailable"))?;
+    }
+    Ok(result.into_iter().map(|byte| byte as i8).collect())
+}
+
 pub(crate) fn next_int(bound: i32) -> anyhow::Result<i32> {
     anyhow::ensure!(bound > 0, "positive SecureRandom bound required");
     let random = SystemRandom::new();
@@ -31,6 +45,15 @@ fn sample_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_random_bytes_have_valid_lengths_and_bounds() {
+        assert!(bytes(-1).is_err());
+        assert!(bytes(4097).is_err());
+        assert!(bytes(0).unwrap().is_empty());
+        assert_eq!(bytes(16).unwrap().len(), 16);
+        assert_eq!(bytes(4096).unwrap().len(), 4096);
+    }
 
     #[test]
     fn incomplete_bucket_is_rejected_before_modulo() {
