@@ -77,6 +77,24 @@ jobs:
           toolchain: stable
           target: ${{ matrix.target }}
 
+      - name: Setup Python for dependency patches
+        if: >-
+          inputs.publish || inputs.target == 'all' ||
+          inputs.target == matrix.target
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Prepare patched dependencies
+        if: >-
+          inputs.publish || inputs.target == 'all' ||
+          inputs.target == matrix.target
+        shell: bash
+        run: |
+          patch --version
+          cargo fetch --locked --manifest-path legado-ffi-core/Cargo.toml --target ${{ matrix.target }}
+          python legado-ffi-core/scripts/prepare-quickjs.py
+
       - name: Install Cross
         if: >-
           matrix.use_cross == true &&
@@ -93,7 +111,7 @@ jobs:
           (inputs.publish || inputs.target == 'all' ||
           inputs.target == matrix.target) &&
           matrix.use_cross == true
-        run: cross build --target ${{ matrix.target }} --release --lib
+        run: cross build --locked --target ${{ matrix.target }} --release --lib
         working-directory: legado-ffi-core
         env:
           CARGO_PROFILE_RELEASE_LTO: thin
@@ -108,7 +126,7 @@ jobs:
           (inputs.publish || inputs.target == 'all' ||
           inputs.target == matrix.target) &&
           matrix.use_cross == false
-        run: cargo build --target ${{ matrix.target }} --release --lib
+        run: cargo build --locked --target ${{ matrix.target }} --release --lib
         working-directory: legado-ffi-core
 
       - name: Zip Artifact (Linux/Android)
@@ -203,6 +221,18 @@ jobs:
             bindgen_args+=" --sysroot=$sysroot"
             echo "BINDGEN_EXTRA_CLANG_ARGS=$bindgen_args"
           } >> "$GITHUB_ENV"
+
+      - name: Setup Python for dependency patches
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Prepare patched dependencies
+        shell: bash
+        run: |
+          patch --version
+          cargo +"${RUST_NIGHTLY}" fetch --locked --manifest-path legado-ffi-core/Cargo.toml --target armv7-unknown-linux-gnueabi
+          python legado-ffi-core/scripts/prepare-quickjs.py
 
       - name: Build Kindle library and target std
         env:
@@ -319,6 +349,24 @@ jobs:
             bindgen_args+=" --sysroot=$sysroot"
             echo "BINDGEN_EXTRA_CLANG_ARGS=$bindgen_args"
           } >> "$GITHUB_ENV"
+
+      - name: Setup Python for dependency patches
+        if: >-
+          inputs.publish || inputs.target == 'all' ||
+          inputs.target == matrix.target
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Prepare patched dependencies
+        if: >-
+          inputs.publish || inputs.target == 'all' ||
+          inputs.target == matrix.target
+        shell: bash
+        run: |
+          patch --version
+          cargo +"${RUST_NIGHTLY}" fetch --locked --manifest-path legado-ffi-core/Cargo.toml --target ${{ matrix.target }}
+          python legado-ffi-core/scripts/prepare-quickjs.py
 
       - name: Build library and target std
         if: >-
