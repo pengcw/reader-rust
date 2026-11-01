@@ -16,7 +16,8 @@
                             }
                             obj = obj[part];
                         }
-                        return !!obj && Object.prototype.hasOwnProperty.call(obj, '__javaName');
+                        return !!obj && Object.prototype.hasOwnProperty.call(obj, '__javaCompatClass')
+                            && obj.__javaCompatClass === true;
                     };
                     java.startBrowser = function(url, title, html) {
                         if (!java.__browserPreview(String(url || ''), String(title || ''), String(html || ''))) {
@@ -334,10 +335,17 @@
                         const errorBody = raw.errorBody ?? null;
                         const message = String(raw.message == null ? 'OK' : raw.message);
                         const headers = Object.assign({}, raw.headers || {});
+                        const headerValues = raw.headerValues || {};
                         const responseHeaders = Object.assign({}, headers, {
                             get(name) {
                                 const key = Object.keys(headers).find(k => k.toLowerCase() === String(name).toLowerCase());
                                 return key === undefined ? null : headers[key];
+                            },
+                            values(name) {
+                                const key = Object.keys(headerValues).find(k => k.toLowerCase() === String(name).toLowerCase());
+                                if (key !== undefined) return [...headerValues[key]];
+                                const value = this.get(name);
+                                return value == null ? [] : [value];
                             },
                             names: () => Object.keys(headers),
                             toMultimap: () => Object.assign({}, headers)
@@ -381,6 +389,7 @@
                                 code,
                                 message,
                                 headers,
+                                headerValues,
                                 isSuccessful,
                                 callTime,
                                 errorBody
@@ -389,6 +398,38 @@
                     };
                     globalThis.__readerMakeStrResponse = strResponseFromJson;
                     if (java.__loginGetStrResponse) {
+                        // A single facade reads the active RequestSpec on every operation.
+                        // Never mutate source defaults or return an unlinked Map snapshot.
+                        const currentHeaders = () => JSON.parse(java.__loginHeaderMap());
+                        const findHeader = name => currentHeaders().find(
+                            ([key]) => key === String(name));
+                        const headerMap = {
+                            get(name) {
+                                const pair = findHeader(name);
+                                return pair ? pair[1] : null;
+                            },
+                            containsKey(name) { return !!findHeader(name); },
+                            put(name, value) {
+                                const old = this.get(name);
+                                java.__loginPutHeaders(JSON.stringify([[String(name), String(value)]]));
+                                return old;
+                            },
+                            putAll(values) {
+                                const pairs = values instanceof NativeMap ? [...values.entries()]
+                                    : values && typeof values === 'object' && !Array.isArray(values)
+                                        ? Object.entries(values) : null;
+                                if (!pairs) throw new TypeError('putAll expects a map');
+                                java.__loginPutHeaders(JSON.stringify(pairs.map(([name, value]) =>
+                                    [String(name), String(value)])));
+                            },
+                            size() { return currentHeaders().length; },
+                            isEmpty() { return currentHeaders().length === 0; }
+                        };
+                        java.getHeaderMap = function() {
+                            if (arguments.length) throw new TypeError('getHeaderMap takes no arguments');
+                            return headerMap;
+                        };
+                        java.headerMap = headerMap;
                         let initializingLoginUrl = false;
                         java.initUrl = function() {
                             if (arguments.length) throw new TypeError('initUrl takes no arguments');

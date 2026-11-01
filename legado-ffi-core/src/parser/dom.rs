@@ -4,9 +4,34 @@ use ego_tree::NodeId;
 use rquickjs::{function::Func, Ctx, Function, Value};
 use scraper::{ElementRef, Html, Selector};
 use serde_json::{json, Value as JsonValue};
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{cell::RefCell, collections::{HashMap, HashSet}, rc::Rc};
 
 pub(crate) type SharedDocument = Rc<RefCell<Option<Rc<SharedTree>>>>;
+
+// A separate, bounded input slot for native Jsoup callbacks. The existing
+// SharedTree handles rule-field node descriptors, not arbitrary JS HTML strings.
+#[derive(Default)]
+pub(crate) struct HtmlQueryCache(RefCell<Option<(String, Rc<Html>)>>);
+
+impl HtmlQueryCache {
+    pub(crate) fn with_document<T>(&self, content: &str, f: impl FnOnce(&Html) -> T) -> T {
+        const MAX_HTML_BYTES: usize = 512 * 1024;
+        if content.len() > MAX_HTML_BYTES {
+            // Do not retain the previous cached tree while parsing a large page.
+            self.0.borrow_mut().take();
+            return f(&html::parse_document(content));
+        }
+        let document = {
+            let mut slot = self.0.borrow_mut();
+            if !slot.as_ref().is_some_and(|(source, _)| source == content) {
+                slot.take(); // Drop the old tree before allocating a different one.
+                *slot = Some((content.to_owned(), Rc::new(html::parse_document(content))));
+            }
+            Rc::clone(&slot.as_ref().unwrap().1)
+        };
+        f(&document)
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct SharedTree {
@@ -84,9 +109,7 @@ impl NodeContext {
         let value = match operation {
             "attr" => json!(element.value().attr(argument).unwrap_or("")),
             "hasAttr" => json!(element.value().attr(argument).is_some()),
-            "text" => json!(html::normalize_jsoup_text_node(
-                &element.text().collect::<Vec<_>>().join(" ")
-            )),
+            "text" => json!(html::jsoup_element_text(&element)),
             "ownText" => {
                 let preserve_whitespace = std::iter::once(element)
                     .chain(element.ancestors().filter_map(ElementRef::wrap))
@@ -135,6 +158,15 @@ impl NodeContext {
                         .unwrap_or(JsonValue::Null)
                 }
             }
+            "nextElementSibling" => {
+                let (index, parent_path) = indices.split_last().expect("validated DOM path");
+                let mut next_path = parent_path.to_vec();
+                next_path.push(index + 1);
+                self.element(&next_path)
+                    .map(&mut descriptor)
+                    .transpose()?
+                    .unwrap_or(JsonValue::Null)
+            }
             "elementSiblingIndex" => json!(indices.last().copied().unwrap_or(0)),
             "children" => {
                 let nodes: Vec<_> = element
@@ -155,6 +187,7 @@ impl NodeContext {
                     anyhow::bail!("Invalid DOM selector");
                 }
                 let mut nodes = Vec::new();
+                let mut seen = HashSet::new();
                 let matches_self = match Selector::parse(argument) {
                     Ok(selector) => selector.matches_with_scope(&element, Some(element)),
                     Err(_) => html::select_css_list(&self.document.html, argument)
@@ -162,10 +195,11 @@ impl NodeContext {
                         .any(|candidate| candidate.id() == element.id()),
                 };
                 if matches_self {
+                    seen.insert(element.id());
                     nodes.push(element);
                 }
                 for candidate in html::select_css_from_element(element, argument) {
-                    if nodes.iter().all(|node| node.id() != candidate.id()) {
+                    if seen.insert(candidate.id()) {
                         nodes.push(candidate);
                     }
                     if nodes.len() > 4096 {

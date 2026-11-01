@@ -265,7 +265,7 @@ fn parse_css_selector(css_selector: &str) -> Option<Selector> {
 
 // Jsoup's regex pseudos inspect the matched element's text, before evaluating
 // sibling/descendant combinators. Leave regex metacharacters untouched.
-fn split_jsoup_matches(selector: &str) -> Option<(&str, &str, &str, bool)> {
+fn split_jsoup_matches(selector: &str) -> Option<(&str, &str, &str, bool, bool)> {
     let mut quote = None;
     let mut bracket_depth = 0usize;
     let mut escaped = false;
@@ -289,13 +289,16 @@ fn split_jsoup_matches(selector: &str) -> Option<(&str, &str, &str, bool)> {
             '[' => bracket_depth += 1,
             ']' => bracket_depth = bracket_depth.saturating_sub(1),
             ':' if bracket_depth == 0 => {
-                let (start, own) = if selector[index..].starts_with(":matchesOwn(") {
-                    (index + ":matchesOwn(".len(), true)
-                } else if selector[index..].starts_with(":matches(") {
-                    (index + ":matches(".len(), false)
-                } else {
-                    continue;
-                };
+                let (start, own, whole) =
+                    if selector[index..].starts_with(":matchesWholeOwnText(") {
+                        (index + ":matchesWholeOwnText(".len(), true, true)
+                    } else if selector[index..].starts_with(":matchesOwn(") {
+                        (index + ":matchesOwn(".len(), true, false)
+                    } else if selector[index..].starts_with(":matches(") {
+                        (index + ":matches(".len(), false, false)
+                    } else {
+                        continue;
+                    };
                 let prefix = selector[..index].trim();
                 let prefix = if prefix.is_empty() { "*" } else { prefix };
                 let mut depth = 1usize;
@@ -333,6 +336,7 @@ fn split_jsoup_matches(selector: &str) -> Option<(&str, &str, &str, bool)> {
                                     &selector[start..end],
                                     &selector[end + 1..],
                                     own,
+                                    whole,
                                 ));
                             }
                         }
@@ -367,7 +371,7 @@ fn select_css_with_matches<'a>(
     selector: &str,
     select: impl Fn(&str) -> Vec<ElementRef<'a>>,
 ) -> Option<Vec<ElementRef<'a>>> {
-    let (prefix, pattern, suffix, own) = split_jsoup_matches(selector)?;
+    let (prefix, pattern, suffix, own, whole) = split_jsoup_matches(selector)?;
     if !matches_suffix_valid(suffix) || !crate::parser::source_regex::is_valid(pattern) {
         return Some(Vec::new());
     }
@@ -375,17 +379,22 @@ fn select_css_with_matches<'a>(
         select(prefix)
             .into_iter()
             .filter(|el| {
+                let separator = if whole { "" } else { " " };
                 let text = if own {
                     el.children()
                         .filter_map(|node| node.value().as_text())
                         .map(|node| node.text.as_ref())
                         .collect::<Vec<_>>()
-                        .join(" ")
+                        .join(separator)
                 } else {
-                    el.text().collect::<Vec<_>>().join(" ")
+                    el.text().collect::<Vec<_>>().join(separator)
                 };
-                let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                crate::parser::source_regex::captures_first(pattern, &normalized).is_some()
+                let matched_text = if whole {
+                    text
+                } else {
+                    text.split_whitespace().collect::<Vec<_>>().join(" ")
+                };
+                crate::parser::source_regex::captures_first(pattern, &matched_text).is_some()
             })
             .flat_map(|el| {
                 let suffix = suffix.trim();
@@ -535,7 +544,7 @@ fn split_contains_sibling(suffix: &str) -> (&str, &str) {
 }
 
 fn css_contains_text(element: &ElementRef<'_>, normalized_needle: &str) -> bool {
-    let text = element.text().collect::<Vec<_>>().join(" ");
+    let text = jsoup_element_text(element);
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
     normalized.to_lowercase().contains(normalized_needle)
 }
@@ -717,7 +726,7 @@ fn css_fragment_is_valid(css: &str) -> bool {
                 };
                 !branch.is_empty() && css_fragment_is_valid(&scoped)
             })
-    } else if let Some((prefix, pattern, suffix, _)) = split_jsoup_matches(css) {
+    } else if let Some((prefix, pattern, suffix, _, _)) = split_jsoup_matches(css) {
         parse_css_selector(prefix).is_some()
             && crate::parser::source_regex::is_valid(pattern)
             && matches_suffix_valid(suffix)
@@ -1407,14 +1416,60 @@ fn select_with_combination<'a>(doc: &'a Html, rule: &str) -> Vec<ElementRef<'a>>
     result
 }
 
+/// Jsoup's Element.text(): inline nodes concatenate without synthetic spaces;
+/// blocks and <br> separate readable text. Normalize whitespace across nodes.
+pub(crate) fn jsoup_element_text(el: &ElementRef) -> String {
+    fn separate(text: &mut String) {
+        if !text.is_empty() && !text.ends_with(' ') {
+            text.push(' ');
+        }
+    }
+
+    fn visit(el: ElementRef<'_>, text: &mut String) {
+        for node in el.children() {
+            if let Some(value) = node.value().as_text() {
+                for ch in value.text.chars() {
+                    if matches!(ch, ' ' | '\t' | '\n' | '\r' | '\x0c' | '\u{00a0}') {
+                        separate(text);
+                    } else if !matches!(ch, '\u{200b}' | '\u{00ad}') {
+                        text.push(ch);
+                    }
+                }
+            } else if let Some(child) = ElementRef::wrap(node) {
+                let tag = child.value().name();
+                let block = matches!(
+                    tag,
+                    "address" | "article" | "aside" | "blockquote" | "br" | "dd" | "div"
+                        | "dl" | "dt" | "fieldset" | "figcaption" | "figure" | "footer"
+                        | "form" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "header"
+                        | "hr" | "li" | "main" | "nav" | "ol" | "p" | "section"
+                        | "table" | "tbody" | "td" | "th" | "tr" | "ul"
+                );
+                if block {
+                    separate(text);
+                }
+                if !matches!(tag, "script" | "style") {
+                    visit(child, text);
+                }
+                if block {
+                    separate(text);
+                }
+            }
+        }
+    }
+
+    let mut text = String::new();
+    visit(*el, &mut text);
+    text.trim().to_string()
+}
+
 /// Extract text from element with various Legado extractors
 pub fn extract_text(el: &ElementRef, extractor: &str) -> Option<String> {
     let extractor = extractor.trim();
 
     match extractor {
         "text" | "@text" => {
-            let text = el.text().collect::<Vec<_>>().join(" ");
-            let text = text.trim().to_string();
+            let text = jsoup_element_text(el);
             if text.is_empty() {
                 None
             } else {
@@ -1691,7 +1746,26 @@ pub fn select_all_text(doc: &Html, rule: &str) -> Option<String> {
 }
 
 pub fn select_text(doc: &Html, rule: &str) -> Option<String> {
-    select_text_list(doc, rule).into_iter().next()
+    // Composite and chained rules retain the existing full-list semantics.
+    if split_top_level(rule, &["&&", "||", "%%"]).delimiter.is_some()
+        || split_top_level(rule, &["@@"]).delimiter.is_some()
+    {
+        return select_text_list(doc, rule).into_iter().next();
+    }
+
+    let parts = split_top_level(rule, &["@"]).parts;
+    let first = parts.first()?;
+    let matches = collect_matches(doc, &parse_selector_with_index(first.trim()));
+    if parts.len() == 1 {
+        return matches
+            .into_iter()
+            .next()
+            .map(|el| extract_text(&el, "text").unwrap_or_default());
+    }
+    let steps = parse_element_text_steps(&parts[1..].join("@"));
+    matches
+        .into_iter()
+        .find_map(|el| select_text_from_element_with_steps(&el, &steps))
 }
 
 pub fn select_text_list(doc: &Html, rule: &str) -> Vec<String> {

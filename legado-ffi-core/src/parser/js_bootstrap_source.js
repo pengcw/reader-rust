@@ -8,6 +8,8 @@
                         String(key) + '=' + String(value)).join('; ') : null;
                 };
                 source.getTag = () => java.getSource()?.bookSourceName ?? null;
+                source.getBookSourceUrl = () => source.bookSourceUrl ?? source.getKey();
+                source.getConcurrentRate = () => source.concurrentRate ?? null;
                 // User-selected compatibility stub: host rate policy is unchanged.
                 source.putConcurrent = function() { return true; };
                 // Discovery kinds are recomputed per request; there is no result cache to clear.

@@ -71,6 +71,51 @@ pub(super) fn active_login_check_request() -> Option<RequestSpec> {
     LOGIN_CHECK_REQUEST.with(|cell| cell.borrow().as_ref().map(|state| state.spec.clone()))
 }
 
+/// Read the live login request headers, not the source defaults or a detached copy.
+pub(super) fn java_login_header_map() -> Result<String, String> {
+    let spec = active_login_check_request().ok_or("getHeaderMap requires loginCheckJs")?;
+    serde_json::to_string(&spec.headers).map_err(|error| error.to_string())
+}
+
+/// Apply a complete put/putAll call to this loginCheckJs request only.
+/// Validate every pair before touching the prepared spec so failed updates are atomic.
+pub(super) fn java_put_login_headers(raw: &str) -> Result<(), String> {
+    let updates: Vec<(String, String)> =
+        serde_json::from_str(raw).map_err(|_| "invalid request header entries".to_owned())?;
+    for (name, value) in &updates {
+        ureq::http::HeaderName::try_from(name.as_str())
+            .map_err(|_| "invalid request header name".to_owned())?;
+        ureq::http::HeaderValue::try_from(value.as_str())
+            .map_err(|_| "invalid request header value".to_owned())?;
+    }
+    LOGIN_CHECK_REQUEST.with(|cell| {
+        let mut scope = cell.borrow_mut();
+        let request = scope.as_mut().ok_or("getHeaderMap requires loginCheckJs")?;
+        for (name, value) in updates {
+            if let Some(index) = request
+                .spec
+                .headers
+                .iter()
+                .position(|(old, _)| old.eq_ignore_ascii_case(&name))
+            {
+                request.spec.headers[index] = (name.clone(), value);
+                // HTTP field names are case-insensitive: avoid a stale duplicate
+                // Authorization/Cookie overriding this update on the wire.
+                let mut i = request.spec.headers.len();
+                while i > index + 1 {
+                    i -= 1;
+                    if request.spec.headers[i].0.eq_ignore_ascii_case(&name) {
+                        request.spec.headers.remove(i);
+                    }
+                }
+            } else {
+                request.spec.headers.push((name, value));
+            }
+        }
+        Ok(())
+    })
+}
+
 /// Prepare the replacement without holding a RefCell borrow during nested URL JavaScript.
 pub(super) fn java_init_login_url() -> Result<(String, String), String> {
     let state = LOGIN_CHECK_REQUEST
@@ -696,6 +741,15 @@ fn execute_prepared_str_response(
             })
         })
         .collect::<serde_json::Map<String, JsonValue>>();
+    let mut header_values = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for (name, value) in &response.headers {
+        if let Ok(value) = value.to_str() {
+            header_values
+                .entry(name.as_str().to_string())
+                .or_default()
+                .push(value.to_string());
+        }
+    }
     let content_type = response
         .headers
         .get("content-type")
@@ -721,6 +775,7 @@ fn execute_prepared_str_response(
         "code": response.status,
         "message": http_status_message(response.status),
         "headers": headers,
+        "headerValues": header_values,
         "isSuccessful": (200..300).contains(&response.status),
     })
     .to_string()

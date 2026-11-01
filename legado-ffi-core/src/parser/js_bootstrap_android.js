@@ -501,7 +501,9 @@
                             return wrapJavaString(text.slice(start, end));
                         } }
                     });
-                    java.__javaStringResult = value => javaStrings.get(value);
+                    const jsoupDocumentResult = java.__jsoupDocumentResult;
+                    java.__javaStringResult = value => javaStrings.get(value) ?? jsoupDocumentResult(value);
+                    delete java.__jsoupDocumentResult;
                     Object.defineProperty(globalThis, '__rquickjs_string_from_object__', {
                         value: java.__javaStringResult
                     });
@@ -913,6 +915,14 @@
                             }
                             return this[index];
                         }
+                        set(index, value) {
+                            if (arguments.length !== 2 || !Number.isInteger(index) || index < 0 || index >= this.length) {
+                                throw new RangeError('ArrayList index out of bounds');
+                            }
+                            const previous = this[index];
+                            this[index] = value;
+                            return previous;
+                        }
                     }
                     function JavaLinkedHashMap(values) {
                         if (arguments.length > 1) throw new TypeError('unsupported LinkedHashMap constructor');
@@ -1131,6 +1141,9 @@
                             Object.defineProperty(value, '__javaName', {
                                 value: name, configurable: true
                             });
+                            Object.defineProperty(value, '__javaCompatClass', {
+                                value: true, configurable: true
+                            });
                         } catch (_) {}
                         return value;
                     };
@@ -1242,7 +1255,9 @@
                     Packages.java.net.URLEncoder = markClass('URLEncoder', URLEncoder);
                     Packages.java.net.URLDecoder = markClass('URLDecoder', URLDecoder);
                     Packages.java.util.Arrays = markClass('Arrays', Arrays);
-                    Packages.java.util.HashMap = markClass('HashMap', JavaHashMap);
+                    Packages.java.util.HashMap = markClass('HashMap', new Proxy(JavaHashMap, {
+                        apply(Target, _thisArg, args) { return new Target(...args); }
+                    }));
                     Packages.java.util.ArrayList = markClass('ArrayList', JavaArrayList);
                     Packages.java.util.LinkedHashMap = markClass('LinkedHashMap', JavaLinkedHashMap);
                     Packages.java.util.Base64 = markClass('Base64', javaBase64);
@@ -1279,6 +1294,19 @@
                     Packages.cn.hutool.core.util = Packages.cn.hutool.core.util || {};
                     Packages.cn.hutool.crypto = Packages.cn.hutool.crypto || {};
                     Packages.cn.hutool.crypto.digest = Packages.cn.hutool.crypto.digest || {};
+                    Packages.cn.hutool.core.util.StrUtil = markClass('StrUtil', {
+                        reverse(value) {
+                            return value == null ? null : new JavaString(String(value).split('').reverse().join(''));
+                        }
+                    });
+                    Packages.cn.hutool.core.util.ZipUtil = markClass('ZipUtil', {
+                        unGzip(value, charset) {
+                            const bytes = java.gunzipBytes(hutoolBytes(value));
+                            const text = java.__decodeArchiveText(JSON.stringify(bytes), String(charset));
+                            if (text == null) throw new Error('ZipUtil.unGzip: invalid charset');
+                            return new JavaString(text);
+                        }
+                    });
                     Packages.cn.hutool.core.codec.Base64 = markClass('Base64', {
                         encode(value) { return base64.encodeToString(hutoolBytes(value), base64.NO_WRAP); },
                         encodeUrlSafe(value) {
@@ -1306,6 +1334,11 @@
                         }
                     });
                     Packages.cn.hutool.crypto.digest.DigestUtil = markClass('DigestUtil', {
+                        md5(value) {
+                            const bytes = java.__digestBytes(hutoolBytes(value), 'MD5');
+                            if (bytes == null) throw new Error('DigestUtil.md5 failed');
+                            return bytes;
+                        },
                         md5Hex(value) {
                             if (typeof value !== 'string' && !(value instanceof JsString)) {
                                 throw new TypeError('DigestUtil.md5Hex: unsupported non-text input');

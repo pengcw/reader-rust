@@ -12,7 +12,8 @@ pub(crate) use crate::parser::js_http::with_login_check_request;
 use crate::parser::js_http::{
     active_login_check_request, decode_archive_text, java_analyzed_request_body,
     java_analyzed_request_response, java_analyzed_test_request_response, java_archive_input,
-    java_init_login_url, java_login_response_headers, java_request_simple, java_request_simple_response,
+    java_init_login_url, java_login_header_map, java_login_response_headers,
+    java_put_login_headers, java_request_simple, java_request_simple_response,
     java_response_decode_text, java_retry_login_request, java_web_view, resolve_js_lib_entry,
     webview_user_agent,
 };
@@ -48,8 +49,9 @@ use rquickjs::function::Func;
 use rquickjs::{Context, Object, Runtime, Value};
 use serde_json::Value as JsonValue;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ptr::NonNull;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock as Lazy;
@@ -744,6 +746,7 @@ pub(super) fn eval_js_inner_with_source(
 
     let bootstrap_dir = js_bytecode::disk_directory();
     JS_ENV.with(|(runtime, start_time)| {
+        let html_query_cache = Rc::new(dom::HtmlQueryCache::default());
         let mut profile_mark = (*JS_PROFILE_ENABLED).then(Instant::now);
         let mut profile_stages = [0u128; 7];
         let mut profile_cleanup = [0u128; 2];
@@ -834,6 +837,7 @@ pub(super) fn eval_js_inner_with_source(
             if let Some(active_source) = ACTIVE_JS_BOOK_SOURCE.with(|cell| cell.borrow().clone()) {
                 source_obj.set("bookSourceUrl", active_source.book_source_url)?;
                 source_obj.set("bookSourceName", active_source.book_source_name)?;
+                source_obj.set("concurrentRate", active_source.concurrent_rate)?;
                 source_obj.set("bookSourceComment", ctx.json_parse(
                     serde_json::to_string(&active_source.book_source_comment)?,
                 )?)?;
@@ -1470,6 +1474,20 @@ pub(super) fn eval_js_inner_with_source(
             )?;
             if active_login_check_request().is_some() {
                 java_obj.set(
+                    "__loginHeaderMap",
+                    Func::new(|ctx: rquickjs::Ctx<'_>| -> rquickjs::Result<String> {
+                        java_login_header_map()
+                            .map_err(|error| rquickjs::Exception::throw_type(&ctx, &error))
+                    }),
+                )?;
+                java_obj.set(
+                    "__loginPutHeaders",
+                    Func::new(|ctx: rquickjs::Ctx<'_>, entries: String| -> rquickjs::Result<()> {
+                        java_put_login_headers(&entries)
+                            .map_err(|error| rquickjs::Exception::throw_type(&ctx, &error))
+                    }),
+                )?;
+                java_obj.set(
                     "getUserAgent",
                     Func::new(|| -> String {
                         active_login_check_request()
@@ -1967,6 +1985,7 @@ pub(super) fn eval_js_inner_with_source(
 
             let content_for_elements = content_state.clone();
             let base_url_for_elements = base_url_state.clone();
+            let cache_for_elements = Rc::clone(&html_query_cache);
             java_obj.set(
                 "getElements",
                 Func::new(
@@ -1989,6 +2008,7 @@ pub(super) fn eval_js_inner_with_source(
                             &base_url,
                             raw_css.unwrap_or(false),
                             node_identity.unwrap_or(false),
+                            &cache_for_elements,
                         ))
                     },
                 ),
@@ -2252,10 +2272,41 @@ pub(super) fn eval_js_inner_with_source(
 
             eval_fixed_setup_script(ctx.clone(), BootstrapSlot::XPath, bootstrap_dir.as_deref())?;
 
+            let cache_for_text_nodes = Rc::clone(&html_query_cache);
+            globals.get::<_, Object<'_>>("java")?.set(
+                "__jsoupTextNodes",
+                Func::new(move |markup: String| -> String {
+                    cache_for_text_nodes.with_document(&markup, |document| {
+                        let selector = scraper::Selector::parse("body > *").unwrap();
+                        let nodes = document.select(&selector).next()
+                            .into_iter()
+                            .flat_map(|element| element.children().filter_map(|child| {
+                                child.value().as_text().map(|text| text.text.to_string())
+                            }))
+                            .collect::<Vec<_>>();
+                        serde_json::to_string(&nodes).unwrap_or_else(|_| "[]".to_string())
+                    })
+                }),
+            )?;
+            let cache_for_siblings = Rc::clone(&html_query_cache);
             globals.get::<_, Object<'_>>("java")?.set(
                 "__jsoupSiblings",
-                Func::new(|source: String, id: String| -> String {
-                    jsoup_following_siblings_json(&source, &id)
+                Func::new(move |source: String, id: String, reverse: rquickjs::function::Opt<bool>| -> String {
+                    jsoup_siblings_json(&source, &id, reverse.0.unwrap_or(false), &cache_for_siblings)
+                }),
+            )?;
+            let cache_for_ancestors = Rc::clone(&html_query_cache);
+            globals.get::<_, Object<'_>>("java")?.set(
+                "__jsoupAncestors",
+                Func::new(move |source: String, id: String| -> String {
+                    jsoup_ancestors_json(&source, &id, &cache_for_ancestors)
+                }),
+            )?;
+            let cache_for_parents = Rc::clone(&html_query_cache);
+            globals.get::<_, Object<'_>>("java")?.set(
+                "__jsoupParents",
+                Func::new(move |source: String, ids: String| -> String {
+                    jsoup_parents_json(&source, &ids, &cache_for_parents)
                 }),
             )?;
             globals.get::<_, Object<'_>>("java")?.set(
@@ -3113,6 +3164,7 @@ fn java_get_elements_json_with_mode(
     base_url: &str,
     raw_css: bool,
     node_identity: bool,
+    cache: &dom::HtmlQueryCache,
 ) -> String {
     let rule = rule.trim();
     if !raw_css {
@@ -3189,17 +3241,18 @@ fn java_get_elements_json_with_mode(
         rule
     }
     .trim();
-    let document = html::parse_document(content);
-    let elements = if raw_css {
-        html::select_css_list(&document, selector)
-    } else {
-        html::select_list(&document, selector)
-    };
-    let values = elements
-        .into_iter()
-        .map(|element| jsoup_html_element_json(element, node_identity))
-        .collect::<Vec<_>>();
-    serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string())
+    cache.with_document(content, |document| {
+        let elements = if raw_css {
+            html::select_css_list(document, selector)
+        } else {
+            html::select_list(document, selector)
+        };
+        let values = elements
+            .into_iter()
+            .map(|element| jsoup_html_element_json(element, node_identity))
+            .collect::<Vec<_>>();
+        serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string())
+    })
 }
 
 fn jsoup_html_element_json(element: scraper::ElementRef<'_>, with_identity: bool) -> JsonValue {
@@ -3215,29 +3268,73 @@ fn jsoup_html_element_json(element: scraper::ElementRef<'_>, with_identity: bool
         "attrList": attr_list,
         "html": element.inner_html(),
         "outerHtml": element.html(),
-        "text": element.text().collect::<Vec<_>>().join(" ").trim(),
+        "text": html::jsoup_element_text(&element),
     });
     if with_identity {
         item["__readerHtmlNodeId"] = format!("{:?}", element.id()).into();
+        let mut parent = element.parent();
+        let mut ancestors = Vec::new();
+        while let Some(node) = parent {
+            parent = node.parent();
+            if scraper::ElementRef::wrap(node).is_some() {
+                ancestors.push(format!("{:?}", node.id()));
+                if ancestors.len() >= 4096 { break; }
+            }
+        }
+        item["__readerHtmlAncestors"] = serde_json::json!(ancestors);
     }
     item
 }
 
-// Used only by Jsoup.nextElementSibling(); return the remainder in one parse.
-fn jsoup_following_siblings_json(source: &str, id: &str) -> String {
-    let document = html::parse_document(source.trim());
-    let mut next = document.tree.nodes()
-        .find(|node| format!("{:?}", node.id()) == id)
-        .and_then(|node| node.next_sibling());
-    let mut siblings = Vec::new();
-    while let Some(node) = next {
-        next = node.next_sibling();
-        if let Some(element) = scraper::ElementRef::wrap(node) {
-            siblings.push(jsoup_html_element_json(element, true));
-            if siblings.len() >= 4096 { break; }
+// Collect adjacent element siblings once; skip intervening text/comment nodes.
+fn jsoup_siblings_json(source: &str, id: &str, reverse: bool, cache: &dom::HtmlQueryCache) -> String {
+    cache.with_document(source.trim(), |document| {
+        let mut sibling = document.tree.nodes()
+            .find(|node| format!("{:?}", node.id()) == id)
+            .and_then(|node| if reverse { node.prev_sibling() } else { node.next_sibling() });
+        let mut siblings = Vec::new();
+        while let Some(node) = sibling {
+            sibling = if reverse { node.prev_sibling() } else { node.next_sibling() };
+            if let Some(element) = scraper::ElementRef::wrap(node) {
+                siblings.push(jsoup_html_element_json(element, true));
+                if siblings.len() >= 4096 { break; }
+            }
         }
-    }
-    serde_json::to_string(&siblings).unwrap_or_else(|_| "[]".into())
+        serde_json::to_string(&siblings).unwrap_or_else(|_| "[]".into())
+    })
+}
+
+// Jsoup Element.parents(): immediate parent first, excluding the element itself.
+fn jsoup_ancestors_json(source: &str, id: &str, cache: &dom::HtmlQueryCache) -> String {
+    cache.with_document(source.trim(), |document| {
+        let mut parent = document.tree.nodes()
+            .find(|node| format!("{:?}", node.id()) == id)
+            .and_then(|node| node.parent());
+        let mut ancestors = Vec::new();
+        while let Some(node) = parent {
+            parent = node.parent();
+            if let Some(element) = scraper::ElementRef::wrap(node) {
+                ancestors.push(jsoup_html_element_json(element, true));
+                if ancestors.len() >= 4096 { break; }
+            }
+        }
+        serde_json::to_string(&ancestors).unwrap_or_else(|_| "[]".into())
+    })
+}
+
+// Resolve all parent elements requested by a Jsoup selection in one HTML parse.
+fn jsoup_parents_json(source: &str, ids: &str, cache: &dom::HtmlQueryCache) -> String {
+    let wanted: HashSet<String> = serde_json::from_str::<Vec<String>>(ids)
+        .unwrap_or_default().into_iter().collect();
+    if wanted.is_empty() { return "[]".into(); }
+    cache.with_document(source.trim(), |document| {
+        let parents = document.tree.nodes()
+            .filter(|node| wanted.contains(&format!("{:?}", node.id())))
+            .filter_map(scraper::ElementRef::wrap)
+            .map(|element| jsoup_html_element_json(element, true))
+            .collect::<Vec<_>>();
+        serde_json::to_string(&parents).unwrap_or_else(|_| "[]".into())
+    })
 }
 
 fn java_aes_decrypt_byte_array(input: &str) -> Vec<u8> {
@@ -4460,6 +4557,21 @@ mod tests {
             .unwrap(),
             "true"
         );
+    }
+
+    #[test]
+    fn jsoup_import_names_do_not_register_compatibility_classes() {
+        assert_eq!(eval_js(r#"
+            const imported = new JavaImporter(Packages.org.jsoup.Jsoup, Packages.org.jsoup.Connection);
+            Packages.inheritedCompat = Object.create(Packages.java.lang.String);
+            Packages.falseCompat = {__javaCompatClass: false};
+            imported.Jsoup === org.jsoup.Jsoup
+                && imported.Connection === org.jsoup.Connection
+                && !java.hasJavaClass('org.jsoup.Jsoup')
+                && !java.hasJavaClass('org.jsoup.Connection')
+                && !java.hasJavaClass('inheritedCompat')
+                && !java.hasJavaClass('falseCompat')
+        "#, "", "https://example.com").unwrap(), "true");
     }
 
     #[test]

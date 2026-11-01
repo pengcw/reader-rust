@@ -12,7 +12,7 @@ import tempfile
 VERSION = "0.12.2"
 ARCHIVE_SHA256 = "a13ac243b86a74120814ef7e9e30ad5a2c1199b7b9963b1cf7c84e4cdc1cad99"
 SOURCE_SHA256 = "ce9a95d3c011f255c1facb7d4361c71209e71ba58d84acd3281a755d0686a285"
-PATCHED_FILES = ("quickjs/quickjs.c", "quickjs/quickjs-opcode.h", "src/lib.rs")
+PATCHED_FILES = ("quickjs/quickjs.c", "quickjs/quickjs-opcode.h", "src/lib.rs", "build.rs")
 
 
 def digest(path):
@@ -112,9 +112,27 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cargo-home", type=Path,
                         default=Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo")))
+    parser.add_argument("--fetch", action="store_true",
+                        help="Fetch locked dependencies before preparing, outside Cargo path overrides")
+    parser.add_argument("--offline", action="store_true", help="Use only cached dependencies with --fetch")
+    parser.add_argument("--target", help="Optional Cargo fetch target triple")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     cargo_home = args.cargo_home.expanduser().resolve()
+    if args.fetch:
+        cargo = shutil.which("cargo")
+        if cargo is None:
+            raise RuntimeError("cargo is not on PATH; load the Rust environment first")
+        command = [cargo, "fetch", "--locked", "--manifest-path", str(root / "Cargo.toml")]
+        if args.offline:
+            command.append("--offline")
+        if args.target:
+            command.extend(["--target", args.target])
+        # Cargo discovers config from cwd, not --manifest-path. A clean cwd
+        # avoids the crate's paths pointing at not-yet-generated dependencies.
+        with tempfile.TemporaryDirectory(prefix="legado-cargo-fetch-") as cwd:
+            subprocess.run(command, cwd=cwd, check=True,
+                           env={**os.environ, "CARGO_HOME": str(cargo_home)})
     prepare(root, cargo_home)
     prepare_core(root, cargo_home)
 

@@ -1368,22 +1368,24 @@ impl RuleEngine {
                         if let Some((index, _)) =
                             rule_analyzer::find_next_delimiter(selection, &["##"], 0)
                         {
-                            let extracted =
-                                jsonpath::jsonpath_first_string(&v, &selection[..index])
-                                    .unwrap_or_default();
+                            let extracted = json_content_selection(
+                                &v, &selection[..index], base_url, context,
+                            );
                             apply_legado_regex(&extracted, &selection[index..])
                         } else {
-                            jsonpath::jsonpath_first_string(&v, selection).unwrap_or_default()
+                            json_content_selection(&v, selection, base_url, context)
                         }
                     }
                 } else {
                     String::new()
                 }
             }
-            ParseMode::XPath => {
-                html::select_xpath_content(&content_body, self.strip_mode_prefix(content_rule))
-                    .join("\n")
-            }
+            ParseMode::XPath => eval_xpath_content_stages(
+                content_rule,
+                &content_body,
+                base_url,
+                context,
+            ),
             ParseMode::Regex => {
                 let rule_trimmed = self.strip_mode_prefix(content_rule).trim();
                 if rule_trimmed.starts_with("##") {
@@ -1558,6 +1560,22 @@ impl RuleEngine {
                 raw.lines().map(str::to_owned).collect()
             }
         });
+        // An empty <js></js> is a no-op, but its following ## rule still
+        // replaces each selected URL (1148#494 No.1版主).
+        let values = if let Some((script, suffix)) = next_rule
+            .split_once("<js>")
+            .and_then(|(_, tail)| tail.split_once("</js>"))
+        {
+            if script.trim().is_empty() && suffix.trim().starts_with("##") {
+                let mut replacement = SourceRule::compile("", ParseMode::Css, false);
+                replacement.make_up_rule(suffix.trim());
+                values.into_iter().map(|url| replacement.apply_replacement(&url)).collect()
+            } else {
+                values
+            }
+        } else {
+            values
+        };
         // AnalyzeRule.getStringList(isUrl=true) resolves URLs, then keeps
         // only the first occurrence. Do this before BookContent chooses
         // recursive (one link) versus one-shot (multiple links) paging.
@@ -1699,6 +1717,7 @@ impl RuleEngine {
             list_js,
             base_url,
             &list_context,
+            body,
         );
         let mut out = Vec::new();
         for captures in rows {
@@ -1800,6 +1819,51 @@ impl RuleEngine {
         }
 
         let expanded = interpolate_common_templates(next_rule, body, base_url, ctx);
+        // A pure leading JS stage can attach URL request options through its
+        // own ## replacement (1148#922 / aoaostar#612). Apply it per URL.
+        if let Some((script, suffix)) = expanded
+            .strip_prefix("<js>")
+            .and_then(|rest| rest.split_once("</js>"))
+        {
+            if suffix.trim().starts_with("##") {
+                let Ok(output) = eval_js_with_bindings(script, body, base_url, &ctx.js_bindings()) else {
+                    return vec![];
+                };
+                let urls: Vec<String> = parse_js_output_items(&output)
+                    .map(|items| items.iter().filter_map(jsonpath::value_to_string).collect())
+                    .unwrap_or_else(|| output.lines().map(str::to_owned).collect());
+                let mut replacement = SourceRule::compile("", ParseMode::Js, false);
+                replacement.make_up_rule(suffix.trim());
+                return normalize_toc_next_urls(base_url,
+                    urls.into_iter().map(|url| replacement.apply_replacement(&url)).collect());
+            }
+        }
+        // A leading JS result may be parsed by JSONPath before a final JS
+        // list transform (aoaostar#1231 拂袖). Preserve that selected list.
+        if let Some((script, tail)) = expanded
+            .strip_prefix("<js>")
+            .and_then(|rest| rest.split_once("</js>"))
+        {
+            if let Some((selector, final_js)) = tail.trim().split_once("@js:") {
+                let selector = selector.trim();
+                if selector.starts_with("$.") || selector.starts_with("$[")
+                    || starts_with_ascii_case(selector, "@json:")
+                {
+                    let Ok(json) = eval_js_with_bindings(script, body, base_url, &ctx.js_bindings()) else {
+                        return vec![];
+                    };
+                    let Ok(value) = serde_json::from_str::<Value>(&json) else {
+                        return vec![];
+                    };
+                    let values = query_json_list(&value, selector);
+                    let mut stage = SourceRule::compile(final_js, ParseMode::Js, false);
+                    stage.make_up_rule(final_js);
+                    let urls = eval_toc_next_js_stage(values, &stage.rule, base_url, ctx, body);
+                    return normalize_toc_next_urls(base_url,
+                        urls.into_iter().map(|url| stage.apply_replacement(&url)).collect());
+                }
+            }
+        }
         // Split JS before "##": those regex directives belong to the
         // selector output and must run before the JS list transformation.
         let (before_js, post_js) = extract_js(&expanded);
@@ -1857,15 +1921,37 @@ impl RuleEngine {
             raw_urls
         };
         let raw_urls = if let Some(script) = post_js {
-            let values = raw_urls.into_iter().map(Value::String).collect();
-            match eval_list_js_checked_with_source(values, script, base_url, ctx, body) {
-                Ok(Value::Array(items)) => items.iter().filter_map(jsonpath::value_to_string).collect(),
-                Ok(Value::String(output)) => parse_js_output_items(&output)
-                    .map(|items| items.iter().filter_map(jsonpath::value_to_string).collect())
-                    .unwrap_or_else(|| output.lines().map(str::to_owned).collect()),
-                Ok(value) => jsonpath::value_to_string(&value).into_iter().collect(),
-                Err(_) => vec![],
+            eval_toc_next_js_stage(raw_urls.into_iter().map(Value::String).collect(),
+                script, base_url, ctx, body)
+        } else {
+            raw_urls
+        };
+        // Regex after a CSS → JS list stage belongs to the JS output,
+        // and applies to each next-page URL (aoaostar#1065/#2286).
+        let raw_urls = if let Some(suffix) = expanded.split_once("</js>").map(|(_, tail)| tail.trim()) {
+            if suffix.starts_with("##") {
+                let mut replacement = SourceRule::compile("", ParseMode::Js, false);
+                replacement.make_up_rule(suffix);
+                raw_urls.into_iter().map(|url| replacement.apply_replacement(&url)).collect()
+            } else {
+                raw_urls
             }
+        } else {
+            raw_urls
+        };
+        // A separate @js: stage can follow the explicit <js> block.
+        // Its own ## replacement runs on the stage output (aoaostar#954).
+        let raw_urls = if let Some(final_script) = expanded
+            .split_once("</js>")
+            .and_then(|(_, tail)| tail.trim().strip_prefix("@js:"))
+        {
+            let mut stage = SourceRule::compile(final_script, ParseMode::Js, false);
+            stage.make_up_rule(final_script);
+            let urls = eval_toc_next_js_stage(
+                raw_urls.into_iter().map(Value::String).collect(),
+                &stage.rule, base_url, ctx, body,
+            );
+            urls.into_iter().map(|url| stage.apply_replacement(&url)).collect()
         } else {
             raw_urls
         };
@@ -1981,6 +2067,7 @@ impl RuleEngine {
             list_js,
             base_url,
             ctx,
+            body,
         );
         let mut out = Vec::new();
         for captures in rows {
@@ -2063,59 +2150,54 @@ impl RuleEngine {
         let doc = html::parse_document(body);
         let (selector, list_js) = extract_js(list_sel);
         let list_context = RuleVariableContext::for_search_item();
-        let items = apply_html_list_js(
+        let (items, markup, objects) = apply_html_list_js(
             html::select_list(&doc, self.strip_mode_prefix(selector)),
             list_js,
             base_url,
             &list_context,
+            body,
         );
+        if let Some(objects) = objects {
+            return self.search_books_json(
+                source,
+                &Value::Array(objects).to_string(),
+                base_url,
+                rule,
+                "$[*]",
+            );
+        }
+        let post_selector = html_list_post_selector(list_sel);
+        let post_doc = match (markup.as_deref(), post_selector) {
+            (Some(markup), Some(_)) => Some(html::parse_document(markup)),
+            _ => None,
+        };
+        let items = match (post_doc.as_ref(), post_selector) {
+            (Some(doc), Some(selector)) => html::select_list(doc, selector),
+            _ => items,
+        };
         let mut out = Vec::with_capacity(items.len());
 
         for el in items {
             let mut context = RuleVariableContext::for_search_item();
             context.html_document = list_context.html_document.clone();
-            let name = rule
-                .name
-                .as_ref()
-                .and_then(|r| eval_field_html_with_ctx(r, &el, base_url, &mut context))
-                .unwrap_or_default();
+            let text_cache = std::cell::OnceCell::new();
+            let eval_field = |rule: Option<&String>, ctx: &mut RuleVariableContext| {
+                rule.and_then(|rule| {
+                    eval_field_html_with_cached_text(rule, &el, &text_cache, base_url, ctx)
+                })
+            };
+            let name = eval_field(rule.name.as_ref(), &mut context).unwrap_or_default();
             if name.trim().is_empty() {
                 continue;
             }
-            let author = rule
-                .author
-                .as_ref()
-                .and_then(|r| eval_field_html_with_ctx(r, &el, base_url, &mut context))
-                .unwrap_or_default();
-            let book_url = rule
-                .book_url
-                .as_ref()
-                .and_then(|r| eval_field_html_with_ctx(r, &el, base_url, &mut context))
-                .unwrap_or_default();
-            let cover_url = rule
-                .cover_url
-                .as_ref()
-                .and_then(|r| eval_field_html_with_ctx(r, &el, base_url, &mut context));
-            let intro = rule
-                .intro
-                .as_ref()
-                .and_then(|r| eval_field_html_with_ctx(r, &el, base_url, &mut context));
-            let kind = rule
-                .kind
-                .as_ref()
-                .and_then(|r| eval_field_html_with_ctx(r, &el, base_url, &mut context));
-            let last_chapter = rule
-                .last_chapter
-                .as_ref()
-                .and_then(|r| eval_field_html_with_ctx(r, &el, base_url, &mut context));
-            let update_time = rule
-                .update_time
-                .as_ref()
-                .and_then(|r| eval_field_html_with_ctx(r, &el, base_url, &mut context));
-            let word_count = rule
-                .word_count
-                .as_ref()
-                .and_then(|r| eval_field_html_with_ctx(r, &el, base_url, &mut context));
+            let author = eval_field(rule.author.as_ref(), &mut context).unwrap_or_default();
+            let book_url = eval_field(rule.book_url.as_ref(), &mut context).unwrap_or_default();
+            let cover_url = eval_field(rule.cover_url.as_ref(), &mut context);
+            let intro = eval_field(rule.intro.as_ref(), &mut context);
+            let kind = eval_field(rule.kind.as_ref(), &mut context);
+            let last_chapter = eval_field(rule.last_chapter.as_ref(), &mut context);
+            let update_time = eval_field(rule.update_time.as_ref(), &mut context);
+            let word_count = eval_field(rule.word_count.as_ref(), &mut context);
             let book_url_abs = resolve_url(base_url, &book_url);
             let cover_url_abs = cover_url.map(|u| resolve_url(base_url, &u));
             out.push(SearchBook {
@@ -2149,9 +2231,10 @@ impl RuleEngine {
             Err(_) => return vec![],
         };
         let document = package.as_document();
+        let post_selector = html_list_post_selector(list_rule);
         let (list_rule, list_js) = extract_js(list_rule);
         let list_context = RuleVariableContext::for_search_item();
-        let items = apply_xpath_list_js(
+        let (items, markup) = apply_xpath_list_js(
             html::xpath_select_nodes_in_mode(
                 sxd_xpath::nodeset::Node::Root(document.root()),
                 self.strip_mode_prefix(list_rule),
@@ -2161,7 +2244,11 @@ impl RuleEngine {
             base_url,
             &list_context,
             html_mode,
+            body,
         );
+        if let (Some(markup), Some(selector)) = (markup, post_selector) {
+            return self.search_books_html(source, &markup, base_url, rule, selector);
+        }
         let mut out = Vec::with_capacity(items.len());
 
         for item in items {
@@ -2239,13 +2326,15 @@ impl RuleEngine {
             Ok(v) => v,
             Err(_) => return vec![],
         };
-        let (list_rule, list_js) = extract_js(list_rule);
+        let (list_rule, list_js, post_selector) = split_json_list_js(list_rule);
         let list_context = RuleVariableContext::for_search_item();
         let items = apply_json_list_js(
             query_json_list(&v, list_rule),
             list_js,
+            post_selector,
             base_url,
             &list_context,
+            body,
         );
         let mut out = Vec::with_capacity(items.len());
         for item in items {
@@ -2283,7 +2372,7 @@ impl RuleEngine {
                 base_url,
                 &mut context,
             );
-            let kind = eval_field_json_with_ctx(
+            let kind = eval_field_json_kind_with_ctx(
                 rule.kind.as_deref().unwrap_or(""),
                 &item,
                 base_url,
@@ -2732,7 +2821,12 @@ fn parse_book_info_json(
     if let Some(val) = &intro {
         ctx.set_book_field("intro", val);
     }
-    let kind = eval_field_json_with_ctx(rule.kind.as_deref().unwrap_or(""), &scope, base_url, ctx);
+    let kind = eval_field_json_kind_with_ctx(
+        rule.kind.as_deref().unwrap_or(""),
+        &scope,
+        base_url,
+        ctx,
+    );
     if let Some(val) = &kind {
         ctx.set_book_field("kind", val);
     }
@@ -2834,12 +2928,22 @@ fn parse_chapter_list_html(
     }
 
     let (selector, list_js) = extract_js(list_sel);
-    let items = apply_html_list_js(
+    let (items, markup, _objects) = apply_html_list_js(
         html::select_list(&doc, strip_mode_prefix(selector)),
         list_js,
         base_url,
         ctx,
+        body,
     );
+    let post_selector = html_list_post_selector(list_sel);
+    let post_doc = match (markup.as_deref(), post_selector) {
+        (Some(markup), Some(_)) => Some(html::parse_document(markup)),
+        _ => None,
+    };
+    let items = match (post_doc.as_ref(), post_selector) {
+        (Some(doc), Some(selector)) => html::select_list(doc, selector),
+        _ => items,
+    };
     let mut out = Vec::with_capacity(items.len());
 
     for el in items {
@@ -2900,14 +3004,24 @@ fn parse_chapter_list_xpath(
         rule.init.as_deref(),
         html_mode,
     );
+    let post_selector = html_list_post_selector(list_rule);
     let (list_rule, list_js) = extract_js(list_rule);
-    let items = apply_xpath_list_js(
+    let (items, markup) = apply_xpath_list_js(
         html::xpath_select_nodes_in_mode(scope, strip_mode_prefix(list_rule), html_mode),
         list_js,
         base_url,
         ctx,
         html_mode,
+        body,
     );
+    if let (Some(markup), Some(selector)) = (markup, post_selector) {
+        let mut html_rule = rule.clone();
+        html_rule.init = None;
+        html_rule.next_toc_url = None;
+        let (chapters, _) = parse_chapter_list_html(engine, &markup, base_url, &html_rule, selector, ctx);
+        let next_urls = engine.parse_next_toc_urls(body, base_url, rule, ctx);
+        return (chapters, next_urls);
+    }
 
     let mut out = Vec::with_capacity(items.len());
     for item in items {
@@ -3010,12 +3124,18 @@ fn parse_chapter_list_json(
             ctx.insert("cid".to_string(), cid);
         }
     }
-    let (list_rule, list_js) = extract_js(list_rule);
+    let (list_rule, list_js, post_selector) = split_json_list_js(list_rule);
+    let (list_rule, put_entries) = extract_put_entries(list_rule);
+    evaluate_put_entries(&put_entries, ctx, |put_rule, ctx| {
+        eval_field_json_with_ctx(put_rule, &scope, base_url, ctx)
+    });
     let items = apply_json_list_js(
-        jsonpath::jsonpath_query(&scope, strip_mode_prefix(list_rule)),
+        query_json_list(&scope, &list_rule),
         list_js,
+        post_selector,
         base_url,
         ctx,
+        body,
     );
 
     let mut out = Vec::with_capacity(items.len());
@@ -3119,6 +3239,23 @@ pub(crate) fn dedupe_chapters_last_wins(chapters: Vec<BookChapter>) -> Vec<BookC
         }
     }
     out
+}
+
+fn eval_toc_next_js_stage(
+    values: Vec<Value>,
+    script: &str,
+    base_url: &str,
+    ctx: &RuleVariableContext,
+    source_body: &str,
+) -> Vec<String> {
+    match eval_list_js_checked_with_source(values, script, base_url, ctx, source_body) {
+        Ok(Value::Array(items)) => items.iter().filter_map(jsonpath::value_to_string).collect(),
+        Ok(Value::String(output)) => parse_js_output_items(&output)
+            .map(|items| items.iter().filter_map(jsonpath::value_to_string).collect())
+            .unwrap_or_else(|| output.lines().map(str::to_owned).collect()),
+        Ok(value) => jsonpath::value_to_string(&value).into_iter().collect(),
+        Err(_) => vec![],
+    }
 }
 
 fn normalize_toc_next_urls(base_url: &str, urls: Vec<String>) -> Vec<String> {
@@ -3585,9 +3722,10 @@ fn eval_list_js(
     script: Option<&str>,
     base_url: &str,
     ctx: &RuleVariableContext,
+    source_body: &str,
 ) -> Option<Value> {
     let script = script.filter(|script| !script.trim().is_empty())?;
-    eval_list_js_checked(values, script, base_url, ctx).ok()
+    eval_list_js_checked_with_source(values, script, base_url, ctx, source_body).ok()
 }
 
 fn eval_list_js_checked(
@@ -3710,6 +3848,26 @@ fn eval_collection_with_context(
         let json = serde_json::from_str::<Value>(&body).ok();
         return eval_collection_with_context(&body, json.as_ref(), remainder, base_url, ctx);
     }
+    // In getStringList, a replacement between two JS stages transforms each
+    // selected item before the following JS receives the list (aoaostar#157).
+    if let Some((regex, tail)) = post.split_once("<js>") {
+        if regex.trim_start().starts_with("##") {
+            if let Some((script, remainder)) = tail.split_once("</js>") {
+                if remainder.trim().is_empty() {
+                    let mut replacement = SourceRule::compile("", ParseMode::Css, false);
+                    replacement.make_up_rule(regex.trim());
+                    let selected = values.into_iter()
+                        .map(|value| Value::String(replacement.apply_replacement(&value_to_rule_string(value))))
+                        .collect();
+                    return Ok(match eval_list_js_checked(selected, script, base_url, ctx)? {
+                        Value::Array(items) => items,
+                        Value::Null => Vec::new(),
+                        value => vec![value],
+                    });
+                }
+            }
+        }
+    }
     let replace_start = rule_analyzer::find_next_delimiter(post, &["##"], 0)
         .map(|(index, _)| index)
         .unwrap_or(post.len());
@@ -3732,14 +3890,20 @@ fn eval_collection_with_context(
     Ok(values)
 }
 
+fn html_list_post_selector(rule: &str) -> Option<&str> {
+    let tail = rule.split_once("</js>")?.1.trim();
+    (!tail.is_empty() && html::css_rule_is_valid(tail)).then_some(tail)
+}
+
 fn apply_html_list_js<'a>(
     items: Vec<scraper::ElementRef<'a>>,
     script: Option<&str>,
     base_url: &str,
     ctx: &RuleVariableContext,
-) -> Vec<scraper::ElementRef<'a>> {
+    source_body: &str,
+) -> (Vec<scraper::ElementRef<'a>>, Option<String>, Option<Vec<Value>>) {
     if script.is_none() {
-        return items;
+        return (items, None, None);
     }
 
     let values = items
@@ -3757,23 +3921,31 @@ fn apply_html_list_js<'a>(
                 "attrs": attrs,
                 "html": element.inner_html(),
                 "outerHtml": element.html(),
-                "text": element.text().collect::<Vec<_>>().join(" ").trim(),
+                "text": html::jsoup_element_text(element),
             })
         })
         .collect();
 
-    let Some(Value::Array(result)) = eval_list_js(values, script, base_url, ctx) else {
-        return items;
-    };
-    let indices = result
-        .into_iter()
-        .filter_map(|item| item.get("__readerIndex").and_then(Value::as_u64))
-        .map(|index| index as usize)
-        .collect::<Vec<_>>();
-    indices
-        .into_iter()
-        .filter_map(|index| items.get(index).copied())
-        .collect()
+    match eval_list_js(values, script, base_url, ctx, source_body) {
+        Some(Value::Array(result)) => {
+            // Real book-list JS can replace Jsoup nodes with fresh book objects.
+            if !result.is_empty()
+                && result
+                    .iter()
+                    .all(|item| item.is_object() && item.get("__readerIndex").is_none())
+            {
+                return (items, None, Some(result));
+            }
+            let items = result
+                .into_iter()
+                .filter_map(|item| item.get("__readerIndex").and_then(Value::as_u64))
+                .filter_map(|index| items.get(index as usize).copied())
+                .collect();
+            (items, None, None)
+        }
+        Some(Value::String(markup)) => (items, Some(markup), None),
+        _ => (items, None, None),
+    }
 }
 
 fn query_json_list(value: &Value, rule: &str) -> Vec<Value> {
@@ -3805,23 +3977,56 @@ fn query_json_list(value: &Value, rule: &str) -> Vec<Value> {
     }
 }
 
+fn split_json_list_js(rule: &str) -> (&str, Option<&str>, Option<&str>) {
+    if let Some((prefix, rest)) = rule.split_once("<js>") {
+        if let Some((script, tail)) = rest.split_once("</js>") {
+            let tail = tail.trim();
+            if tail.starts_with('$') || starts_with_ascii_case(tail, "@json:") {
+                return (prefix.trim(), Some(script), Some(tail));
+            }
+        }
+    }
+    let (selector, script) = extract_js(rule);
+    (selector, script, None)
+}
+
 fn apply_json_list_js(
     items: Vec<Value>,
     script: Option<&str>,
+    post_selector: Option<&str>,
     base_url: &str,
     ctx: &RuleVariableContext,
+    source_body: &str,
 ) -> Vec<Value> {
+    if let Some(selector) = post_selector {
+        let Some(output) = eval_list_js(items, script, base_url, ctx, source_body) else {
+            return Vec::new();
+        };
+        let output = match output {
+            Value::String(text) => serde_json::from_str(&text).unwrap_or(Value::String(text)),
+            value => value,
+        };
+        let (selector, next_js, next_tail) = split_json_list_js(selector);
+        return apply_json_list_js(
+            query_json_list(&output, selector),
+            next_js,
+            next_tail,
+            base_url,
+            ctx,
+            source_body,
+        );
+    }
     if script.is_none() {
         return items;
     }
-    match eval_list_js(items.clone(), script, base_url, ctx) {
+    match eval_list_js(items, script, base_url, ctx, source_body) {
         Some(Value::Array(items)) => items,
         // Source scripts often return JSON.stringify(list), not a JS array.
         Some(Value::String(output)) => match serde_json::from_str(&output) {
             Ok(Value::Array(parsed)) => parsed,
-            _ => items,
+            _ => vec![],
         },
-        _ => items,
+        _ => vec![],
     }
 }
 
@@ -3830,6 +4035,7 @@ fn apply_regex_list_js(
     script: Option<&str>,
     base_url: &str,
     ctx: &RuleVariableContext,
+    source_body: &str,
 ) -> Vec<Vec<Option<String>>> {
     if script.is_none() {
         return rows;
@@ -3845,7 +4051,7 @@ fn apply_regex_list_js(
             )
         })
         .collect();
-    let Some(Value::Array(result)) = eval_list_js(values, script, base_url, ctx) else {
+    let Some(Value::Array(result)) = eval_list_js(values, script, base_url, ctx, source_body) else {
         return rows;
     };
 
@@ -3870,19 +4076,16 @@ fn apply_xpath_list_js<'a>(
     base_url: &str,
     ctx: &RuleVariableContext,
     html_mode: bool,
-) -> Vec<sxd_xpath::nodeset::Node<'a>> {
-    if script.is_none() {
-        return items;
-    }
-
-    if items.is_empty() {
-        return items;
+    source_body: &str,
+) -> (Vec<sxd_xpath::nodeset::Node<'a>>, Option<String>) {
+    if script.is_none() || items.is_empty() {
+        return (items, None);
     }
     let Some(snapshot) = html::xpath_document_snapshot(items[0]) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     let Some(mut values) = html::xpath_nodes_json(&items, html_mode, &snapshot) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     for (index, (value, node)) in values.iter_mut().zip(&items).enumerate() {
         if matches!(node, sxd_xpath::nodeset::Node::Element(_)) {
@@ -3892,14 +4095,18 @@ fn apply_xpath_list_js<'a>(
         }
     }
 
-    let Some(Value::Array(result)) = eval_list_js(values, script, base_url, ctx) else {
-        return items;
-    };
-    result
-        .into_iter()
-        .filter_map(|item| item.get("__readerIndex").and_then(Value::as_u64))
-        .filter_map(|index| items.get(index as usize).copied())
-        .collect()
+    match eval_list_js(values, script, base_url, ctx, source_body) {
+        Some(Value::Array(result)) => (
+            result
+                .into_iter()
+                .filter_map(|item| item.get("__readerIndex").and_then(Value::as_u64))
+                .filter_map(|index| items.get(index as usize).copied())
+                .collect(),
+            None,
+        ),
+        Some(Value::String(markup)) => (items, Some(markup)),
+        _ => (items, None),
+    }
 }
 
 fn direct_get_key(rule: &str) -> Option<&str> {
@@ -4104,6 +4311,7 @@ impl FieldInput<'_> {
         rule: &str,
         base_url: &str,
         ctx: &mut RuleVariableContext,
+        list_result: bool,
     ) -> Option<Option<String>> {
         let mode = classify_rule_mode(rule, self.fallback(), matches!(self, Self::Json(_))).0;
         if matches!(mode, ParseMode::Js | ParseMode::Regex) {
@@ -4117,11 +4325,37 @@ impl FieldInput<'_> {
         rule_analyzer::split_top_level(selection, &["&&", "||", "%%"])
             .delimiter
             .as_ref()?;
-        let mut text = self.groups(selection, base_url, ctx).join("\n");
+        let values = self.groups(selection, base_url, ctx);
+        let mut text = values.join("\n");
+        let mut list_values = list_result.then_some(values);
         let suffix = rule.trim_start()[selection.len()..].trim_start();
+        // JSON field combinations may be cleaned with ## before a subsequent
+        // JS block (1148#252). Keep scalar and list output paths distinct.
+        if matches!(self, Self::Json(_)) && !list_result {
+            if let Some((regex, first_js)) = suffix.split_once("<js>") {
+                if regex.starts_with("##") {
+                    let mut replacement = SourceRule::compile("", ParseMode::JsonPath, true);
+                    replacement.make_up_rule(regex.trim());
+                    let value = replacement.apply_replacement(&text);
+                    if let Some(text) = eval_js_block_chain(value, first_js, base_url, ctx) {
+                        return Some((!text.is_empty()).then_some(text));
+                    }
+                }
+            }
+        }
         let mut post = SourceRule::compile("", self.fallback(), matches!(self, Self::Json(_)));
         post.make_up_rule(suffix);
-        if let Some(script) = extract_js(&post.rule).1 {
+        if matches!(self, Self::Html(_))
+            && post.rule.starts_with("<js>")
+            && has_following_js_stage(&post.rule[4..])
+        {
+            // CSS combination followed by multiple independent JS stages.
+            if let Some(result) = eval_js_block_chain(
+                text.clone(), &post.rule[4..], base_url, ctx,
+            ) {
+                text = result;
+            }
+        } else if let Some(script) = extract_js(&post.rule).1 {
             // Combined JSON selectors run before their shared JS suffix.
             // Expand {{JSONPath}} against the original item, not the selected
             // text; otherwise unresolved expressions leak into a later URL
@@ -4130,10 +4364,29 @@ impl FieldInput<'_> {
                 Self::Json(value) => interpolate_json_templates(script, value, base_url, ctx),
                 _ => script.to_string(),
             };
-            if let Ok(result) = eval_js_with_bindings(&script, &text, base_url, &ctx.js_bindings())
-            {
-                text = result;
+            let mut bindings = ctx.js_bindings();
+            if let Some(values) = &list_values {
+                bindings.insert("result".to_string(),
+                    Value::Array(values.iter().cloned().map(Value::String).collect()));
             }
+            if let Ok(result) = eval_js_with_bindings(&script, &text, base_url, &bindings) {
+                if let Some(values) = &mut list_values {
+                    *values = match serde_json::from_str::<Value>(&result) {
+                        Ok(Value::Array(items)) => items.iter()
+                            .filter_map(jsonpath::value_to_string).collect(),
+                        _ => result.split('\n').map(str::to_owned).collect(),
+                    };
+                } else {
+                    text = result;
+                }
+            }
+        }
+        if let Some(values) = list_values {
+            let text = values.into_iter()
+                .map(|item| post.apply_replacement(&item))
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>().join(",");
+            return Some((!text.is_empty()).then_some(text));
         }
         text = post.apply_replacement(&text);
         if matches!(self, Self::XPath(_, _)) {
@@ -4169,6 +4422,149 @@ fn eval_html_node_js(
     })
 }
 
+// Ignore JS string literals that happen to contain the characters "<js>".
+fn has_following_js_stage(first_block: &str) -> bool {
+    first_block.split_once("</js>")
+        .is_some_and(|(_, tail)| tail.trim_start().starts_with("<js>"))
+}
+
+// Consecutive explicit JS stages consume the preceding stage's string result.
+fn eval_js_block_chain(
+    mut text: String,
+    first_block: &str,
+    base_url: &str,
+    ctx: &RuleVariableContext,
+) -> Option<String> {
+    let mut rest = first_block;
+    loop {
+        let (script, remaining) = rest.split_once("</js>")?;
+        text = eval_js_with_bindings(script, &text, base_url, &ctx.js_bindings()).ok()?;
+        let remaining = remaining.trim();
+        if remaining.is_empty() {
+            return Some(text);
+        }
+        rest = remaining.strip_prefix("<js>")?;
+    }
+}
+
+// Legado executes each explicit JS stage after the CSS selection against the
+// preceding result. This is shared by document and selected-element fields.
+fn select_html_then_js(
+    html_body: &str,
+    rule: &str,
+    base_url: &str,
+    ctx: &RuleVariableContext,
+) -> Option<String> {
+    let (selector, tail) = match rule.split_once("<js>") {
+        Some((selector, tail)) => (selector.trim(), Some(tail)),
+        None => (rule.trim(), None),
+    };
+    if selector.is_empty() || selector.contains("@js:") || !html::css_rule_is_valid(selector) {
+        return None;
+    }
+    let doc = html::parse_document(html_body);
+    let text = if rule_analyzer::split_top_level(selector, &["&&", "||", "%%"])
+        .delimiter
+        .is_some()
+    {
+        html::select_text_list(&doc, selector).join("\n")
+    } else {
+        html::select_text(&doc, selector).unwrap_or_default()
+    };
+    match tail {
+        Some(first_block) => eval_js_block_chain(text, first_block, base_url, ctx),
+        None => Some(text),
+    }
+}
+
+// Upstream splits each <js> into its own SourceRule. A standalone ## stage
+// applies to the fetched text before the following JS (b778fe6b#215).
+fn eval_html_css_js_regex_js(
+    rule: &str,
+    el: &scraper::ElementRef<'_>,
+    base_url: &str,
+    ctx: &RuleVariableContext,
+) -> Option<String> {
+    let (selector, first) = rule.split_once("<js>")?;
+    let selector = selector.trim();
+    if selector.is_empty() || !html::css_rule_is_valid(selector) {
+        return None;
+    }
+    let (first_script, middle) = first.split_once("</js>")?;
+    let (middle, next_js) = middle.trim().split_once("<js>")?;
+    let (next_selector, regex) = middle.trim().split_once("##")?;
+    let selected = html::select_text_from_element(el, selector)?;
+    let fetched = eval_js_with_bindings(first_script, &selected, base_url, &ctx.js_bindings()).ok()?;
+    let fetched = if next_selector.trim().is_empty() {
+        fetched
+    } else {
+        select_html_then_js(&fetched, next_selector.trim(), base_url, ctx)?
+    };
+    let mut replacement = SourceRule::compile("", ParseMode::Css, false);
+    replacement.make_up_rule(&format!("##{regex}"));
+    let replaced = replacement.apply_replacement(&fetched);
+    if let Some((script, remaining)) = next_js.split_once("</js>") {
+        if let Some((selection, final_js)) = remaining.trim().split_once("<js>") {
+            if let Some((css, regex)) = selection.split_once("##") {
+                let css = css.trim();
+                if !css.is_empty() && html::css_rule_is_valid(css) {
+                    let fetched = eval_js_with_bindings(script, &replaced, base_url, &ctx.js_bindings()).ok()?;
+                    let selected = select_html_then_js(&fetched, css, base_url, ctx)?;
+                    let mut cleanup = SourceRule::compile("", ParseMode::Css, false);
+                    cleanup.make_up_rule(&format!("##{}", regex.trim()));
+                    return eval_js_block_chain(cleanup.apply_replacement(&selected), final_js, base_url, ctx);
+                }
+            }
+        }
+    }
+    if let Some((script, suffix)) = next_js.split_once("</js>") {
+        if suffix.trim().starts_with("##") && suffix.contains("@js:") {
+            let result = eval_js_with_bindings(script, &replaced, base_url, &ctx.js_bindings()).ok()?;
+            return eval_regex_then_at_js(result, suffix, base_url, ctx);
+        }
+    }
+    eval_js_block_chain(replaced, next_js, base_url, ctx)
+}
+
+// Upstream splitSourceRule treats @js: after ## as a separate stage.
+// The regex operates on the preceding JS result, never on the original HTML.
+fn eval_regex_then_at_js(
+    result: String,
+    suffix: &str,
+    base_url: &str,
+    ctx: &RuleVariableContext,
+) -> Option<String> {
+    let (pattern, script) = suffix.trim().strip_prefix("##")?.split_once("@js:")?;
+    if pattern.matches("##").count() > 1 || script.trim().is_empty() {
+        return None;
+    }
+    let mut cleanup = SourceRule::compile("", ParseMode::Css, false);
+    cleanup.make_up_rule(&format!("##{}", pattern.trim()));
+    let cleaned = cleanup.apply_replacement(&result);
+    eval_js_with_bindings(script, &cleaned, base_url, &ctx.js_bindings()).ok()
+}
+
+fn eval_html_js_regex_at_js(
+    rule: &str,
+    element: &scraper::ElementRef<'_>,
+    base_url: &str,
+    ctx: &RuleVariableContext,
+) -> Option<String> {
+    let (selector, after_open) = rule.split_once("<js>")?;
+    let (script, suffix) = after_open.split_once("</js>")?;
+    if !suffix.trim().starts_with("##") || !suffix.contains("@js:") {
+        return None;
+    }
+    let result = if selector.trim().is_empty() {
+        eval_html_node_js(script, *element, base_url, ctx).ok()?
+    } else {
+        if !html::css_rule_is_valid(selector.trim()) { return None; }
+        let selected = html::select_text_from_element(element, selector.trim())?;
+        eval_js_with_bindings(script, &selected, base_url, &ctx.js_bindings()).ok()?
+    };
+    eval_regex_then_at_js(result, suffix, base_url, ctx)
+}
+
 fn eval_field_html_with_ctx(
     rule: &str,
     el: &scraper::ElementRef,
@@ -4185,7 +4581,7 @@ fn eval_field_html_with_cached_text(
     base_url: &str,
     ctx: &mut RuleVariableContext,
 ) -> Option<String> {
-    if let Some(result) = FieldInput::Html(*el).combined(rule, base_url, ctx) {
+    if let Some(result) = FieldInput::Html(*el).combined(rule, base_url, ctx, false) {
         return result;
     }
     if let Some(key) = direct_get_key(rule) {
@@ -4210,7 +4606,60 @@ fn eval_field_html_with_cached_text(
     let template_input = element_html.as_deref().unwrap_or(input);
     let expanded = interpolate_common_templates(&source_rule.rule, template_input, base_url, ctx);
     let had_templates = expanded != source_rule.rule;
+    if let Some(text) = eval_html_js_regex_at_js(&expanded, el, base_url, ctx) {
+        return (!text.is_empty()).then_some(text);
+    }
+    if let Some(text) = eval_html_css_js_regex_js(&expanded, el, base_url, ctx) {
+        return (!text.is_empty()).then_some(text);
+    }
+    if let Some(text) = eval_replacement_then_js(&el.html(), &expanded, base_url, ctx) {
+        return (!text.is_empty()).then_some(text);
+    }
     source_rule.make_up_rule(&expanded);
+    // Legado can feed a Document returned by a leading <js> block into
+    // the following selector (e.g. Jsoup.connect(url).get()</js>id.toc@text).
+    if let Some(after_open) = source_rule.rule.strip_prefix("<js>") {
+        if let Some((script, selector)) = after_open.split_once("</js>") {
+            let selector = selector.trim();
+            if !selector.is_empty() {
+                let fetched = eval_html_node_js(script, *el, base_url, ctx).ok()?;
+                let text = select_html_then_js(&fetched, selector, base_url, ctx)?;
+                let text = source_rule.apply_replacement(&text);
+                return (!text.is_empty()).then_some(text);
+            }
+        }
+    }
+    // A selected field may fetch a different HTML page in JS, then run CSS
+    // on that result (1148#278 七真书院: link -> JS -> author selector).
+    if let Some((selection, after_open)) = source_rule.rule.split_once("<js>") {
+        if !selection.trim().is_empty() {
+            if let Some((script, selector)) = after_open.split_once("</js>") {
+                let selector = selector.trim();
+                let css = selector.split_once("<js>").map_or(selector, |(css, _)| css.trim());
+                if !css.is_empty() && !css.contains("@js:") && html::css_rule_is_valid(css) {
+                    let selected = html::select_text_from_element(el, selection.trim())?;
+                    let fetched = eval_js_with_bindings(script, &selected, base_url, &ctx.js_bindings()).ok()?;
+                    let text = select_html_then_js(&fetched, selector, base_url, ctx)?;
+                    let text = source_rule.apply_replacement(&text);
+                    return (!text.is_empty()).then_some(text);
+                }
+            }
+        }
+    }
+    // A scalar CSS field may also have consecutive JS transforms without a
+    // second CSS selection (1148#625 / #437).
+    if source_rule.mode == ParseMode::Css {
+        if let Some((selection, first_block)) = source_rule.rule.split_once("<js>") {
+            let selection = selection.trim();
+            if has_following_js_stage(first_block) && html::css_rule_is_valid(selection) {
+                let selected = html::select_text_from_element(el, selection).unwrap_or_default();
+                if let Some(text) = eval_js_block_chain(selected, first_block, base_url, ctx) {
+                    let text = source_rule.apply_replacement(&text);
+                    return (!text.is_empty()).then_some(text);
+                }
+            }
+        }
+    }
     let (pure, js) = extract_js(&source_rule.rule);
 
     let mut text = match source_rule.mode {
@@ -4258,6 +4707,40 @@ fn eval_content_html_doc_with_ctx(
     base_url: &str,
     ctx: &RuleVariableContext,
 ) -> String {
+    // A CSS ## replacement ends before a subsequent @js: stage.
+    // Without this boundary, the script is inserted into the replacement
+    // string itself (1148#998 爱看书吧).
+    if let Some((prefix, script)) = rule.split_once("@js:") {
+        let (selector, cleanup) = split_legado_regex(prefix);
+        let selector = strip_prefix_ascii_case(selector.trim(), "@css:")
+            .unwrap_or(selector.trim());
+        if let Some(regex) = cleanup.filter(|_| html::css_rule_is_valid(selector)) {
+            let selected = html::select_all_text(doc, selector).unwrap_or_default();
+            let cleaned = apply_legado_regex(&selected, regex);
+            if let Ok(text) = eval_js_with_bindings(script, &cleaned, base_url, &ctx.js_bindings()) {
+                return text;
+            }
+        }
+    }
+    // A CSS selection may feed consecutive JS blocks, or be cleaned by
+    // ## before a JS block. These are separate upstream SourceRule stages.
+    if let Some((prefix, chain)) = rule.split_once("<js>") {
+        let (selector, cleanup) = split_legado_regex(prefix);
+        let selector = strip_prefix_ascii_case(selector.trim(), "@css:")
+            .unwrap_or(selector.trim());
+        if (cleanup.is_some() || has_following_js_stage(chain))
+            && html::css_rule_is_valid(selector)
+        {
+            let selected = html::select_all_text(doc, selector).unwrap_or_default();
+            let cleaned = match cleanup {
+                Some(regex) => apply_legado_regex(&selected, regex),
+                None => selected,
+            };
+            if let Some(text) = eval_js_block_chain(cleaned, chain, base_url, ctx) {
+                return text;
+            }
+        }
+    }
     let mut stage = SourceRule::compile(rule, ParseMode::Css, false);
     stage.make_up_rule(&stage.rule.clone());
     let (selection, js) = extract_js(&stage.rule);
@@ -4283,6 +4766,35 @@ fn eval_content_html_doc_with_ctx(
         }
     }
     stage.apply_replacement(&text)
+}
+
+// Document fields use the same staged regex/@js: semantics as list items,
+// with an optional CSS cleanup before the first JS block (1148#433).
+fn eval_html_doc_css_regex_js_regex_at_js(
+    rule: &str,
+    doc: &scraper::Html,
+    base_url: &str,
+    ctx: &RuleVariableContext,
+) -> Option<String> {
+    let (prefix, after_open) = rule.split_once("<js>")?;
+    let (script, suffix) = after_open.split_once("</js>")?;
+    if !suffix.trim().starts_with("##") || !suffix.contains("@js:") {
+        return None;
+    }
+    let (selector, initial_regex) = match prefix.split_once("##") {
+        Some((selector, regex)) => (selector, Some(regex)),
+        None => (prefix, None),
+    };
+    let selector = selector.trim();
+    if selector.is_empty() || !html::css_rule_is_valid(selector) { return None; }
+    let mut selected = html::select_text_list(doc, selector).join("\n");
+    if let Some(regex) = initial_regex {
+        let mut cleanup = SourceRule::compile("", ParseMode::Css, false);
+        cleanup.make_up_rule(&format!("##{}", regex.trim()));
+        selected = cleanup.apply_replacement(&selected);
+    }
+    let result = eval_js_with_bindings(script, &selected, base_url, &ctx.js_bindings()).ok()?;
+    eval_regex_then_at_js(result, suffix, base_url, ctx)
 }
 
 fn eval_field_html_doc_with_ctx(
@@ -4311,7 +4823,39 @@ fn eval_field_html_doc_with_cached_input(
     });
     let expanded = interpolate_common_templates(&source_rule.rule, input, base_url, ctx);
     let had_templates = expanded != source_rule.rule;
+    if let Some(text) = eval_html_doc_css_regex_js_regex_at_js(&expanded, doc, base_url, ctx) {
+        return (!text.is_empty()).then_some(text);
+    }
+    if let Some(text) = eval_replacement_then_js(input, &expanded, base_url, ctx) {
+        return (!text.is_empty()).then_some(text);
+    }
     source_rule.make_up_rule(&expanded);
+    // A leading JS block may return a new HTML document for a following
+    // CSS field rule (e.g. the 红袖添香 book description).
+    if let Some(after_open) = source_rule.rule.strip_prefix("<js>") {
+        if let Some((script, selector)) = after_open.split_once("</js>") {
+            let selector = selector.trim();
+            let css = selector.split_once("<js>").map_or(selector, |(css, _)| css.trim());
+            if !css.is_empty() && !css.contains("@js:") && html::css_rule_is_valid(css) {
+                let fetched = eval_js_with_bindings(script, input, base_url, &ctx.js_bindings()).ok()?;
+                let text = select_html_then_js(&fetched, selector, base_url, ctx)?;
+                let text = source_rule.apply_replacement(&text);
+                return (!text.is_empty()).then_some(text);
+            }
+        }
+    }
+    if source_rule.mode == ParseMode::Css {
+        if let Some((selection, first_block)) = source_rule.rule.split_once("<js>") {
+            let selection = selection.trim();
+            if has_following_js_stage(first_block) && html::css_rule_is_valid(selection) {
+                let selected = html::select_text(doc, selection).unwrap_or_default();
+                if let Some(text) = eval_js_block_chain(selected, first_block, base_url, ctx) {
+                    let text = source_rule.apply_replacement(&text);
+                    return (!text.is_empty()).then_some(text);
+                }
+            }
+        }
+    }
     let (pure, js) = extract_js(&source_rule.rule);
 
     let mut text = match source_rule.mode {
@@ -4435,7 +4979,7 @@ fn eval_field_xpath_with_ctx(
     if rule.trim().is_empty() {
         return None;
     }
-    if let Some(result) = FieldInput::XPath(node, html_mode).combined(rule, base_url, ctx) {
+    if let Some(result) = FieldInput::XPath(node, html_mode).combined(rule, base_url, ctx, false) {
         return result;
     }
     if let Some(key) = direct_get_key(rule) {
@@ -4448,6 +4992,31 @@ fn eval_field_xpath_with_ctx(
     });
     let expanded = interpolate_common_templates(&source_rule.rule, &input, base_url, ctx);
     let had_templates = expanded != source_rule.rule;
+    // A real XPath scalar field may clean its selected value before
+    // consecutive JS stages (1148#625 小说笔趣).
+    if source_rule.mode == ParseMode::XPath {
+        if let Some(boundary) = content_js_boundary(&expanded) {
+            let (selector, regex) = split_legado_regex(&expanded[..boundary]);
+            if let Some(regex) = regex {
+                let pure = strip_mode_prefix(selector.trim());
+                let scoped =
+                    if !matches!(node, sxd_xpath::nodeset::Node::Root(_)) && pure.starts_with("//") {
+                        Cow::Owned(format!(".{pure}"))
+                    } else {
+                        Cow::Borrowed(pure)
+                    };
+                let selected = html::xpath_eval_strings_in_mode(node, scoped.as_ref(), html_mode)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+                let cleaned = apply_legado_regex(&selected, regex);
+                let text =
+                    eval_text_post_stages(cleaned, &expanded[boundary..], base_url, ctx);
+                let trimmed = text.trim();
+                return (!trimmed.is_empty()).then(|| trimmed.to_string());
+            }
+        }
+    }
     source_rule.make_up_rule(&expanded);
     let (pure, js) = extract_js(&source_rule.rule);
     if source_rule.mode == ParseMode::XPath
@@ -4518,6 +5087,57 @@ fn select_xpath_scope<'a>(
         .into_iter()
         .next()
         .unwrap_or(node)
+}
+
+fn eval_field_json_kind_with_ctx(
+    rule: &str,
+    value: &Value,
+    base_url: &str,
+    ctx: &mut RuleVariableContext,
+) -> Option<String> {
+    // 1148#113/#926: JSON kind rules using Java List get/set/size
+    // need a mutable list, not the first JSONPath scalar. Apply ## per item
+    // before the JS stage when present (1148#926 detail).
+    if let Some(boundary) = content_js_boundary(rule) {
+        let (selector, regex) = split_legado_regex(&rule[..boundary]);
+        if let Some(script) = strip_prefix_ascii_case(rule[boundary..].trim(), "@js:") {
+            let list_script = ["result.size(", "result.get(", "result.set(", "result.add("]
+                .iter().any(|method| script.contains(method));
+            if list_script && selector.trim().starts_with('$')
+                && rule_analyzer::split_top_level(&selector, &["&&", "||", "%%"])
+                    .delimiter.is_none()
+            {
+                let input = serde_json::to_string(value).ok()?;
+                let values = eval_collection_with_context(
+                    &input, Some(value), &selector, base_url, ctx,
+                ).ok()?;
+                let values = values.into_iter()
+                    .filter_map(|item| jsonpath::value_to_string(&item))
+                    .map(|item| Value::String(regex.map_or(item.clone(), |r| apply_legado_regex(&item, r))))
+                    .collect();
+                let script = interpolate_json_templates(script, value, base_url, ctx);
+                let output = eval_list_js_checked(values, &script, base_url, ctx).ok()?;
+                let items = match output {
+                    Value::Array(items) => items,
+                    Value::Null => return None,
+                    item => vec![item],
+                };
+                let text = items.iter()
+                    .filter_map(jsonpath::value_to_string)
+                    .filter(|item| !item.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                return (!text.is_empty()).then_some(text);
+            }
+        }
+    }
+    // Legado BookList.getSearchItem reads kind via getStringList, then joins
+    // with commas. Unlike scalar fields, the combined selector must pass a
+    // mutable list into the trailing JS stage (e.g. result.add("漫画")).
+    if let Some(result) = FieldInput::Json(value).combined(rule, base_url, ctx, true) {
+        return result;
+    }
+    eval_field_json_with_ctx(rule, value, base_url, ctx)
 }
 
 fn eval_field_json_with_ctx(
@@ -4601,7 +5221,7 @@ fn eval_field_json_with_ctx(
         let value = serde_json::from_str(&output).unwrap_or(Value::String(output));
         return eval_field_json_with_ctx(remainder, &value, base_url, ctx);
     }
-    if let Some(result) = FieldInput::Json(v).combined(rule, base_url, ctx) {
+    if let Some(result) = FieldInput::Json(v).combined(rule, base_url, ctx, false) {
         return result;
     }
     if let Some(key) = direct_get_key(rule) {
@@ -4621,6 +5241,23 @@ fn eval_field_json_with_ctx(
         eval_field_json_with_ctx(put_rule, v, base_url, ctx)
     });
     let expanded = interpolate_json_templates(&source_rule.rule, v, base_url, ctx);
+    // A JSON book field can start with a request URL, fetch JSON in JS,
+    // then extract from that response using JSONPath (1148#252).
+    if let Some((url, after_open)) = expanded.split_once("<js>") {
+        let url = url.trim();
+        if (url.starts_with("http://") || url.starts_with("https://"))
+            && after_open.contains("</js>")
+        {
+            if let Some((script, remainder)) = after_open.split_once("</js>") {
+                let remainder = remainder.trim();
+                if remainder.starts_with('$') || starts_with_ascii_case(remainder, "@json:") {
+                    let output = eval_js_with_bindings(script, url, base_url, &ctx.js_bindings()).ok()?;
+                    let value = serde_json::from_str(&output).unwrap_or(Value::String(output));
+                    return eval_field_json_with_ctx(remainder, &value, base_url, ctx);
+                }
+            }
+        }
+    }
     let had_templates = expanded != source_rule.rule;
     source_rule.make_up_rule(&expanded);
     let (pure, js) = extract_js(&source_rule.rule);
@@ -4762,6 +5399,32 @@ pub(crate) fn normalize_list_rule(rule: &str) -> (&str, bool) {
     (rule, false)
 }
 
+// BookContent uses JSONPath getString, which joins all matched values.
+// Other field evaluators intentionally retain their first-match behavior.
+fn json_content_matches(value: &Value, rule: &str) -> String {
+    jsonpath::jsonpath_query(value, rule.trim())
+        .iter()
+        .filter_map(jsonpath::value_to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn json_content_selection(
+    value: &Value,
+    rule: &str,
+    base_url: &str,
+    context: &mut RuleVariableContext,
+) -> String {
+    if rule_analyzer::split_top_level(rule, &["&&", "||", "%%"])
+        .delimiter
+        .is_some()
+    {
+        FieldInput::Json(value).groups(rule, base_url, context).join("\n")
+    } else {
+        json_content_matches(value, rule)
+    }
+}
+
 // Stage markers are located outside selector quotes/brackets. Never scan a JS
 // body for selector combinators; @js consumes the entire remaining script.
 fn content_js_boundary(rule: &str) -> Option<usize> {
@@ -4773,6 +5436,89 @@ fn content_js_boundary(rule: &str) -> Option<usize> {
         0,
     )
     .map(|(index, _)| index)
+}
+
+fn split_replacement_post_stages(rule: &str) -> Option<(&str, &str)> {
+    let rule = rule.trim();
+    if !rule.starts_with("##") {
+        return None;
+    }
+    if let Some(end) = rule.find("###").map(|index| index + 3) {
+        let suffix = rule[end..].trim();
+        if starts_with_ascii_case(suffix, "<js>") || starts_with_ascii_case(suffix, "@js:") {
+            return Some((&rule[..end], suffix));
+        }
+    }
+    let boundary = content_js_boundary(rule)?;
+    Some((&rule[..boundary], &rule[boundary..]))
+}
+
+fn eval_replacement_then_js(
+    input: &str,
+    rule: &str,
+    base_url: &str,
+    context: &RuleVariableContext,
+) -> Option<String> {
+    let (regex, suffix) = split_replacement_post_stages(rule)?;
+    let replaced = apply_legado_regex(input, regex);
+    Some(eval_text_post_stages(
+        replaced,
+        suffix,
+        base_url,
+        context,
+    ))
+}
+
+fn eval_text_post_stages(
+    mut current: String,
+    mut remaining: &str,
+    base_url: &str,
+    context: &RuleVariableContext,
+) -> String {
+    remaining = remaining.trim();
+    while !remaining.is_empty() {
+        if let Some(script) = strip_prefix_ascii_case(remaining, "@js:") {
+            return eval_js_with_bindings(script, &current, base_url, &context.js_bindings())
+                .unwrap_or_default();
+        }
+        if let Some(rest) = strip_prefix_ascii_case(remaining, "<js>") {
+            let Some(end) = find_ascii_case(rest, "</js>") else {
+                return String::new();
+            };
+            let Ok(output) =
+                eval_js_with_bindings(&rest[..end], &current, base_url, &context.js_bindings())
+            else {
+                return String::new();
+            };
+            current = output;
+            remaining = rest[end + "</js>".len()..].trim();
+            continue;
+        }
+        if remaining.starts_with("##") {
+            let boundary = content_js_boundary(remaining).unwrap_or(remaining.len());
+            current = apply_legado_regex(&current, &remaining[..boundary]);
+            remaining = remaining[boundary..].trim();
+            continue;
+        }
+        return String::new();
+    }
+    current
+}
+
+fn eval_xpath_content_stages(
+    rule: &str,
+    body: &str,
+    base_url: &str,
+    context: &RuleVariableContext,
+) -> String {
+    let rule = strip_mode_prefix(rule.trim());
+    let boundary = content_js_boundary(rule).unwrap_or(rule.len());
+    let (selector, regex) = split_legado_regex(&rule[..boundary]);
+    let mut current = html::select_xpath_content(body, selector.trim()).join("\n");
+    if let Some(regex) = regex {
+        current = apply_legado_regex(&current, regex);
+    }
+    eval_text_post_stages(current, &rule[boundary..], base_url, context)
 }
 
 fn eval_json_content_stages(
@@ -4808,8 +5554,26 @@ fn eval_json_content_stages(
         let selection = remaining[..boundary].trim();
         let value =
             serde_json::from_str(&current).unwrap_or_else(|_| Value::String(current.clone()));
-        let Some(selected) = eval_field_json_with_ctx(selection, &value, base_url, context) else {
-            return String::new();
+        let json_selection = strip_mode_prefix(selection);
+        let (selector, regex) = split_legado_regex(json_selection);
+        let selected = if selector.starts_with('$')
+            && !selection.contains("@put:")
+            && !selection.contains("@get:")
+        {
+            // BookContent joins every JSONPath match before regex and JS.
+            // Scalar book/chapter fields still use the first match.
+            let text = json_content_selection(&value, &selector, base_url, context);
+            if let Some(rule) = regex {
+                apply_legado_regex(&text, rule)
+            } else {
+                text
+            }
+        } else {
+            let Some(selected) = eval_field_json_with_ctx(selection, &value, base_url, context)
+            else {
+                return String::new();
+            };
+            selected
         };
         current = selected;
         remaining = remaining[boundary..].trim();
@@ -5010,7 +5774,12 @@ fn build_search_book_from_json(
         eval_field_json_with_ctx(rule.cover_url.as_deref().unwrap_or(""), item, base_url, ctx)
             .map(|u| resolve_url(base_url, &u));
     let intro = eval_field_json_with_ctx(rule.intro.as_deref().unwrap_or(""), item, base_url, ctx);
-    let kind = eval_field_json_with_ctx(rule.kind.as_deref().unwrap_or(""), item, base_url, ctx);
+    let kind = eval_field_json_kind_with_ctx(
+        rule.kind.as_deref().unwrap_or(""),
+        item,
+        base_url,
+        ctx,
+    );
     let last_chapter = eval_field_json_with_ctx(
         rule.last_chapter.as_deref().unwrap_or(""),
         item,
@@ -5164,6 +5933,13 @@ fn capture_rule_values_with_ctx(
     });
     if extract_js(&rule).1.is_none() {
         return capture_rule_values(Some(&rule), captures);
+    }
+    // Regex-list fields can start with a replacement-only stage and then
+    // continue into JS (aoaostar-full#519 笔趣阁~pysmei).
+    if let Some((prefix, suffix)) = split_replacement_post_stages(&rule) {
+        let replaced = capture_rule_values(Some(prefix), captures)?;
+        let output = eval_text_post_stages(replaced, suffix, base_url, context);
+        return (!output.is_empty()).then_some(output);
     }
 
     // Separate replacement groups before expanding list captures: `$1` in a
@@ -6680,7 +7456,7 @@ function mkCard(name, author, url) {
 const doc = org.jsoup.Jsoup.parse(result, baseUrl);
 const cards = new org.jsoup.select.Elements();
 for (const entry of doc.select('div.media, li.list-group-item')) {
-    if (entry.tagName() === 'li') {
+    if (String(entry.tagName()) === 'li') {
         const link = entry.select('a').first();
         cards.add(mkCard(link.text(), '', link.attr('abs:href')));
     } else {

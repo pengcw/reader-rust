@@ -13,6 +13,7 @@
         items.first = () => items.length ? items[0] : null;
         items.last = () => items.length ? items[items.length - 1] : null;
         items.isEmpty = () => items.length === 0;
+        items.hasClass = name => items.some(item => item.hasClass(name));
         items.attr = name => {
             const item = items.find(node => node.hasAttr(name));
             return item ? item.attr(name) : '';
@@ -24,6 +25,11 @@
         items.outerHtml = outerHtml;
         items.text = () => items.map(item => item.text()).join(' ');
         items.toString = outerHtml;
+        // Array items are enumerable; collection methods are not.
+        for (const name of ['first', 'last', 'isEmpty', 'hasClass', 'attr',
+                            'get', 'size', 'toArray', 'outerHtml', 'text', 'toString']) {
+            Object.defineProperty(items, name, { enumerable: false });
+        }
         return items;
     };
     const node = descriptor => {
@@ -42,9 +48,10 @@
             html: () => query('html', path),
             outerHtml: () => query('outerHtml', path),
             select: selector => collection(query('select', path, selector)),
-            selectFirst: selector => collection(query('select', path, selector)).first(),
+            selectFirst: selector => node(query('select', path, selector)[0]),
             parent: () => node(query('parent', path)),
             previousElementSibling: () => node(query('previousElementSibling', path)),
+            nextElementSibling: () => node(query('nextElementSibling', path)),
             children: () => collection(query('children', path)),
             elementSiblingIndex: () => query('elementSiblingIndex', path),
             toString: () => query('outerHtml', path),
