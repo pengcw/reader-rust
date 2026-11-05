@@ -289,6 +289,7 @@ if (globalThis.java && globalThis.java.getString) {
                         if (!value || typeof value !== 'object') return;
                         if (typeof value.getVariable !== 'function') {
                             value.getVariable = function(key) {
+                                if (arguments.length === 0) return this.variable == null ? null : this.variable;
                                 const variables = this.variableMap || {};
                                 const found = variables[String(key)];
                                 return found == null ? '' : String(found);
@@ -322,6 +323,26 @@ if (globalThis.java && globalThis.java.getString) {
                     };
                     _attachGetters(globalThis.book, ['name', 'author', 'bookUrl', 'coverUrl', 'kind', 'wordCount']);
                     _attachGetters(globalThis.chapter, ['url', 'title', 'index']);
+                    // Only member-call expressions adapt these boolean fields;
+                    // ordinary reads, strict equality and JSON stay boolean.
+                    const _boolGetters = new WeakMap();
+                    const _boolMethod = [function() {
+                        if (arguments.length) throw new TypeError('Expected no arguments');
+                        return false;
+                    }, function() {
+                        if (arguments.length) throw new TypeError('Expected no arguments');
+                        return true;
+                    }];
+                    java.__readerResolveBoolGetter = function(obj, name, value) {
+                        const names = _boolGetters.get(obj);
+                        return names && names.has(name) ? _boolMethod[value ? 1 : 0] : null;
+                    };
+                    if (globalThis.chapter && typeof globalThis.chapter === 'object') {
+                        for (const name of ['isVip', 'isPay']) {
+                            if (globalThis.chapter[name] === undefined) globalThis.chapter[name] = false;
+                        }
+                        _boolGetters.set(globalThis.chapter, new Set(['isVip', 'isPay']));
+                    }
                     // Project extension: despite its name, this never refreshes or searches.
                     globalThis.java.refreshBookUrl = function() {
                         const url = globalThis.book && globalThis.book.bookUrl;
@@ -331,6 +352,28 @@ if (globalThis.java && globalThis.java.getString) {
                         return url;
                     };
                     if (globalThis.book && typeof globalThis.book === 'object') {
+                        // Match BookExtensions.setType(vararg Int) in the current JS scope only.
+                        // Do not change the host's book type or reading route.
+                        globalThis.book.setType = function(...types) {
+                            let value = 0;
+                            for (const type of types) {
+                                if (!Number.isInteger(type) ||
+                                    type < -2147483648 || type > 2147483647) {
+                                    throw new TypeError('setType requires Int arguments');
+                                }
+                                value |= type;
+                            }
+                            this.type = value;
+                        };
+                        // Read settings remain no-ops until the host supports persistence.
+                        globalThis.book.setReverseToc = function() {};
+                        globalThis.book.setUseReplaceRule = function() {};
+                        globalThis.book.upCustomIntro = function() {
+                            this.customIntro = this.intro;
+                        };
+                        globalThis.book.putCustomVariable = function(value) {
+                            this.putVariable('custom', value);
+                        };
                         globalThis.book.getDisplayCover = function() {
                             return this.customCoverUrl == null || this.customCoverUrl === ''
                                 ? this.coverUrl : this.customCoverUrl;

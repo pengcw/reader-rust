@@ -33,7 +33,12 @@
                             throw error;
                         }
                         const body = String(response.data.html || '');
-                        return {body: () => body};
+                        // Legado returns StrResponse(finalUrl, html), not a body-only object.
+                        return strResponseFromJson({
+                            url: response.data.url || url,
+                            body,
+                            code: 200
+                        });
                     };
                     if (java.__clickCaptureActive) {
                         java.showReadingBrowser = java.startBrowser;
@@ -359,8 +364,17 @@
                             return value;
                         };
                         const rawRequest = { url: () => url };
+                        const priorStatus = raw.priorStatus == null ? null : Number(raw.priorStatus);
+                        const priorResponse = Number.isInteger(priorStatus) && priorStatus > 0
+                            ? {
+                                code: () => priorStatus,
+                                isRedirect: () => [300, 301, 302, 303, 307, 308].includes(priorStatus),
+                                priorResponse: () => null
+                            }
+                            : null;
                         const rawResponse = {
                             request: () => rawRequest,
+                            priorResponse: () => priorResponse,
                             body: rawResponseBody,
                             url: () => url,
                             code: () => code,
@@ -392,7 +406,8 @@
                                 headerValues,
                                 isSuccessful,
                                 callTime,
-                                errorBody
+                                errorBody,
+                                ...(priorStatus === null ? {} : {priorStatus})
                             })
                         };
                     };
@@ -556,6 +571,51 @@
                         const text = java.__cacheFileText(url);
                         if (text.trim() !== '') globalThis.cache.putFile(key, text, saveTime);
                         return text;
+                    };
+                    // LIMITED SUPPORT: text-only HTTP(S) downloadFile/readTxtFile compatibility.
+                    // Only json/js/txt virtual MD5 names backed by per-source persistent cache;
+                    // no native file paths, binary files, hex downloads or charset overloads.
+                    const downloadTextFileName = url => {
+                        let address = url;
+                        let type;
+                        const optionStart = url.indexOf(',{');
+                        if (optionStart >= 0) {
+                            try {
+                                const options = JSON.parse(url.slice(optionStart + 1));
+                                if (options && !Array.isArray(options) && typeof options === 'object') {
+                                    address = url.slice(0, optionStart);
+                                    if (typeof options.type === 'string') type = options.type;
+                                }
+                            } catch {}
+                        }
+                        const path = address.split(/[?#]/, 1)[0].split('/').pop();
+                        const suffix = path.includes('.') ? path.split('.').pop() : 'ext';
+                        type = String(type ?? suffix).toLowerCase();
+                        if (!['json', 'js', 'txt'].includes(type)) {
+                            throw new TypeError('downloadFile supports .json, .js, and .txt text only');
+                        }
+                        return java.md5Encode16(url) + '.' + type;
+                    };
+                    // LIMITED SUPPORT: download fresh text on each call; return a virtual relative name.
+                    java.downloadFile = function(url) {
+                        if (arguments.length !== 1 || typeof url !== 'string' || !url.trim()) {
+                            throw new TypeError('downloadFile requires one URL argument');
+                        }
+                        const filename = downloadTextFileName(url);
+                        const text = java.__cacheFileText(url);
+                        globalThis.cache.putFile('downloadFile:' + filename, text, 0);
+                        return '/' + filename;
+                    };
+                    // LIMITED SUPPORT: read virtual text-cache names only, not arbitrary files.
+                    java.readTxtFile = function(path) {
+                        if (arguments.length !== 1 || typeof path !== 'string') {
+                            throw new TypeError('readTxtFile supports one relative text filename only');
+                        }
+                        const filename = path.startsWith('/') ? path.slice(1) : path;
+                        if (!/^[0-9a-f]{16}\.(?:json|js|txt)$/i.test(filename)) {
+                            throw new TypeError('readTxtFile requires a generated text filename');
+                        }
+                        return globalThis.cache.getFile('downloadFile:' + filename) ?? '';
                     };
                     // Limited QueryTTF objects are private maps, never persistent native handles.
                     const fontObjects = new WeakMap();

@@ -267,6 +267,7 @@ impl ScriptCache {
         Some(RawHttpResponse {
             url: entry.final_url,
             status: entry.status,
+            prior_status: None,
             headers: HeaderMap::new(),
             body,
         })

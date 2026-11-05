@@ -773,6 +773,7 @@ fn execute_prepared_str_response(
         "errorBody": null,
         "url": response.url,
         "code": response.status,
+        "priorStatus": response.prior_status,
         "message": http_status_message(response.status),
         "headers": headers,
         "headerValues": header_values,

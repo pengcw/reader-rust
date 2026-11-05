@@ -947,6 +947,7 @@ fn execute_toc(
     }
 
     let mut book_variable = book_info.variable.clone();
+    let mut cleared_pre_update_variable = false;
     if run_pre_update {
         if let Some(script) = source
             .rule_toc
@@ -974,7 +975,7 @@ fn execute_toc(
             // Legado ignores the hook's return value; only book mutations matter.
             // Run once before the first TOC request, never again for subsequent pages.
             let capture = format!(
-                "{{\n{script}\n}}\nJSON.stringify({{tocUrl:book.tocUrl,variableMap:book.variableMap}})"
+                "const __readerOriginalVariable = book.variable;\n{{\n{script}\n}}\nJSON.stringify({{tocUrl:book.tocUrl,variableMap:book.variableMap,variable:book.variable === __readerOriginalVariable ? null : book.variable}})"
             );
             match with_js_lib(source.js_lib.as_deref(), || {
                 eval_js_toc_pre_update(&capture, &toc_url, &bindings, &initial_url, &toc_url)
@@ -990,7 +991,12 @@ fn execute_toc(
                             book_fields.insert("tocUrl".to_string(), toc_url.clone());
                             book_fields.insert("toc_url".to_string(), toc_url.clone());
                         }
-                        if let Some(variables) =
+                        // Only an actual string-property mutation takes precedence over
+                        // variableMap changes (the bootstrap may normalize initial null).
+                        if let Some(updated) = state.get("variable").and_then(Value::as_str) {
+                            cleared_pre_update_variable = updated.is_empty();
+                            book_variable = Some(updated.to_string());
+                        } else if let Some(variables) =
                             state.get("variableMap").filter(|value| value.is_object())
                         {
                             book_variable = Some(variables.to_string());
@@ -1137,6 +1143,11 @@ fn execute_toc(
     }
     let mut data =
         json!({"chapters": chapters, "pages": visited_pages.len(), "truncated": truncated});
+    // RuleVariableContext represents an empty map as None; retain an explicit
+    // preUpdateJs string reset for the host to persist after successful TOC.
+    if cleared_pre_update_variable && book_variable.is_none() {
+        book_variable = Some(String::new());
+    }
     if let Some(variable) = book_variable {
         data["variable"] = json!(variable);
     }
@@ -2099,6 +2110,7 @@ fn validate_login_response(
             "body": response.body.clone(),
             "url": response.url.clone(),
             "code": response.status,
+            "priorStatus": response.prior_status,
             "headers": response_headers,
             "isSuccessful": (200..300).contains(&response.status),
         }),
@@ -2210,6 +2222,9 @@ fn response_from_login_check(value: Value, original: HttpResponse) -> Option<Htt
     Some(HttpResponse {
         url,
         status,
+        prior_status: object.get("priorStatus")
+            .and_then(Value::as_u64)
+            .and_then(|status| u16::try_from(status).ok()),
         headers,
         body,
     })

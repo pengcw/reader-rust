@@ -45,6 +45,7 @@ impl std::error::Error for HttpClientError {}
 pub(crate) struct RawHttpResponse {
     pub(crate) url: String,
     pub(crate) status: u16,
+    pub(crate) prior_status: Option<u16>,
     pub(crate) headers: HeaderMap,
     pub(crate) body: Vec<u8>,
 }
@@ -272,6 +273,7 @@ impl HttpClient {
 
         let mut base_headers = header_map(headers)?;
         let mut body = body.map(str::to_owned);
+        let mut prior_status = None;
 
         for redirect_count in 0..=max_redirects {
             let mut request_headers = base_headers.clone();
@@ -331,6 +333,7 @@ impl HttpClient {
                         _ => {}
                     }
 
+                    prior_status = Some(status);
                     current_url = next_url;
                     continue;
                 }
@@ -352,6 +355,7 @@ impl HttpClient {
             return Ok(RawHttpResponse {
                 url: current_url.to_string(),
                 status,
+                prior_status,
                 headers: response_headers,
                 body: bytes,
             });
@@ -505,7 +509,7 @@ fn map_io_error(error: std::io::Error, url: &Url) -> HttpClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;
@@ -541,8 +545,7 @@ mod tests {
             let address = listener.local_addr().unwrap();
             let server = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0u8; 1024];
-                stream.read(&mut request).unwrap();
+                crate::util::test_http::consume_request(&mut stream);
                 if slow_body {
                     // Respond with headers, then stall before the declared body.
                     stream

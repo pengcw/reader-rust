@@ -23,7 +23,7 @@ impl HtmlQueryCache {
         }
         let document = {
             let mut slot = self.0.borrow_mut();
-            if !slot.as_ref().is_some_and(|(source, _)| source == content) {
+            if slot.as_ref().is_none_or(|(source, _)| source != content) {
                 slot.take(); // Drop the old tree before allocating a different one.
                 *slot = Some((content.to_owned(), Rc::new(html::parse_document(content))));
             }

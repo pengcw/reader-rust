@@ -8,7 +8,7 @@
 +    JS_MarkValue(rt, ctx->legado_string_length, mark_func);
 @@ -2741,0 +2745 @@
 +    JS_FreeValue(ctx, ctx->legado_string_length);
-@@ -17536,0 +17541,26 @@
+@@ -17536,0 +17541,79 @@
 +/* Legado extension: property reads stay numeric; only member-call reads adapt. */
 +static bool legado_is_string(JSValueConst value)
 +{
@@ -35,11 +35,65 @@
 +    return JS_DupValue(ctx, ctx->legado_string_length);
 +}
 +
-@@ -19102,0 +19133 @@
++/* Call adapters are used only by compiled member calls, never property reads. */
++static bool legado_bool_atom(JSContext *ctx, JSAtom atom)
++{
++    char buf[16];
++    const char *name = JS_AtomGetStr(ctx, buf, sizeof(buf), atom);
++    return !strcmp(name, "isVip") || !strcmp(name, "isPay");
++}
++
++static bool legado_member_atom(JSContext *ctx, JSAtom atom)
++{
++    return atom == JS_ATOM_length || legado_bool_atom(ctx, atom);
++}
++
++/* Value is owned; preserve it unless an explicitly registered getter exists. */
++static JSValue legado_bool_member_call(JSContext *ctx, JSValueConst receiver,
++                                       JSAtom atom, JSValue value)
++{
++    JSValue java = JS_GetPropertyStr(ctx, ctx->global_obj, "java");
++    if (JS_IsException(java)) {
++        JS_FreeValue(ctx, value);
++        return java;
++    }
++    JSValue resolver = JS_IsObject(java)
++        ? JS_GetPropertyStr(ctx, java, "__readerResolveBoolGetter")
++        : JS_UNDEFINED;
++    JS_FreeValue(ctx, java);
++    if (JS_IsException(resolver)) {
++        JS_FreeValue(ctx, value);
++        return resolver;
++    }
++    if (!JS_IsFunction(ctx, resolver)) {
++        JS_FreeValue(ctx, resolver);
++        return value;
++    }
++    JSValue name = JS_AtomToString(ctx, atom);
++    if (JS_IsException(name)) {
++        JS_FreeValue(ctx, resolver);
++        JS_FreeValue(ctx, value);
++        return name;
++    }
++    JSValue args[3] = {JS_DupValue(ctx, receiver), name, JS_DupValue(ctx, value)};
++    JSValue method = JS_Call(ctx, resolver, JS_UNDEFINED, 3, args);
++    for (int i = 0; i < 3; i++)
++        JS_FreeValue(ctx, args[i]);
++    JS_FreeValue(ctx, resolver);
++    if (JS_IsException(method) || JS_IsFunction(ctx, method)) {
++        JS_FreeValue(ctx, value);
++        return method;
++    }
++    JS_FreeValue(ctx, method);
++    return value;
++}
++
+@@ -19102,0 +19186 @@
 +        CASE(OP_legado_get_field_call):
-@@ -19104,0 +19136,9 @@
+@@ -19104,0 +19189,10 @@
 +                JSValueConst receiver = sp[-1];
-+                if (opcode == OP_legado_get_field_call && legado_is_string(receiver)) {
++                JSAtom field_atom = get_u32(pc);
++                if (opcode == OP_legado_get_field_call && field_atom == JS_ATOM_length && legado_is_string(receiver)) {
 +                    sf->cur_pc = pc + 4;
 +                    JSValue method = legado_get_string_length(ctx);
 +                    if (JS_IsException(method)) goto exception;
@@ -47,47 +101,68 @@
 +                    *sp++ = method;
 +                    BREAK;
 +                }
-@@ -19381,0 +19422 @@
+@@ -19143,6 +19237,13 @@
+                     if (unlikely(JS_IsException(val)))
+                         goto exception;
+                 }
++                if (opcode == OP_legado_get_field_call && JS_IsBool(val) &&
++                    legado_bool_atom(ctx, atom) && JS_IsObject(sp[-1]) &&
++                    JS_VALUE_GET_OBJ(sp[-1])->class_id == JS_CLASS_OBJECT) {
++                    sf->cur_pc = pc;
++                    val = legado_bool_member_call(ctx, sp[-1], atom, val);
++                    if (JS_IsException(val)) goto exception;
++                }
+                 *sp++ = val;
+             }
+             BREAK;
+@@ -19381,0 +19483 @@
 +        CASE(OP_legado_get_array_call):
-@@ -19387 +19428,12 @@
+@@ -19387 +19489,19 @@
 -                val = JS_GetPropertyValue(ctx, sp[-2], sp[-1]);
-+                if (opcode == OP_legado_get_array_call && legado_is_string(sp[-2])) {
++                JSValueConst receiver = sp[-2];
++                bool plain_object = JS_IsObject(receiver) &&
++                    JS_VALUE_GET_OBJ(receiver)->class_id == JS_CLASS_OBJECT;
++                if (opcode == OP_legado_get_array_call &&
++                    (legado_is_string(receiver) || plain_object)) {
 +                    JSAtom atom = JS_ValueToAtom(ctx, sp[-1]);
 +                    if (atom == JS_ATOM_NULL) goto exception;
-+                    if (atom == JS_ATOM_length)
++                    if (atom == JS_ATOM_length && legado_is_string(receiver))
 +                        val = legado_get_string_length(ctx);
-+                    else
-+                        val = JS_GetProperty(ctx, sp[-2], atom);
++                    else {
++                        val = JS_GetProperty(ctx, receiver, atom);
++                        if (plain_object && JS_IsBool(val) && legado_bool_atom(ctx, atom))
++                            val = legado_bool_member_call(ctx, receiver, atom, val);
++                    }
 +                    JS_FreeAtom(ctx, atom);
 +                    JS_FreeValue(ctx, sp[-1]);
 +                } else {
-+                    val = JS_GetPropertyValue(ctx, sp[-2], sp[-1]);
++                    val = JS_GetPropertyValue(ctx, receiver, sp[-1]);
 +                }
-@@ -26761,2 +26813,4 @@
+@@ -26761,2 +26882,4 @@
 -                    /* keep the object on the stack */
 -                    fd->byte_code.buf[fd->last_opcode_pos] = OP_get_field2;
 +                    /* Only method calls adapt length; update expressions must not. */
 +                    fd->byte_code.buf[fd->last_opcode_pos] =
-+                        get_u32(fd->byte_code.buf + fd->last_opcode_pos + 1) == JS_ATOM_length
++                        legado_member_atom(s->ctx, get_u32(fd->byte_code.buf + fd->last_opcode_pos + 1))
 +                        ? OP_legado_get_field_call : OP_get_field2;
-@@ -26770,2 +26824,4 @@
+@@ -26770,2 +26893,4 @@
 -                        /* keep the object on the stack */
 -                        fd->byte_code.buf[fd->last_opcode_pos] = OP_get_field2;
 +                        /* Keep optional member-call behavior separate from updates. */
 +                        fd->byte_code.buf[fd->last_opcode_pos] =
-+                            get_u32(fd->byte_code.buf + fd->last_opcode_pos + 1) == JS_ATOM_length
++                            legado_member_atom(s->ctx, get_u32(fd->byte_code.buf + fd->last_opcode_pos + 1))
 +                            ? OP_legado_get_field_call : OP_get_field2;
-@@ -26790,2 +26846,2 @@
+@@ -26790,2 +26915,2 @@
 -                    /* keep the object on the stack */
 -                    fd->byte_code.buf[fd->last_opcode_pos] = OP_get_array_el2;
 +                    /* Computed call: check the property key once at execution. */
 +                    fd->byte_code.buf[fd->last_opcode_pos] = OP_legado_get_array_call;
-@@ -26799,2 +26855,2 @@
+@@ -26799,2 +26924,2 @@
 -                        /* keep the object on the stack */
 -                        fd->byte_code.buf[fd->last_opcode_pos] = OP_get_array_el2;
 +                        /* Computed optional call, not a property update. */
 +                        fd->byte_code.buf[fd->last_opcode_pos] = OP_legado_get_array_call;
-@@ -37656 +37712 @@
+@@ -37656 +37781 @@
 -#define BC_VERSION 26
 +#define BC_VERSION (26 | 128) /* Private Legado opcode layout. */
 --- a/quickjs/quickjs-opcode.h
@@ -100,8 +175,8 @@
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -9,0 +10,3 @@
-+/// Compile-time marker for the Legado member-call String.length() extension.
-+pub const LEGADO_STRING_LENGTH_PATCH: u32 = 2;
++/// Compile-time marker for the Legado member-call property adapter.
++pub const LEGADO_STRING_LENGTH_PATCH: u32 = 3;
 +
 --- a/build.rs
 +++ b/build.rs

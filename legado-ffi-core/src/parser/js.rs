@@ -371,7 +371,7 @@ thread_local! {
 
     static JS_ENV: (Runtime, SharedJsBudget) = {
         // Missing preparation must fail compilation, never ship an unpatched engine.
-        const { assert!(rquickjs::qjs::LEGADO_STRING_LENGTH_PATCH == 2) };
+        const { assert!(rquickjs::qjs::LEGADO_STRING_LENGTH_PATCH == 3) };
         let _: [(); 1] = [(); rquickjs::LEGADO_STRING_WRAPPER_PATCH];
         let rt = Runtime::new().expect("Failed to create JS Runtime");
         rt.set_max_stack_size(512 * 1024);
@@ -430,6 +430,55 @@ pub fn eval_js_with_bindings(
         None,
         Some(bindings),
     )
+}
+
+// Read back only ordinary book metadata from the same init evaluation.
+// The script and its completion value are left untouched.
+pub(crate) fn eval_js_with_book_fields(
+    script: &str,
+    input: &str,
+    base_url: &str,
+    bindings: &HashMap<String, JsonValue>,
+) -> anyhow::Result<(String, HashMap<String, String>)> {
+    let captured = RefCell::new(HashMap::new());
+    let result = eval_js_inner_with_book_capture(
+        script,
+        Some(input),
+        Some(base_url),
+        None,
+        None,
+        None,
+        Some(bindings),
+        false,
+        None,
+        Some(&captured),
+        None,
+    )?;
+    Ok((result, captured.into_inner()))
+}
+
+// Observe a chapter title changed by a field's JS without rerunning the script.
+pub(crate) fn eval_js_with_chapter_title(
+    script: &str,
+    input: &str,
+    base_url: &str,
+    bindings: &HashMap<String, JsonValue>,
+) -> anyhow::Result<(String, Option<String>)> {
+    let captured = RefCell::new(None);
+    let result = eval_js_inner_with_book_capture(
+        script,
+        Some(input),
+        Some(base_url),
+        None,
+        None,
+        None,
+        Some(bindings),
+        false,
+        None,
+        None,
+        Some(&captured),
+    )?;
+    Ok((result, captured.into_inner()))
 }
 
 /// `refreshTocUrl()` can reuse the detail page already fetched by `execute_toc`.
@@ -693,6 +742,34 @@ pub(super) fn eval_js_inner_with_source(
     bindings: Option<&HashMap<String, JsonValue>>,
     template_result: bool,
     header_map: Option<HeaderMapContext<'_>>,
+) -> anyhow::Result<String> {
+    eval_js_inner_with_book_capture(
+        script,
+        input,
+        base_url,
+        key,
+        page,
+        source_key,
+        bindings,
+        template_result,
+        header_map,
+        None,
+        None,
+    )
+}
+
+fn eval_js_inner_with_book_capture(
+    script: &str,
+    input: Option<&str>,
+    base_url: Option<&str>,
+    key: Option<&str>,
+    page: Option<i32>,
+    source_key: Option<&str>,
+    bindings: Option<&HashMap<String, JsonValue>>,
+    template_result: bool,
+    header_map: Option<HeaderMapContext<'_>>,
+    book_capture: Option<&RefCell<HashMap<String, String>>>,
+    chapter_title_capture: Option<&RefCell<Option<String>>>,
 ) -> anyhow::Result<String> {
     if let Some(raw_ctx) = ACTIVE_JS_REENTRANT_CTX.with(|cell| *cell.borrow()) {
         // SAFETY: the pointer is installed only for the duration of a native
@@ -2428,6 +2505,34 @@ pub(super) fn eval_js_inner_with_source(
             js_profile_mark(&mut profile_mark, &mut profile_stages, 4);
             let scoped_script = format!("{{\n{script}\n}}");
             let v = eval_script(ctx.clone(), &scoped_script)?;
+            if let (Some(capture), Some(original)) = (
+                book_capture,
+                bindings.and_then(|bindings| bindings.get("book")),
+            ) {
+                let book: Object<'_> = globals.get("book")?;
+                for key in ["name", "author", "intro", "kind", "coverUrl", "bookUrl"] {
+                    let value: Value<'_> = book.get(key)?;
+                    if let Some(value) = value.into_string() {
+                        let value = value.to_string()?;
+                        if original.get(key).and_then(JsonValue::as_str) != Some(value.as_str()) {
+                            capture.borrow_mut().insert(key.to_string(), value);
+                        }
+                    }
+                }
+            }
+            if let (Some(capture), Some(original)) = (
+                chapter_title_capture,
+                bindings.and_then(|bindings| bindings.get("chapter")),
+            ) {
+                let chapter: Object<'_> = globals.get("chapter")?;
+                let title: Value<'_> = chapter.get("title")?;
+                if let Some(title) = title.into_string() {
+                    let title = title.to_string()?;
+                    if original.get("title").and_then(JsonValue::as_str) != Some(title.as_str()) {
+                        *capture.borrow_mut() = Some(title);
+                    }
+                }
+            }
             js_profile_mark(&mut profile_mark, &mut profile_stages, 5);
             if let Some((_, updated)) = header_map {
                 *updated.borrow_mut() = Some(collect_header_map(&ctx)?);
@@ -3278,7 +3383,9 @@ fn jsoup_html_element_json(element: scraper::ElementRef<'_>, with_identity: bool
             parent = node.parent();
             if scraper::ElementRef::wrap(node).is_some() {
                 ancestors.push(format!("{:?}", node.id()));
-                if ancestors.len() >= 4096 { break; }
+                if ancestors.len() >= 4096 {
+                    break;
+                }
             }
         }
         item["__readerHtmlAncestors"] = serde_json::json!(ancestors);
@@ -3287,17 +3394,36 @@ fn jsoup_html_element_json(element: scraper::ElementRef<'_>, with_identity: bool
 }
 
 // Collect adjacent element siblings once; skip intervening text/comment nodes.
-fn jsoup_siblings_json(source: &str, id: &str, reverse: bool, cache: &dom::HtmlQueryCache) -> String {
+fn jsoup_siblings_json(
+    source: &str,
+    id: &str,
+    reverse: bool,
+    cache: &dom::HtmlQueryCache,
+) -> String {
     cache.with_document(source.trim(), |document| {
-        let mut sibling = document.tree.nodes()
+        let mut sibling = document
+            .tree
+            .nodes()
             .find(|node| format!("{:?}", node.id()) == id)
-            .and_then(|node| if reverse { node.prev_sibling() } else { node.next_sibling() });
+            .and_then(|node| {
+                if reverse {
+                    node.prev_sibling()
+                } else {
+                    node.next_sibling()
+                }
+            });
         let mut siblings = Vec::new();
         while let Some(node) = sibling {
-            sibling = if reverse { node.prev_sibling() } else { node.next_sibling() };
+            sibling = if reverse {
+                node.prev_sibling()
+            } else {
+                node.next_sibling()
+            };
             if let Some(element) = scraper::ElementRef::wrap(node) {
                 siblings.push(jsoup_html_element_json(element, true));
-                if siblings.len() >= 4096 { break; }
+                if siblings.len() >= 4096 {
+                    break;
+                }
             }
         }
         serde_json::to_string(&siblings).unwrap_or_else(|_| "[]".into())
@@ -3307,7 +3433,9 @@ fn jsoup_siblings_json(source: &str, id: &str, reverse: bool, cache: &dom::HtmlQ
 // Jsoup Element.parents(): immediate parent first, excluding the element itself.
 fn jsoup_ancestors_json(source: &str, id: &str, cache: &dom::HtmlQueryCache) -> String {
     cache.with_document(source.trim(), |document| {
-        let mut parent = document.tree.nodes()
+        let mut parent = document
+            .tree
+            .nodes()
             .find(|node| format!("{:?}", node.id()) == id)
             .and_then(|node| node.parent());
         let mut ancestors = Vec::new();
@@ -3315,7 +3443,9 @@ fn jsoup_ancestors_json(source: &str, id: &str, cache: &dom::HtmlQueryCache) -> 
             parent = node.parent();
             if let Some(element) = scraper::ElementRef::wrap(node) {
                 ancestors.push(jsoup_html_element_json(element, true));
-                if ancestors.len() >= 4096 { break; }
+                if ancestors.len() >= 4096 {
+                    break;
+                }
             }
         }
         serde_json::to_string(&ancestors).unwrap_or_else(|_| "[]".into())
@@ -3325,10 +3455,16 @@ fn jsoup_ancestors_json(source: &str, id: &str, cache: &dom::HtmlQueryCache) -> 
 // Resolve all parent elements requested by a Jsoup selection in one HTML parse.
 fn jsoup_parents_json(source: &str, ids: &str, cache: &dom::HtmlQueryCache) -> String {
     let wanted: HashSet<String> = serde_json::from_str::<Vec<String>>(ids)
-        .unwrap_or_default().into_iter().collect();
-    if wanted.is_empty() { return "[]".into(); }
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    if wanted.is_empty() {
+        return "[]".into();
+    }
     cache.with_document(source.trim(), |document| {
-        let parents = document.tree.nodes()
+        let parents = document
+            .tree
+            .nodes()
             .filter(|node| wanted.contains(&format!("{:?}", node.id())))
             .filter_map(scraper::ElementRef::wrap)
             .map(|element| jsoup_html_element_json(element, true))
@@ -5020,8 +5156,7 @@ mod tests {
         let server = thread::spawn(move || {
             for (delay, body) in [(0, "ok"), (160, "slow")] {
                 let (mut stream, _) = accept_with_timeout(&listener);
-                let mut request = [0; 2048];
-                stream.read(&mut request).unwrap();
+                crate::util::test_http::consume_request(&mut stream);
                 thread::sleep(Duration::from_millis(delay));
                 let _ = write!(
                     stream,
@@ -5227,8 +5362,7 @@ mod tests {
                     let server = thread::spawn(move || {
                         for delay in [150, 70] {
                             let (mut stream, _) = accept_with_timeout(&listener);
-                            let mut request = [0; 2048];
-                            stream.read(&mut request).unwrap();
+                            crate::util::test_http::consume_request(&mut stream);
                             if slow_body {
                                 stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n").unwrap();
                             }
@@ -5349,8 +5483,7 @@ mod tests {
         let server = thread::spawn(move || {
             for delay in [150, 0] {
                 let (mut stream, _) = accept_with_timeout(&listener);
-                let mut request = [0; 2048];
-                stream.read(&mut request).unwrap();
+                crate::util::test_http::consume_request(&mut stream);
                 thread::sleep(Duration::from_millis(delay));
                 let _ = stream.write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
@@ -5875,8 +6008,7 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
             let server = thread::spawn(move || {
                 for status in [200, 404, 503] {
                     let (mut stream, _) = accept_with_timeout(&listener);
-                    let mut request = [0; 2048];
-                    stream.read(&mut request).unwrap();
+                    crate::util::test_http::consume_request(&mut stream);
                     thread::sleep(Duration::from_millis(50));
                     write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody").unwrap();
                 }
@@ -5924,8 +6056,7 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
         let server = thread::spawn(move || {
             for (status, delay) in [(404, 30), (200, 50), (404, 30)] {
                 let (mut stream, _) = accept_with_timeout(&listener);
-                let mut request = [0; 2048];
-                stream.read(&mut request).unwrap();
+                crate::util::test_http::consume_request(&mut stream);
                 thread::sleep(Duration::from_millis(delay));
                 write!(
                     stream,
@@ -5969,8 +6100,7 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
         let server = thread::spawn(move || {
             for status in [503, 200] {
                 let (mut stream, _) = accept_with_timeout(&listener);
-                let mut request = [0; 2048];
-                stream.read(&mut request).unwrap();
+                crate::util::test_http::consume_request(&mut stream);
                 thread::sleep(Duration::from_millis(75));
                 write!(
                     stream,
@@ -6005,8 +6135,7 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
         let url = format!("http://{}/init", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
             let (mut stream, _) = accept_with_timeout(&listener);
-            let mut request = [0; 2048];
-            stream.read(&mut request).unwrap();
+            crate::util::test_http::consume_request(&mut stream);
             thread::sleep(Duration::from_millis(20));
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
@@ -6043,8 +6172,7 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
             let server = thread::spawn(move || {
                 for delay in [100, 50] {
                     let (mut stream, _) = accept_with_timeout(&listener);
-                    let mut request = [0; 2048];
-                    stream.read(&mut request).unwrap();
+                    crate::util::test_http::consume_request(&mut stream);
                     thread::sleep(Duration::from_millis(delay));
                     let _ = stream.write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",

@@ -7,10 +7,16 @@ pub struct SearchBook {
     pub author: String,
     pub book_url: String,
     pub origin: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_order: Option<i32>,
     pub cover_url: Option<String>,
     pub intro: Option<String>,
     pub kind: Option<String>,
     pub last_chapter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_chapter_title: Option<String>,
     pub update_time: Option<String>,
     pub word_count: Option<String>,
     /// JSON-serialized book variables, matching Legado's SearchBook wire format.

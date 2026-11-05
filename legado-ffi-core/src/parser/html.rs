@@ -1499,9 +1499,13 @@ pub fn extract_text(el: &ElementRef, extractor: &str) -> Option<String> {
                 Some(text)
             }
         }
-        // @html 语义为 innerHTML（不含元素自身标签）；el.html() 是 outerHTML，
-        // 会把容器开标签（如 <div id="clickeye_content">）带入正文导致"没清理干净"。
-        "html" | "@html" => Some(el.inner_html()),
+        // Legado @html returns outerHtml. Preserve existing innerHTML for
+        // containers, but keep the selected <img> itself (its innerHTML is empty).
+        "html" | "@html" => Some(if el.value().name() == "img" {
+            el.html()
+        } else {
+            el.inner_html()
+        }),
         "all" | "@all" => Some(el.html()),
         _ => {
             if let Some(attr_name) = parse_attr_extractor(extractor) {
@@ -3210,6 +3214,10 @@ fn format_keep_img_with_script_text(
         regex::Regex::new(r#"(?i)\b(?:src|data-src|data-original)\s*=\s*["']?([^"'\s>]+)["']?"#)
             .unwrap()
     });
+    static LAZY_SRC_RE: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::Regex::new(r#"(?i)\bdata-(?:src|original|srcset)\s*=\s*["']?([^"'\s>]+)["']?"#)
+            .unwrap()
+    });
     let src_re = &*SRC_RE;
     text = IMG_RE
         .replace_all(&text, |caps: &regex::Captures| {
@@ -3217,8 +3225,15 @@ fn format_keep_img_with_script_text(
             let mut inline_review = false;
             let mut dp_review = false;
             let mut image_meta = None;
-            let mut full_img = if let Some(src_caps) = src_re.captures(img_tag) {
-                let raw_src = src_caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+            // Match the Legado formatter's lazy-attribute priority and greedy
+            // last-src selection. Preserve the special src-with-options path.
+            let raw_src = if img_tag.contains(" data-legado-image-meta=\"") {
+                src_re.captures(img_tag)
+            } else {
+                LAZY_SRC_RE.captures_iter(img_tag).last()
+                    .or_else(|| src_re.captures_iter(img_tag).last())
+            }.and_then(|caps| caps.get(1).map(|m| m.as_str()));
+            let mut full_img = if let Some(raw_src) = raw_src {
                 dp_review = raw_src.strip_prefix("dp:").is_some_and(|count| {
                     !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit())
                 });
@@ -3430,6 +3445,22 @@ pub fn clean_html(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_images_choose_lazy_attributes_and_last_duplicate_src() {
+        let base = "https://img-rules.invalid/chapters/1";
+        for (html, url) in [
+            (r#"<img src="/loading.gif" data-original="/real.webp">"#, "/real.webp"),
+            (r#"<img data-original="/real.webp" src="/loading.gif">"#, "/real.webp"),
+            (r#"<img src="/loading.gif" data-src="/real.webp">"#, "/real.webp"),
+            (r#"<img data-src="/first.webp" data-original="/real.webp">"#, "/real.webp"),
+            (r#"<img src="/loading.gif" src="/real.webp">"#, "/real.webp"),
+            (r#"<img src="/plain.webp">"#, "/plain.webp"),
+        ] {
+            let expected = format!(r#"<img src="https://img-rules.invalid{url}">"#);
+            assert_eq!(format_keep_img(html, base), expected, "{html}");
+        }
+    }
 
     #[test]
     fn cleaning_modes_keep_their_script_policy_across_calls() {
@@ -3801,6 +3832,22 @@ mod tests {
     }
 
     #[test]
+    fn css_html_keeps_img_nodes_without_changing_container_inner_html() {
+        let doc = parse_document(
+            r#"<div class="page-chapter"><img src="/p1.jpg"><img src="/p2.jpg"></div>"#,
+        );
+        let images = select_text_list(&doc, ".page-chapter img@html");
+        assert_eq!(images.len(), 2);
+        assert!(images[0].starts_with("<img"), "{images:?}");
+        assert!(images[0].contains("src=\"/p1.jpg\""), "{images:?}");
+        assert!(images[1].contains("src=\"/p2.jpg\""), "{images:?}");
+        // Keep existing behavior for container elements and minimize fallout.
+        let inner = select_text(&doc, ".page-chapter@html").unwrap();
+        assert!(inner.contains("p1.jpg"));
+        assert!(!inner.starts_with("<div"), "{inner:?}");
+    }
+
+    #[test]
     fn standard_css_descendant_selectors_keep_tag_and_pseudo_syntax() {
         let doc = parse_document(
             r#"<div class="book-cell"><p>Other</p><p>169 万字</p></div>
@@ -3964,7 +4011,7 @@ mod tests {
         );
         assert_eq!(
             select_text_list(&doc, "dt:contains(图书 分类)@text"),
-            vec!["图书  分类"]
+            vec!["图书 分类"]
         );
         assert_eq!(select_css_list(&doc, "dt:contains(不存在) + dd").len(), 0);
         assert!(parse_css_selector(r#"[data-x=":contains(分类)"]"#).is_some());

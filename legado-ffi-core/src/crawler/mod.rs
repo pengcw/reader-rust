@@ -84,6 +84,7 @@ pub(crate) struct BodyJs {
 pub struct HttpResponse {
     pub url: String,
     pub status: u16,
+    pub prior_status: Option<u16>,
     pub headers: HashMap<String, String>,
     pub body: String,
 }
@@ -281,6 +282,7 @@ impl HttpSession {
                 HttpResponse {
                     url: response.url,
                     status: response.status,
+                    prior_status: response.prior_status,
                     headers: HashMap::new(),
                     body,
                 },
@@ -331,6 +333,7 @@ impl HttpSession {
             ) {
                 Ok(response) => {
                     let status = response.status;
+                    let prior_status = response.prior_status;
                     let url = response.url;
                     let content_type = response
                         .headers
@@ -408,6 +411,7 @@ impl HttpSession {
                         HttpResponse {
                             url,
                             status,
+                            prior_status,
                             headers: response_headers,
                             body,
                         },
@@ -686,6 +690,7 @@ fn data_uri_response(
         Ok(RawHttpResponse {
             url: spec.url.clone(),
             status: 200,
+            prior_status: None,
             headers: HeaderMap::new(),
             body,
         })
