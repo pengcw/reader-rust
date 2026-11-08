@@ -57,6 +57,7 @@
             toString: () => query('outerHtml', path),
             toJSON: () => query('outerHtml', path)
         };
+        object.parentNode = object.parent;
         nodes.set(object, path);
         return object;
     };

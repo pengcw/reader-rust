@@ -22,6 +22,35 @@ function _r_initialize_linkedom(html) {
         }
     }
     globalThis.document = document;
+    // LinkeDOM has a select.value getter but no setter; browser pages assign it.
+    var selectProto = _r_linkedom.HTMLSelectElement.prototype;
+    var removeSelect = selectProto.remove;
+    Object.defineProperty(selectProto, 'remove', {
+        value: function(index) {
+            if (!arguments.length) return removeSelect.call(this);
+            var option = this.querySelectorAll('option')[index | 0];
+            if (option) option.remove();
+        },
+        configurable: true,
+        writable: true
+    });
+    Object.defineProperty(selectProto, 'value', {
+        get: function() {
+            var option = this.querySelector('option[selected]');
+            return option ? (option.getAttribute('value') ?? option.textContent) : undefined;
+        },
+        set: function(value) {
+            var wanted = String(value), matched = false;
+            this.querySelectorAll('option').forEach(function(option) {
+                var actual = option.getAttribute('value') ?? option.textContent;
+                if (!matched && actual === wanted) {
+                    option.setAttribute('selected', '');
+                    matched = true;
+                } else option.removeAttribute('selected');
+            });
+        },
+        configurable: true
+    });
     Object.keys(_r_linkedom).forEach(function(name) {
         if (/^(HTML|SVG|Document|Node|Element|Event|CustomEvent|DOMParser|ShadowRoot|Text|Comment)/.test(name))
             globalThis[name] = _r_linkedom[name];

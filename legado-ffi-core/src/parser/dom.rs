@@ -297,7 +297,10 @@ pub(crate) fn evaluate<T>(
     ACTIVE.with(|cell| crate::util::scoped::with_scoped_value(cell, Some(node), || f(descriptor)))
 }
 
-pub(crate) fn install<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Option<Function<'js>>> {
+pub(crate) fn install<'js>(
+    ctx: &Ctx<'js>,
+    eval_script: impl FnOnce() -> anyhow::Result<Value<'js>>,
+) -> anyhow::Result<Option<Function<'js>>> {
     let Some(node) = ACTIVE.with(|cell| cell.borrow().clone()) else {
         return Ok(None);
     };
@@ -332,7 +335,9 @@ pub(crate) fn install<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Option<Function<'
             },
         ),
     )?;
-    ctx.eval(include_str!("js_dom.js")).map(Some)
+    let function = eval_script()?.into_function()
+        .ok_or_else(|| anyhow::anyhow!("DOM bootstrap must return a result extractor"))?;
+    Ok(Some(function))
 }
 
 #[cfg(test)]

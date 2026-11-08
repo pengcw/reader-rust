@@ -194,8 +194,8 @@ struct JsProfileTotals {
     micros: [u128; 7],
     setup_micros: [u128; 3],
     cleanup_micros: [u128; 2],
-    slots_micros: [u128; 9],
-    bytecode_phase_micros: [[u128; 9]; 3], // ReadObject, EvalFunction, cold compile
+    slots_micros: [u128; 10],
+    bytecode_phase_micros: [[u128; 10]; 3], // ReadObject, EvalFunction, cold compile
     lib_split_micros: [u128; 3],           // compile/serialize, bytecode read, execute
     lib_cache_hits: u64,
     lib_bytecode_bytes: usize,
@@ -210,8 +210,8 @@ impl JsProfileTotals {
         stages: [u128; 7],
         setup: [u128; 3],
         cleanup: [u128; 2],
-        slots: [u128; 9],
-        phases: [[u128; 9]; 3],
+        slots: [u128; 10],
+        phases: [[u128; 10]; 3],
         lib_split: [u128; 3],
         lib_cache: (u64, usize),
         bridge: ([u128; 6], u64),
@@ -264,7 +264,7 @@ impl JsProfileTotals {
                 .zip(&self.bytecode_phase_micros)
             {
                 for (name, elapsed) in [
-                    "java", "source", "xpath", "jsoup", "android", "security", "math", "des", "aes",
+                    "java", "source", "xpath", "jsoup", "android", "security", "math", "des", "aes", "dom",
                 ]
                 .into_iter()
                 .zip(values)
@@ -354,8 +354,8 @@ fn eval_builtin_setup_script<'js>(
 
 thread_local! {
     static JS_SETUP_METRICS: RefCell<[u128; 3]> = const { RefCell::new([0; 3]) };
-    static JS_SETUP_SLOT_METRICS: RefCell<[u128; 9]> = const { RefCell::new([0; 9]) };
-    static JS_BYTECODE_PHASE_METRICS: RefCell<[[u128; 9]; 3]> = const { RefCell::new([[0; 9]; 3]) };
+    static JS_SETUP_SLOT_METRICS: RefCell<[u128; 10]> = const { RefCell::new([0; 10]) };
+    static JS_BYTECODE_PHASE_METRICS: RefCell<[[u128; 10]; 3]> = const { RefCell::new([[0; 10]; 3]) };
     static JS_LIB_SPLIT_METRICS: RefCell<[u128; 3]> = const { RefCell::new([0; 3]) };
     static JS_LIB_CACHE_STATS: RefCell<(u64, usize)> = const { RefCell::new((0, 0)) };
     static JS_BRIDGE_METRICS: RefCell<([u128; 6], u64)> = const { RefCell::new(([0; 6], 0)) };
@@ -821,7 +821,11 @@ fn eval_js_inner_with_book_capture(
         );
     }
 
-    let bootstrap_dir = js_bytecode::disk_directory();
+    let needs_dom = bindings
+        .and_then(|values| values.get("result"))
+        .and_then(|result| result.get("__readerDomNode"))
+        .is_some();
+    let bootstrap_dir = js_bytecode::disk_directory(needs_dom);
     JS_ENV.with(|(runtime, start_time)| {
         let html_query_cache = Rc::new(dom::HtmlQueryCache::default());
         let mut profile_mark = (*JS_PROFILE_ENABLED).then(Instant::now);
@@ -829,8 +833,8 @@ fn eval_js_inner_with_book_capture(
         let mut profile_cleanup = [0u128; 2];
         if *JS_PROFILE_ENABLED {
             JS_SETUP_METRICS.with(|totals| *totals.borrow_mut() = [0; 3]);
-            JS_SETUP_SLOT_METRICS.with(|totals| *totals.borrow_mut() = [0; 9]);
-            JS_BYTECODE_PHASE_METRICS.with(|totals| *totals.borrow_mut() = [[0; 9]; 3]);
+            JS_SETUP_SLOT_METRICS.with(|totals| *totals.borrow_mut() = [0; 10]);
+            JS_BYTECODE_PHASE_METRICS.with(|totals| *totals.borrow_mut() = [[0; 10]; 3]);
             JS_LIB_SPLIT_METRICS.with(|totals| *totals.borrow_mut() = [0; 3]);
             JS_LIB_CACHE_STATS.with(|stats| *stats.borrow_mut() = (0, 0));
             JS_BRIDGE_METRICS.with(|metrics| *metrics.borrow_mut() = ([0; 6], 0));
@@ -2415,11 +2419,9 @@ fn eval_js_inner_with_book_capture(
             let java_string_result: rquickjs::Function<'_> = globals
                 .get::<_, Object<'_>>("java")?
                 .get("__javaStringResult")?;
-            let dom_start = (*JS_PROFILE_ENABLED).then(Instant::now);
-            let dom_string_result = dom::install(&ctx)?;
-            if let Some(dom_start) = dom_start {
-                JS_SETUP_METRICS.with(|totals| totals.borrow_mut()[2] += dom_start.elapsed().as_micros());
-            }
+            let dom_string_result = dom::install(&ctx, || {
+                eval_profiled_setup_script(ctx.clone(), BootstrapSlot::Dom, 2, bootstrap_dir.as_deref())
+            })?;
             eval_builtin_setup_script(ctx.clone(), BootstrapSlot::Security, bootstrap_dir.as_deref())?;
             eval_builtin_setup_script(ctx.clone(), BootstrapSlot::Math, bootstrap_dir.as_deref())?;
             eval_builtin_setup_script(ctx.clone(), BootstrapSlot::Des, bootstrap_dir.as_deref())?;
@@ -2776,7 +2778,10 @@ fn eval_js_reentrant<'js>(
         }
         install_explicit_java_map_bindings(&ctx, bindings)?;
 
-        let dom_string_result = dom::install(&ctx)?;
+        let dom_string_result = dom::install(&ctx, || {
+            let directory = js_bytecode::disk_directory(true);
+            eval_profiled_setup_script(ctx.clone(), BootstrapSlot::Dom, 2, directory.as_deref())
+        })?;
         let dom_string = |value: Value<'js>| -> rquickjs::Result<Option<String>> {
             match &dom_string_result {
                 Some(extract) => {

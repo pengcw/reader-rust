@@ -5,9 +5,9 @@
     let revision = 0;
     let targets = new Map();
     const inlineHandlers = new WeakMap();
-    const selector = 'input,button,[onclick],[role="button"]';
+    const selector = 'input,textarea,select,button,[onclick],[role="button"]';
     const available = node => {
-        if (node.hasAttribute('disabled') || node.getAttribute('aria-disabled') === 'true') return false;
+        if (node.hasAttribute('disabled') || node.disabled === true || node.getAttribute('aria-disabled') === 'true') return false;
         for (let parent = node; parent && parent.nodeType === 1; parent = parent.parentElement) {
             if (parent.hasAttribute('hidden') || parent.style.display === 'none') return false;
         }
@@ -15,33 +15,38 @@
     };
     const kindOf = node => {
         if (!available(node)) return null;
+        if (node.localName === 'textarea') return node.hasAttribute('readonly') ? null : 'input';
         if (node.localName === 'input') {
             const type = (node.getAttribute('type') || 'text').toLowerCase();
-            if ((type === 'text' || type === 'password') && !node.hasAttribute('readonly')) return 'input';
-            if (type === 'button') return 'click';
+            if ((type === 'text' || type === 'password' || type === 'color') && !node.hasAttribute('readonly')) return 'input';
+            if (type === 'button' || type === 'checkbox') return 'click';
             return null;
         }
-        return node.localName === 'button' || node.hasAttribute('onclick')
+        return node.localName === 'select' || node.localName === 'button' || node.hasAttribute('onclick')
             || typeof node.onclick === 'function' || node.getAttribute('role') === 'button' ? 'click' : null;
     };
     // LinkeDOM supports handler properties/listeners, but does not compile HTML
     // onclick attributes. Bind the clicked path in its own page global scope.
-    const bindClickPath = node => {
+    const bindEventPath = (node, type) => {
+        const property = 'on' + type;
         for (let current = node; current && current.nodeType === 1; current = current.parentElement) {
-            const source = current.getAttribute('onclick');
-            const previous = inlineHandlers.get(current);
-            if (previous && current.onclick === previous.handler) {
+            const source = current.getAttribute(property);
+            const records = inlineHandlers.get(current);
+            const previous = records && records[property];
+            if (previous && current[property] === previous.handler) {
                 if (source === previous.source) continue;
-                current.onclick = null;
+                current[property] = null;
             }
-            if (typeof current.onclick === 'function' || source === null) continue;
+            if (typeof current[property] === 'function' || source === null) continue;
             // pi-lens-ignore: ast-grep:no-global-eval-js
             const compiled = new Function('event', source);
             const handler = function(event) {
                 if (compiled.call(this, event) === false) event.preventDefault();
             };
-            current.onclick = handler;
-            inlineHandlers.set(current, {source, handler});
+            current[property] = handler;
+            const handlers = records || {};
+            handlers[property] = {source, handler};
+            inlineHandlers.set(current, handlers);
         }
     };
     return {
@@ -65,6 +70,21 @@
                     dynamicParents.add(parent);
                 }
             });
+            const labelText = label => {
+                const copy = label.cloneNode(true);
+                copy.querySelectorAll('input,textarea,select,button,script,style').forEach(node => node.remove());
+                return copy.textContent.replace(/\s+/g, ' ').trim();
+            };
+            const labels = new Map();
+            document.querySelectorAll('label[for]').forEach(label => {
+                const id = label.getAttribute('for');
+                if (!labels.has(id)) labels.set(id, labelText(label));
+            });
+            const controlName = node => {
+                const label = node.closest('label');
+                return (node.getAttribute('aria-label') || labels.get(node.id)
+                    || (label && labelText(label)) || node.getAttribute('title') || '').trim();
+            };
             const actions = [];
             originals.forEach((node, index) => {
                 const clone = projected[index];
@@ -73,6 +93,29 @@
                 if (password) clone.removeAttribute('value');
                 const kind = kindOf(node);
                 if (!kind) return;
+                const name = controlName(node);
+                const prefix = name ? name + '：' : '';
+                if (node.localName === 'select') {
+                    const options = Array.from(node.querySelectorAll('option'));
+                    const choices = document.createElement('div');
+                    const selectedValue = String(node.value);
+                    options.forEach((option, position) => {
+                        if (option.disabled || option.hasAttribute('disabled')
+                            || option.closest('optgroup[disabled]')) return;
+                        const uri = 'legado-action:/' + pageId + '/' + revision + '/' + index + '/' + position;
+                        const link = document.createElement('a');
+                        link.setAttribute('href', uri);
+                        link.classList.add('legado-click');
+                        const optionValue = option.getAttribute('value') ?? option.textContent;
+                        const selected = selectedValue === optionValue;
+                        link.textContent = '[' + prefix + (selected ? '已选' : '选择') + '：' + option.textContent.trim() + ']';
+                        choices.appendChild(link);
+                        targets.set(uri, {node, kind, option});
+                        actions.push({uri, kind});
+                    });
+                    if (choices.firstChild) clone.replaceWith(choices);
+                    return;
+                }
                 const uri = 'legado-action:/' + pageId + '/' + revision + '/' + index;
                 const link = document.createElement('a');
                 link.setAttribute('href', uri);
@@ -85,10 +128,20 @@
                 const action = {uri, kind};
                 if (kind === 'input') {
                     action.password = password;
+                    if (name) action.label = name;
+                    const hint = node.getAttribute('placeholder');
+                    if (hint) action.hint = hint;
+                    if ((node.getAttribute('type') || '').toLowerCase() === 'color') {
+                        action.inputType = 'color';
+                        if (!action.hint) action.hint = '#RRGGBB，如 #aabbcc';
+                    }
+                    if (node.localName === 'textarea') action.multiline = true;
                     action.value = String(node.value || '');
-                    link.textContent = password ? '[密码：编辑]' : '[' + (action.value || '空') + '：编辑]';
+                    link.textContent = password ? '[' + (name || '密码') + '：编辑]' : '[' + prefix + (action.value || '空') + '：编辑]';
                 } else {
-                    link.textContent = '[' + (node.textContent.trim() || node.getAttribute('value') || '点击') + ']';
+                    link.textContent = node.localName === 'input' && (node.getAttribute('type') || '').toLowerCase() === 'checkbox'
+                        ? '[' + prefix + (node.checked ? '已勾选' : '未勾选') + ']'
+                        : '[' + (node.textContent.trim() || node.getAttribute('value') || '点击') + ']';
                 }
                 // Avoid wrapping nested controls in nested anchors. Container
                 // actions get a separate entry; leaf controls become the link.
@@ -114,14 +167,38 @@
                 || kindOf(target.node) !== target.kind
                 || (expectedKind && expectedKind !== target.kind)) return false;
             if (target.kind === 'input' && typeof value !== 'string') return false;
+            if (target.kind === 'input' && target.node.localName === 'input'
+                && (target.node.getAttribute('type') || '').toLowerCase() === 'color') {
+                if (!/^#[0-9a-f]{6}$/i.test(value)) return false;
+                value = value.toLowerCase();
+            }
+            if (target.option && (!target.node.contains(target.option)
+                || target.option.disabled || target.option.hasAttribute('disabled')
+                || target.option.closest('optgroup[disabled]'))) return false;
             targets = new Map();
             const node = target.node;
-            if (target.kind === 'click') {
-                bindClickPath(node);
+            if (target.option) {
+                node.value = target.option.getAttribute('value') ?? target.option.textContent;
+                bindEventPath(node, 'change');
+                node.dispatchEvent(new Event('input', {bubbles: true}));
+                node.dispatchEvent(new Event('change', {bubbles: true}));
+            } else if (target.kind === 'click') {
+                bindEventPath(node, 'click');
+                const checkbox = node.localName === 'input' && (node.getAttribute('type') || '').toLowerCase() === 'checkbox';
+                if (checkbox) {
+                    node.checked = !node.checked;
+                    if (node.checked) node.setAttribute('checked', '');
+                    else node.removeAttribute('checked');
+                }
                 node.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, button: 0}));
+                if (checkbox) {
+                    bindEventPath(node, 'change');
+                    node.dispatchEvent(new Event('input', {bubbles: true}));
+                    node.dispatchEvent(new Event('change', {bubbles: true}));
+                }
             } else {
                 node.value = value;
-                node.setAttribute('value', value);
+                if (node.localName === 'input') node.setAttribute('value', value);
                 node.dispatchEvent(new Event('input', {bubbles: true}));
                 node.dispatchEvent(new Event('change', {bubbles: true}));
             }

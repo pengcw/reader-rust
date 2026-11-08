@@ -1,5 +1,5 @@
 //! Cache bytecode for bundled JavaScript bootstraps, with helpers for jsLib.
-//! All nine fixed bootstraps reuse disk bytecode across tasks when the host
+//! All ten fixed bootstraps reuse disk bytecode across tasks when the host
 //! provides a cache root. Dynamic jsLib bytecode may be
 //! cached only by an ActiveSession and released when its operation ends.
 //! Every invocation uses a fresh QuickJS Context; never cache JSValues,
@@ -26,6 +26,7 @@ pub(super) enum BootstrapSlot {
     Math,
     Des,
     Aes,
+    Dom,
 }
 
 impl BootstrapSlot {
@@ -40,6 +41,7 @@ impl BootstrapSlot {
             Self::Math => include_str!("js_math.js"),
             Self::Des => include_str!("js_des.js"),
             Self::Aes => include_str!("js_aes.js"),
+            Self::Dom => include_str!("js_dom.js"),
         }
     }
 }
@@ -47,7 +49,7 @@ impl BootstrapSlot {
 thread_local! {
     // Each thread's QuickJS Runtime lasts for the thread's lifetime.
     // Keep only serialized bytes, not compiled Values tied to an old Context.
-    static COMPILED: RefCell<[Option<Arc<[u8]>>; 9]> =
+    static COMPILED: RefCell<[Option<Arc<[u8]>>; 10]> =
         RefCell::new(std::array::from_fn(|_| None));
 }
 
@@ -104,8 +106,10 @@ fn save_bootstrap(file: &std::path::Path, bytes: &[u8]) {
 }
 
 // Query the Lua host at most once per fresh set of fixed bootstraps.
-pub(super) fn disk_directory() -> Option<std::path::PathBuf> {
-    let missing = COMPILED.with(|cache| cache.borrow().iter().any(Option::is_none));
+pub(super) fn disk_directory(include_dom: bool) -> Option<std::path::PathBuf> {
+    // DOM is lazy: ordinary JS must not query the host repeatedly for an unused slot.
+    let count = if include_dom { 10 } else { BootstrapSlot::Dom as usize };
+    let missing = COMPILED.with(|cache| cache.borrow()[..count].iter().any(Option::is_none));
     missing
         .then(crate::crawler::script_cache::ScriptCache::from_host)
         .flatten()?
