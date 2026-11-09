@@ -255,6 +255,87 @@ fn normalize_jsoup_eq(selector: &str) -> Option<std::borrow::Cow<'_, str>> {
     }
 }
 
+// Legacy Jsoup treats ~= attribute values as Java regex, including
+// patterns that are also valid standard CSS word selectors.
+fn select_css_with_attribute_regex<'a>(
+    selector: &str,
+    select: impl Fn(&str) -> Vec<ElementRef<'a>>,
+) -> Option<Vec<ElementRef<'a>>> {
+    if !selector.contains("~=") {
+        return None;
+    }
+    let open = selector[..selector.find("~=")?].rfind('[')?;
+    let mut depth = 0usize;
+    let mut escaped = false;
+    let close = selector[open..].char_indices().find_map(|(offset, ch)| {
+        if escaped {
+            escaped = false;
+            return None;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '[' => depth += 1,
+            ']' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + offset);
+                }
+            }
+            _ => {}
+        }
+        None
+    })?;
+    let suffix = &selector[close + 1..];
+    // Jsoup allows a descendant selector after [attr~=regex] (aoaostar
+    // 言情中文). Keep other relation types on the existing path.
+    let descendant = suffix.chars().next().is_some_and(char::is_whitespace)
+        && !suffix.trim().is_empty()
+        && parse_css_selector(suffix.trim()).is_some();
+    if !suffix.is_empty()
+        && !suffix.starts_with(":contains(")
+        && !suffix.starts_with(":containsOwn(")
+        && !descendant
+    {
+        return None;
+    }
+    let (key, pattern) = selector[open + 1..close].split_once("~=")?;
+    let key = key.trim();
+    let pattern = pattern.trim();
+    if key.is_empty()
+        || !key.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':'))
+        || pattern.starts_with(['\'', '"'])
+    {
+        return None;
+    }
+    if !crate::parser::source_regex::is_valid(pattern) {
+        return Some(Vec::new());
+    }
+    let candidate = if descendant {
+        format!("{}[{key}]", &selector[..open])
+    } else {
+        format!("{}[{key}]{suffix}", &selector[..open])
+    };
+    if !css_fragment_is_valid(&candidate) {
+        return None;
+    }
+    let matched = select(&candidate)
+        .into_iter()
+        .filter(|el| {
+            el.value().attr(key).is_some_and(|value| {
+                crate::parser::source_regex::captures_first(pattern, value).is_some()
+            })
+        });
+    Some(if descendant {
+        let mut seen = HashSet::new();
+        matched
+            .flat_map(|el| select_css_suffix(el, suffix))
+            .filter(|el| seen.insert(el.id()))
+            .collect()
+    } else {
+        matched.collect()
+    })
+}
+
 fn parse_css_selector(css_selector: &str) -> Option<Selector> {
     let normalized = normalize_jsoup_eq(css_selector)?;
     Selector::parse(&normalized).ok().or_else(|| {
@@ -516,6 +597,9 @@ fn contains_suffix_valid(suffix: &str) -> bool {
         return true;
     }
     let trimmed = suffix.trim();
+    if trimmed.starts_with('>') {
+        return parse_css_selector(&scope_child_selector(trimmed)).is_some();
+    }
     if let Some(rest) = trimmed.strip_prefix(['+', '~']) {
         let (sibling, descendant) = split_contains_sibling(rest);
         return parse_css_selector(sibling).is_some()
@@ -523,7 +607,6 @@ fn contains_suffix_valid(suffix: &str) -> bool {
                 || parse_css_selector(&scope_child_selector(descendant)).is_some());
     }
     suffix.chars().next().is_some_and(char::is_whitespace)
-        && !trimmed.starts_with('>')
         && parse_css_selector(trimmed).is_some()
 }
 
@@ -675,6 +758,9 @@ pub(crate) fn css_rule_is_valid(rule: &str) -> bool {
 
 // Validate nested CSS fragments without interpreting Legado rule-level extractors.
 fn css_fragment_is_valid(css: &str) -> bool {
+    if select_css_with_attribute_regex(css, |_| Vec::new()).is_some() {
+        return true;
+    }
     if parse_css_selector(css).is_some() {
         return true;
     }
@@ -1110,6 +1196,9 @@ fn select_css<'a>(doc: &'a Html, css_selector: &str) -> Vec<ElementRef<'a>> {
             .collect();
         return unique_in_document_order(matches, doc.select(&UNIVERSAL_SELECTOR));
     }
+    if let Some(matches) = select_css_with_attribute_regex(css_selector, |part| select_css(doc, part)) {
+        return matches;
+    }
     if let Some(matches) = select_css_with_not(css_selector, |part| select_css(doc, part)) {
         return unique_in_document_order(matches, doc.select(&UNIVERSAL_SELECTOR));
     }
@@ -1160,6 +1249,11 @@ pub(crate) fn select_css_from_element<'a>(
             .flat_map(|part| select_css_from_element(el, part))
             .collect();
         return unique_in_document_order(matches, elements());
+    }
+    if let Some(matches) =
+        select_css_with_attribute_regex(css_selector, |part| select_css_from_element(el, part))
+    {
+        return matches;
     }
     if let Some(matches) =
         select_css_with_not(css_selector, |part| select_css_from_element(el, part))

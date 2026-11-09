@@ -2683,6 +2683,39 @@ fn book_info_word_count(raw: String) -> Option<String> {
     Some(raw)
 }
 
+// Both BookInfo.kind's list path and AnalyzeRule.putRule's getString()
+// must keep values from nested CSS selectors, not just the first descendant.
+fn select_css_list_doc(doc: &scraper::Html, rule: &str) -> Vec<String> {
+    let split = rule_analyzer::split_top_level(rule, &["&&", "||", "%%"]);
+    if let Some(operator) = split.delimiter.as_deref() {
+        let mut groups = Vec::new();
+        for branch in split.parts {
+            let values = select_css_list_doc(doc, &branch);
+            if !values.is_empty() {
+                groups.push(values);
+                if operator == "||" {
+                    break;
+                }
+            }
+        }
+        return if operator == "%%" {
+            rule_analyzer::interleave_result_groups(groups)
+        } else {
+            groups.into_iter().flatten().collect()
+        };
+    }
+    let parts = rule_analyzer::split_top_level(rule, &["@"]).parts;
+    if parts.len() > 2 && !rule.contains("@@") {
+        let roots = html::select_list(doc, &parts[0]);
+        let tail = parts[1..].join("@");
+        roots.into_iter()
+            .flat_map(|root| html::select_text_list_from_element(&root, &tail))
+            .collect()
+    } else {
+        html::select_text_list(doc, rule)
+    }
+}
+
 // BookInfo.kind uses getStringList rather than the scalar getString used
 // by other fields. Keep complex/JS rules on their existing evaluation path.
 fn book_info_css_kind(rule: &str, doc: &scraper::Html) -> Option<String> {
@@ -2697,22 +2730,7 @@ fn book_info_css_kind(rule: &str, doc: &scraper::Html) -> Option<String> {
     }
     let expanded = source.rule.clone();
     source.make_up_rule(&expanded);
-    let parts = rule_analyzer::split_top_level(&source.rule, &["@"]).parts;
-    let values = if parts.len() > 2
-        && !source.rule.contains("@@")
-        && rule_analyzer::split_top_level(&source.rule, &["&&", "||", "%%"])
-            .delimiter
-            .is_none()
-    {
-        let roots = html::select_list(doc, &parts[0]);
-        let tail = parts[1..].join("@");
-        roots
-            .into_iter()
-            .flat_map(|root| html::select_text_list_from_element(&root, &tail))
-            .collect::<Vec<_>>()
-    } else {
-        html::select_text_list(doc, &source.rule)
-    };
+    let values = select_css_list_doc(doc, &source.rule);
     let values = values
         .into_iter()
         .map(|item| source.apply_replacement(&item))
@@ -4246,13 +4264,16 @@ fn evaluate_template_expression(
             .unwrap_or_default();
     }
     if expression.starts_with("@@") {
-        return eval_field_html_doc_with_ctx(
-            expression,
-            &html::parse_document(input),
-            base_url,
-            &mut ctx.clone(),
-        )
-        .unwrap_or_default();
+        let doc = html::parse_document(input);
+        // AnalyzeRule's {{@@...}} evaluates a string, preserving every CSS
+        // match before ## cleanup, unlike ordinary scalar detail fields.
+        if let Some(text) =
+            eval_css_string_values(expression, |rule| select_css_list_doc(&doc, rule))
+        {
+            return text;
+        }
+        return eval_field_html_doc_with_ctx(expression, &doc, base_url, &mut ctx.clone())
+            .unwrap_or_default();
     }
     if starts_with_ascii_case(expression, "@css:") {
         let selector = strip_prefix_ascii_case(expression, "@css:").unwrap_or(expression);
@@ -5242,6 +5263,30 @@ fn eval_field_html_with_ctx(
     eval_field_html_with_cached_text(rule, el, &std::cell::OnceCell::new(), base_url, ctx)
 }
 
+// AnalyzeRule.getString() joins CSS matches before optional ## cleanup
+// for @put values and {{@@...}} templates; ordinary scalar fields stay first-match.
+fn eval_css_string_values(
+    expression: &str,
+    select: impl FnOnce(&str) -> Vec<String>,
+) -> Option<String> {
+    let mut value = SourceRule::compile(expression, ParseMode::Css, false);
+    if value.mode != ParseMode::Css
+        || !value.put_entries.is_empty()
+        || expression.contains("{{")
+        || expression.contains("@get:")
+        || extract_js(expression).1.is_some()
+    {
+        return None;
+    }
+    let rule = value.rule.clone();
+    value.make_up_rule(&rule);
+    if value.rule.is_empty() || !html::css_rule_is_valid(&value.rule) {
+        return None;
+    }
+    let items = select(&value.rule);
+    (!items.is_empty()).then(|| value.apply_replacement(&items.join("\n")))
+}
+
 fn eval_field_html_with_cached_text(
     rule: &str,
     el: &scraper::ElementRef,
@@ -5266,6 +5311,11 @@ fn eval_field_html_with_cached_text(
         ""
     };
     evaluate_put_entries(&source_rule.put_entries, ctx, |put_rule, ctx| {
+        if let Some(text) = eval_css_string_values(put_rule, |rule| {
+            html::select_text_list_from_element(el, rule)
+        }) {
+            return Some(text);
+        }
         eval_field_html_with_cached_text(put_rule, el, text_cache, base_url, ctx)
     });
     // Legado evaluates element-relative template selectors against the
@@ -5541,6 +5591,9 @@ fn eval_field_html_doc_with_cached_input(
         }
     }
     evaluate_put_entries(&source_rule.put_entries, ctx, |put_rule, ctx| {
+        if let Some(text) = eval_css_string_values(put_rule, |rule| select_css_list_doc(doc, rule)) {
+            return Some(text);
+        }
         eval_field_html_doc_with_cached_input(put_rule, doc, serialized, base_url, ctx)
     });
     let expanded = interpolate_common_templates(&source_rule.rule, input, base_url, ctx);
