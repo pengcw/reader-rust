@@ -196,7 +196,7 @@ struct JsProfileTotals {
     cleanup_micros: [u128; 2],
     slots_micros: [u128; 10],
     bytecode_phase_micros: [[u128; 10]; 3], // ReadObject, EvalFunction, cold compile
-    lib_split_micros: [u128; 3],           // compile/serialize, bytecode read, execute
+    lib_split_micros: [u128; 3],            // compile/serialize, bytecode read, execute
     lib_cache_hits: u64,
     lib_bytecode_bytes: usize,
     // Per JS invocation: native source, cookie/cache, java, then host parse/call/encode.
@@ -264,7 +264,8 @@ impl JsProfileTotals {
                 .zip(&self.bytecode_phase_micros)
             {
                 for (name, elapsed) in [
-                    "java", "source", "xpath", "jsoup", "android", "security", "math", "des", "aes", "dom",
+                    "java", "source", "xpath", "jsoup", "android", "security", "math", "des",
+                    "aes", "dom",
                 ]
                 .into_iter()
                 .zip(values)
@@ -1288,9 +1289,11 @@ fn eval_js_inner_with_book_capture(
             let native_mark = (*JS_PROFILE_ENABLED).then(Instant::now);
 
             let java_obj = Object::new(ctx.clone())?;
-            let file_cache_namespace = ACTIVE_JS_BOOK_SOURCE.with(|cell| {
+            let trusted_namespace = ACTIVE_JS_BOOK_SOURCE.with(|cell| {
                 cell.borrow().as_ref().map(|source| source.book_source_url.clone())
-            }).unwrap_or_else(|| source_key_val.clone());
+            });
+            let file_cache_namespace = trusted_namespace.clone()
+                .unwrap_or_else(|| source_key_val.clone());
             java_obj.set(
                 "__fileCache",
                 Func::new(move |action: String, arguments: String| -> String {
@@ -1318,6 +1321,15 @@ fn eval_js_inner_with_book_capture(
                             "kind":"invalid_argument","message":"invalid cache request"}}).to_string();
                     };
                     object.insert("namespace".into(), JsonValue::String(file_cache_namespace.clone()));
+                    // Direct native I/O is allowed only with a trusted active book source.
+                    if trusted_namespace.is_some() {
+                        match crate::runtime::file_cache::FileCache::current() {
+                            Ok(cache) => return cache.invoke(&file_cache_namespace, &action, &args).to_string(),
+                            Err(err) if err.kind != "unavailable" => return err.envelope().to_string(),
+                            Err(_) => (),
+                        }
+                    }
+                    // Transitional fallback for hosts without resource.cache.config.
                     crate::host_services::call(operation, &args).to_string()
                 }),
             )?;
@@ -1441,7 +1453,26 @@ fn eval_js_inner_with_book_capture(
                         return serde_json::json!({"ok":false,"error":{"kind":"invalid_argument","message":"invalid host arguments JSON"}}).to_string();
                     };
                     let mark = (*JS_PROFILE_ENABLED).then(Instant::now);
-                    let response = crate::host_services::call(&operation, &arguments);
+                    let response = if let Some(action) = operation.strip_prefix("cache.file.") {
+                        let namespace = ACTIVE_JS_BOOK_SOURCE.with(|slot| {
+                            slot.borrow().as_ref().map(|source| source.book_source_url.clone())
+                        });
+                        match crate::runtime::file_cache::FileCache::current() {
+                            Ok(cache) => {
+                                let requested = arguments.get("namespace").and_then(JsonValue::as_str);
+                                if namespace.as_deref().is_none_or(|source| Some(source) != requested) {
+                                    serde_json::json!({"ok":false,"error":{
+                                        "kind":"permission_denied","message":"cache source namespace mismatch"}})
+                                } else {
+                                    cache.invoke(namespace.as_deref().unwrap(), action, &arguments)
+                                }
+                            }
+                            Err(error) if error.kind != "unavailable" => error.envelope(),
+                            Err(_) => crate::host_services::call(&operation, &arguments),
+                        }
+                    } else {
+                        crate::host_services::call(&operation, &arguments)
+                    };
                     js_bridge_mark(4, mark);
                     let mark = (*JS_PROFILE_ENABLED).then(Instant::now);
                     let encoded = response.to_string();
@@ -1468,8 +1499,23 @@ fn eval_js_inner_with_book_capture(
                     let Ok(state) = InfoMapState::from_value(value) else {
                         return serde_json::json!({"ok":false,"error":{"kind":"invalid_argument","message":"invalid infoMap state"}}).to_string();
                     };
-                    let arguments = serde_json::json!({"values":state.values,"saveTime":state.save_time});
-                    crate::host_services::call("info_map.save_now", &arguments).to_string()
+                    match crate::runtime::file_cache::FileCache::current() {
+                        Ok(cache) => {
+                            let Some(source) = active_source_key else {
+                                return serde_json::json!({"ok":false,"error":{
+                                    "kind":"permission_denied","message":"infoMap requires a trusted source context"}}).to_string();
+                            };
+                            match crate::runtime::file_cache::save_info_map_now(&cache, &source, &state) {
+                                Ok(()) => serde_json::json!({"ok":true,"data":true}).to_string(),
+                                Err(error) => error.envelope().to_string(),
+                            }
+                        }
+                        Err(error) if error.kind != "unavailable" => error.envelope().to_string(),
+                        Err(_) => {
+                            let arguments = serde_json::json!({"values":state.values,"saveTime":state.save_time});
+                            crate::host_services::call("info_map.save_now", &arguments).to_string()
+                        }
+                    }
                 }),
             )?;
             java_obj.set(
@@ -7738,7 +7784,7 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
         let body = r#"<?xml version="1.0"?><Root><Item><Child>Value</Child></Item><Sibling>Other</Sibling></Root>"#;
         let output = eval_js(
             r#"
-            const item = java.getElement('//Item', result);
+            const item = java.getElement('//Item', result).first();
             [item.select('./Child').size(), item.select('.//Child').size(),
              item.select('.//child').size(), item.select('@xpath:parent::Root').size(),
              item.select('@xpath:following-sibling::Sibling').size(),
@@ -7756,8 +7802,8 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
         let body = r#"<?xml version="1.0"?><root xmlns:x="urn:x" xmlns:y="urn:y"><x:Item id="plain" x:id="X" y:id="Y"><x:Child>V</x:Child><link>https://fixture.test/a</link></x:Item></root>"#;
         let output = eval_js(
             r#"
-            const item = java.getElement('//x:Item', result);
-            const link = java.getElement('//link', result);
+            const item = java.getElement('//x:Item', result).first();
+            const link = java.getElement('//link', result).first();
             [item.attr('id'), item.attr('x:id'), item.attr('y:id'),
              item.select('.//x:Child').size(),
              item.outerHtml().includes('urn:x'), item.outerHtml().includes('urn:y'),
@@ -7778,7 +7824,7 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
             r#"<div><section id="item"><span class="kid">Value</span></section></div>"#,
         ] {
             let output = eval_js(r#"
-                const item = java.getElement('//Item', result) || java.getElement('//section', result);
+                const item = java.getElement('//Item', result).first() || java.getElement('//section', result).first();
                 [java.getElements('.kid', item).size(),
                  java.getElements('@css:.kid', item).size(),
                  java.getElements('.kid', item, true).size(),
@@ -7795,7 +7841,7 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
         let body = r#"<?xml version="1.0"?><root xmlns:x="urn:outer"><x:Child>Outer</x:Child><branch xmlns:x="urn:inner"><x:Child>Inner</x:Child><link>URL</link></branch></root>"#;
         let output = eval_js(
             r#"
-            const branch = java.getElement('//branch', result);
+            const branch = java.getElement('//branch', result).first();
             [branch.select('./x:Child').first().text(),
              java.getString('@xpath:./html()', branch).includes('URL'),
              java.getString('@xpath:./html()', branch).includes('x:Child')].join('|')
@@ -7827,7 +7873,7 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
         "#, &body, "https://fixture.test").unwrap();
         assert_eq!(output, "200|1|true|true|100|99");
         let output = eval_js(
-            r#"java.getElement('//Item', result).__readerXPathNode.documentId"#,
+            r#"java.getElement('//Item', result).first().__readerXPathNode.documentId"#,
             &body,
             "https://fixture.test",
         )
@@ -7854,8 +7900,8 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
         let body = r#"<?xml version="1.0"?><Root><Item><Child>One</Child><Child>Two</Child></Item></Root>"#;
         let output = eval_js(
             r#"
-            const item = java.getElement('//Item', result);
-            const child = java.getElement('@xpath:./Child', item);
+            const item = java.getElement('//Item', result).first();
+            const child = java.getElement('@xpath:./Child', item).first();
             [java.getString('@xpath:./Child', item),
              java.getStringList('@xpath:./Child', item).join(','),
              java.getElements('@xpath:./Child', item).size(),
@@ -7897,12 +7943,13 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
             <div id="footer">The End</div>
         "#;
 
-        // 1. Test getElement singular, id() function, select() chaining with XPath
+        // getElement returns a collection; select its first node for XPath chaining.
+        // 1. Test id() and empty collection behavior.
         let script = r#"
-            const root = java.getElement('id("catalog")', result);
+            const root = java.getElement('id("catalog")', result).first();
             const img = root.select('.//img').first();
             const links = root.select('.//ul/li/a');
-            const footer = java.getElement('id("footer")', result);
+            const footer = java.getElement('id("footer")', result).first();
             const missing = java.getElement('id("nonexistent")', result);
 
             [
@@ -7915,7 +7962,7 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
                 links.get(1).attr('href'),
                 links.get(1).text(),
                 footer.text(),
-                missing === null
+                missing.isEmpty()
             ].join('|')
         "#;
         let output = eval_js(script, body, "https://example.com").unwrap();
@@ -7935,7 +7982,7 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
 
         // 3. Test mixed XPath and CSS chaining: select XPath root then select CSS
         let script_mixed = r#"
-            const catalog = java.getElement('//div[@id="catalog"]', result);
+            const catalog = java.getElement('//div[@id="catalog"]', result).first();
             const span = catalog.select('span.count').first();
             const link = catalog.select('ul li a').first();
             [span.text(), span.attr('class'), link.attr('href')].join('|')

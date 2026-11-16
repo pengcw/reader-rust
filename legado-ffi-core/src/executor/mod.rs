@@ -216,6 +216,10 @@ impl From<FetchError> for ExecuteError {
 
 /// 执行 ABI v2 JSON 请求。该函数不跨 FFI，便于单元测试。
 pub fn execute(source_json: &str, request_json: &str) -> String {
+    crate::runtime::file_cache::with_request(|| execute_scoped(source_json, request_json))
+}
+
+fn execute_scoped(source_json: &str, request_json: &str) -> String {
     let value = match execute_inner(source_json, request_json) {
         Ok(value) => value,
         Err(error) => error.into_json(),
@@ -236,6 +240,14 @@ fn execute_inner(source_json: &str, request_json: &str) -> ExecuteResult<Value> 
         session: request_session,
         info_map: request_info_map,
     } = parse_request(request_json)?;
+    // Controlled host operation: no HTTP session, JS execution or exposed paths.
+    if operation == Operation::CacheClear {
+        let cache = crate::runtime::file_cache::FileCache::current()
+            .map_err(|err| ExecuteError::internal(err.message))?;
+        cache.clear(&source.book_source_url)
+            .map_err(|err| ExecuteError::internal(err.message))?;
+        return Ok(json!({"ok":true,"data":true}));
+    }
     let engine = RuleEngine::new().map_err(|error| ExecuteError::internal(error.to_string()))?;
 
     let (result, session_delta) = with_active_session(
@@ -254,6 +266,7 @@ fn execute_inner(source_json: &str, request_json: &str) -> ExecuteResult<Value> 
                     },
                     options.max_response_bytes,
                     || match operation {
+                        Operation::CacheClear => unreachable!("handled before execution"),
                         Operation::Search => {
                             execute_search(&source, &engine, &http_session, &params, &options)
                         }
@@ -396,9 +409,16 @@ fn parse_source(raw: &str) -> ExecuteResult<BookSource> {
     Ok(source)
 }
 
-fn load_info_map_state(supplied: Option<InfoMapState>) -> ExecuteResult<InfoMapState> {
+fn load_info_map_state(source: &str, supplied: Option<InfoMapState>) -> ExecuteResult<InfoMapState> {
     if let Some(state) = supplied {
         return Ok(state);
+    }
+    match crate::runtime::file_cache::FileCache::current() {
+        Ok(cache) => return crate::runtime::file_cache::load_info_map(&cache, source)
+            .map_err(|error| ExecuteError::internal(error.message)),
+        Err(err) if err.kind != "unavailable" =>
+            return Err(ExecuteError::internal(err.message)),
+        Err(_) => (), // Legacy hosts without a configured native cache.
     }
     let response = crate::host_services::call("info_map.load", &json!({}));
     if response["ok"] == true {
@@ -523,7 +543,7 @@ fn execute_explore(
 ) -> ExecuteResult<Value> {
     let rule = required_string(params, "url")?;
     let page = optional_page(params)?;
-    let state = load_info_map_state(supplied)?;
+    let state = load_info_map_state(&source.book_source_url, supplied)?;
     // URL stages and loginCheckJs share the Map; independent list fields do not.
     let (response, state) = with_js_info_map(state, || {
         fetch_rule(
@@ -540,7 +560,7 @@ fn execute_explore(
     let data = serde_json::to_value(engine.explore_books(source, &response.body, &response.url))
         .map_err(|error| ExecuteError::internal(error.to_string()))?;
     let mut result = success(data, 1, false, &response, options);
-    publish_info_map_state(&mut result, state, false)?;
+    publish_info_map_state(&mut result, &source.book_source_url, state, false)?;
     Ok(result)
 }
 
@@ -558,7 +578,7 @@ fn execute_explore_action(
         "(()=>{{let refresh=false;java.refreshExplore=()=>{{refresh=true;}};(0,eval)({});return JSON.stringify({{refreshExplore:refresh}});}})()",
         serde_json::to_string(action).map_err(|error| ExecuteError::internal(error.to_string()))?
     );
-    let state = load_info_map_state(supplied)?;
+    let state = load_info_map_state(&source.book_source_url, supplied)?;
     let (((output, messages, _, _), relogin), state) = with_js_info_map(state, || {
         with_relogin_request(|| with_login_messages(|| with_js_lib(source.js_lib.as_deref(), || {
             eval_js(&script, "", &source.book_source_url)
@@ -570,7 +590,7 @@ fn execute_explore_action(
     if relogin.is_some() { data["refreshExplore"] = json!(true); }
     data["message"] = json!(messages.join("\n"));
     let mut response = success_without_http(data);
-    publish_info_map_state(&mut response, state, true)?;
+    publish_info_map_state(&mut response, &source.book_source_url, state, true)?;
     Ok(response)
 }
 
@@ -579,18 +599,33 @@ fn execute_explore_kinds_with_state(
     options: &ValidatedOptions,
     supplied: Option<InfoMapState>,
 ) -> ExecuteResult<Value> {
-    let state = load_info_map_state(supplied)?;
+    let state = load_info_map_state(&source.book_source_url, supplied)?;
     let (result, state) = with_js_info_map(state, || execute_explore_kinds(source, options));
     let mut response = result?;
-    publish_info_map_state(&mut response, state, true)?;
+    publish_info_map_state(&mut response, &source.book_source_url, state, true)?;
     Ok(response)
 }
 
 fn publish_info_map_state(
     response: &mut Value,
+    source: &str,
     state: InfoMapState,
     flush: bool,
 ) -> ExecuteResult<()> {
+    match crate::runtime::file_cache::FileCache::current() {
+        Ok(cache) => {
+            let committed = crate::runtime::file_cache::commit_info_map(&cache, source, state, flush)
+                .map_err(|error| ExecuteError::internal(error.message))?;
+            response["infoMap"] = json!(committed.state);
+            if let Some(error) = committed.persistence_error {
+                response["infoMapError"] = json!(error);
+            }
+            return Ok(());
+        }
+        Err(err) if err.kind != "unavailable" =>
+            return Err(ExecuteError::internal(err.message)),
+        Err(_) => (), // Legacy hosts without a configured native cache.
+    }
     let committed =
         crate::host_services::call("info_map.commit", &json!({"state": state, "flush": flush}));
     if committed["ok"] == true {

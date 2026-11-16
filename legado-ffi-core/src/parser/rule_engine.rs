@@ -1693,7 +1693,17 @@ impl RuleEngine {
             Err(_) => return vec![],
         };
 
-        if let Some(items) = parse_js_output_items(&output) {
+        // Keep JSON-encoded string rows as strings. Legado's setContent(item)
+        // allows JSONPath fields to parse them, while JS fields still receive
+        // the original text (including exact large integer IDs).
+        let items = serde_json::from_str::<Value>(output.trim()).ok().and_then(|value| {
+            match value {
+                Value::Array(items) => Some(items),
+                value @ Value::Object(_) => Some(vec![value]),
+                _ => None,
+            }
+        });
+        if let Some(items) = items {
             let mut out = Vec::with_capacity(items.len());
             for item in items {
                 let mut context = RuleVariableContext::for_search_book(source);
@@ -2047,6 +2057,24 @@ impl RuleEngine {
         };
 
         if let Some(items) = parse_js_output_items(&output) {
+            // Legado also accepts JS arrays of HTML fragments as chapter items.
+            // Parse each fragment separately so chapterName/chapterUrl keep their scope.
+            if !items.is_empty() && items.iter().all(|item| {
+                item.as_str().is_some_and(|html| {
+                    html.trim_start().starts_with('<') && html.contains('>')
+                })
+            }) {
+                let markup: String = items.iter().filter_map(Value::as_str)
+                    .map(|html| format!("<div>{html}</div>"))
+                    .collect();
+                let mut html_rule = rule.clone();
+                html_rule.init = None;
+                html_rule.next_toc_url = None;
+                let (chapters, _) = parse_chapter_list_html(
+                    self, &markup, base_url, &html_rule, "body > div", ctx);
+                let next_urls = self.parse_next_toc_urls(body, base_url, rule, ctx);
+                return (chapters, next_urls);
+            }
             let mut out: Vec<BookChapter> = Vec::with_capacity(items.len());
             for item in items {
                 let mut chapter_ctx =
@@ -2221,7 +2249,7 @@ impl RuleEngine {
         let doc = html::parse_document(body);
         let (selector, list_js) = extract_js(list_sel);
         let list_context = RuleVariableContext::for_search_item();
-        let (items, markup, objects) = apply_html_list_js(
+        let (items, markup, objects, html_nodes) = apply_html_list_js(
             html::select_list(&doc, self.strip_mode_prefix(selector)),
             list_js,
             base_url,
@@ -2238,12 +2266,13 @@ impl RuleEngine {
             );
         }
         let post_selector = html_list_post_selector(list_sel);
-        let post_doc = match (markup.as_deref(), post_selector) {
-            (Some(markup), Some(_)) => Some(html::parse_document(markup)),
-            _ => None,
-        };
+        let post_doc = markup
+            .as_deref()
+            .filter(|_| html_nodes || post_selector.is_some())
+            .map(html::parse_document);
         let items = match (post_doc.as_ref(), post_selector) {
             (Some(doc), Some(selector)) => html::select_list(doc, selector),
+            (Some(doc), None) if html_nodes => html::select_list(doc, "body > *"),
             _ => items,
         };
         let mut out = Vec::with_capacity(items.len());
@@ -3511,20 +3540,37 @@ fn parse_chapter_list_html(
     }
 
     let (selector, list_js) = extract_js(list_sel);
-    let (items, markup, _objects) = apply_html_list_js(
+    let (items, markup, objects, html_nodes) = apply_html_list_js(
         html::select_list(&doc, strip_mode_prefix(selector)),
         list_js,
         base_url,
         ctx,
         body,
     );
+    // HTML list JS may replace selected elements with chapter objects.
+    // Keep the JSON field rules for those objects, as in a pure JS TOC.
+    if let Some(objects) = objects {
+        let mut chapters = Vec::with_capacity(objects.len());
+        for item in objects {
+            let mut chapter_ctx =
+                ctx.for_chapter(item.get("variable").and_then(Value::as_str), "");
+            if let Some(chapter) =
+                build_chapter_from_json(&item, base_url, rule, &mut chapter_ctx, chapters.len())
+            {
+                chapters.push(chapter);
+            }
+        }
+        let next_urls = engine.parse_next_toc_urls(body, base_url, rule, ctx);
+        return (chapters, next_urls);
+    }
     let post_selector = html_list_post_selector(list_sel);
-    let post_doc = match (markup.as_deref(), post_selector) {
-        (Some(markup), Some(_)) => Some(html::parse_document(markup)),
-        _ => None,
-    };
+    let post_doc = markup
+        .as_deref()
+        .filter(|_| html_nodes || post_selector.is_some())
+        .map(html::parse_document);
     let items = match (post_doc.as_ref(), post_selector) {
         (Some(doc), Some(selector)) => html::select_list(doc, selector),
+        (Some(doc), None) if html_nodes => html::select_list(doc, "body > *"),
         _ => items,
     };
     let mut out = Vec::with_capacity(items.len());
@@ -4544,9 +4590,10 @@ fn apply_html_list_js<'a>(
     Vec<scraper::ElementRef<'a>>,
     Option<String>,
     Option<Vec<Value>>,
+    bool,
 ) {
     if script.is_none() {
-        return (items, None, None);
+        return (items, None, None, false);
     }
 
     let values = items
@@ -4571,23 +4618,55 @@ fn apply_html_list_js<'a>(
 
     match eval_list_js(values, script, base_url, ctx, source_body) {
         Some(Value::Array(result)) => {
-            // Real book-list JS can replace Jsoup nodes with fresh book objects.
-            if !result.is_empty()
-                && result
+            // A CSS list script may append elements from java.getElement().
+            // Such nodes have no index in the original selection; preserve
+            // the complete ordered list as HTML instead of silently dropping them.
+            if result.iter().any(|item| {
+                item.get("__readerHtmlElement").and_then(Value::as_bool) == Some(true)
+                    && item.get("__readerIndex").is_none()
+            }) {
+                let markup: Option<Vec<String>> = result
                     .iter()
-                    .all(|item| item.is_object() && item.get("__readerIndex").is_none())
+                    .map(|item| {
+                        if let Some(index) = item.get("__readerIndex").and_then(Value::as_u64) {
+                            items.get(index as usize).map(|el| el.html())
+                        } else if item.get("__readerHtmlElement").and_then(Value::as_bool)
+                            == Some(true)
+                        {
+                            item.get("outerHtml").and_then(Value::as_str).map(str::to_owned)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if let Some(markup) = markup {
+                    return (Vec::new(), Some(markup.concat()), None, true);
+                }
+            }
+            // A list script can mix original Jsoup elements with fresh
+            // book/chapter objects (1148#486). The JSON field evaluator
+            // already handles HTML carriers, so preserve this ordered array.
+            if result.iter().all(Value::is_object)
+                && result.iter().any(|item| {
+                    item.get("__readerIndex").is_none()
+                        && item.get("__readerHtmlElement").and_then(Value::as_bool) != Some(true)
+                })
+                && result.iter().all(|item| {
+                    item.get("__readerIndex").is_none()
+                        || item.get("__readerHtmlElement").and_then(Value::as_bool) == Some(true)
+                })
             {
-                return (items, None, Some(result));
+                return (items, None, Some(result), false);
             }
             let items = result
                 .into_iter()
                 .filter_map(|item| item.get("__readerIndex").and_then(Value::as_u64))
                 .filter_map(|index| items.get(index as usize).copied())
                 .collect();
-            (items, None, None)
+            (items, None, None, false)
         }
-        Some(Value::String(markup)) => (items, Some(markup), None),
-        _ => (items, None, None),
+        Some(Value::String(markup)) => (items, Some(markup), None, false),
+        _ => (items, None, None, false),
     }
 }
 
@@ -6677,52 +6756,50 @@ fn build_search_book_from_json(
     rule: &SearchRule,
     ctx: &mut RuleVariableContext,
 ) -> Option<SearchBook> {
-    let name = eval_field_json_with_ctx(rule.name.as_deref().unwrap_or(""), item, base_url, ctx)
-        .unwrap_or_default();
-    let name = book_info_format_name(name);
+    // Original Legado keeps JSON-encoded string items as String objects.
+    // JSON selectors read their parsed content, but a pure JS field gets
+    // the exact unparsed text and does not round opaque 64-bit IDs.
+    let decoded = item
+        .as_str()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .filter(|value| value.is_object() || value.is_array());
+    let field_item = |field: &str| -> &Value {
+        let field = field.trim_start();
+        if starts_with_ascii_case(field, "<js>")
+            || starts_with_ascii_case(field, "@js:")
+            || starts_with_ascii_case(field, "js:")
+        {
+            item
+        } else {
+            decoded.as_ref().unwrap_or(item)
+        }
+    };
+    let eval_field = |field: Option<&String>, ctx: &mut RuleVariableContext| {
+        let field = field.map(String::as_str).unwrap_or("");
+        eval_field_json_with_ctx(field, field_item(field), base_url, ctx)
+    };
+
+    let name = book_info_format_name(eval_field(rule.name.as_ref(), ctx).unwrap_or_default());
     if name.is_empty() {
         return None;
     }
     ctx.set_book_field("name", &name);
-    let author = book_info_format_author(
-        eval_field_json_with_ctx(rule.author.as_deref().unwrap_or(""), item, base_url, ctx)
-            .unwrap_or_default(),
-    );
+    let author = book_info_format_author(eval_field(rule.author.as_ref(), ctx).unwrap_or_default());
     ctx.set_book_field("author", &author);
+    let kind_rule = rule.kind.as_deref().unwrap_or("");
     let kind = rule
         .kind
         .as_deref()
-        .and_then(|rule| book_info_rule_kind(rule, FieldInput::Json(item), base_url, ctx))
-        .or_else(|| {
-            eval_field_json_kind_with_ctx(rule.kind.as_deref().unwrap_or(""), item, base_url, ctx)
-        });
+        .and_then(|rule| book_info_rule_kind(rule, FieldInput::Json(field_item(rule)), base_url, ctx))
+        .or_else(|| eval_field_json_kind_with_ctx(kind_rule, field_item(kind_rule), base_url, ctx));
     ctx.set_book_field("kind", kind.as_deref().unwrap_or(""));
-    let word_count = eval_field_json_with_ctx(
-        rule.word_count.as_deref().unwrap_or(""),
-        item,
-        base_url,
-        ctx,
-    );
-    let last_chapter = eval_field_json_with_ctx(
-        rule.last_chapter.as_deref().unwrap_or(""),
-        item,
-        base_url,
-        ctx,
-    );
-    let update_time = eval_field_json_with_ctx(
-        rule.update_time.as_deref().unwrap_or(""),
-        item,
-        base_url,
-        ctx,
-    );
-    let intro = eval_field_json_with_ctx(rule.intro.as_deref().unwrap_or(""), item, base_url, ctx);
-    let cover_url =
-        eval_field_json_with_ctx(rule.cover_url.as_deref().unwrap_or(""), item, base_url, ctx)
-            .map(|u| resolve_url(base_url, &u));
+    let word_count = eval_field(rule.word_count.as_ref(), ctx);
+    let last_chapter = eval_field(rule.last_chapter.as_ref(), ctx);
+    let update_time = eval_field(rule.update_time.as_ref(), ctx);
+    let intro = eval_field(rule.intro.as_ref(), ctx);
+    let cover_url = eval_field(rule.cover_url.as_ref(), ctx).map(|u| resolve_url(base_url, &u));
     ctx.set_book_field("coverUrl", cover_url.as_deref().unwrap_or(""));
-    let book_url =
-        eval_field_json_with_ctx(rule.book_url.as_deref().unwrap_or(""), item, base_url, ctx)
-            .unwrap_or_default();
+    let book_url = eval_field(rule.book_url.as_ref(), ctx).unwrap_or_default();
     Some(SearchBook {
         name: ctx.book_fields.get("name").cloned().unwrap_or(name),
         author,

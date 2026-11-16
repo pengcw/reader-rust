@@ -234,6 +234,12 @@ if (globalThis.java && globalThis.java.getString) {
                             get: { value: listGet },
                             set: { value: listSet },
                             add: { value: appendListValue },
+                            addAll: { value: function(values) {
+                                if (!Array.isArray(values)) throw new TypeError('addAll requires a collection');
+                                const extra = Array.from(values);
+                                for (const item of extra) this.push(item);
+                                return extra.length > 0;
+                            } },
                             size: { value: listSize },
                             isEmpty: { value: function() { return this.length === 0; } },
                             toArray: { value: function() { return Array.from(this); } },
@@ -398,8 +404,16 @@ if (globalThis.java && globalThis.java.getString) {
                     globalThis.java.getElements = _wrapElements;
                     globalThis.java.getElement = function(rule, content) {
                         const jsonValue = _nativeGetElement(rule, _readerNodeContent(rule, content, false));
-                        if (jsonValue != null) return JSON.parse(jsonValue);
-                        const items = _wrapElements(rule, content);
-                        return items.length > 0 ? items[0] : null;
+                        if (jsonValue != null) {
+                            const parsed = JSON.parse(jsonValue);
+                            // A JSONPath array is a Java List in Legado, not
+                            // a plain JS array. Retain its collection methods.
+                            return Array.isArray(parsed) && /^(?:\$|@json:)/i.test(String(rule).trim())
+                                ? _decorateItems(parsed) : parsed;
+                        }
+                        // Absent JSON and JS values remain null; only HTML/XPath
+                        // selectors return a Jsoup Elements collection.
+                        if (/^(?:\$|@json:|@js:|js:|<js>)/i.test(String(rule).trim())) return null;
+                        return _wrapElements(rule, content);
                     };
                 }
