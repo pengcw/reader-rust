@@ -27,7 +27,9 @@
                     globalThis.org.jsoup = asObject(globalThis.org.jsoup);
                     globalThis.org.jsoup.Jsoup = asObject(globalThis.org.jsoup.Jsoup);
                     const fetchedDocuments = new WeakMap();
-                    java.__jsoupDocumentResult = value => fetchedDocuments.get(value);
+                    const parsedDocuments = new WeakSet();
+                    java.__jsoupDocumentResult = value => fetchedDocuments.get(value)
+                        ?? (parsedDocuments.has(value) ? String(value.html()) : undefined);
                     globalThis.org.jsoup.select = asObject(globalThis.org.jsoup.select);
                     globalThis.org.jsoup.nodes = asObject(globalThis.org.jsoup.nodes);
                     if (typeof globalThis.org.jsoup.select.Elements !== 'function') {
@@ -678,10 +680,11 @@
                                 } });
                                 return result;
                             };
-                            return wrapStringMethods({
+                            const document = wrapStringMethods({
                                 createElement,
                                 baseUri() { return base; },
                                 html() { return source; },
+                                toString() { return source; },
                                 title() {
                                     const title = this.selectFirst('title');
                                     return title ? title.text() : '';
@@ -713,6 +716,8 @@
                                     return items;
                                 }
                             }, ['baseUri', 'html', 'title', 'text']);
+                            parsedDocuments.add(document);
+                            return document;
                         };
                     }
                     if (typeof globalThis.org.jsoup.nodes.Element !== 'function') {

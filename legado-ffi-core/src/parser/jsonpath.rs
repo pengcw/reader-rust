@@ -161,7 +161,7 @@ fn regex_filter_query(value: &Value, rule: &str) -> Option<Option<Vec<Value>>> {
     if !super::source_regex::is_valid(&pattern) {
         return Some(None);
     }
-    let prefix = normalize_negative_indices(prefix);
+    let prefix = normalize_bracket_steps(prefix);
     let Ok(parents) = jsonpath_lib::select(value, &prefix) else {
         return Some(None);
     };
@@ -205,7 +205,7 @@ fn regex_filter_query(value: &Value, rule: &str) -> Option<Option<Vec<Value>>> {
 
 // jsonpath_lib clamps underflowing negative indexes to zero. A one-item slice
 // uses the same bounds but becomes empty on underflow, without replacing its evaluator.
-fn normalize_negative_indices(rule: &str) -> std::borrow::Cow<'_, str> {
+fn normalize_bracket_steps(rule: &str) -> std::borrow::Cow<'_, str> {
     let mut quote = None;
     let mut escaped = false;
     let mut parentheses = 0usize;
@@ -234,17 +234,24 @@ fn normalize_negative_indices(rule: &str) -> std::borrow::Cow<'_, str> {
                 let Some(end) = rule[index..].find(']').map(|end| index + end) else {
                     continue;
                 };
-                let Ok(position) = rule[index + 1..end].trim().parse::<isize>() else {
-                    continue;
-                };
-                if position >= 0 {
+                let step = rule[index + 1..end].trim();
+                let position = step.parse::<isize>().ok();
+                let needs_dot = (position.is_some() || step == "*")
+                    && rule[end + 1..].starts_with(|ch: char| ch.is_ascii_alphabetic() || ch == '_');
+                if let Some(position) = position.filter(|&n| n < 0) {
+                    output.push_str(&rule[copied..index]);
+                    if position == -1 {
+                        output.push_str("[-1:]");
+                    } else {
+                        output.push_str(&format!("[{position}:{}]", position + 1));
+                    }
+                } else if needs_dot {
+                    output.push_str(&rule[copied..=end]);
+                } else {
                     continue;
                 }
-                output.push_str(&rule[copied..index]);
-                if position == -1 {
-                    output.push_str("[-1:]");
-                } else {
-                    output.push_str(&format!("[{position}:{}]", position + 1));
+                if needs_dot {
+                    output.push('.');
                 }
                 copied = end + 1;
             }
@@ -314,6 +321,47 @@ fn jsonpath_query_with_arrays(value: &Value, rule: &str, flatten_arrays: bool) -
     jsonpath_query_checked(value, rule, flatten_arrays).unwrap_or_default()
 }
 
+// Jayway compares string and number nodes across types. jsonpath_lib also drops
+// missing and null fields for !=. Limit this adapter to simple source predicates.
+fn simple_comparison<'a>(root: &'a Value, rule: &str) -> Option<Vec<&'a Value>> {
+    if !rule.contains("!=") && !rule.contains("==") {
+        return None;
+    }
+    static FILTER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"^\$(?:\.([A-Za-z_]\w*))?\.?\[\?\(\s*@\.([A-Za-z_]\w*)\s*(==|!=)\s*(?:([0-9]+)|'([A-Za-z_]\w*)'|"([A-Za-z_]\w*)")\s*\)\](?:\.([A-Za-z_]\w*))?$"#).unwrap()
+    });
+    let parts = FILTER.captures(rule)?;
+    let parent = match parts.get(1) {
+        Some(key) => root.get(key.as_str())?,
+        None => root,
+    };
+    let rows: &[Value] = match parent {
+        Value::Array(items) => items,
+        Value::Object(_) => std::slice::from_ref(parent),
+        _ => return None,
+    };
+    let equality = &parts[3] == "==";
+    let integer = parts.get(4).map(|m| m.as_str().parse::<u32>()).transpose().ok()?;
+    let literal = parts.get(5).or(parts.get(6)).or(parts.get(4))?.as_str();
+    if integer.is_some() && literal.len() > 1 && literal.starts_with('0') {
+        return None;
+    }
+    let mut result = Vec::new();
+    for row in rows {
+        let equal = match row.get(&parts[2]) {
+            Some(Value::String(s)) => s == literal,
+            Some(Value::Number(n)) => integer.is_some_and(|i| n.as_f64() == Some(f64::from(i))),
+            _ => false,
+        };
+        if equal == equality {
+            if let Some(value) = parts.get(7).map_or(Some(row), |key| row.get(key.as_str())) {
+                result.push(value);
+            }
+        }
+    }
+    Some(result)
+}
+
 fn jsonpath_query_checked(value: &Value, rule: &str, flatten_arrays: bool) -> Option<Vec<Value>> {
     if let Some(rendered) = render_embedded_paths(value, rule) {
         return Some(vec![Value::String(rendered)]);
@@ -340,8 +388,15 @@ fn jsonpath_query_checked(value: &Value, rule: &str, flatten_arrays: bool) -> Op
     if has_unsupported_filter_selector(rule) {
         return None;
     }
-    let rule = normalize_negative_indices(rule);
-    if let Ok(res) = jsonpath_lib::select(value, &rule) {
+    let rule = normalize_bracket_steps(rule);
+    if let Some(field) = rule.strip_prefix("$..[?(@.").and_then(|s| s.strip_suffix(")]")) {
+        if !field.is_empty() && field.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            let mut matches = Vec::new();
+            collect_with_field(value, field, &mut matches);
+            return Some(matches);
+        }
+    }
+    if let Some(res) = simple_comparison(value, &rule).or_else(|| jsonpath_lib::select(value, &rule).ok()) {
         let mut out = Vec::new();
         for item in res {
             match item {
@@ -354,6 +409,26 @@ fn jsonpath_query_checked(value: &Value, rule: &str, flatten_arrays: bool) -> Op
         Some(out)
     } else {
         None
+    }
+}
+
+// Jayway scans each subtree before the next sibling (笔趣阁 / 晋江).
+fn collect_with_field(value: &Value, field: &str, matches: &mut Vec<Value>) {
+    match value {
+        Value::Object(map) => {
+            if map.contains_key(field) {
+                matches.push(value.clone());
+            }
+            for child in map.values() {
+                collect_with_field(child, field, matches);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                collect_with_field(child, field, matches);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -410,6 +485,74 @@ fn render_embedded_paths(value: &Value, rule: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn p471_source_filters_keep_missing_and_null_and_compare_numeric_text() {
+        let rows = json!([{"id":"missing"},{"type":null,"id":"null"},{"type":1,"id":"number"},
+            {"type":"1","id":"text"},{"type":"01","id":"leading"},{"type":2,"id":"two"}]);
+        let data = json!({"data":rows});
+        assert_eq!(jsonpath_query(&data, "$.data[?(@.type != 1)].id"),
+            vec![json!("missing"), json!("null"), json!("leading"), json!("two")]);
+        let toc = json!([{"source":null,"_id":"abc"},{"source":"zhuishuvip","_id":"skip"}]);
+        assert_eq!(jsonpath_query(&toc, "$.[?(@.source!='zhuishuvip')]._id"), vec![json!("abc")]);
+    }
+
+    #[test]
+    fn p473_biquge_content_accepts_text_or_numeric_one() {
+        let data = json!({"data":[{"hasContent":"1","content":"文本标记"},
+            {"hasContent":1,"content":"数字标记"},{"hasContent":"01","content":"前导零"},
+            {"hasContent":false,"content":"关闭"},{"content":"缺失"}]});
+        assert_eq!(jsonpath_query(&data, "$.data[?(@.hasContent==1)].content"),
+            vec![json!("文本标记"), json!("数字标记")]);
+    }
+
+    #[test]
+    fn p476_biquge_volume_children_precede_the_next_chapter() {
+        let child = json!({"id":2,"hasContent":false});
+        let sibling = json!({"id":3,"hasContent":true});
+        let parent = json!({"id":1,"hasContent":null,"child":child});
+        let rule = "$..[?(@.hasContent)]";
+        assert_eq!(jsonpath_query(&json!([parent,sibling]), rule),
+            vec![parent, child.clone(), sibling.clone()]);
+        assert_eq!(jsonpath_query(&json!([{"list":[child]},sibling]), rule),
+            vec![child, sibling]);
+    }
+
+    #[test]
+    fn p475_recursive_presence_includes_matching_root_before_children() {
+        let child = json!({"name":"child","hasContent":false});
+        let root = json!({"name":"root","hasContent":null,"rows":[child,child]});
+        let rule = "$..[?(@.hasContent)]";
+        assert_eq!(jsonpath_query(&root, rule), vec![root.clone(), child.clone(), child.clone()]);
+        assert_eq!(jsonpath_query(&json!([child]), rule), vec![child]);
+        assert!(jsonpath_query(&root, "$..[?(@.other)]").is_empty());
+    }
+
+    #[test]
+    fn p474_biquge_filter_checks_single_object_itself() {
+        let path = "$.data[?(@.hasContent==1)].content";
+        for (flag, expected) in [(json!("1"), true), (json!(1), true), (json!(0), false)] {
+            let data = json!({"data":{"hasContent":flag,"content":"正文",
+                "child":{"hasContent":1,"content":"子节点"}}});
+            assert_eq!(jsonpath_query(&data, path),
+                if expected { vec![json!("正文")] } else { vec![] });
+        }
+    }
+
+    #[test]
+    fn p470_last_chapter_after_array_index() {
+        let data = json!({"tracks":{"list":[{"title":"旧"},{"title":"新"}]},
+            "ep_list":[{"short_title":"第一话"}], "[0]title":"literal"});
+        for (rule, expected) in [
+            ("$.tracks.list[-1]title", "新"),
+            ("$..ep_list[0]short_title", "第一话"),
+            ("$.tracks.list[*]title", "旧"),
+            ("$['[0]title']", "literal"),
+        ] {
+            assert_eq!(jsonpath_first_string(&data, rule).as_deref(), Some(expected), "{rule}");
+        }
+        assert!(jsonpath_query(&data, "$.tracks.list[-3]title").is_empty());
+    }
 
     #[test]
     fn compat_jsonpath_direct_and_embedded_values() {
@@ -520,7 +663,7 @@ mod tests {
 
         // PASS: comparison operators and JSON type distinction.
         for (rule, expected) in [
-            ("$.books[?(@.price == 10)].name", vec![json!("B")]),
+            ("$.books[?(@.price == 10)].name", vec![json!("B"), json!("C")]),
             ("$.books[?(@.price == '10')].name", vec![json!("C")]),
             ("$.books[?(@.price != 10)].name", vec![json!("A")]),
             ("$.books[?(@.price < 10)].name", vec![json!("A")]),
@@ -539,8 +682,9 @@ mod tests {
             jsonpath_query(&value, "$.books[?(@.vip)].name"),
             vec![json!("A"), json!("B")]
         );
-        // DIFFERENT_SEMANTICS: missing-field != currently yields no match.
-        assert!(jsonpath_query(&value, "$.books[?(@.missing != 1)].name").is_empty());
+        // Jayway compares an absent field as UNDEFINED, distinct from 1.
+        assert_eq!(jsonpath_query(&value, "$.books[?(@.missing != 1)].name"),
+            vec![json!("A"), json!("B"), json!("C")]);
 
         // PASS: negative index, stepped slice, recursive descent, and root arrays.
         assert_eq!(jsonpath_query(&value, "$.books[-1].name"), vec![json!("C")]);

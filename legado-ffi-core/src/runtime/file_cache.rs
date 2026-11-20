@@ -354,11 +354,10 @@ impl FileCache {
         for entry in fs::read_dir(&dir).map_err(|_| error("operation_failed", "cache clear failed"))? {
             let entry = entry.map_err(|_| error("operation_failed", "cache clear failed"))?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            if entry_name(&name) || temporary_name(&name) {
-                if regular_file(&entry.path())?.is_some() {
+            if (entry_name(&name) || temporary_name(&name))
+                && regular_file(&entry.path())?.is_some() {
                     fs::remove_file(entry.path()).map_err(|_| error("operation_failed", "cache delete failed"))?;
                 }
-            }
         }
         sync_directory(&dir).map_err(|_| error("operation_failed", "cache delete sync failed"))
     }

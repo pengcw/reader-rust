@@ -1461,7 +1461,9 @@ impl RuleEngine {
                 if has_stages || js.is_some() {
                     // Content selectors collect all paragraphs before running the
                     // trailing script, just as they do without a JS stage.
-                    eval_content_html_doc_with_ctx(content_rule, &doc, base_url, context)
+                    eval_content_html_doc_with_ctx(
+                        content_rule, &doc, base_url, context, &content_body,
+                    )
                 } else {
                     html::select_all_text(&doc, self.strip_mode_prefix(content_rule))
                         .unwrap_or_default()
@@ -2056,7 +2058,16 @@ impl RuleEngine {
             Err(_) => return (vec![], vec![]),
         };
 
-        if let Some(items) = parse_js_output_items(&output) {
+        // Keep stringified JSON chapter rows as Strings for direct JS fields.
+        // JSONPath fields still read the decoded row, just as in search lists.
+        let items = serde_json::from_str::<Value>(output.trim())
+            .ok()
+            .and_then(|value| match value {
+                Value::Array(items) => Some(items),
+                value @ Value::Object(_) => Some(vec![value]),
+                _ => None,
+            });
+        if let Some(items) = items {
             // Legado also accepts JS arrays of HTML fragments as chapter items.
             // Parse each fragment separately so chapterName/chapterUrl keep their scope.
             if !items.is_empty() && items.iter().all(|item| {
@@ -2077,11 +2088,16 @@ impl RuleEngine {
             }
             let mut out: Vec<BookChapter> = Vec::with_capacity(items.len());
             for item in items {
+                let decoded = item
+                    .as_str()
+                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                    .filter(|value| value.is_object() || value.is_array());
+                let fields = decoded.as_ref().unwrap_or(&item);
                 let mut chapter_ctx =
-                    ctx.for_chapter(item.get("variable").and_then(Value::as_str), "");
-                if let Some(mut chapter) =
-                    build_chapter_from_json(&item, base_url, rule, &mut chapter_ctx, out.len())
-                {
+                    ctx.for_chapter(fields.get("variable").and_then(Value::as_str), "");
+                if let Some(mut chapter) = build_chapter_from_json(
+                    fields, Some(&item), base_url, rule, &mut chapter_ctx, out.len(),
+                ) {
                     chapter.index = out.len() as i32;
                     out.push(chapter);
                 }
@@ -3554,9 +3570,9 @@ fn parse_chapter_list_html(
         for item in objects {
             let mut chapter_ctx =
                 ctx.for_chapter(item.get("variable").and_then(Value::as_str), "");
-            if let Some(chapter) =
-                build_chapter_from_json(&item, base_url, rule, &mut chapter_ctx, chapters.len())
-            {
+            if let Some(chapter) = build_chapter_from_json(
+                &item, None, base_url, rule, &mut chapter_ctx, chapters.len(),
+            ) {
                 chapters.push(chapter);
             }
         }
@@ -3787,6 +3803,29 @@ fn parse_chapter_list_json(
 
     let mut out = Vec::with_capacity(items.len());
     for item in items {
+        // JSONPath -> JS can append JSON.stringify(chapter) to object rows.
+        // Preserve the raw String for JS fields; decode only JSON selectors.
+        if list_js.is_some() {
+            if let Value::String(raw) = &item {
+                if let Ok(value @ (Value::Object(_) | Value::Array(_))) =
+                    serde_json::from_str::<Value>(raw)
+                {
+                    let mut chapter_ctx =
+                        ctx.for_chapter(value.get("variable").and_then(Value::as_str), "");
+                    if let Some(chapter) = build_chapter_from_json(
+                        &value,
+                        Some(&item),
+                        base_url,
+                        rule,
+                        &mut chapter_ctx,
+                        out.len(),
+                    ) {
+                        out.push(chapter);
+                    }
+                    continue;
+                }
+            }
+        }
         let mut chapter_ctx = ctx.for_chapter(item.get("variable").and_then(Value::as_str), "");
         let title = eval_field_json_with_ctx(
             rule.chapter_name.as_deref().unwrap_or(""),
@@ -4616,8 +4655,19 @@ fn apply_html_list_js<'a>(
         })
         .collect();
 
+    // Jsoup Elements stringification is handled by the shared JS list wrapper.
     match eval_list_js(values, script, base_url, ctx, source_body) {
         Some(Value::Array(result)) => {
+            if !result.is_empty()
+                && result.iter().all(|item| {
+                    item.as_str().is_some_and(looks_like_html_fragment)
+                })
+            {
+                let markup: String = result.iter().filter_map(Value::as_str)
+                    .map(|html| format!("<div>{html}</div>"))
+                    .collect();
+                return (Vec::new(), Some(markup), None, true);
+            }
             // A CSS list script may append elements from java.getElement().
             // Such nodes have no index in the original selection; preserve
             // the complete ordered list as HTML instead of silently dropping them.
@@ -4712,6 +4762,27 @@ fn split_json_list_js(rule: &str) -> (&str, Option<&str>, Option<&str>) {
     (selector, script, None)
 }
 
+// Some Legado rules parse the string form of a JSONPath object list as JSON.
+// A native JS Array would instead coerce object rows to "[object Object]".
+// Adapt only JSONPath object lists, not HTML/XPath/CSS or primitive lists.
+fn eval_json_list_js(
+    items: Vec<Value>,
+    script: Option<&str>,
+    base_url: &str,
+    ctx: &RuleVariableContext,
+    source_body: &str,
+) -> Option<Value> {
+    let script = script.filter(|script| !script.trim().is_empty())?;
+    if items.iter().all(|item| item.is_object() || item.is_array()) {
+        let wrapped = format!(
+            "Object.defineProperty(result, 'toString', {{value: function() {{return JSON.stringify(this);}}}});\n{script}"
+        );
+        eval_list_js(items, Some(&wrapped), base_url, ctx, source_body)
+    } else {
+        eval_list_js(items, Some(script), base_url, ctx, source_body)
+    }
+}
+
 fn apply_json_list_js(
     items: Vec<Value>,
     script: Option<&str>,
@@ -4721,7 +4792,7 @@ fn apply_json_list_js(
     source_body: &str,
 ) -> Vec<Value> {
     if let Some(selector) = post_selector {
-        let Some(output) = eval_list_js(items, script, base_url, ctx, source_body) else {
+        let Some(output) = eval_json_list_js(items, script, base_url, ctx, source_body) else {
             return Vec::new();
         };
         let output = match output {
@@ -4741,7 +4812,7 @@ fn apply_json_list_js(
     if script.is_none() {
         return items;
     }
-    match eval_list_js(items, script, base_url, ctx, source_body) {
+    match eval_json_list_js(items, script, base_url, ctx, source_body) {
         Some(Value::Array(items)) => items,
         // Source scripts often return JSON.stringify(list), not a JS array.
         Some(Value::String(output)) => match serde_json::from_str(&output) {
@@ -4818,7 +4889,16 @@ fn apply_xpath_list_js<'a>(
         }
     }
 
-    match eval_list_js(values, script, base_url, ctx, source_body) {
+    // AnalyzeByXPath.getElements returns a Java List<JXNode> in Legado.
+    // When a source stringifies that list, keep Java's "[a, b]" form;
+    // native JS Array.toString() uses "a,b" instead (和图书 volume split).
+    let script = script.unwrap_or_default();
+    let wrapped = script.contains("String(result)").then(|| {
+        format!(
+            "Object.defineProperty(result, 'toString', {{value:function(){{return '[' + this.map(String).join(', ') + ']';}}}});\n{script}"
+        )
+    });
+    match eval_list_js(values, Some(wrapped.as_deref().unwrap_or(script)), base_url, ctx, source_body) {
         Some(Value::Array(result)) => (
             result
                 .into_iter()
@@ -5524,6 +5604,7 @@ fn eval_content_html_doc_with_ctx(
     doc: &scraper::Html,
     base_url: &str,
     ctx: &RuleVariableContext,
+    source_body: &str,
 ) -> String {
     // A CSS ## replacement ends before a subsequent @js: stage.
     // Without this boundary, the script is inserted into the replacement
@@ -5592,7 +5673,10 @@ fn eval_content_html_doc_with_ctx(
         html::select_all_text(doc, selection).unwrap_or_default()
     };
     if let Some(script) = js {
-        if let Ok(result) = eval_js_with_bindings(script, &text, base_url, &ctx.js_bindings()) {
+        // CSS extraction updates result, not Legado's original-response src.
+        let mut bindings = ctx.js_bindings();
+        bindings.insert("src".to_string(), Value::String(source_body.to_string()));
+        if let Ok(result) = eval_js_with_bindings(script, &text, base_url, &bindings) {
             text = result;
         }
     }
@@ -6115,6 +6199,21 @@ fn eval_field_json_with_ctx(
         };
         return eval_field_html_with_ctx(rule, &element, base_url, &mut *guard.context);
     }
+    // In a URL template, result comes from JS and JSONPath reads the original row.
+    if let Some((stages, tail)) = rule.rsplit_once("</js>") {
+        let tail = tail.trim();
+        let literal_url = tail.starts_with("data:") || tail.starts_with("https://") || tail.starts_with("http://");
+        if literal_url && tail.contains("{{result}}")
+            && tail.split("{{").skip(1).all(|part| part.starts_with("result}}") || part.starts_with("$."))
+            && !tail.contains("##") && !tail.contains("<js>") && !tail.contains("@js:")
+        {
+            let stage_end = stages.len() + "</js>".len();
+            let text = eval_field_json_with_ctx(&rule[..stage_end], v, base_url, ctx)?;
+            return Some(tail.split("{{result}}")
+                .map(|part| interpolate_json_templates(part, v, base_url, ctx))
+                .collect::<Vec<_>>().join(&text));
+        }
+    }
     if let Some((script, remainder)) =
         split_leading_js_transform(rule).filter(|(_, remainder)| !remainder.starts_with("##"))
     {
@@ -6193,8 +6292,22 @@ fn eval_field_json_with_ctx(
         }
     }
     let had_templates = expanded != source_rule.rule;
+    let (selector, script) = extract_js(&source_rule.rule);
+    let filter_template = source_rule.mode == ParseMode::JsonPath
+        && script.is_some()
+        && selector.starts_with("$[?(")
+        && selector.ends_with(")]")
+        && selector.contains("{{");
     source_rule.make_up_rule(&expanded);
     let (pure, js) = extract_js(&source_rule.rule);
+    if filter_template {
+        // Legado passes the interpolated selector to JS as text. Nested
+        // java.getElement(result) evaluates it against the current chapter.
+        let mut bindings = ctx.js_bindings();
+        bindings.insert("result".to_string(), json!(pure));
+        let text = eval_js_with_bindings(js?, &input, base_url, &bindings).ok()?;
+        return Some(source_rule.apply_replacement(&text)).filter(|text| !text.is_empty());
+    }
 
     let mut text = match source_rule.mode {
         ParseMode::JsonPath => {
@@ -6359,6 +6472,28 @@ fn json_content_matches(value: &Value, rule: &str) -> String {
         .join("\n")
 }
 
+// A recursive JSONPath can select an array as one matched value.
+// BookContent -> JS must retain that array's JSON text, not flatten its
+// members into newline-separated objects (1148.json#620).
+fn json_content_nested_array(value: &Value, rule: &str) -> Option<String> {
+    let Value::Array(items) = jsonpath::jsonpath_object_value(value, rule)? else {
+        return None;
+    };
+    if !items.iter().any(Value::is_array) {
+        return None;
+    }
+    Some(
+        items
+            .iter()
+            .filter_map(|item| match item {
+                Value::Array(_) => Some(item.to_string()),
+                value => jsonpath::value_to_string(value),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
 fn json_content_selection(
     value: &Value,
     rule: &str,
@@ -6507,18 +6642,22 @@ fn eval_json_content_stages(
 ) -> String {
     let mut remaining = rule.trim();
     let mut current = body.to_string();
+    // JS result follows each stage; src stays the original response.
+    // Refresh other bindings at each stage so context changes remain visible.
+    let eval_stage = |script: &str, result: &str, context: &RuleVariableContext| {
+        let mut bindings = context.js_bindings();
+        bindings.insert("src".to_string(), Value::String(body.to_string()));
+        eval_js_with_bindings(script, result, base_url, &bindings)
+    };
     while !remaining.is_empty() {
         if let Some(script) = strip_prefix_ascii_case(remaining, "@js:") {
-            return eval_js_with_bindings(script, &current, base_url, &context.js_bindings())
-                .unwrap_or_default();
+            return eval_stage(script, &current, context).unwrap_or_default();
         }
         if let Some(rest) = strip_prefix_ascii_case(remaining, "<js>") {
             let Some(end) = find_ascii_case(rest, "</js>") else {
                 return String::new();
             };
-            let Ok(output) =
-                eval_js_with_bindings(&rest[..end], &current, base_url, &context.js_bindings())
-            else {
+            let Ok(output) = eval_stage(&rest[..end], &current, context) else {
                 return String::new();
             };
             current = output;
@@ -6540,7 +6679,12 @@ fn eval_json_content_stages(
         {
             // BookContent joins every JSONPath match before regex and JS.
             // Scalar book/chapter fields still use the first match.
-            let text = json_content_selection(&value, &selector, base_url, context);
+            let text = if boundary < remaining.len() {
+                json_content_nested_array(&value, &selector)
+                    .unwrap_or_else(|| json_content_selection(&value, &selector, base_url, context))
+            } else {
+                json_content_selection(&value, &selector, base_url, context)
+            };
             if let Some(rule) = regex {
                 apply_legado_regex(&text, rule)
             } else {
@@ -6821,47 +6965,42 @@ fn build_search_book_from_json(
 
 fn build_chapter_from_json(
     item: &Value,
+    raw_item: Option<&Value>,
     base_url: &str,
     rule: &TocRule,
     ctx: &mut RuleVariableContext,
     index: usize,
 ) -> Option<BookChapter> {
-    let title = eval_field_json_with_ctx(
-        rule.chapter_name.as_deref().unwrap_or(""),
-        item,
-        base_url,
-        ctx,
-    )
-    .unwrap_or_default();
+    let eval_field = |rule: &str, ctx: &mut RuleVariableContext| {
+        let field = rule.trim_start();
+        let input = if starts_with_ascii_case(field, "<js>")
+            || starts_with_ascii_case(field, "@js:")
+            || starts_with_ascii_case(field, "js:")
+        {
+            raw_item.unwrap_or(item)
+        } else {
+            item
+        };
+        eval_field_json_with_ctx(rule, input, base_url, ctx)
+    };
+    let title = eval_field(rule.chapter_name.as_deref().unwrap_or(""), ctx)
+        .unwrap_or_default();
     if title.is_empty() {
         return None;
     }
     ctx.chapter_title = Some(title.clone());
-    let raw_url = eval_field_json_with_ctx(
-        rule.chapter_url.as_deref().unwrap_or(""),
-        item,
-        base_url,
-        ctx,
-    )
-    .unwrap_or_default();
-    let tag = eval_field_json_with_ctx(
-        rule.update_time.as_deref().unwrap_or(""),
-        item,
-        base_url,
-        ctx,
-    );
-    let is_volume =
-        eval_field_json_with_ctx(rule.is_volume.as_deref().unwrap_or(""), item, base_url, ctx)
-            .map(is_truthy)
-            .unwrap_or(false);
-    let is_vip =
-        eval_field_json_with_ctx(rule.is_vip.as_deref().unwrap_or(""), item, base_url, ctx)
-            .map(is_truthy)
-            .unwrap_or(false);
-    let is_pay =
-        eval_field_json_with_ctx(rule.is_pay.as_deref().unwrap_or(""), item, base_url, ctx)
-            .map(is_truthy)
-            .unwrap_or(false);
+    let raw_url = eval_field(rule.chapter_url.as_deref().unwrap_or(""), ctx)
+        .unwrap_or_default();
+    let tag = eval_field(rule.update_time.as_deref().unwrap_or(""), ctx);
+    let is_volume = eval_field(rule.is_volume.as_deref().unwrap_or(""), ctx)
+        .map(is_truthy)
+        .unwrap_or(false);
+    let is_vip = eval_field(rule.is_vip.as_deref().unwrap_or(""), ctx)
+        .map(is_truthy)
+        .unwrap_or(false);
+    let is_pay = eval_field(rule.is_pay.as_deref().unwrap_or(""), ctx)
+        .map(is_truthy)
+        .unwrap_or(false);
     Some(BookChapter {
         title: title.clone(),
         url: finalize_chapter_url(base_url, &raw_url, &title, is_volume, index),
@@ -8110,6 +8249,48 @@ arr;"#
         assert_eq!(apply_legado_regex("nothing", "##\\d+##N###"), "");
         assert_eq!(apply_legado_regex("a[b", "##[##X###"), "X");
         assert_eq!(apply_legado_regex("no match", "##[##X###"), "X");
+    }
+
+    #[test]
+    fn p480_biquge_url_uses_js_directory_and_original_book_id() {
+        let rule = "<js>java.put('cid',Math.floor({{$.Id}}/1000)+1)</js>https://infosxs.pysmei.com/BookFiles/Html/{{result}}/{{$.Id}}/info.html";
+        for (id, directory) in [(1999, 2), (2000, 3)] {
+            let url = eval_field_json_with_ctx(rule, &json!({"Id":id}), "https://fixture.invalid/",
+                &mut RuleVariableContext::default());
+            assert_eq!(url, Some(format!("https://infosxs.pysmei.com/BookFiles/Html/{directory}/{id}/info.html")));
+        }
+    }
+
+    #[test]
+    fn p479_songhe_search_url_keeps_endpoint_after_id_transform() {
+        let rule = "$.bid\n<js>1100000000+parseInt(result)</js>\nhttps://bookshelf.html5.qq.com/qbread/api/novel/intro-info?bookid={{result}}";
+        let url = eval_field_json_with_ctx(rule, &json!({"bid":"123"}), "https://fixture.invalid/",
+            &mut RuleVariableContext::default());
+        assert_eq!(url.as_deref(), Some("https://bookshelf.html5.qq.com/qbread/api/novel/intro-info?bookid=1100000123"));
+    }
+
+    #[test]
+    fn p478_muli_chapter_data_url_keeps_encoded_id_and_options() {
+        let row = json!({"itemId":"123"});
+        for (newline, kind) in [("\n", "fqpyc"), ("\r\n", "木里")] {
+            let rule = format!("$.itemId{newline}<js>java.base64Encode(result)</js>{newline}data:;base64,{{{{result}}}},{{\"type\":\"{kind}\"}}");
+            assert_eq!(eval_field_json_with_ctx(&rule, &row, "https://fixture.invalid/",
+                &mut RuleVariableContext::default()).unwrap(),
+                format!("data:;base64,MTIz,{{\"type\":\"{kind}\"}}"));
+        }
+    }
+
+    #[test]
+    fn p477_chapter_filter_template_is_passed_to_js_with_original_row() {
+        for (title, id) in [("甲", 1), ("乙", 2)] {
+            let mut ctx = RuleVariableContext::default();
+            ctx.chapter_title = Some(title.to_string());
+            let row = json!({"chapter_name":title,"id":id});
+            let rule = r#"$[?(@.chapter_name=="{{chapter.title}}")]
+@js:java.getElement(result)[0].id.toString()"#;
+            assert_eq!(eval_field_json_with_ctx(rule, &row, "https://fixture.invalid/", &mut ctx),
+                Some(id.to_string()));
+        }
     }
 
     #[test]

@@ -110,7 +110,12 @@ if (globalThis.java && globalThis.java.getString) {
                             add: { value: appendListValue },
                             get: { value: listGet },
                             set: { value: listSet },
-                            toArray: { value: function() { return Array.from(this); } }
+                            toArray: { value: function() { return Array.from(this); } },
+                            // AnalyzeRule.getStringList exposes a Java List, not a
+                            // native JS array. Pixiv filters parse its [a, b] form.
+                            toString: { value: function() {
+                                return '[' + this.map(item => String(item)).join(', ') + ']';
+                            } }
                         });
                         return values;
                     };
@@ -256,6 +261,16 @@ if (globalThis.java && globalThis.java.getString) {
                             }, writable: true, configurable: true },
                             html: { value: function() { return this.map(item => item.html()).join('\n'); }, writable: true, configurable: true }
                         });
+                        if (items.length && items.every(item => item
+                                && typeof item.outerHtml === 'function'
+                                && !item.__readerXPathNode)) {
+                            // AnalyzeByJSoup returns Elements, whose string form
+                            // joins outer HTML with newlines (久久漫画 / 桃桃书屋).
+                            Object.defineProperty(items, 'toString', {
+                                configurable: true,
+                                value: function() { return this.map(item => item.outerHtml()).join('\n'); }
+                            });
+                        }
                         if (items.every(item => item && typeof item.select === 'function'
                                 && typeof item.outerHtml === 'function')) {
                             Object.defineProperties(items, {
