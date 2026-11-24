@@ -252,10 +252,11 @@ if (globalThis.java && globalThis.java.getString) {
                                                 }
                                                 // Java element snapshots can clean their own inner
                                                 // markup without changing the original response.
-                                                if (!this.length) return this;
+                                                if (!matchIndices.length) return this;
                                                 const updated = java.__jsoupRemove(item.outerHtml, rule, wrapped.tagName(), matchIndices);
                                                 if (updated == null) throw new Error('invalid jsoup remove selector');
                                                 Object.assign(item, JSON.parse(updated));
+                                                matchIndices.length = 0;
                                                 return this;
                                             }
                                         });
@@ -337,7 +338,15 @@ if (globalThis.java && globalThis.java.getString) {
                                         Object.defineProperty(selected, 'remove', {
                                             configurable: true, writable: true,
                                             value: function(index) {
-                                                if (arguments.length) return this.splice(listIndex(index, this.length), 1)[0];
+                                                if (arguments.length) {
+                                                    const pos = listIndex(index, this.length);
+                                                    const node = this[pos];
+                                                    for (const group of groups) {
+                                                        const i = group.indexOf(node);
+                                                        if (i !== -1) group.remove(i);
+                                                    }
+                                                    return this.splice(pos, 1)[0];
+                                                }
                                                 for (const group of groups) group.remove();
                                                 return this;
                                             }

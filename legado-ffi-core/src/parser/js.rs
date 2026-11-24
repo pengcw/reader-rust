@@ -5557,11 +5557,11 @@ mod tests {
 
         let result = with_js_http_context(&client, &source, || {
             eval_js(
-                "(() => { const body = java.ajax('ftp://invalid'); const response = java.connect('ftp://invalid'); return [typeof body, body.length > 0, response.code(), response.body().length > 0].join('|'); })()",
+                "(() => { const body = java.ajax('ftp://invalid'); const response = java.connect('ftp://invalid'); return [typeof body, typeof body.matches === 'function', body.length > 0, response.code(), response.body().length > 0].join('|'); })()",
                 "", &url,
             ).unwrap()
         });
-        assert_eq!(result, "string|true|200|true");
+        assert_eq!(result, "object|true|true|200|true");
     }
 
     #[test]
@@ -5588,10 +5588,10 @@ mod tests {
         };
         let client = HttpClient::standalone();
         let script = format!(
-            "(() => {{ const body = java.ajax({url:?}); const response = java.connect({url:?}); return [typeof body, body.length > 0, response.code(), response.body().length > 0].join('|'); }})()"
+            "(() => {{ const body = java.ajax({url:?}); const response = java.connect({url:?}); return [typeof body, typeof body.matches === 'function', body.length > 0, response.code(), response.body().length > 0].join('|'); }})()"
         );
         let result = with_js_http_context(&client, &source, || eval_js(&script, "", &url).unwrap());
-        assert_eq!(result, "string|true|200|true");
+        assert_eq!(result, "object|true|true|200|true");
         server.join().unwrap();
     }
 
@@ -5838,7 +5838,8 @@ mod tests {
                 calls.push([url, timeout]); return JSON.stringify({body: 'ok', code: 201});
             };
             for (const timeout of [undefined, null, 1, 120000]) {
-                if (java.ajax(['http://example.test'], timeout) !== 'ok'
+                const body = java.ajax(['http://example.test'], timeout);
+                if (String(body) !== 'ok' || !body.matches('ok')
                     || java.connect('http://example.test', {}, timeout).code() !== 201) throw new Error('valid timeout failed');
             }
             let rejected = 0;
