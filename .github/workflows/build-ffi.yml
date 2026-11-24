@@ -55,8 +55,9 @@ jobs:
             os: ubuntu-latest
             use_cross: true
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            use_cross: true
+            os: ubuntu-22.04
+            use_cross: false
+            use_zigbuild: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             use_cross: false
@@ -120,13 +121,28 @@ jobs:
             -C link-arg=-Wl,--icf=all -C force-unwind-tables=no
           CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS: -C force-unwind-tables=no
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C force-unwind-tables=no
-          CFLAGS_x86_64_unknown_linux_gnu: -mstackrealign
+
+      - name: Setup Zig & cargo-zigbuild
+        if: >-
+          matrix.use_zigbuild == true &&
+          (inputs.publish || inputs.target == 'all' ||
+          inputs.target == matrix.target)
+        run: pip install cargo-zigbuild ziglang
+
+      - name: Build Library (Zigbuild)
+        if: >-
+          matrix.use_zigbuild == true &&
+          (inputs.publish || inputs.target == 'all' ||
+          inputs.target == matrix.target)
+        run: cargo zigbuild --locked --target ${{ matrix.target }}.2.23 --release --lib
+        working-directory: legado-ffi-core
 
       - name: Build Library (Cargo)
         if: >-
           (inputs.publish || inputs.target == 'all' ||
           inputs.target == matrix.target) &&
-          matrix.use_cross == false
+          matrix.use_cross == false &&
+          matrix.use_zigbuild != true
         run: cargo build --locked --target ${{ matrix.target }} --release --lib
         working-directory: legado-ffi-core
 
