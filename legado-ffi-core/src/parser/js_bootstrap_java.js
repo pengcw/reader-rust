@@ -100,12 +100,28 @@
                             error.kind = 'limit_exceeded'; throw error;
                         }
                         if (text === '') return '';
-                        const output = java.hostCall('text.chinese.convert', {direction, text});
-                        if (typeof output !== 'string' || output.length > 262144) {
-                            const error = new Error('invalid Chinese conversion response');
-                            error.kind = 'invalid_response'; throw error;
+                        let converted = '';
+                        // A valid UTF-16 code unit uses at most 3 UTF-8 bytes;
+                        // keep each host request below the Lua provider's 64-KiB byte limit.
+                        for (let start = 0; start < text.length;) {
+                            let end = Math.min(start + 20000, text.length);
+                            const last = text.charCodeAt(end - 1);
+                            if (end < text.length && last >= 0xD800 && last <= 0xDBFF) end--;
+                            const chunk = java.hostCall('text.chinese.convert', {
+                                direction, text: text.slice(start, end)
+                            });
+                            if (typeof chunk !== 'string') {
+                                const error = new Error('invalid Chinese conversion response');
+                                error.kind = 'invalid_response'; throw error;
+                            }
+                            converted += chunk;
+                            if (converted.length > 262144) {
+                                const error = new Error('invalid Chinese conversion response');
+                                error.kind = 'invalid_response'; throw error;
+                            }
+                            start = end;
                         }
-                        return output;
+                        return converted;
                     };
                     java.t2s = value => chineseConvert('t2s', value);
                     java.s2t = value => chineseConvert('s2t', value);
@@ -241,6 +257,11 @@
                                 responseCookies.set(pair.slice(0, equals).trim(), pair.slice(equals + 1).trim());
                             }
                         }
+                        Object.defineProperty(responseCookies, 'toString', {
+                            value: () => '{' + Array.from(responseCookies.entries()).map(([k, v]) => `${k}=${v}`).join(', ') + '}',
+                            configurable: true,
+                            writable: true
+                        });
                         const header = name => {
                             const key = Object.keys(headers).find(k => k.toLowerCase() === String(name).toLowerCase());
                             return key === undefined ? null : headers[key];
@@ -280,6 +301,8 @@
                             toJSON: () => raw
                         };
                     };
+                    const nativeGetWebViewUA = java.getWebViewUA;
+                    java.getWebViewUA = () => new Packages.java.lang.String(nativeGetWebViewUA());
                     const nativeVariableGet = java.__nativeVariableGet;
                     const requestCallTimeout = value => {
                         if (value == null) return undefined;
@@ -290,7 +313,9 @@
                     };
                     java.ajax = (value, callTimeout) => {
                         const target = Array.isArray(value) ? value[0] : value;
-                        return java.__nativeAjax(String(target == null ? '' : target), requestCallTimeout(callTimeout));
+                        // Rhino exposes Kotlin String results with Java regex methods.
+                        return new Packages.java.lang.String(java.__nativeAjax(
+                            String(target == null ? '' : target), requestCallTimeout(callTimeout)));
                     };
                     // UI belongs to the host; native only collects interactive login actions.
                     java.openUrl = (url, mimeType) => java.__openUrl(
@@ -386,6 +411,7 @@
                         return {
                             __ffiStrResponse: true,
                             body: callableString(bodyText),
+                            getBody: () => raw.body == null ? null : bodyText,
                             header: name => responseHeaders.get(name),
                             url: () => url,
                             code: () => code,
@@ -520,11 +546,11 @@
                         if (typeof charsetOrFlags === 'number') {
                             const bytes = JSON.parse(java.__base64DecodeBytes(
                                 text, Number(charsetOrFlags)));
-                            return java.bytesToStr(bytes, 'UTF-8');
+                            return new Packages.java.lang.String(java.bytesToStr(bytes, 'UTF-8'));
                         }
-                        return charsetOrFlags == null
+                        return new Packages.java.lang.String(charsetOrFlags == null
                             ? nativeBase64Decode(text)
-                            : nativeBase64Decode(text, String(charsetOrFlags));
+                            : nativeBase64Decode(text, String(charsetOrFlags)));
                     };
                     java.base64DecodeToByteArray = function(value, flags) {
                         if (value == null || String(value).trim() === '') return null;

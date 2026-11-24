@@ -60,6 +60,9 @@ pub struct ExploreKind {
     pub action: Option<String>,
     pub url: Option<String>,
     pub style: Option<Value>,
+    // Preserve selection metadata (chars/default/viewName) for the Lua UI.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 fn deserialize_rule_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>

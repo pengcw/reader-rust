@@ -47,6 +47,29 @@ pub fn parse_document(html: &str) -> Html {
     Html::parse_document(html)
 }
 
+// A serialized table item needs its original HTML parsing context.
+pub(crate) fn table_fragment_wrapper(tag: &str) -> (&'static str, &'static str) {
+    match tag {
+        "td" | "th" => ("<table><tbody><tr>", "</tr></tbody></table>"),
+        "tr" => ("<table><tbody>", "</tbody></table>"),
+        "col" => ("<table><colgroup>", "</colgroup></table>"),
+        "tbody" | "thead" | "tfoot" | "caption" | "colgroup" => ("<table>", "</table>"),
+        _ => ("", ""),
+    }
+}
+
+pub(crate) fn parse_java_html(input: &str) -> Html {
+    let tag = input.trim_start().strip_prefix('<')
+        .and_then(|value| value.split(|c: char| c == '>' || c.is_ascii_whitespace()).next())
+        .unwrap_or_default();
+    let (prefix, suffix) = table_fragment_wrapper(tag);
+    if prefix.is_empty() {
+        parse_document(input)
+    } else {
+        parse_document(&format!("{prefix}{input}{suffix}"))
+    }
+}
+
 /// Convert Legado selector format to CSS selector
 /// Legado formats:
 /// - class.xxx yyy zzz → .xxx.yyy.zzz (multiple classes on one element)
@@ -1434,6 +1457,14 @@ fn select_chain<'a>(doc: &'a Html, rule: &str) -> Vec<ElementRef<'a>> {
     }
     let rule = rule.strip_prefix("@@").unwrap_or(rule);
     let parts = split_top_level(rule, &["@", "@@"]).parts;
+    // The first stage selects nodes, even when its tag is named `html`.
+    let end = parts.iter().enumerate().skip(1)
+        .find_map(|(index, part)| is_value_extractor(part).then_some(index))
+        .unwrap_or(parts.len());
+    select_chain_parts(doc, &parts[..end])
+}
+
+fn select_chain_parts<'a>(doc: &'a Html, parts: &[String]) -> Vec<ElementRef<'a>> {
     let mut current_matches: Vec<ElementRef<'a>> = Vec::new();
     let mut is_first = true;
 
@@ -1441,9 +1472,6 @@ fn select_chain<'a>(doc: &'a Html, rule: &str) -> Vec<ElementRef<'a>> {
         let part = part.trim();
         if part.is_empty() {
             continue;
-        }
-        if is_value_extractor(part) {
-            break;
         }
         let parsed = parse_selector_with_index(part);
         if is_first {
@@ -1746,6 +1774,10 @@ fn select_text_from_element_with_steps(
 }
 
 pub fn select_text_from_element(el: &ElementRef, rule: &str) -> Option<String> {
+    if rule.starts_with('@') && !rule.starts_with("@@") {
+        let values = select_prefixed_text_values(el, rule);
+        return (!values.is_empty()).then(|| values.join("\n"));
+    }
     let steps = parse_element_text_steps(rule);
     select_text_from_element_with_steps(el, &steps)
 }
@@ -1779,6 +1811,60 @@ pub(crate) fn select_text_list_from_element(el: &ElementRef, rule: &str) -> Vec<
         .into_iter()
         .filter_map(|el| extract_text(&el, "text"))
         .collect()
+}
+
+// Legado RuleAnalyzer.trim() removes leading @ before splitting the rule.
+fn select_prefixed_text_values(el: &ElementRef, rule: &str) -> Vec<String> {
+    let mut values = select_text_list_from_element(el, rule.trim_start_matches('@').trim_start());
+    filter_list_attributes(rule, &mut values);
+    values
+}
+
+// AnalyzeByJSoup.getResultLast filters attributes within each selector branch.
+pub(crate) fn filter_list_attributes(rule: &str, values: &mut Vec<String>) {
+    let parts = split_top_level(rule, &["@"]).parts;
+    if parts.len() > 1 && !matches!(parts.last().map(String::as_str).unwrap_or(""),
+        "" | "text" | "textNodes" | "ownText" | "html" | "all")
+    {
+        let mut seen = HashSet::new();
+        values.retain(|value| !value.trim().is_empty() && seen.insert(value.clone()));
+    }
+}
+
+// Java AnalyzeByJSoup.getResultLast returns one combined outerHtml value
+// for html/all. Keep direct content and field extractors unchanged.
+pub(crate) fn select_java_markup(doc: &mut Html, rule: &str) -> Option<Vec<String>> {
+    let rule = rule.trim_start_matches('@').trim_start();
+    if split_top_level(rule, &["@@"]).delimiter.is_some() {
+        return None;
+    }
+    let parts = split_top_level(rule, &["@"]).parts;
+    let extractor = parts.last()?.as_str();
+    if parts.len() < 2 || !matches!(extractor, "html" | "all") {
+        return None;
+    }
+    let elements = select_chain_parts(doc, &parts[..parts.len() - 1]);
+    if elements.is_empty() {
+        return Some(Vec::new());
+    }
+    let ids: Vec<_> = elements.iter().map(|el| el.id()).collect();
+    if extractor == "html" {
+        let removed: HashSet<_> = elements.iter()
+            .flat_map(|el| select_css_from_element(*el, "script,style"))
+            .map(|el| el.id())
+            .collect();
+        for id in removed {
+            if let Some(mut node) = doc.tree.get_mut(id) {
+                node.detach();
+            }
+        }
+    }
+    let markup = ids.into_iter()
+        .filter_map(|id| doc.tree.get(id).and_then(ElementRef::wrap))
+        .map(|el| el.html())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(vec![markup])
 }
 
 /// Select all matching elements and collect their text, joined by newlines
@@ -1925,6 +2011,11 @@ pub fn select_text_list(doc: &Html, rule: &str) -> Vec<String> {
     }
 
     let first_part = parts[0].trim();
+
+    // The leading @ is trimmed by Legado before selector traversal.
+    if first_part.is_empty() && parts.len() > 1 {
+        return select_prefixed_text_values(&doc.root_element(), rule);
+    }
 
     let matches = collect_matches(doc, &parse_selector_with_index(first_part));
     if matches.is_empty() {

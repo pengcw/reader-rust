@@ -15,6 +15,11 @@ if (globalThis.java && globalThis.java.getString) {
                         return id;
                     };
                     const _readerNodeContent = (rule, content, rawCss = false) => {
+                        if (content instanceof String) return String(content);
+                        if (Array.isArray(content) && content.length && typeof content.size === 'function'
+                            && content.every(item => item && typeof item.outerHtml === 'function' && !item.__readerXPathNode)) {
+                            return content.map(item => item.outerHtml()).join('\n');
+                        }
                         if (!content || typeof content !== 'object' || !('__readerXPathNode' in content)) return content;
                         const xpath = !rawCss && /^\s*(?:@xpath:|\/|\.\/|id\()/i.test(String(rule));
                         if (xpath) {
@@ -30,10 +35,18 @@ if (globalThis.java && globalThis.java.getString) {
                     let currentHtmlContent = null;
                     const _orig_getString = globalThis.java.getString;
                     globalThis.java.getString = function(rule, content, isUrl, unescape) {
-                        const r = (rule !== undefined && rule !== null) ? String(rule) : undefined;
+                        let r = (rule !== undefined && rule !== null) ? String(rule) : undefined;
                         if (content === undefined && currentHtmlContent) {
                             if (r === 'text') return currentHtmlContent.text();
                             if (r === 'href') return currentHtmlContent.attr('href');
+                        }
+                        // A leading bare attribute refers to the current element.
+                        if (currentHtmlContent && r
+                            && (content == null || (typeof content === 'boolean' && arguments.length === 2))) {
+                            const attr = /^@?([\w:-]+)(?=\s*(?:\|\||&&|##|$))/.exec(r);
+                            if (attr && currentHtmlContent.hasAttr(attr[1])) {
+                                r = currentHtmlContent.tagName() + '.0@' + attr[1] + r.slice(attr[0].length);
+                            }
                         }
                         if (typeof content === 'boolean' && arguments.length === 2) {
                             return _orig_getString(r, undefined, false, content);
@@ -125,8 +138,10 @@ if (globalThis.java && globalThis.java.getString) {
                         const htmlNode = typeof content.outerHtml === 'function'
                             && typeof content.select === 'function' && !content.__readerXPathNode;
                         currentHtmlContent = htmlNode ? content : null;
-                        if (htmlNode) {
+                        if (htmlNode || (content.__readerXPathNode && typeof content.outerHtml === 'function')) {
                             content = content.outerHtml();
+                        } else if (content instanceof String) {
+                            content = String(content);
                         } else if (typeof content === 'object') {
                             try { content = JSON.stringify(content); } catch (e) {}
                         }

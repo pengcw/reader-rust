@@ -666,8 +666,9 @@
                                     const matches = matchesSelector(selector);
                                     return derived(items.filter(item => !matches(item)));
                                 };
-                                for (const method of ['select', 'selectFirst', 'next', 'prev', 'nextAll', 'prevAll', 'parents', 'not', 'is', 'hasAttr'])
-                                    Object.defineProperty(items, method, { enumerable: false });
+                                for (const key of Object.keys(items)) {
+                                    if (!/^\d+$/.test(key)) Object.defineProperty(items, key, { enumerable: false });
+                                }
                                 // Preserve existing Elements getter values; only new setter overloads change behavior.
                                 return items;
                             };
@@ -705,14 +706,18 @@
                                         read: () => source,
                                         write: html => { source = html; invalidate(); }
                                     }, identity);
-                                    items.remove = function(index) {
-                                        if (arguments.length) return removeAt(items, index);
-                                        const updated = globalThis.java.__jsoupRemove(source, rule);
-                                        if (updated == null) throw new Error('invalid jsoup remove selector');
-                                        source = updated;
-                                        invalidate();
-                                        return items;
-                                    };
+                                    Object.defineProperty(items, 'remove', {
+                                        value: function(index) {
+                                            if (arguments.length) return removeAt(items, index);
+                                            const updated = globalThis.java.__jsoupRemove(source, rule);
+                                            if (updated == null) throw new Error('invalid jsoup remove selector');
+                                            source = updated;
+                                            invalidate();
+                                            return items;
+                                        },
+                                        configurable: true,
+                                        writable: true
+                                    });
                                     return items;
                                 }
                             }, ['baseUri', 'html', 'title', 'text']);

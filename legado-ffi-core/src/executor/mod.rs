@@ -544,20 +544,52 @@ fn execute_explore(
     let rule = required_string(params, "url")?;
     let page = optional_page(params)?;
     let state = load_info_map_state(&source.book_source_url, supplied)?;
+    let allow_http_status_fallback = source
+        .rule_explore
+        .as_ref()
+        .and_then(|r| r.book_list.as_deref())
+        .is_some_and(|b| b.contains("<js>") || b.contains("@js:"));
     // URL stages and loginCheckJs share the Map; independent list fields do not.
-    let (response, state) = with_js_info_map(state, || {
-        fetch_rule(
-            session,
-            source,
-            &rule,
-            "",
-            page,
-            &source.book_source_url,
-            options,
-        )
-    });
-    let response = response?;
-    let data = serde_json::to_value(engine.explore_books(source, &response.body, &response.url))
+    let (response, pending_http_err, state) = if allow_http_status_fallback {
+        let (res, state): (ExecuteResult<_>, _) = with_js_info_map(state, || {
+            let spec = analyze_url_with_context(&rule, "", page, &source.book_source_url, source, None)
+                .map_err(ExecuteError::url_rule)?;
+            let (resp, pending_err) = session
+                .fetch_for_login_check(&spec, options.max_response_bytes, options.render_timeout_ms)
+                .map_err(|error| map_fetch_error(error, source))?;
+            if source.login_check_js.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+                let checked = with_login_check_request(
+                    &spec, &rule, "", page, &source.book_source_url, source, None,
+                    || validate_login_response(source, resp, pending_err),
+                )?;
+                Ok((checked, None))
+            } else {
+                Ok((resp, pending_err))
+            }
+        });
+        let (resp, pending_err) = res?;
+        (resp, pending_err, state)
+    } else {
+        let (response, state) = with_js_info_map(state, || {
+            fetch_rule(
+                session,
+                source,
+                &rule,
+                "",
+                page,
+                &source.book_source_url,
+                options,
+            )
+        });
+        (response?, None, state)
+    };
+    let books = engine.explore_books(source, &response.body, &response.url);
+    if books.is_empty() {
+        if let Some(err) = pending_http_err {
+            return Err(map_fetch_error(err, source));
+        }
+    }
+    let data = serde_json::to_value(books)
         .map_err(|error| ExecuteError::internal(error.to_string()))?;
     let mut result = success(data, 1, false, &response, options);
     publish_info_map_state(&mut result, &source.book_source_url, state, false)?;
@@ -575,11 +607,11 @@ fn execute_explore_action(
         .filter(|action| !action.trim().is_empty() && action.len() <= 64 * 1024)
         .ok_or_else(|| ExecuteError::invalid_request("explore action must be a nonempty string up to 64 KiB"))?;
     let script = format!(
-        "(()=>{{let refresh=false;java.refreshExplore=()=>{{refresh=true;}};(0,eval)({});return JSON.stringify({{refreshExplore:refresh}});}})()",
+        "(()=>{{let refresh=false,search=null;java.refreshExplore=()=>{{refresh=true;}};java.searchBook=value=>{{if(search!==null)return;const text=String(value==null?'':value);if(text.length>1024)throw new RangeError('searchBook keyword too long');search=text;}};(0,eval)({});const result={{refreshExplore:refresh}};if(search!==null)result.searchBook=search;return JSON.stringify(result);}})()",
         serde_json::to_string(action).map_err(|error| ExecuteError::internal(error.to_string()))?
     );
     let state = load_info_map_state(&source.book_source_url, supplied)?;
-    let (((output, messages, _, _), relogin), state) = with_js_info_map(state, || {
+    let (((output, messages, _, open_urls), relogin), state) = with_js_info_map(state, || {
         with_relogin_request(|| with_login_messages(|| with_js_lib(source.js_lib.as_deref(), || {
             eval_js(&script, "", &source.book_source_url)
         })))
@@ -589,6 +621,7 @@ fn execute_explore_action(
         .map_err(|error| ExecuteError::parse(format!("invalid explore action result: {error}")))?;
     if relogin.is_some() { data["refreshExplore"] = json!(true); }
     data["message"] = json!(messages.join("\n"));
+    data["openUrls"] = json!(open_urls);
     let mut response = success_without_http(data);
     publish_info_map_state(&mut response, &source.book_source_url, state, true)?;
     Ok(response)
@@ -684,30 +717,33 @@ fn execute_explore_kinds(source: &BookSource, options: &ValidatedOptions) -> Exe
     }
     let text = text.trim();
     let kinds: Vec<crate::model::book_source::ExploreKind> = if text.starts_with('[') {
-        serde_json::from_str(text).map_err(|error| {
-            ExecuteError::parse(format!("invalid explore categories JSON: {error}"))
-        })?
+        crate::crawler::parse_legacy_json(text)
+            .or_else(|error| match normalize_explore_json(text) {
+                Some(cleaned) => crate::crawler::parse_legacy_json(&cleaned),
+                None => Err(error),
+            })
+            .map_err(|error| {
+                ExecuteError::parse(format!("invalid explore categories JSON: {error}"))
+            })?
     } else {
-        let mut entries = vec![text.to_string()];
-        for delimiter in ["&&", "\r\n", "\n"] {
-            entries = entries
-                .into_iter()
-                .flat_map(|entry| {
-                    crate::parser::rule_analyzer::split_top_level(&entry, &[delimiter]).parts
-                })
-                .collect();
-        }
-        entries
-            .into_iter()
+        // A malformed URL must not consume the categories on following lines.
+        // Keep the existing protection for && inside request options on each line.
+        text.lines()
+            .flat_map(|line| {
+                crate::parser::rule_analyzer::split_top_level(line, &["&&"]).parts
+            })
             .filter(|entry| !entry.is_empty())
             .map(|entry| {
-                let (title, url) = entry.split_once("::").unwrap_or((&entry, ""));
+                let mut fields = entry.split("::");
+                let title = fields.next().unwrap_or_default();
+                let url = fields.next().unwrap_or_default();
                 crate::model::book_source::ExploreKind {
                     title: title.trim().to_string(),
                     url: (!url.trim().is_empty()).then(|| url.trim().to_string()),
                     style: None,
                     kind_type: None,
                     action: None,
+                    extra: serde_json::Map::new(),
                 }
             })
             .collect()
@@ -719,6 +755,78 @@ fn execute_explore_kinds(source: &BookSource, options: &ValidatedOptions) -> Exe
     let data =
         serde_json::to_value(kinds).map_err(|error| ExecuteError::internal(error.to_string()))?;
     Ok(success_without_http(data))
+}
+
+// Gson accepts comments and semicolon separators outside quoted strings.
+fn normalize_explore_json(raw: &str) -> Option<String> {
+    let mut chars = raw.chars().peekable();
+    let mut output = String::with_capacity(raw.len());
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' | '\'' => {
+                let start = output.len();
+                output.push(ch);
+                while let Some(next) = chars.next() {
+                    output.push(next);
+                    if next == '\\' {
+                        output.push(chars.next()?);
+                    } else if next == ch {
+                        break;
+                    }
+                }
+                let key = output[start..].trim_matches(ch);
+                let is_wrap = key == "layout_wrapBefore";
+                if is_wrap || matches!(key, "layout_flexGrow" | "layout_flexShrink" | "layout_flexBasisPercent") {
+                    while let Some(space) = chars.next_if(|c| c.is_ascii_whitespace()) {
+                        output.push(space);
+                    }
+                    if chars.next_if_eq(&':').is_some() {
+                        output.push(':');
+                        while let Some(space) = chars.next_if(|c| c.is_ascii_whitespace()) {
+                            output.push(space);
+                        }
+                        if is_wrap {
+                            let start = output.len();
+                            while let Some(letter) = chars.next_if(char::is_ascii_alphabetic) {
+                                output.push(letter);
+                            }
+                            let word = &output[start..];
+                            if !word.is_empty() && word != "null" {
+                                let value = if word.eq_ignore_ascii_case("true") { "true" } else { "false" };
+                                output.replace_range(start.., value);
+                            }
+                        } else if chars.peek() == Some(&'0') {
+                            while chars.next_if_eq(&'0').is_some() {}
+                            if !chars.peek().is_some_and(char::is_ascii_digit) {
+                                output.push('0');
+                            }
+                        }
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                loop {
+                    if chars.next()? == '*' && chars.peek() == Some(&'/') {
+                        chars.next();
+                        break;
+                    }
+                }
+                output.push(' ');
+            }
+            ch if ch == '#' || (ch == '/' && chars.peek() == Some(&'/')) => {
+                for next in chars.by_ref() {
+                    if next == '\n' || next == '\r' {
+                        break;
+                    }
+                }
+                output.push('\n');
+            }
+            ';' => output.push(','),
+            _ => output.push(ch),
+        }
+    }
+    Some(output)
 }
 
 fn serialized_variable(value: Option<&Value>) -> Option<String> {

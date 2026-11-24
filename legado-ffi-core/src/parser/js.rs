@@ -643,7 +643,33 @@ fn install_info_map<'js>(ctx: &rquickjs::Ctx<'js>, state: &InfoMapState) -> anyh
                     isEmpty: { value: () => current().size === 0 },
                     clear: { value: () => current().clear() }
                 });
-                return view;
+                // Rhino exposes Java Map keys through bracket access.
+                // Keep the existing method names on the view; other keys
+                // read and write the same backing Map as get()/put().
+                const proxy = new Proxy(view, {
+                    get(target, key, receiver) {
+                        if (typeof key === 'string' && !Reflect.has(target, key) && current().has(key)) {
+                            return current().get(key);
+                        }
+                        return Reflect.get(target, key, receiver);
+                    },
+                    set(target, key, value, receiver) {
+                        if (typeof key === 'string' && !Reflect.has(target, key)) {
+                            current().set(key, String(value));
+                            return true;
+                        }
+                        return Reflect.set(target, key, value, receiver);
+                    },
+                    deleteProperty(target, key) {
+                        if (typeof key === 'string' && !Reflect.has(target, key)) {
+                            current().delete(key);
+                            return true;
+                        }
+                        return Reflect.deleteProperty(target, key);
+                    }
+                });
+                views.set(proxy, current);
+                return proxy;
             };
             const api = makeView(() => backing);
             const snapshot = () => ({ values: Object.fromEntries(backing), needSave, saveTime });
@@ -2186,6 +2212,11 @@ fn eval_js_inner_with_book_capture(
                     }
                 }),
             )?;
+            let search_item_scope_id = bindings
+                .and_then(|values| values.get(crate::parser::rule_engine::SEARCH_ITEM_SCOPE_BINDING))
+                .and_then(JsonValue::as_bool)
+                .filter(|enabled| *enabled)
+                .and(object_scope_id);
             let variable_overrides_for_put = variable_overrides.clone();
             java_obj.set(
                 "put",
@@ -2195,7 +2226,11 @@ fn eval_js_inner_with_book_capture(
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(key.clone(), val.clone());
-                    if let Some(active) = current_active_session() {
+                    if let Some(scope_id) = search_item_scope_id {
+                        crate::parser::rule_engine::record_js_object_variable(
+                            scope_id, "book", &key, Some(val.clone()),
+                        );
+                    } else if let Some(active) = current_active_session() {
                         active.set_variable_exact(&key, serde_json::Value::String(val.clone()));
                     } else {
                         JS_KV
@@ -2211,12 +2246,30 @@ fn eval_js_inner_with_book_capture(
             java_obj.set(
                 "__nativeVariableGet",
                 Func::new(move |key: String| -> String {
-                    variable_overrides_for_get
+                    let updated = object_scope_id.is_some_and(|id| {
+                        crate::parser::rule_engine::js_object_variable_change(id, "chapter", &key)
+                            .is_some()
+                            || crate::parser::rule_engine::js_object_variable_change(id, "book", &key)
+                                .is_some()
+                    });
+                    let overridden = variable_overrides_for_get
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .get(&key)
-                        .cloned()
-                        .or_else(|| scoped_java_variable(&rule_bindings, &key))
+                        .cloned();
+                    // Object writes supersede this invocation's java.put
+                    // snapshot. A later java.put updates that same object scope.
+                    if !updated {
+                        if let Some(value) = overridden.as_deref().filter(|value| !value.is_empty()) {
+                            return value.to_string();
+                        }
+                    }
+                    // An empty/removed write should not revive the old book
+                    // variable from the bindings snapshot.
+                    let scoped = (updated || overridden.is_none())
+                        .then(|| scoped_java_variable(&rule_bindings, object_scope_id, &key))
+                        .flatten();
+                    scoped
                         .or_else(|| {
                             current_active_session()
                                 .and_then(|session| session.get_variable(&key))
@@ -2229,6 +2282,7 @@ fn eval_js_inner_with_book_capture(
                                 .unwrap_or_else(|e| e.into_inner())
                                 .get(&key)
                                 .cloned()
+                                .filter(|value| !value.is_empty())
                         })
                         .unwrap_or_default()
                 }),
@@ -2688,25 +2742,55 @@ fn java_log<'js>(
     Ok(value)
 }
 
-fn scoped_java_variable(bindings: &HashMap<String, JsonValue>, key: &str) -> Option<String> {
+fn scoped_java_variable(
+    bindings: &HashMap<String, JsonValue>,
+    object_scope_id: Option<u64>,
+    key: &str,
+) -> Option<String> {
     let chapter = bindings.get("chapter");
     let book = bindings.get("book");
-    let scoped_value = chapter
-        .and_then(|scope| scope.get("variableMap"))
-        .and_then(|variables| variables.get(key))
+    let changed = |kind| {
+        object_scope_id
+            .and_then(|id| crate::parser::rule_engine::js_object_variable_change(id, kind, key))
+    };
+    let chapter_change = changed("chapter");
+    let book_change = changed("book");
+    let variable = |scope: Option<&JsonValue>, change: &Option<Option<String>>| {
+        if let Some(change) = change {
+            return change.as_ref().filter(|value| !value.is_empty()).cloned();
+        }
+        scope
+            .and_then(|value| value.get("variableMap"))
+            .and_then(|values| values.get(key))
+            .map(json_value_to_string)
+            .filter(|value| !value.is_empty())
+    };
+    variable(chapter, &chapter_change)
+        .or_else(|| variable(book, &book_change))
         .or_else(|| {
-            book.and_then(|scope| scope.get("variableMap"))
-                .and_then(|variables| variables.get(key))
+            chapter_change.is_none().then(|| chapter.and_then(|scope| scope.get(key)))
+                .flatten()
+                .map(json_value_to_string)
+                .filter(|value| !value.is_empty())
         })
-        .or_else(|| chapter.and_then(|scope| scope.get(key)))
-        .or_else(|| book.and_then(|scope| scope.get(key)))
+        .or_else(|| {
+            book_change.is_none().then(|| book.and_then(|scope| scope.get(key)))
+                .flatten()
+                .map(json_value_to_string)
+                .filter(|value| !value.is_empty())
+        })
         .or_else(|| {
             (key == "bookName")
                 .then(|| book.and_then(|scope| scope.get("name")))
                 .flatten()
+                .map(json_value_to_string)
+                .filter(|value| !value.is_empty())
         })
-        .or_else(|| bindings.get(key));
-    scoped_value.map(json_value_to_string)
+        .or_else(|| {
+            bindings.get(key)
+                .map(json_value_to_string)
+                .filter(|value| !value.is_empty())
+        })
 }
 
 fn wrapped_string_value<'js>(
@@ -2941,49 +3025,33 @@ pub(crate) fn java_get_string(
         return finalize_java_get_string_url(String::new(), base_url, is_url);
     }
 
-    // JS rules own their logical operators; combine only extraction rules.
-    let delimiters: &[&str] = if js_rule { &[] } else { &["||", "&&"] };
-    let split = rule_analyzer::split_top_level(rule, delimiters);
-    if let Some(delim) = split.delimiter.as_deref() {
-        if delim == "||" {
-            for part in split.parts {
-                let res = java_get_string(
-                    Some(&part),
-                    content,
-                    default_content,
-                    base_url,
-                    false,
-                    unescape,
-                );
-                if !res.is_empty() {
-                    return finalize_java_get_string_url(res, base_url, is_url);
-                }
-            }
-            return finalize_java_get_string_url(String::new(), base_url, is_url);
-        } else if delim == "&&" {
-            let mut results = Vec::new();
-            for part in split.parts {
-                let res = java_get_string(
-                    Some(&part),
-                    content,
-                    default_content,
-                    base_url,
-                    false,
-                    unescape,
-                );
-                if !res.is_empty() {
-                    results.push(res);
-                }
-            }
-            return finalize_java_get_string_url(results.join("\n"), base_url, is_url);
-        }
-    }
-
-    // 分离 ## 替换正则 (规范 6.7)
+    // AnalyzeRule applies replacement and unescape after combining values.
     let (main_rule, regex_part) = rule_engine::split_legado_regex(rule);
     let main_rule = main_rule.trim();
+    // JS rules own their logical operators; combine only extraction rules.
+    let delimiters: &[&str] = if js_rule { &[] } else { &["||", "&&"] };
+    let split = rule_analyzer::split_top_level(main_rule, delimiters);
 
-    let mut res = if main_rule.is_empty() {
+    let mut res = if let Some(delim) = split.delimiter.as_deref() {
+        let mut results = Vec::new();
+        for part in split.parts {
+            let res = java_get_string(
+                Some(&part),
+                content,
+                default_content,
+                base_url,
+                false,
+                false,
+            );
+            if !res.is_empty() {
+                results.push(res);
+                if delim == "||" {
+                    break;
+                }
+            }
+        }
+        results.join("\n")
+    } else if main_rule.is_empty() {
         target_content.to_string()
     } else if main_rule.starts_with("<js>")
         || main_rule.starts_with("@js:")
@@ -3016,12 +3084,14 @@ pub(crate) fn java_get_string(
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(target_content) {
             if pure.is_empty() {
                 jsonpath::value_to_string(&v).unwrap_or_default()
-            } else if pure.starts_with('$') {
-                jsonpath::jsonpath_first_string(&v, pure).unwrap_or_default()
-            } else if let Some(val) = v.get(pure) {
+            } else if let Some(val) = v.get(pure).filter(|_| !pure.starts_with('$')) {
                 jsonpath::value_to_string(val).unwrap_or_default()
             } else {
-                jsonpath::jsonpath_first_string(&v, &format!("$.{}", pure)).unwrap_or_default()
+                java_jsonpath_query(&v, pure)
+                    .iter()
+                    .filter_map(jsonpath::value_to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
             }
         } else {
             String::new()
@@ -3052,10 +3122,21 @@ pub(crate) fn java_get_string(
         } else {
             main_rule
         };
-        let doc = html::parse_document(target_content);
-        html::select_all_text(&doc, pure)
-            .or_else(|| html::select_text(&doc, pure))
-            .unwrap_or_default()
+        let mut doc = html::parse_java_html(target_content);
+        if rule_analyzer::split_top_level(pure, &["@"]).parts.len() > 1
+            && rule_analyzer::split_top_level(pure, &["@@"]).delimiter.is_none()
+        {
+            let values = java_html_string_values(&mut doc, pure);
+            if is_url {
+                values.into_iter().next().unwrap_or_default()
+            } else {
+                values.join("\n")
+            }
+        } else {
+            html::select_all_text(&doc, pure)
+                .or_else(|| html::select_text(&doc, pure))
+                .unwrap_or_default()
+        }
     };
 
     if let Some(regex) = regex_part {
@@ -3112,47 +3193,31 @@ fn java_get_string_list_inner(
         return Vec::new();
     }
 
-    // JS rules own their logical operators; combine only extraction rules.
-    let delimiters: &[&str] = if js_rule { &[] } else { &["||", "&&", "%%"] };
-    let split = rule_analyzer::split_top_level(rule, delimiters);
-    if let Some(delim) = split.delimiter.as_deref() {
-        if delim == "||" {
-            for part in split.parts {
-                let res =
-                    java_get_string_list_inner(Some(&part), content, default_content, base_url);
-                if !res.is_empty() {
-                    return res;
-                }
-            }
-            return Vec::new();
-        } else if delim == "&&" {
-            let mut results = Vec::new();
-            for part in split.parts {
-                results.extend(java_get_string_list_inner(
-                    Some(&part),
-                    content,
-                    default_content,
-                    base_url,
-                ));
-            }
-            return results;
-        } else if delim == "%%" {
-            let groups = split
-                .parts
-                .iter()
-                .map(|part| {
-                    java_get_string_list_inner(Some(part), content, default_content, base_url)
-                })
-                .collect();
-            return rule_analyzer::interleave_result_groups(groups);
-        }
-    }
-
-    // 分离 ## 替换正则 (规范 6.7)
+    // AnalyzeRule applies replacement to each item after combining lists.
     let (main_rule, regex_part) = rule_engine::split_legado_regex(rule);
     let main_rule = main_rule.trim();
+    // JS rules own their logical operators; combine only extraction rules.
+    let delimiters: &[&str] = if js_rule { &[] } else { &["||", "&&", "%%"] };
+    let split = rule_analyzer::split_top_level(main_rule, delimiters);
 
-    let mut list = if main_rule.is_empty() {
+    let mut list = if let Some(delim) = split.delimiter.as_deref() {
+        let mut groups = Vec::new();
+        for part in split.parts {
+            let values =
+                java_get_string_list_inner(Some(&part), content, default_content, base_url);
+            if !values.is_empty() {
+                groups.push(values);
+                if delim == "||" {
+                    break;
+                }
+            }
+        }
+        if delim == "%%" {
+            rule_analyzer::interleave_result_groups(groups)
+        } else {
+            groups.into_iter().flatten().collect()
+        }
+    } else if main_rule.is_empty() {
         vec![target_content.to_string()]
     } else if main_rule.starts_with("<js>")
         || main_rule.starts_with("@js:")
@@ -3214,12 +3279,7 @@ fn java_get_string_list_inner(
         };
 
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(target_content) {
-            if pure.starts_with('$') {
-                jsonpath::jsonpath_query(&v, pure)
-                    .iter()
-                    .filter_map(jsonpath::value_to_string)
-                    .collect()
-            } else if let Some(val) = v.get(pure) {
+            if let Some(val) = v.get(pure).filter(|_| !pure.starts_with('$')) {
                 match val {
                     serde_json::Value::Array(arr) => {
                         arr.iter().filter_map(jsonpath::value_to_string).collect()
@@ -3227,7 +3287,7 @@ fn java_get_string_list_inner(
                     other => jsonpath::value_to_string(other).into_iter().collect(),
                 }
             } else {
-                jsonpath::jsonpath_query(&v, &format!("$.{}", pure))
+                java_jsonpath_query(&v, pure)
                     .iter()
                     .filter_map(jsonpath::value_to_string)
                     .collect()
@@ -3261,8 +3321,8 @@ fn java_get_string_list_inner(
         } else {
             main_rule
         };
-        let doc = html::parse_document(target_content);
-        html::select_text_list(&doc, pure)
+        let mut doc = html::parse_java_html(target_content);
+        java_html_string_values(&mut doc, pure)
     };
 
     if let Some(regex) = regex_part {
@@ -3273,6 +3333,14 @@ fn java_get_string_list_inner(
     }
 
     list
+}
+
+fn java_html_string_values(doc: &mut scraper::Html, rule: &str) -> Vec<String> {
+    html::select_java_markup(doc, rule).unwrap_or_else(|| {
+        let mut values = rule_engine::select_css_list_doc(doc, rule);
+        html::filter_list_attributes(rule, &mut values);
+        values
+    })
 }
 
 fn jsoup_remove_elements(source: &str, selector: &str) -> Option<String> {
@@ -3312,6 +3380,46 @@ fn java_element_js_value(script: &str, content: &str, base_url: &str) -> Option<
         .ok()?
         .get("value")
         .cloned()
+}
+
+// A leading dot already supplies the root path separator.
+fn java_jsonpath_query(value: &JsonValue, rule: &str) -> Vec<JsonValue> {
+    if rule.starts_with('.') {
+        jsonpath::jsonpath_query(value, &format!("${rule}"))
+    } else {
+        jsonpath::jsonpath_query(value, rule)
+    }
+}
+
+fn java_json_elements(value: &JsonValue, rule: &str) -> Vec<JsonValue> {
+    // Preserve direct property lookup before interpreting a path or combination.
+    if !rule.starts_with('$') {
+        if let Some(found) = value.get(rule) {
+            return match found {
+                JsonValue::Array(items) => items.clone(),
+                other => vec![other.clone()],
+            };
+        }
+    }
+    let split = rule_analyzer::split_top_level(rule, &["&&", "||", "%%"]);
+    if let Some(delim) = split.delimiter.as_deref() {
+        let mut groups = Vec::new();
+        for part in split.parts {
+            let values = java_json_elements(value, &part);
+            if !values.is_empty() {
+                groups.push(values);
+                if delim == "||" {
+                    break;
+                }
+            }
+        }
+        return if delim == "%%" {
+            rule_analyzer::interleave_result_groups(groups)
+        } else {
+            groups.into_iter().flatten().collect()
+        };
+    }
+    java_jsonpath_query(value, rule)
 }
 
 fn java_get_elements_json_with_mode(
@@ -3359,16 +3467,7 @@ fn java_get_elements_json_with_mode(
             rule
         }
         .trim();
-        let values = if pure.starts_with('$') {
-            jsonpath::jsonpath_query(&value, pure)
-        } else if let Some(found) = value.get(pure) {
-            match found {
-                JsonValue::Array(items) => items.clone(),
-                other => vec![other.clone()],
-            }
-        } else {
-            jsonpath::jsonpath_query(&value, &format!("$.{pure}"))
-        };
+        let values = java_json_elements(&value, pure);
         return serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string());
     }
 
@@ -3686,9 +3785,22 @@ fn eval_js_lib_for_operation<'js>(
         }
         bytes
     } else {
-        // Compile once for this operation. Errors propagate without retry.
+        // Compile once for this operation. Only retry on Rhino-compat syntax errors.
         let start = times.as_ref().map(|_| Instant::now());
-        let compiled = js_bytecode::compile(&ctx, script);
+        let compiled = match js_bytecode::compile(&ctx, script) {
+            Ok(bytes) => Ok(bytes),
+            Err(err) => {
+                if is_rhino_compat_syntax_error(&err.to_string()) {
+                    if let Some(rewritten) = rewrite_rhino_compat_syntax(script) {
+                        js_bytecode::compile(&ctx, &rewritten)
+                    } else {
+                        Err(err)
+                    }
+                } else {
+                    Err(err)
+                }
+            }
+        };
         if let Some(start) = start {
             times.as_deref_mut().unwrap()[0] = start.elapsed().as_micros();
         }
@@ -3711,6 +3823,12 @@ fn eval_js_lib_for_operation<'js>(
     result
 }
 
+fn is_rhino_compat_syntax_error(msg: &str) -> bool {
+    msg.contains("invalid redefinition of parameter name")
+        || msg.contains("Unexpected token '=>'")
+        || msg.contains("Unexpected identifier")
+}
+
 fn eval_script<'js>(ctx: rquickjs::Ctx<'js>, script: &str) -> anyhow::Result<Value<'js>> {
     let mut options = EvalOptions::default();
     options.global = true;
@@ -3718,13 +3836,310 @@ fn eval_script<'js>(ctx: rquickjs::Ctx<'js>, script: &str) -> anyhow::Result<Val
     match ctx.eval_with_options::<Value, _>(script, options) {
         Ok(value) => Ok(value),
         Err(error) => {
-            if let Some(exception) = ctx.catch().into_exception() {
-                Err(anyhow::anyhow!("JS Exception: {:?}", exception))
-            } else {
-                Err(anyhow::anyhow!("JS eval error: {error:?}"))
+            let Some(exception) = ctx.catch().into_exception() else {
+                return Err(anyhow::anyhow!("JS eval error: {error:?}"));
+            };
+            let msg = exception.message().unwrap_or_default();
+            if is_rhino_compat_syntax_error(&msg) {
+                if let Some(rewritten) = rewrite_rhino_compat_syntax(script) {
+                    let mut retry_options = EvalOptions::default();
+                    retry_options.global = true;
+                    retry_options.strict = false;
+                    return match ctx.eval_with_options::<Value, _>(rewritten.as_str(), retry_options) {
+                        Ok(value) => Ok(value),
+                        Err(retry_err) => {
+                            if let Some(retry_exc) = ctx.catch().into_exception() {
+                                Err(anyhow::anyhow!("JS Exception: {:?}", retry_exc))
+                            } else {
+                                Err(anyhow::anyhow!("JS eval error: {retry_err:?}"))
+                            }
+                        }
+                    };
+                }
             }
+            Err(anyhow::anyhow!("JS Exception: {:?}", exception))
         }
     }
+}
+
+/// Fallback-only syntax rewriter for Rhino-isms that QuickJS rejects with a SyntaxError:
+/// 1. `let <param>` redeclaring a parameter inside its enclosing `function(...) { ... }` -> `var <param>`
+/// 2. Unparenthesized array destructuring arrow parameter `[a, b] =>` -> `([a, b]) =>`
+/// Skips strings, template literals, and comments so literals are never altered.
+fn rewrite_rhino_compat_syntax(script: &str) -> Option<String> {
+    let bytes = script.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len + 16);
+    let mut i = 0usize;
+    let mut changed = false;
+
+    // Stack of (brace_depth_at_function_body, parameter_names)
+    let mut fn_scopes: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut brace_depth = 0usize;
+    let mut last_non_ws: Option<u8> = None;
+
+    let is_ident_start = |b: u8| b.is_ascii_alphabetic() || b == b'_' || b == b'$';
+    let is_ident_part = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+
+    while i < len {
+        let b = bytes[i];
+        // Line comment
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            let start = i;
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            out.push_str(&script[start..i]);
+            continue;
+        }
+        // Block comment
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            let start = i;
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(len);
+            out.push_str(&script[start..i]);
+            continue;
+        }
+        // String / template literal
+        if b == b'\'' || b == b'"' || b == b'`' {
+            let quote = b;
+            let start = i;
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\\' {
+                    i = (i + 2).min(len);
+                    continue;
+                }
+                if bytes[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&script[start..i]);
+            last_non_ws = Some(quote);
+            continue;
+        }
+        if b.is_ascii_whitespace() {
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        if b == b'{' {
+            brace_depth += 1;
+            out.push('{');
+            last_non_ws = Some(b'{');
+            i += 1;
+            continue;
+        }
+        if b == b'}' {
+            if let Some((depth, _)) = fn_scopes.last() {
+                if *depth == brace_depth {
+                    fn_scopes.pop();
+                }
+            }
+            brace_depth = brace_depth.saturating_sub(1);
+            out.push('}');
+            last_non_ws = Some(b'}');
+            i += 1;
+            continue;
+        }
+        // Unparenthesized array destructuring arrow parameter: `[a, b] =>`
+        if b == b'['
+            && !matches!(last_non_ws, Some(c) if is_ident_part(c) || c == b')' || c == b']')
+        {
+            let mut j = i + 1;
+            let mut depth = 1usize;
+            while j < len && depth > 0 {
+                match bytes[j] {
+                    b'[' => depth += 1,
+                    b']' => depth -= 1,
+                    b'\'' | b'"' | b'`' => {
+                        let q = bytes[j];
+                        j += 1;
+                        while j < len {
+                            if bytes[j] == b'\\' {
+                                j = (j + 2).min(len);
+                                continue;
+                            }
+                            if bytes[j] == q {
+                                break;
+                            }
+                            j += 1;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            if depth == 0 {
+                let mut k = j;
+                while k < len && bytes[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if k + 1 < len && bytes[k] == b'=' && bytes[k + 1] == b'>' {
+                    out.push('(');
+                    out.push_str(&script[i..j]);
+                    out.push(')');
+                    changed = true;
+                    last_non_ws = Some(b')');
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        // Identifier / keyword
+        if is_ident_start(b) {
+            let start = i;
+            i += 1;
+            while i < len && is_ident_part(bytes[i]) {
+                i += 1;
+            }
+            let word = &script[start..i];
+            if word == "function" && last_non_ws != Some(b'.') {
+                // Parse optional function name and parameter list: `function [name](p1, p2) {`
+                let mut j = i;
+                while j < len && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < len && bytes[j] == b'*' {
+                    j += 1;
+                    while j < len && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                }
+                if j < len && is_ident_start(bytes[j]) {
+                    while j < len && is_ident_part(bytes[j]) {
+                        j += 1;
+                    }
+                    while j < len && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                }
+                if j < len && bytes[j] == b'(' {
+                    let p_start = j + 1;
+                    let mut p_end = p_start;
+                    let mut p_depth = 1usize;
+                    while p_end < len && p_depth > 0 {
+                        match bytes[p_end] {
+                            b'(' => p_depth += 1,
+                            b')' => p_depth -= 1,
+                            _ => {}
+                        }
+                        if p_depth > 0 {
+                            p_end += 1;
+                        }
+                    }
+                    if p_depth == 0 {
+                        let params: Vec<String> = script[p_start..p_end]
+                            .split(',')
+                            .filter_map(|p| {
+                                let name = p
+                                    .split('=')
+                                    .next()
+                                    .unwrap_or("")
+                                    .trim()
+                                    .trim_start_matches("...");
+                                if !name.is_empty()
+                                    && name.bytes().all(|c| is_ident_part(c))
+                                    && is_ident_start(name.as_bytes()[0])
+                                {
+                                    Some(name.to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        let mut k = p_end + 1;
+                        while k < len && bytes[k].is_ascii_whitespace() {
+                            k += 1;
+                        }
+                        if k < len && bytes[k] == b'{' && !params.is_empty() {
+                            fn_scopes.push((brace_depth + 1, params));
+                        }
+                    }
+                }
+                out.push_str(word);
+                last_non_ws = Some(bytes[i - 1]);
+                continue;
+            }
+            if word == "let" && last_non_ws != Some(b'.') {
+                // Rhino let-expression: `let (a = b) expr` -> `(a = b), expr`
+                let mut j = i;
+                while j < len && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < len && bytes[j] == b'(' {
+                    let mut p = j + 1;
+                    let mut p_depth = 1usize;
+                    while p < len && p_depth > 0 {
+                        match bytes[p] {
+                            b'(' => p_depth += 1,
+                            b')' => p_depth -= 1,
+                            b'\'' | b'"' | b'`' => {
+                                let q = bytes[p];
+                                p += 1;
+                                while p < len {
+                                    if bytes[p] == b'\\' {
+                                        p = (p + 2).min(len);
+                                        continue;
+                                    }
+                                    if bytes[p] == q {
+                                        break;
+                                    }
+                                    p += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                        p += 1;
+                    }
+                    if p_depth == 0 {
+                        out.push_str(&script[j..p]);
+                        out.push(',');
+                        changed = true;
+                        last_non_ws = Some(b',');
+                        i = p;
+                        continue;
+                    }
+                }
+                if let Some((_, params)) = fn_scopes.last() {
+                    let mut j = i;
+                    while j < len && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if j < len && is_ident_start(bytes[j]) {
+                        let id_start = j;
+                        j += 1;
+                        while j < len && is_ident_part(bytes[j]) {
+                            j += 1;
+                        }
+                        let ident = &script[id_start..j];
+                        if params.iter().any(|p| p == ident) {
+                            out.push_str("var");
+                            changed = true;
+                            last_non_ws = Some(b'r');
+                            continue;
+                        }
+                    }
+                }
+            }
+            out.push_str(word);
+            last_non_ws = Some(bytes[i - 1]);
+            continue;
+        }
+        // Any other UTF-8 char
+        let ch = script[i..].chars().next().unwrap();
+        out.push(ch);
+        last_non_ws = Some(b);
+        i += ch.len_utf8();
+    }
+
+    if changed { Some(out) } else { None }
 }
 
 fn active_js_lib_script() -> anyhow::Result<String> {
@@ -7998,5 +8413,65 @@ java.connect('ftp://invalid,{"js":"var leakedVar=1; globalThis.leakedGlobal=1; j
         "#;
         let output_strings = eval_js(script_strings, body, "https://example.com").unwrap();
         assert_eq!(output_strings, "The End|/ch1,/ch2");
+    }
+
+    #[test]
+    fn compat_rhino_let_param_redefinition_and_arrow_destructuring() {
+        let script = r#"
+            function getUrl(path, sourceUrl) {
+                let sourceUrl = sourceUrl || "https://example.com";
+                return sourceUrl + path;
+            }
+            const mapped = [["a", 1], ["b", 2]].map([k, v] => k + "=" + v).join(",");
+            const literal = "let sourceUrl = 1; [k, v] => k; let (x = 1) x";
+            let hit = "no";
+            let data = [1, 2];
+            let list;
+            if (let (list = data) list != 0 && data != undefined) {
+                hit = "yes:" + list.length;
+            }
+            [getUrl("/x"), getUrl("/y", "https://other.test"), mapped, hit, literal].join("|")
+        "#;
+        let output = eval_js(script, "", "https://example.com").unwrap();
+        assert_eq!(
+            output,
+            "https://example.com/x|https://other.test/y|a=1,b=2|yes:2|let sourceUrl = 1; [k, v] => k; let (x = 1) x"
+        );
+    }
+
+    #[test]
+    fn compat_response_cookies_to_string_matches_java_map_format() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/cookies", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let resp = concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Set-Cookie: csrfToken=abc; path=/\r\n",
+                    "Set-Cookie: shuqi_token=tok123; path=/\r\n",
+                    "Content-Length: 2\r\n",
+                    "Connection: close\r\n\r\n",
+                    "ok"
+                );
+                let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
+            }
+        });
+        let script = format!(
+            r#"
+            const r = java.get('{}', {{}});
+            const s = r.cookies().toString();
+            const m = s.match(/shuqi_token=([^,}}]*)/);
+            [s, m ? m[1] : '', r.cookies().get('shuqi_token'), new Map([['a', 1]]).toString()].join('|')
+            "#,
+            url
+        );
+        let output = eval_js(&script, "", &url).unwrap();
+        handle.join().unwrap();
+        assert_eq!(
+            output,
+            "{csrfToken=abc, shuqi_token=tok123}|tok123|tok123|[object Map]"
+        );
     }
 }

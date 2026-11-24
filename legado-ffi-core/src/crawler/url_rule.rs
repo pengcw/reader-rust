@@ -567,19 +567,24 @@ pub(crate) fn strip_url_options(rule: &str) -> &str {
 }
 
 pub(crate) fn parse_url_options(raw: &str) -> Result<Value, String> {
+    parse_legacy_json(raw).map_err(|error| format!("invalid URL options: {error}"))
+}
+
+pub(crate) fn parse_legacy_json<T: serde::de::DeserializeOwned>(
+    raw: &str,
+) -> Result<T, serde_json::Error> {
     serde_json::from_str(raw)
         .or_else(|_| serde_json::from_str(&escape_control_chars_in_json_strings(raw)))
         .or_else(|_| {
             serde_json::from_str(&escape_control_chars_in_json_strings(
-                &normalize_legacy_url_options(raw),
+                &normalize_legacy_json_quotes(raw),
             ))
         })
-        .map_err(|error| format!("invalid URL options: {error}"))
 }
 
 // Normalize only legacy quoting, then let serde_json validate the structure.
 // This is not JavaScript evaluation or a general JSON5 parser.
-fn normalize_legacy_url_options(raw: &str) -> String {
+fn normalize_legacy_json_quotes(raw: &str) -> String {
     let mut output = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
     while let Some(ch) = chars.next() {

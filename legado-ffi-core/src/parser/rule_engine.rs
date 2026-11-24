@@ -55,6 +55,7 @@ struct HtmlCarrierScope {
 }
 
 pub(crate) const OBJECT_SCOPE_BINDING: &str = "__readerRuleObjectScope";
+pub(crate) const SEARCH_ITEM_SCOPE_BINDING: &str = "__readerSearchItemScope";
 
 #[derive(Debug, Default)]
 struct ObjectVariableChanges {
@@ -114,6 +115,26 @@ pub(crate) fn record_js_object_variable(
             }
         }
     });
+}
+
+// None = unchanged; Some(None) = removed; Some(Some("")) = cleared.
+// Read the existing per-book/per-chapter change map rather than a JS-start
+// snapshot, so java.get observes book.putVariable in the same JS stage.
+pub(crate) fn js_object_variable_change(
+    scope_id: u64,
+    kind: &str,
+    key: &str,
+) -> Option<Option<String>> {
+    OBJECT_VARIABLE_SCOPES.with(|scopes| {
+        let scope = scopes.borrow().get(&scope_id)?.upgrade()?;
+        let changes = scope.borrow();
+        let value = match kind {
+            "book" => changes.book.borrow().get(key).cloned(),
+            "chapter" => changes.chapter.borrow().get(key).cloned(),
+            _ => None,
+        };
+        value
+    })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -291,17 +312,19 @@ impl RuleVariableContext {
             "title" => self.chapter_title.clone(),
             _ => variable_value(self.chapter.as_ref(), &chapter_changes, key)
                 .or_else(|| variable_value(self.book.as_ref(), &book_changes, key))
-                .or_else(|| self.book_fields.get(key).cloned())
+                .or_else(|| self.book_fields.get(key).filter(|value| !value.is_empty()).cloned())
                 .or_else(|| {
                     self.rule_data
                         .as_ref()
                         .and_then(|values| values.get(key))
+                        .filter(|value| !value.is_empty())
                         .cloned()
                 })
                 .or_else(|| {
                     current_active_session()
                         .and_then(|session| session.get_variable(key))
                         .map(value_to_rule_string)
+                        .filter(|value| !value.is_empty())
                 }),
         }
     }
@@ -446,7 +469,7 @@ impl RuleVariableContext {
             scopes.retain(|_, value| value.strong_count() > 0);
             scopes.insert(scope_id, Rc::downgrade(&self.object_changes.0));
         });
-        HashMap::from([
+        let mut bindings = HashMap::from([
             (OBJECT_SCOPE_BINDING.to_string(), json!(scope_id)),
             ("book".to_string(), Value::Object(book)),
             ("chapter".to_string(), Value::Object(chapter)),
@@ -461,7 +484,11 @@ impl RuleVariableContext {
                     .cloned()
                     .unwrap_or_else(|| json!("")),
             ),
-        ])
+        ]);
+        if self.capture_search_fields {
+            bindings.insert(SEARCH_ITEM_SCOPE_BINDING.to_string(), json!(true));
+        }
+        bindings
     }
 }
 
@@ -487,6 +514,7 @@ fn variable_value(
         Some(value) => value.clone(),
         None => values.and_then(|values| values.get(key).cloned()),
     }
+    .filter(|value| !value.is_empty())
 }
 
 fn parse_variable_map(variable: Option<&str>) -> HashMap<String, String> {
@@ -718,12 +746,13 @@ impl RuleEngine {
             let rule = source.rule_search.clone().unwrap_or_default();
             let (list_rule, reverse) = normalize_list_rule(rule.book_list.as_deref().unwrap_or(""));
             let context = RuleVariableContext::default();
+            let original_body = body;
             let (body, list_rule) =
                 prepare_list_rule_and_body(Cow::Borrowed(body), list_rule, base_url, &context);
             let mode = self.detect_mode(list_rule, &body);
-            let mut results = match mode {
+            let (mut results, _) = match mode {
                 ParseMode::JsonPath => {
-                    self.search_books_json(source, &body, base_url, &rule, list_rule)
+                    self.search_books_json(source, &body, base_url, &rule, list_rule, original_body)
                 }
                 ParseMode::XPath => {
                     self.search_books_xpath(source, &body, base_url, &rule, list_rule)
@@ -732,7 +761,9 @@ impl RuleEngine {
                 ParseMode::Regex => {
                     self.search_books_regex(source, &body, base_url, &rule, list_rule)
                 }
-                ParseMode::Css => self.search_books_html(source, &body, base_url, &rule, list_rule),
+                ParseMode::Css => {
+                    self.search_books_html(source, &body, base_url, &rule, list_rule, original_body)
+                }
             };
 
             if results.is_empty() && !has_book_url_pattern(source.book_url_pattern.as_deref()) {
@@ -766,12 +797,13 @@ impl RuleEngine {
                 .unwrap_or_else(|| source.rule_search.clone().unwrap_or_default());
             let (list_rule, reverse) = normalize_list_rule(rule.book_list.as_deref().unwrap_or(""));
             let context = RuleVariableContext::default();
+            let original_body = body;
             let (body, list_rule) =
                 prepare_list_rule_and_body(Cow::Borrowed(body), list_rule, base_url, &context);
             let mode = self.detect_mode(list_rule, &body);
-            let mut results = match mode {
+            let (mut results, had_items) = match mode {
                 ParseMode::JsonPath => {
-                    self.search_books_json(source, &body, base_url, &rule, list_rule)
+                    self.search_books_json(source, &body, base_url, &rule, list_rule, original_body)
                 }
                 ParseMode::XPath => {
                     self.search_books_xpath(source, &body, base_url, &rule, list_rule)
@@ -780,9 +812,12 @@ impl RuleEngine {
                 ParseMode::Regex => {
                     self.search_books_regex(source, &body, base_url, &rule, list_rule)
                 }
-                ParseMode::Css => self.search_books_html(source, &body, base_url, &rule, list_rule),
+                ParseMode::Css => {
+                    self.search_books_html(source, &body, base_url, &rule, list_rule, original_body)
+                }
             };
-            if results.is_empty() && !has_book_url_pattern(source.book_url_pattern.as_deref()) {
+            // A list whose rows were filtered is not a detail page.
+            if !had_items && !has_book_url_pattern(source.book_url_pattern.as_deref()) {
                 if let Some(detail_book) = self.search_detail_fallback(source, &body, base_url) {
                     results.push(detail_book);
                 }
@@ -1683,7 +1718,7 @@ impl RuleEngine {
         base_url: &str,
         rule: &SearchRule,
         list_rule: &str,
-    ) -> Vec<SearchBook> {
+    ) -> (Vec<SearchBook>, bool) {
         let context = RuleVariableContext::default();
         let output = match eval_js_with_bindings(
             self.strip_mode_prefix(list_rule),
@@ -1692,7 +1727,7 @@ impl RuleEngine {
             &context.js_bindings(),
         ) {
             Ok(result) => result,
-            Err(_) => return vec![],
+            Err(_) => return (vec![], false),
         };
 
         // Keep JSON-encoded string rows as strings. Legado's setContent(item)
@@ -1706,6 +1741,7 @@ impl RuleEngine {
             }
         });
         if let Some(items) = items {
+            let had_items = !items.is_empty();
             let mut out = Vec::with_capacity(items.len());
             for item in items {
                 let mut context = RuleVariableContext::for_search_book(source);
@@ -1715,13 +1751,13 @@ impl RuleEngine {
                     out.push(book);
                 }
             }
-            return out;
+            return (out, had_items);
         }
 
         // JS can return markup rather than JSON item objects. Reuse the
         // ordinary HTML search path so field order and book JS context stay
         // identical to CSS search (including fallback and kind lists).
-        self.search_books_html(source, &output, base_url, rule, "body > *")
+        self.search_books_html(source, &output, base_url, rule, "body > *", body)
     }
 
     fn search_books_regex(
@@ -1731,7 +1767,7 @@ impl RuleEngine {
         base_url: &str,
         rule: &SearchRule,
         list_rule: &str,
-    ) -> Vec<SearchBook> {
+    ) -> (Vec<SearchBook>, bool) {
         let (list_rule, list_js) = extract_js(list_rule);
         let list_context = RuleVariableContext::for_search_item();
         let rows = apply_regex_list_js(
@@ -1741,6 +1777,7 @@ impl RuleEngine {
             &list_context,
             body,
         );
+        let had_items = !rows.is_empty();
         let mut out = Vec::new();
         for captures in rows {
             let mut context = RuleVariableContext::for_search_book(source);
@@ -1824,7 +1861,7 @@ impl RuleEngine {
                 book_source_urls: None,
             });
         }
-        out
+        (out, had_items)
     }
 
     fn parse_next_toc_urls(
@@ -2258,19 +2295,30 @@ impl RuleEngine {
         base_url: &str,
         rule: &SearchRule,
         list_sel: &str,
-    ) -> Vec<SearchBook> {
+        original_body: &str,
+    ) -> (Vec<SearchBook>, bool) {
         if list_sel.trim().is_empty() {
-            return vec![];
+            return (vec![], false);
         }
         let doc = html::parse_document(body);
         let (selector, list_js) = extract_js(list_sel);
-        let list_context = RuleVariableContext::for_search_item();
+        let (selector, put_entries) = extract_put_entries(selector);
+        let mut list_context = RuleVariableContext::for_search_item();
+        if !put_entries.is_empty() {
+            // List @put reads the full document before selecting elements.
+            // Keep these values at rule scope rather than in each book's data.
+            list_context.book = None;
+            let serialized = std::cell::OnceCell::new();
+            evaluate_put_entries(&put_entries, &mut list_context, |put_rule, ctx| {
+                eval_field_html_doc_with_cached_input(put_rule, &doc, &serialized, base_url, ctx)
+            });
+        }
         let (items, markup, objects, html_nodes) = apply_html_list_js(
-            html::select_list(&doc, self.strip_mode_prefix(selector)),
+            html::select_list(&doc, self.strip_mode_prefix(&selector)),
             list_js,
             base_url,
             &list_context,
-            body,
+            original_body,
         );
         if let Some(objects) = objects {
             return self.search_books_json(
@@ -2279,6 +2327,7 @@ impl RuleEngine {
                 base_url,
                 rule,
                 "$[*]",
+                original_body,
             );
         }
         let post_selector = html_list_post_selector(list_sel);
@@ -2291,10 +2340,14 @@ impl RuleEngine {
             (Some(doc), None) if html_nodes => html::select_list(doc, "body > *"),
             _ => items,
         };
+        let had_items = !items.is_empty();
         let mut out = Vec::with_capacity(items.len());
 
         for el in items {
             let mut context = RuleVariableContext::for_search_book(source);
+            if !put_entries.is_empty() {
+                context.rule_data = list_context.rule_data.clone();
+            }
             context.html_document = list_context.html_document.clone();
             let text_cache = std::cell::OnceCell::new();
             let eval_field = |rule: Option<&String>, ctx: &mut RuleVariableContext| {
@@ -2346,7 +2399,7 @@ impl RuleEngine {
                 book_source_urls: None,
             });
         }
-        out
+        (out, had_items)
     }
 
     fn search_books_xpath(
@@ -2356,10 +2409,10 @@ impl RuleEngine {
         base_url: &str,
         rule: &SearchRule,
         list_rule: &str,
-    ) -> Vec<SearchBook> {
+    ) -> (Vec<SearchBook>, bool) {
         let (package, html_mode) = match html::parse_xpath_package_with_mode(body) {
             Ok(parsed) => parsed,
-            Err(_) => return vec![],
+            Err(_) => return (vec![], false),
         };
         let document = package.as_document();
         let post_selector = html_list_post_selector(list_rule);
@@ -2378,8 +2431,9 @@ impl RuleEngine {
             body,
         );
         if let (Some(markup), Some(selector)) = (markup, post_selector) {
-            return self.search_books_html(source, &markup, base_url, rule, selector);
+            return self.search_books_html(source, &markup, base_url, rule, selector, body);
         }
+        let had_items = !items.is_empty();
         let mut out = Vec::with_capacity(items.len());
 
         for item in items {
@@ -2466,7 +2520,7 @@ impl RuleEngine {
             });
         }
 
-        out
+        (out, had_items)
     }
 
     fn search_books_json(
@@ -2476,24 +2530,38 @@ impl RuleEngine {
         base_url: &str,
         rule: &SearchRule,
         list_rule: &str,
-    ) -> Vec<SearchBook> {
+        original_body: &str,
+    ) -> (Vec<SearchBook>, bool) {
         let v: Value = match serde_json::from_str(body) {
             Ok(v) => v,
-            Err(_) => return vec![],
+            Err(_) => return (vec![], false),
         };
         let (list_rule, list_js, post_selector) = split_json_list_js(list_rule);
-        let list_context = RuleVariableContext::for_search_item();
+        let (list_rule, put_entries) = extract_put_entries(list_rule);
+        let mut list_context = RuleVariableContext::for_search_item();
+        if !put_entries.is_empty() {
+            // List @put evaluates against the response, before selecting rows.
+            // Keep it at rule scope, not in any individual SearchBook variable.
+            list_context.book = None;
+            evaluate_put_entries(&put_entries, &mut list_context, |rule, ctx| {
+                eval_field_json_with_ctx(rule, &v, base_url, ctx)
+            });
+        }
         let items = apply_json_list_js(
-            query_json_list(&v, list_rule),
+            query_json_list(&v, &list_rule),
             list_js,
             post_selector,
             base_url,
             &list_context,
-            body,
+            original_body,
         );
+        let had_items = !items.is_empty();
         let mut out = Vec::with_capacity(items.len());
         for item in items {
             let mut context = RuleVariableContext::for_search_book(source);
+            if !put_entries.is_empty() {
+                context.rule_data = list_context.rule_data.clone();
+            }
             let name = eval_field_json_with_ctx(
                 rule.name.as_deref().unwrap_or(""),
                 &item,
@@ -2585,7 +2653,7 @@ impl RuleEngine {
                 book_source_urls: None,
             });
         }
-        out
+        (out, had_items)
     }
 }
 
@@ -2728,9 +2796,9 @@ fn book_info_word_count(raw: String) -> Option<String> {
     Some(raw)
 }
 
-// Both BookInfo.kind's list path and AnalyzeRule.putRule's getString()
-// must keep values from nested CSS selectors, not just the first descendant.
-fn select_css_list_doc(doc: &scraper::Html, rule: &str) -> Vec<String> {
+// List-valued CSS extraction must keep values from nested selectors,
+// not just the first descendant.
+pub(crate) fn select_css_list_doc(doc: &scraper::Html, rule: &str) -> Vec<String> {
     let split = rule_analyzer::split_top_level(rule, &["&&", "||", "%%"]);
     if let Some(operator) = split.delimiter.as_deref() {
         let mut groups = Vec::new();
@@ -2750,7 +2818,7 @@ fn select_css_list_doc(doc: &scraper::Html, rule: &str) -> Vec<String> {
         };
     }
     let parts = rule_analyzer::split_top_level(rule, &["@"]).parts;
-    if parts.len() > 2 && !rule.contains("@@") {
+    if parts.len() > 2 && !parts[0].is_empty() && !rule.contains("@@") {
         let roots = html::select_list(doc, &parts[0]);
         let tail = parts[1..].join("@");
         roots.into_iter()
@@ -4258,7 +4326,7 @@ fn interpolate_json_templates(
     ctx: &RuleVariableContext,
 ) -> String {
     let input = serde_json::to_string(v).unwrap_or_default();
-    interpolate_templates(rule, &input, base_url, ctx, Some(v))
+    interpolate_templates(rule, &input, base_url, ctx, Some(v), None)
 }
 
 fn interpolate_common_templates(
@@ -4267,7 +4335,7 @@ fn interpolate_common_templates(
     base_url: &str,
     ctx: &RuleVariableContext,
 ) -> String {
-    interpolate_templates(rule, input, base_url, ctx, None)
+    interpolate_templates(rule, input, base_url, ctx, None, None)
 }
 
 fn interpolate_templates(
@@ -4276,6 +4344,7 @@ fn interpolate_templates(
     base_url: &str,
     ctx: &RuleVariableContext,
     json_value: Option<&Value>,
+    element: Option<scraper::ElementRef<'_>>,
 ) -> String {
     let mut output = String::with_capacity(rule.len());
     let mut cursor = 0;
@@ -4289,6 +4358,7 @@ fn interpolate_templates(
                     base_url,
                     ctx,
                     json_value,
+                    element,
                 ));
                 cursor += 2 + end + 2;
                 continue;
@@ -4315,6 +4385,7 @@ fn evaluate_template_expression(
     base_url: &str,
     ctx: &RuleVariableContext,
     json_value: Option<&Value>,
+    element: Option<scraper::ElementRef<'_>>,
 ) -> String {
     if expression.is_empty() {
         return String::new();
@@ -4380,8 +4451,7 @@ fn evaluate_template_expression(
             .unwrap_or_default();
     }
     if let Some(script) = strip_prefix_ascii_case(expression, "@js:") {
-        return eval_js_template_with_bindings(script, input, base_url, &ctx.js_bindings())
-            .unwrap_or_default();
+        return eval_template_js(script, input, base_url, ctx, element);
     }
     if let Some(pattern) = strip_prefix_ascii_case(expression, "@regex:") {
         return regex_capture_first(pattern, input)
@@ -4400,8 +4470,29 @@ fn evaluate_template_expression(
         )
         .unwrap_or_default();
     }
-    eval_js_template_with_bindings(expression, input, base_url, &ctx.js_bindings())
-        .unwrap_or_default()
+    eval_template_js(expression, input, base_url, ctx, element)
+}
+
+fn eval_template_js(
+    script: &str,
+    input: &str,
+    base_url: &str,
+    ctx: &RuleVariableContext,
+    element: Option<scraper::ElementRef<'_>>,
+) -> String {
+    let Some(element) = element else {
+        return eval_js_template_with_bindings(script, input, base_url, &ctx.js_bindings())
+            .unwrap_or_default();
+    };
+    // Nested Java queries use the selected row. Preserve the historical
+    // string result of HTML templates for existing text expressions.
+    dom::evaluate(element, &ctx.html_document, |descriptor| {
+        let mut bindings = ctx.js_bindings();
+        bindings.insert("result".into(), descriptor);
+        let script = format!("java.setContent(globalThis.result); globalThis.result = {};\n{script}",
+            serde_json::to_string(input).unwrap());
+        eval_js_template_with_bindings(&script, input, base_url, &bindings)
+    }).unwrap_or_default()
 }
 
 fn strip_url_config(url: &str) -> &str {
@@ -4466,7 +4557,7 @@ fn eval_list_js_checked_with_source(
     let script_literal = serde_json::to_string(script).unwrap_or_else(|_| "\"\"".to_string());
     let wrapped = format!(
         "const __readerOut = eval({script_literal});\
-         const __readerList = __readerOut == null ? globalThis.result : __readerOut;\
+         const __readerList = __readerOut === undefined ? globalThis.result : __readerOut;\
          JSON.stringify(__readerList);"
     );
     let output = eval_js_with_bindings(&wrapped, source_html, base_url, &bindings)?;
@@ -4526,7 +4617,7 @@ fn eval_collection_with_context(
         };
         // No implicit regex fallback: invalid legacy selectors still produce [].
         let (mode, pure) = classify_rule_mode(selection, fallback, json.is_some());
-        let expanded = interpolate_templates(&pure, input, base_url, ctx, json);
+        let expanded = interpolate_templates(&pure, input, base_url, ctx, json, None);
         let strings =
             |values: Vec<String>| -> Vec<Value> { values.into_iter().map(Value::String).collect() };
         if pure.starts_with("{{") && pure.ends_with("}}") {
@@ -4716,6 +4807,7 @@ fn apply_html_list_js<'a>(
             (items, None, None, false)
         }
         Some(Value::String(markup)) => (items, Some(markup), None, false),
+        Some(Value::Null) => (Vec::new(), None, None, false),
         _ => (items, None, None, false),
     }
 }
@@ -4796,7 +4888,8 @@ fn apply_json_list_js(
             return Vec::new();
         };
         let output = match output {
-            Value::String(text) => serde_json::from_str(&text).unwrap_or(Value::String(text)),
+            Value::String(text) => crate::crawler::parse_legacy_json(&text)
+                .unwrap_or(Value::String(text)),
             value => value,
         };
         let (selector, next_js, next_tail) = split_json_list_js(selector);
@@ -4844,9 +4937,10 @@ fn apply_regex_list_js(
             )
         })
         .collect();
-    let Some(Value::Array(result)) = eval_list_js(values, script, base_url, ctx, source_body)
-    else {
-        return rows;
+    let result = match eval_list_js(values, script, base_url, ctx, source_body) {
+        Some(Value::Array(result)) => result,
+        Some(Value::Null) => return Vec::new(),
+        _ => return rows,
     };
 
     result
@@ -4902,12 +4996,25 @@ fn apply_xpath_list_js<'a>(
         Some(Value::Array(result)) => (
             result
                 .into_iter()
-                .filter_map(|item| item.get("__readerIndex").and_then(Value::as_u64))
+                .filter_map(|item| {
+                    // Hitomi's literal [result] can wrap a singleton
+                    // XPath list; do not unwrap arbitrary nested JS arrays.
+                    let item = match item {
+                        Value::Array(mut nodes)
+                            if script.trim() == "[result]" && nodes.len() == 1 =>
+                        {
+                            nodes.pop()?
+                        }
+                        other => other,
+                    };
+                    item.get("__readerIndex").and_then(Value::as_u64)
+                })
                 .filter_map(|index| items.get(index as usize).copied())
                 .collect(),
             None,
         ),
         Some(Value::String(markup)) => (items, Some(markup)),
+        Some(Value::Null) => (Vec::new(), None),
         _ => (items, None),
     }
 }
@@ -5182,13 +5289,22 @@ impl FieldInput<'_> {
                 _ => script.to_string(),
             };
             let mut bindings = ctx.js_bindings();
+            let input = match self {
+                Self::Html(el) if ctx.capture_search_fields && !list_result => {
+                    // A combined selector changes JS result, not the current
+                    // SearchBook element used by nested java.getString().
+                    bindings.insert("result".to_string(), json!(text));
+                    el.html()
+                }
+                _ => text.clone(),
+            };
             if let Some(values) = &list_values {
                 bindings.insert(
                     "result".to_string(),
                     Value::Array(values.iter().cloned().map(Value::String).collect()),
                 );
             }
-            if let Ok(result) = eval_search_field_js(&script, &text, base_url, ctx, &bindings) {
+            if let Ok(result) = eval_search_field_js(&script, &input, base_url, ctx, &bindings) {
                 if let Some(values) = &mut list_values {
                     *values = match serde_json::from_str::<Value>(&result) {
                         Ok(Value::Array(items)) => {
@@ -5481,7 +5597,7 @@ fn eval_field_html_with_cached_text(
     // chapter node (including links and attributes), not its text alone.
     let element_html = source_rule.rule.contains("{{@@").then(|| el.html());
     let template_input = element_html.as_deref().unwrap_or(input);
-    let expanded = interpolate_common_templates(&source_rule.rule, template_input, base_url, ctx);
+    let expanded = interpolate_templates(&source_rule.rule, template_input, base_url, ctx, None, Some(*el));
     let had_templates = expanded != source_rule.rule;
     if source_rule.mode == ParseMode::Css {
         if let Some((selector, regex, script)) = split_css_regex_at_js(&expanded) {
@@ -5585,14 +5701,19 @@ fn eval_field_html_with_cached_text(
         text = pure.to_string();
     }
     if let Some(script) = js.filter(|_| source_rule.mode != ParseMode::Js) {
-        let js_input: &str = if source_rule.mode == ParseMode::Js && text.is_empty() {
-            input
+        if ctx.capture_search_fields {
+            // A list item remains the content for nested java.getString().
+            // Only the chained JS result is the extracted field.
+            let mut bindings = ctx.js_bindings();
+            bindings.insert("result".to_string(), json!(text));
+            if let Ok(result) = eval_search_field_js(script, &el.html(), base_url, ctx, &bindings) {
+                text = result;
+            }
         } else {
-            &text
-        };
-        let bindings = ctx.js_bindings();
-        if let Ok(result) = eval_search_field_js(script, js_input, base_url, ctx, &bindings) {
-            text = result;
+            let bindings = ctx.js_bindings();
+            if let Ok(result) = eval_search_field_js(script, &text, base_url, ctx, &bindings) {
+                text = result;
+            }
         }
     }
     text = source_rule.apply_replacement(&text);
@@ -6049,7 +6170,19 @@ fn eval_field_xpath_with_ctx(
         text = pure.to_string();
     }
     if let Some(script) = js {
-        if let Ok(result) = eval_js_with_bindings(script, &text, base_url, &ctx.js_bindings()) {
+        if ctx.capture_search_fields {
+            // Keep the selected field in result while nested rule lookups
+            // retain the current XPath list item.
+            let mut bindings = ctx.js_bindings();
+            bindings.insert("result".to_string(), json!(text));
+            if let Ok(result) = eval_search_field_js(
+                script, &xpath_js_input(node, html_mode), base_url, ctx, &bindings,
+            ) {
+                text = result;
+            }
+        } else if let Ok(result) =
+            eval_js_with_bindings(script, &text, base_url, &ctx.js_bindings())
+        {
             text = result;
         }
     }
@@ -6149,13 +6282,7 @@ fn eval_field_json_with_ctx(
             .next()?;
         // HTML fragment parsing uses a body context, which discards bare table
         // rows/cells. Supply only their required container; keep the item root.
-        let (prefix, suffix) = match tag {
-            "td" | "th" => ("<table><tbody><tr>", "</tr></tbody></table>"),
-            "tr" => ("<table><tbody>", "</tbody></table>"),
-            "col" => ("<table><colgroup>", "</colgroup></table>"),
-            "tbody" | "thead" | "tfoot" | "caption" | "colgroup" => ("<table>", "</table>"),
-            _ => ("", ""),
-        };
+        let (prefix, suffix) = html::table_fragment_wrapper(tag);
         if ctx
             .html_carrier
             .as_ref()
@@ -6312,7 +6439,13 @@ fn eval_field_json_with_ctx(
     let mut text = match source_rule.mode {
         ParseMode::JsonPath => {
             if pure.is_empty() {
-                String::new()
+                // Legado applies a leading ## replacement to the current
+                // JSON item's string form when no selector precedes it.
+                if source_rule.replacement_rule.is_some() {
+                    input.clone()
+                } else {
+                    String::new()
+                }
             } else if pure.starts_with('$') {
                 pick_json_field(v, Some(pure)).unwrap_or_default()
             } else {
@@ -6352,7 +6485,11 @@ fn eval_field_json_with_ctx(
         }
     };
     if let Some(script) = js {
-        if let Ok(result) = eval_js_with_bindings(script, &text, base_url, &ctx.js_bindings()) {
+        // The JS result is the extracted field, but java.getString() and src
+        // still read the original list item (AnalyzeRule.setContent(item)).
+        let mut bindings = ctx.js_bindings();
+        bindings.insert("result".to_string(), json!(text));
+        if let Ok(result) = eval_search_field_js(script, &input, base_url, ctx, &bindings) {
             text = result;
         }
     }
@@ -6725,10 +6862,20 @@ fn prepare_list_rule_and_body<'a>(
 ) -> (Cow<'a, str>, &'a str) {
     let mut current_body = body;
     let mut current_rule = rule.trim();
+    let mut original_body = None;
 
     while let Some((script, remainder)) = split_leading_js_transform(current_rule) {
-        match eval_js_with_bindings(script, &current_body, base_url, &ctx.js_bindings()) {
+        let mut bindings = ctx.js_bindings();
+        if let Some(original) = &original_body {
+            // A subsequent JS stage receives the previous result, but src
+            // still refers to the initial response (AnalyzeRule.content).
+            bindings.insert("src".to_string(), json!(original));
+        }
+        match eval_js_with_bindings(script, &current_body, base_url, &bindings) {
             Ok(result) if !result.trim().is_empty() => {
+                if original_body.is_none() && split_leading_js_transform(remainder).is_some() {
+                    original_body = Some(current_body.to_string());
+                }
                 current_body = Cow::Owned(result);
                 current_rule = remainder;
             }
@@ -7279,7 +7426,7 @@ mod tests {
             ("@token", "value"),
         ] {
             assert_eq!(
-                evaluate_template_expression(expression, input, "https://example.com", &ctx, None),
+                evaluate_template_expression(expression, input, "https://example.com", &ctx, None, None),
                 expected,
                 "{expression}"
             );
@@ -8011,7 +8158,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                interpolate_templates(rule, "", "https://fixture.test", &ctx, None),
+                interpolate_templates(rule, "", "https://fixture.test", &ctx, None, None),
                 expected,
                 "{rule}"
             );
@@ -8029,6 +8176,7 @@ mod tests {
             "https://example.test",
             &ctx,
             Some(&value),
+            None,
         );
         assert_eq!(expanded, "Book|3||{{x}}|Alias");
     }

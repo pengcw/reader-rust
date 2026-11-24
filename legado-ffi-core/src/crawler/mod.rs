@@ -23,7 +23,7 @@ pub use session::{current_active_session, with_active_session, ActiveSession, Ex
 use url_rule::parse_source_headers;
 pub use url_rule::{analyze_url, analyze_url_with_context, UrlRuleContext};
 pub(crate) use url_rule::{
-    analyze_url_with_headers, parse_url_options, recompile_login_url, source_header_map,
+    analyze_url_with_headers, parse_legacy_json, parse_url_options, recompile_login_url, source_header_map,
     split_url_options, strip_url_options,
 };
 

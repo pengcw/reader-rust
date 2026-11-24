@@ -19,13 +19,13 @@ impl HtmlQueryCache {
         if content.len() > MAX_HTML_BYTES {
             // Do not retain the previous cached tree while parsing a large page.
             self.0.borrow_mut().take();
-            return f(&html::parse_document(content));
+            return f(&html::parse_java_html(content));
         }
         let document = {
             let mut slot = self.0.borrow_mut();
             if slot.as_ref().is_none_or(|(source, _)| source != content) {
                 slot.take(); // Drop the old tree before allocating a different one.
-                *slot = Some((content.to_owned(), Rc::new(html::parse_document(content))));
+                *slot = Some((content.to_owned(), Rc::new(html::parse_java_html(content))));
             }
             Rc::clone(&slot.as_ref().unwrap().1)
         };
@@ -107,6 +107,7 @@ impl NodeContext {
             Ok(json!({"__readerDomNode": path}))
         };
         let value = match operation {
+            "tagName" => json!(element.value().name()),
             "attr" => json!(element.value().attr(argument).unwrap_or("")),
             "hasAttr" => json!(element.value().attr(argument).is_some()),
             "text" => json!(html::jsoup_element_text(&element)),

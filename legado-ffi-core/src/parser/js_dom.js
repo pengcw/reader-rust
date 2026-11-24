@@ -36,6 +36,7 @@
         if (descriptor == null) return null;
         const path = descriptor.__readerDomNode;
         const object = {
+            tagName: () => query('tagName', path),
             attr: name => query('attr', path, name),
             hasAttr: name => query('hasAttr', path, name),
             hasClass: name => {
