@@ -20,7 +20,11 @@ if (globalThis.java && globalThis.java.getString) {
                             && content.every(item => item && typeof item.outerHtml === 'function' && !item.__readerXPathNode)) {
                             return content.map(item => item.outerHtml()).join('\n');
                         }
-                        if (!content || typeof content !== 'object' || !('__readerXPathNode' in content)) return content;
+                        if (!content || typeof content !== 'object') return content;
+                        if (!Array.isArray(content) && !content.__readerXPathNode
+                            && typeof content.outerHtml === 'function'
+                            && typeof content.select === 'function') return String(content.outerHtml());
+                        if (!('__readerXPathNode' in content)) return content;
                         const xpath = !rawCss && /^\s*(?:@xpath:|\/|\.\/|id\()/i.test(String(rule));
                         if (xpath) {
                             const node = content.__readerXPathNode;
@@ -235,10 +239,38 @@ if (globalThis.java && globalThis.java.getString) {
                                     const xpath = /^\s*(?:@xpath:|\/|\.\/|id\()/i.test(rule);
                                     const content = xpath && context
                                         ? {__readerXPathNode: context} : item.outerHtml || '';
-                                    return _wrapElements(rule, content, xpath ? false : true);
+                                    const selected = _wrapElements(rule, content, xpath ? false : true);
+                                    if (!context && !xpath && !rawCss) {
+                                        const matchIndices = selected.map((_, idx) => idx);
+                                        Object.defineProperty(selected, 'remove', {
+                                            configurable: true, writable: true,
+                                            value: function(index) {
+                                                if (arguments.length) {
+                                                    const pos = listIndex(index, this.length);
+                                                    matchIndices.splice(pos, 1);
+                                                    return this.splice(pos, 1)[0];
+                                                }
+                                                // Java element snapshots can clean their own inner
+                                                // markup without changing the original response.
+                                                if (!this.length) return this;
+                                                const updated = java.__jsoupRemove(item.outerHtml, rule, wrapped.tagName(), matchIndices);
+                                                if (updated == null) throw new Error('invalid jsoup remove selector');
+                                                Object.assign(item, JSON.parse(updated));
+                                                return this;
+                                            }
+                                        });
+                                    }
+                                    return selected;
                                 },
                                 toString() { return item.outerHtml || ''; }
                             };
+                            // Jsoup DataNode content is distinct from visible text.
+                            if (!context) {
+                                wrapped.data = function() {
+                                    return /^(?:script|style)$/i.test(this.tagName())
+                                        ? globalThis.org.jsoup.parser.Parser.unescapeEntities(this.html(), false) : '';
+                                };
+                            }
                             if (htmlNodeId !== undefined) {
                                 Object.defineProperty(wrapped, '__readerHtmlNodeId', {value: htmlNodeId});
                             }
@@ -281,9 +313,16 @@ if (globalThis.java && globalThis.java.getString) {
                                 && !item.__readerXPathNode)) {
                             // AnalyzeByJSoup returns Elements, whose string form
                             // joins outer HTML with newlines (久久漫画 / 桃桃书屋).
-                            Object.defineProperty(items, 'toString', {
-                                configurable: true,
-                                value: function() { return this.map(item => item.outerHtml()).join('\n'); }
+                            const outerHtml = function() { return this.map(item => item.outerHtml()).join('\n'); };
+                            Object.defineProperties(items, {
+                                toString: { configurable: true, value: outerHtml },
+                                outerHtml: { configurable: true, value: outerHtml },
+                                clone: { configurable: true, value: function() {
+                                    const copies = this.map(item => typeof item.clone === 'function'
+                                        ? item.clone()
+                                        : _decorateItems([JSON.parse(JSON.stringify(item))]).first());
+                                    return _decorateItems(copies, false, true);
+                                } }
                             });
                         }
                         if (items.every(item => item && typeof item.select === 'function'
@@ -292,11 +331,19 @@ if (globalThis.java && globalThis.java.getString) {
                                 hasAttr: { value: function(name) { return this.some(item => item.hasAttr(name)); } },
                                 is: { value: function(selector) { return this.not(selector).length !== this.length; } },
                                 select: { writable: true, configurable: true, value: function(selector) {
-                                    const selected = [];
-                                    for (const item of this) {
-                                        for (const match of item.select(selector)) selected.push(match);
+                                    const groups = this.map(item => item.select(selector));
+                                    const selected = _decorateItems(groups.flat(), true);
+                                    if (!rawCss && groups.every(group => typeof group.remove === 'function')) {
+                                        Object.defineProperty(selected, 'remove', {
+                                            configurable: true, writable: true,
+                                            value: function(index) {
+                                                if (arguments.length) return this.splice(listIndex(index, this.length), 1)[0];
+                                                for (const group of groups) group.remove();
+                                                return this;
+                                            }
+                                        });
                                     }
-                                    return _decorateItems(selected, true);
+                                    return selected;
                                 } },
                                 not: { writable: true, configurable: true, value: function(selector) {
                                     return _decorateItems(this.filter(item => {

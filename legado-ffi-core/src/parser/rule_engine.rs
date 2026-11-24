@@ -752,7 +752,7 @@ impl RuleEngine {
             let mode = self.detect_mode(list_rule, &body);
             let (mut results, _) = match mode {
                 ParseMode::JsonPath => {
-                    self.search_books_json(source, &body, base_url, &rule, list_rule, original_body)
+                    self.search_books_json(source, &body, base_url, &rule, list_rule, original_body, matches!(body, Cow::Owned(_)))
                 }
                 ParseMode::XPath => {
                     self.search_books_xpath(source, &body, base_url, &rule, list_rule)
@@ -803,7 +803,7 @@ impl RuleEngine {
             let mode = self.detect_mode(list_rule, &body);
             let (mut results, had_items) = match mode {
                 ParseMode::JsonPath => {
-                    self.search_books_json(source, &body, base_url, &rule, list_rule, original_body)
+                    self.search_books_json(source, &body, base_url, &rule, list_rule, original_body, matches!(body, Cow::Owned(_)))
                 }
                 ParseMode::XPath => {
                     self.search_books_xpath(source, &body, base_url, &rule, list_rule)
@@ -975,6 +975,7 @@ impl RuleEngine {
                     &rule,
                     list_rule,
                     &mut context,
+                    matches!(prepared_body, Cow::Owned(_)),
                 ),
                 ParseMode::XPath => parse_chapter_list_xpath(
                     self,
@@ -2301,7 +2302,7 @@ impl RuleEngine {
             return (vec![], false);
         }
         let doc = html::parse_document(body);
-        let (selector, list_js) = extract_js(list_sel);
+        let (selector, list_js, json_tail) = split_json_list_js(list_sel);
         let (selector, put_entries) = extract_put_entries(selector);
         let mut list_context = RuleVariableContext::for_search_item();
         if !put_entries.is_empty() {
@@ -2320,6 +2321,13 @@ impl RuleEngine {
             &list_context,
             original_body,
         );
+        if let Some(selector) = json_tail {
+            let output = markup.as_deref().and_then(|text| crate::crawler::parse_legacy_json(text).ok())
+                .or_else(|| objects.map(Value::Array));
+            return output.map(|value| self.search_books_json(
+                source, &value.to_string(), base_url, rule, selector, original_body, true,
+            )).unwrap_or_default();
+        }
         if let Some(objects) = objects {
             return self.search_books_json(
                 source,
@@ -2328,6 +2336,7 @@ impl RuleEngine {
                 rule,
                 "$[*]",
                 original_body,
+                true,
             );
         }
         let post_selector = html_list_post_selector(list_sel);
@@ -2531,8 +2540,9 @@ impl RuleEngine {
         rule: &SearchRule,
         list_rule: &str,
         original_body: &str,
+        allow_legacy: bool,
     ) -> (Vec<SearchBook>, bool) {
-        let v: Value = match serde_json::from_str(body) {
+        let v = match parse_list_json(body, allow_legacy) {
             Ok(v) => v,
             Err(_) => return (vec![], false),
         };
@@ -3623,7 +3633,7 @@ fn parse_chapter_list_html(
         let _ = eval_field_html_doc_with_ctx(init, &doc, base_url, ctx);
     }
 
-    let (selector, list_js) = extract_js(list_sel);
+    let (selector, list_js, json_tail) = split_json_list_js(list_sel);
     let (items, markup, objects, html_nodes) = apply_html_list_js(
         html::select_list(&doc, strip_mode_prefix(selector)),
         list_js,
@@ -3631,6 +3641,13 @@ fn parse_chapter_list_html(
         ctx,
         body,
     );
+    let objects = if let Some(selector) = json_tail {
+        let output = markup.as_deref().and_then(|text| crate::crawler::parse_legacy_json(text).ok())
+            .or_else(|| objects.map(Value::Array));
+        Some(output.map(|value| query_json_list(&value, selector)).unwrap_or_default())
+    } else {
+        objects
+    };
     // HTML list JS may replace selected elements with chapter objects.
     // Keep the JSON field rules for those objects, as in a pure JS TOC.
     if let Some(objects) = objects {
@@ -3831,6 +3848,15 @@ fn parse_chapter_list_xpath(
     (out, next_urls)
 }
 
+// Match the middle-JS JSON stage without relaxing raw response parsing.
+fn parse_list_json(body: &str, allow_legacy: bool) -> serde_json::Result<Value> {
+    if allow_legacy {
+        crate::crawler::parse_legacy_json(body)
+    } else {
+        serde_json::from_str(body)
+    }
+}
+
 fn parse_chapter_list_json(
     engine: &RuleEngine,
     body: &str,
@@ -3838,8 +3864,9 @@ fn parse_chapter_list_json(
     rule: &TocRule,
     list_rule: &str,
     ctx: &mut RuleVariableContext,
+    allow_legacy: bool,
 ) -> (Vec<BookChapter>, Vec<String>) {
-    let v: Value = match serde_json::from_str(body) {
+    let v = match parse_list_json(body, allow_legacy) {
         Ok(v) => v,
         Err(_) => return (vec![], vec![]),
     };

@@ -282,7 +282,7 @@ pub(crate) fn jsonpath_object_value(value: &Value, rule: &str) -> Option<Value> 
     }
 }
 
-fn jsonpath_is_indefinite(rule: &str) -> bool {
+pub(crate) fn jsonpath_is_indefinite(rule: &str) -> bool {
     let chars: Vec<char> = rule.chars().collect();
     let mut quote = None;
     let mut escaped = false;

@@ -397,10 +397,6 @@
                                         if (!copy) throw new Error('failed to clone jsoup element');
                                         return copy;
                                     };
-                                    // Jsoup data() reads raw DataNode content (script/style),
-                                    // not the normalized visible text of ordinary elements.
-                                    item.data = () => /^(?:script|style)$/i.test(item.tagName())
-                                        ? globalThis.org.jsoup.parser.Parser.unescapeEntities(item.html(), false) : '';
                                     item.ownText = () => {
                                         const match = /^<([a-z][\w:-]*)\b/i.exec(item.outerHtml());
                                         if (!match) return '';

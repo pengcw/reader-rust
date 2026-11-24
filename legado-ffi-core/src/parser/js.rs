@@ -2492,8 +2492,8 @@ fn eval_js_inner_with_book_capture(
             )?;
             globals.get::<_, Object<'_>>("java")?.set(
                 "__jsoupRemove",
-                Func::new(|source: String, selector: String| -> Option<String> {
-                    jsoup_remove_elements(&source, &selector)
+                Func::new(|source: String, selector: String, root_tag: rquickjs::function::Opt<String>, indices: rquickjs::function::Opt<Vec<usize>>| -> Option<String> {
+                    jsoup_remove_elements(&source, &selector, root_tag.0.as_deref(), indices.0.as_deref())
                 }),
             )?;
             globals.get::<_, Object<'_>>("java")?.set(
@@ -3085,13 +3085,9 @@ pub(crate) fn java_get_string(
             if pure.is_empty() {
                 jsonpath::value_to_string(&v).unwrap_or_default()
             } else if let Some(val) = v.get(pure).filter(|_| !pure.starts_with('$')) {
-                jsonpath::value_to_string(val).unwrap_or_default()
+                java_json_value_strings(val).join("\n")
             } else {
-                java_jsonpath_query(&v, pure)
-                    .iter()
-                    .filter_map(jsonpath::value_to_string)
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                java_jsonpath_strings(&v, pure).join("\n")
             }
         } else {
             String::new()
@@ -3280,17 +3276,9 @@ fn java_get_string_list_inner(
 
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(target_content) {
             if let Some(val) = v.get(pure).filter(|_| !pure.starts_with('$')) {
-                match val {
-                    serde_json::Value::Array(arr) => {
-                        arr.iter().filter_map(jsonpath::value_to_string).collect()
-                    }
-                    other => jsonpath::value_to_string(other).into_iter().collect(),
-                }
+                java_json_value_strings(val)
             } else {
-                java_jsonpath_query(&v, pure)
-                    .iter()
-                    .filter_map(jsonpath::value_to_string)
-                    .collect()
+                java_jsonpath_strings(&v, pure)
             }
         } else {
             Vec::new()
@@ -3343,19 +3331,41 @@ fn java_html_string_values(doc: &mut scraper::Html, rule: &str) -> Vec<String> {
     })
 }
 
-fn jsoup_remove_elements(source: &str, selector: &str) -> Option<String> {
+fn jsoup_remove_elements(source: &str, selector: &str, root_tag: Option<&str>, indices: Option<&[usize]>) -> Option<String> {
     if !html::css_rule_is_valid(selector) {
         return None;
     }
-    let mut document = html::parse_document(source);
-    let ids = html::select_css_list(&document, selector)
+    let mut document = if root_tag.is_some() {
+        html::parse_java_html(source)
+    } else {
+        html::parse_document(source)
+    };
+    // Java query results are detached element snapshots. Keep their root
+    // readable even when the selector also matches the root itself.
+    let root = match root_tag {
+        Some(tag) => Some(html::select_css_list(&document, tag).first()?.id()),
+        None => None,
+    };
+    let all_matches = html::select_css_list(&document, selector);
+    let ids = all_matches
         .iter()
-        .map(|element| element.id())
+        .enumerate()
+        .filter(|(idx, element)| {
+            indices.is_none_or(|list| list.contains(idx))
+                && root.is_none_or(|id| {
+                    element.id() != id && element.ancestors().any(|node| node.id() == id)
+                })
+        })
+        .map(|(_, element)| element.id())
         .collect::<Vec<_>>();
     for id in ids {
         if let Some(mut node) = document.tree.get_mut(id) {
             node.detach();
         }
+    }
+    if let Some(id) = root {
+        let element = document.tree.get(id).and_then(scraper::ElementRef::wrap)?;
+        return serde_json::to_string(&jsoup_html_element_json(element, false)).ok();
     }
     Some(document.html())
 }
@@ -3389,6 +3399,38 @@ fn java_jsonpath_query(value: &JsonValue, rule: &str) -> Vec<JsonValue> {
     } else {
         jsonpath::jsonpath_query(value, rule)
     }
+}
+
+// AnalyzeByJSonPath stringifies null entries of a result list, unlike
+// AnalyzeRule.getElements. Preserve the existing scalar-null behavior.
+fn java_json_list_strings(items: &[JsonValue]) -> Vec<String> {
+    items.iter()
+        .map(|item| jsonpath::value_to_string(item).unwrap_or_else(|| "null".to_string()))
+        .collect()
+}
+
+fn java_json_value_strings(value: &JsonValue) -> Vec<String> {
+    match value {
+        JsonValue::Array(items) => java_json_list_strings(items),
+        other => jsonpath::value_to_string(other).into_iter().collect(),
+    }
+}
+
+fn java_jsonpath_strings(value: &JsonValue, rule: &str) -> Vec<String> {
+    if jsonpath::jsonpath_is_indefinite(rule) {
+        return java_json_list_strings(&java_jsonpath_query(value, rule));
+    }
+    let normalized;
+    let rule = if rule.starts_with('.') {
+        normalized = format!("${rule}");
+        &normalized
+    } else {
+        rule
+    };
+    jsonpath::jsonpath_object_value(value, rule)
+        .as_ref()
+        .map(java_json_value_strings)
+        .unwrap_or_default()
 }
 
 fn java_json_elements(value: &JsonValue, rule: &str) -> Vec<JsonValue> {
@@ -3467,7 +3509,8 @@ fn java_get_elements_json_with_mode(
             rule
         }
         .trim();
-        let values = java_json_elements(&value, pure);
+        let mut values = java_json_elements(&value, pure);
+        values.retain(|item| !item.is_null());
         return serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string());
     }
 

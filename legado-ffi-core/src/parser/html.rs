@@ -49,12 +49,21 @@ pub fn parse_document(html: &str) -> Html {
 
 // A serialized table item needs its original HTML parsing context.
 pub(crate) fn table_fragment_wrapper(tag: &str) -> (&'static str, &'static str) {
-    match tag {
-        "td" | "th" => ("<table><tbody><tr>", "</tr></tbody></table>"),
-        "tr" => ("<table><tbody>", "</tbody></table>"),
-        "col" => ("<table><colgroup>", "</colgroup></table>"),
-        "tbody" | "thead" | "tfoot" | "caption" | "colgroup" => ("<table>", "</table>"),
-        _ => ("", ""),
+    if tag.eq_ignore_ascii_case("td") || tag.eq_ignore_ascii_case("th") {
+        ("<table><tbody><tr>", "</tr></tbody></table>")
+    } else if tag.eq_ignore_ascii_case("tr") {
+        ("<table><tbody>", "</tbody></table>")
+    } else if tag.eq_ignore_ascii_case("col") {
+        ("<table><colgroup>", "</colgroup></table>")
+    } else if tag.eq_ignore_ascii_case("tbody")
+        || tag.eq_ignore_ascii_case("thead")
+        || tag.eq_ignore_ascii_case("tfoot")
+        || tag.eq_ignore_ascii_case("caption")
+        || tag.eq_ignore_ascii_case("colgroup")
+    {
+        ("<table>", "</table>")
+    } else {
+        ("", "")
     }
 }
 
