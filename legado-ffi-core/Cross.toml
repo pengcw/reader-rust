@@ -1,6 +1,3 @@
-[build.env]
-passthrough = ["CFLAGS_x86_64_unknown_linux_gnu"]
-
 [target.aarch64-linux-android]
 dockerfile = "Dockerfile.cross"
 
