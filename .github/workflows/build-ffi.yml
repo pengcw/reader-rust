@@ -120,6 +120,7 @@ jobs:
             -C link-arg=-Wl,--icf=all -C force-unwind-tables=no
           CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS: -C force-unwind-tables=no
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C force-unwind-tables=no
+          CFLAGS_x86_64_unknown_linux_gnu: -mstackrealign
 
       - name: Build Library (Cargo)
         if: >-
