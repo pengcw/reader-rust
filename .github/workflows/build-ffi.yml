@@ -55,8 +55,8 @@ jobs:
             os: ubuntu-latest
             use_cross: true
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
-            use_cross: false
+            os: ubuntu-latest
+            use_cross: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             use_cross: false
@@ -120,6 +120,7 @@ jobs:
             -C link-arg=-Wl,--icf=all -C force-unwind-tables=no
           CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS: -C force-unwind-tables=no
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C force-unwind-tables=no
+          CFLAGS_x86_64_unknown_linux_gnu: -mstackrealign
 
       - name: Build Library (Cargo)
         if: >-
