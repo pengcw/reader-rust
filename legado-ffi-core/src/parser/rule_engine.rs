@@ -727,7 +727,22 @@ impl RuleEngine {
         } else {
             rule
         };
-        classify_rule_mode_with_css_regex_fallback(mode_rule, ParseMode::Css, content_is_json).0
+        let mode = classify_rule_mode_with_css_regex_fallback(mode_rule, ParseMode::Css, content_is_json).0;
+        // A mixed HTML/JSON fallback list is classified by the response
+        // in AnalyzeRule. A JSONPath alternative is not a regex signal.
+        if mode == ParseMode::Regex && !content_is_json && js.is_some()
+            && classify_rule_mode(mode_rule, ParseMode::Css, false).0 == ParseMode::Css
+        {
+            let split = rule_analyzer::split_top_level(mode_rule, &["||"]);
+            if split.delimiter.as_deref() == Some("||")
+                && split.parts.iter().any(|part| part.starts_with("$.") || part.starts_with("$["))
+                && split.parts.first().is_some_and(|part| html::css_rule_is_valid(part))
+                && split.parts.iter().all(|part| part.starts_with("$.") || part.starts_with("$[") || html::css_rule_is_valid(part))
+            {
+                return ParseMode::Css;
+            }
+        }
+        mode
     }
 
     /// Strip mode prefix from rule
@@ -2130,7 +2145,15 @@ impl RuleEngine {
                     .as_str()
                     .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
                     .filter(|value| value.is_object() || value.is_array());
-                let fields = decoded.as_ref().unwrap_or(&item);
+                // Mixed JS lists may contain literal HTML alongside node
+                // carriers. Preserve each fragment's scope for selector fields,
+                // while leading JS still receives the original string.
+                let html_item = item.as_str().filter(|raw| looks_like_html_fragment(raw))
+                    .map(|raw| json!({
+                        "__readerHtmlElement": true,
+                        "outerHtml": format!("<div>{raw}</div>")
+                    }));
+                let fields = decoded.as_ref().or(html_item.as_ref()).unwrap_or(&item);
                 let mut chapter_ctx =
                     ctx.for_chapter(fields.get("variable").and_then(Value::as_str), "");
                 if let Some(mut chapter) = build_chapter_from_json(
@@ -5699,7 +5722,7 @@ fn eval_field_html_with_cached_text(
     let mut text = match source_rule.mode {
         // A replacement-only rule operates on the current element, not an
         // empty selector result. Keep its markup (attributes included).
-        _ if pure.is_empty() && source_rule.replacement_rule.is_some() => el.html(),
+        _ if pure.is_empty() && js.is_none() && source_rule.replacement_rule.is_some() => el.html(),
         ParseMode::Css => {
             if pure.is_empty() {
                 String::new()
@@ -7715,6 +7738,18 @@ mod tests {
         assert_eq!(engine.detect_mode(".class", ""), ParseMode::Css);
         assert_eq!(engine.detect_mode("js:return 1", ""), ParseMode::Js);
         assert_eq!(engine.detect_mode("<js>return 1</js>", ""), ParseMode::Js);
+    }
+
+    #[test]
+    fn mixed_html_json_list_fallback_does_not_trigger_regex_mode() {
+        let engine = RuleEngine::new().unwrap();
+        let mixed = "class.cytable@tag.tr[1:20]@tag.a[1]||$.items[:20]<js>result</js>";
+        assert_eq!(engine.detect_mode(mixed, "<table></table>"), ParseMode::Css);
+        assert_eq!(engine.detect_mode(mixed, r#"{"items":[]}"#), ParseMode::JsonPath);
+        assert_eq!(engine.detect_mode(&format!("@regex:{mixed}"), "<table></table>"), ParseMode::Regex);
+        assert_eq!(engine.detect_mode("(?s)<h1>(.*?)</h1><js>result</js>", "<h1>A</h1>"), ParseMode::Regex);
+        assert_eq!(engine.detect_mode("class.items@tag.a<js>result</js>", "<div></div>"), ParseMode::Css);
+        assert_eq!(engine.detect_mode("$.items[*]<js>result</js>", r#"{"items":[]}"#), ParseMode::JsonPath);
     }
 
     #[test]
@@ -9870,6 +9905,18 @@ chapter_id='{{$.chapter_id}}'
             .as_deref(),
             Some("AC|1|AC|D")
         );
+    }
+
+    #[test]
+    fn html_carrier_kind_js_then_regex_preserves_current_row() {
+        let carrier = json!({"__readerHtmlElement":true,"outerHtml":"<tr><td><a href='/one'>甲书</a></td><td>2024-01-01</td></tr>"});
+        let base = "https://fixture.invalid/badge/pindao";
+        let mut context = RuleVariableContext::for_search_item();
+        let script = r#"<js>if(result=="β"){"marker"}else if(baseUrl.includes("badge/")){"[获得时间:]"+java.getString('td.1@text')}</js>"#;
+        let rule = format!(r"{script}##\[|\]");
+        assert_eq!(eval_field_json_with_ctx(script, &carrier, base, &mut context).as_deref(), Some("[获得时间:]2024-01-01"));
+        assert_eq!(eval_field_json_with_ctx(&rule, &carrier, base, &mut context).as_deref(), Some("获得时间:2024-01-01"));
+        assert_eq!(eval_field_json_kind_with_ctx(&rule, &carrier, base, &mut context).as_deref(), Some("获得时间:2024-01-01"));
     }
 
     #[test]

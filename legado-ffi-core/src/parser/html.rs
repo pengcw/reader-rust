@@ -2485,11 +2485,11 @@ fn xpath_candidates(xpath: &str, root: bool) -> Vec<String> {
 
 /// XPath support using sxd-xpath
 pub fn select_xpath(html: &str, xpath: &str) -> Vec<String> {
-    select_xpath_values(html, xpath, false)
+    select_xpath_values(html, xpath, false, false)
 }
 
 pub(crate) fn select_xpath_content(html: &str, xpath: &str) -> Vec<String> {
-    select_xpath_values(html, xpath, true)
+    select_xpath_values(html, xpath, true, false)
 }
 
 fn evaluate_xpath_with_fallback<'d>(
@@ -2559,15 +2559,23 @@ pub(crate) fn xpath_select_nodes_in_mode<'d>(
 }
 
 pub(crate) fn xpath_eval_strings(node: sxd_xpath::nodeset::Node<'_>, xpath: &str) -> Vec<String> {
+    xpath_eval_string_values(node, xpath, false)
+}
+
+fn xpath_eval_string_values(
+    node: sxd_xpath::nodeset::Node<'_>,
+    xpath: &str,
+    outer_elements: bool,
+) -> Vec<String> {
     let wants_html = xpath.trim() == "html()" || xpath.trim().ends_with("/html()");
     match evaluate_xpath_with_fallback(node, xpath) {
         Some(sxd_xpath::Value::Nodeset(nodes)) => nodes
             .document_order()
             .into_iter()
             .map(|node| {
-                if wants_html {
+                if wants_html || outer_elements {
                     if let sxd_xpath::nodeset::Node::Element(element) = node {
-                        return sxd_element_to_html(element, false);
+                        return sxd_element_to_html(element, !wants_html);
                     }
                 }
                 node.string_value()
@@ -2578,6 +2586,13 @@ pub(crate) fn xpath_eval_strings(node: sxd_xpath::nodeset::Node<'_>, xpath: &str
         Some(sxd_xpath::Value::Boolean(value)) => vec![value.to_string()],
         None => Vec::new(),
     }
+}
+
+// AnalyzeByXPath.getStringList uses JXNode.asString() for HTML elements.
+// Keep the existing XML text-list contract and scalar result semantics.
+pub(crate) fn select_java_xpath_list(content: &str, xpath: &str) -> Vec<String> {
+    select_xpath_from_context_with_markup(content, xpath, true)
+        .unwrap_or_else(|| select_xpath_values(content, xpath, false, true))
 }
 
 pub(crate) fn xpath_eval_strings_in_mode(
@@ -2634,7 +2649,7 @@ fn normalize_html_xpath_attribute_names(xpath: &str, html_mode: bool) -> std::bo
     }
 }
 
-fn select_xpath_values(html: &str, xpath: &str, format_nodes: bool) -> Vec<String> {
+fn select_xpath_values(html: &str, xpath: &str, format_nodes: bool, outer_elements: bool) -> Vec<String> {
     let (package, html_mode) = match parse_xpath_package_with_mode(html) {
         Ok(parsed) => parsed,
         Err(_) => return vec![],
@@ -2642,7 +2657,7 @@ fn select_xpath_values(html: &str, xpath: &str, format_nodes: bool) -> Vec<Strin
     let xpath = normalize_html_xpath_attribute_names(xpath, html_mode);
     let node = sxd_xpath::nodeset::Node::Root(package.as_document().root());
     if !format_nodes {
-        return xpath_eval_strings(node, xpath.as_ref());
+        return xpath_eval_string_values(node, xpath.as_ref(), html_mode && outer_elements);
     }
 
     let wants_html = xpath.trim() == "html()" || xpath.trim().ends_with("/html()");
@@ -2738,6 +2753,10 @@ fn with_xpath_node_context<T>(
 }
 
 pub(crate) fn select_xpath_from_context(content: &str, xpath: &str) -> Option<Vec<String>> {
+    select_xpath_from_context_with_markup(content, xpath, false)
+}
+
+fn select_xpath_from_context_with_markup(content: &str, xpath: &str, outer_elements: bool) -> Option<Vec<String>> {
     with_xpath_node_context(content, Vec::new(), |node, mode, _| {
         if !mode && (xpath.trim() == "html()" || xpath.trim().ends_with("/html()")) {
             return xpath_select_nodes(node, xpath)
@@ -2753,7 +2772,8 @@ pub(crate) fn select_xpath_from_context(content: &str, xpath: &str) -> Option<Ve
                 })
                 .collect();
         }
-        xpath_eval_strings_in_mode(node, xpath, mode)
+        let xpath = normalize_html_xpath_attribute_names(xpath, mode);
+        xpath_eval_string_values(node, xpath.as_ref(), mode && outer_elements)
     })
 }
 

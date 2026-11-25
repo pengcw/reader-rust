@@ -2079,7 +2079,7 @@ fn eval_js_inner_with_book_capture(
                           content: Option<String>,
                           is_url: Option<bool>,
                           unescape: Option<bool>|
-                          -> String {
+                          -> rquickjs::Result<String> {
                         let default_content = if content.is_none() {
                             default_content_for_get_string
                                 .lock()
@@ -2092,14 +2092,33 @@ fn eval_js_inner_with_book_capture(
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .clone();
-                        with_js_reentrant_ctx(&ctx, || java_get_string(
+                        // A standalone @get is a literal rule after Legado's
+                        // variable substitution, not an HTML/JSON selector.
+                        if let Some(key) = rule.as_deref().map(str::trim).and_then(|r| {
+                            let prefix = r.get(..6)?;
+                            let key = r.get(6..)?.strip_suffix('}')?;
+                            (prefix.eq_ignore_ascii_case("@get:{")
+                                && !key.is_empty() && !key.contains('}')).then_some(key)
+                        }) {
+                            let java: Object<'_> = ctx.globals().get("java")?;
+                            let get: rquickjs::Function<'_> = java.get("__nativeVariableGet")?;
+                            let value: String = get.call((key,))?;
+                            let value = value.trim().to_owned();
+                            let value = if unescape.unwrap_or(true) && value.contains('&') {
+                                html::html_unescape(&value)
+                            } else {
+                                value
+                            };
+                            return Ok(finalize_java_get_string_url(value, &base_url, is_url.unwrap_or(false)));
+                        }
+                        Ok(with_js_reentrant_ctx(&ctx, || java_get_string(
                             rule.as_deref(),
                             content.as_deref(),
                             &default_content,
                             &base_url,
                             is_url.unwrap_or(false),
                             unescape.unwrap_or(true),
-                        ))
+                        )))
                     },
                 ),
             )?;
@@ -3255,8 +3274,7 @@ fn java_get_string_list_inner(
             })
             .unwrap_or_default()
     } else if let Some(pure) = html::xpath_rule(main_rule) {
-        html::select_xpath_from_context(target_content, pure)
-            .unwrap_or_else(|| html::select_xpath(target_content, pure))
+        html::select_java_xpath_list(target_content, pure)
     } else if main_rule.starts_with("@json:")
         || main_rule.starts_with("@Json:")
         || main_rule.starts_with("@JSON:")
