@@ -440,6 +440,7 @@ pub(crate) fn eval_js_with_book_fields(
     input: &str,
     base_url: &str,
     bindings: &HashMap<String, JsonValue>,
+    join_list: bool,
 ) -> anyhow::Result<(String, HashMap<String, String>)> {
     let captured = RefCell::new(HashMap::new());
     let result = eval_js_inner_with_book_capture(
@@ -452,7 +453,7 @@ pub(crate) fn eval_js_with_book_fields(
         Some(bindings),
         false,
         None,
-        Some(&captured),
+        Some((&captured, join_list)),
         None,
     )?;
     Ok((result, captured.into_inner()))
@@ -795,7 +796,7 @@ fn eval_js_inner_with_book_capture(
     bindings: Option<&HashMap<String, JsonValue>>,
     template_result: bool,
     header_map: Option<HeaderMapContext<'_>>,
-    book_capture: Option<&RefCell<HashMap<String, String>>>,
+    book_capture: Option<(&RefCell<HashMap<String, String>>, bool)>,
     chapter_title_capture: Option<&RefCell<Option<String>>>,
 ) -> anyhow::Result<String> {
     if let Some(raw_ctx) = ACTIVE_JS_REENTRANT_CTX.with(|cell| *cell.borrow()) {
@@ -2626,7 +2627,7 @@ fn eval_js_inner_with_book_capture(
             js_profile_mark(&mut profile_mark, &mut profile_stages, 4);
             let scoped_script = format!("{{\n{script}\n}}");
             let v = eval_script(ctx.clone(), &scoped_script)?;
-            if let (Some(capture), Some(original)) = (
+            if let (Some((capture, _)), Some(original)) = (
                 book_capture,
                 bindings.and_then(|bindings| bindings.get("book")),
             ) {
@@ -2659,7 +2660,15 @@ fn eval_js_inner_with_book_capture(
                 *updated.borrow_mut() = Some(collect_header_map(&ctx)?);
             }
 
-            let result = if v.is_null() {
+            let result = if let Some(array) = v.as_array().filter(|_| {
+                book_capture.is_some_and(|(_, join_list)| join_list)
+            }) {
+                // BookList.kind consumes an actual JS/Java list. Do not
+                // deserialize arbitrary string results that look like JSON.
+                array.iter::<rquickjs::Coerced<String>>()
+                    .map(|item| item.map(|value| value.0))
+                    .collect::<rquickjs::Result<Vec<_>>>()?.join(",")
+            } else if v.is_null() {
                 String::new()
             } else if v.is_undefined() {
                 if !template_result {

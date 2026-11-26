@@ -3766,6 +3766,95 @@ mod tests {
     }
 
     #[test]
+    fn p658_kanshuv_original_intro_two_replacement_stages() {
+        use crate::ffi::{reader_execute, reader_free_string};
+        use safer_ffi::prelude::char_p;
+        use std::ffi::CString;
+
+        // 6083.json: exact search/info intro rule. Exercise ABI v2 and HTTP.
+        let intro = r#"$.summary<js>##简介：</js>##^|[　]{2}|\\n##<br>"#;
+        for (op, params) in [
+            ("search", serde_json::json!({"key":"测试","page":1})),
+            ("info", serde_json::json!({"url":"/book/1"})),
+        ] {
+            let response = if op == "search" {
+                r#"{"result":{"records":[{"name":"甲书","id":"1","summary":"简介：甲　　乙\\n丙"}]}}"#
+            } else {
+                r#"{"result":{"name":"甲书","id":"1","summary":"简介：甲　　乙\\n丙"}}"#
+            };
+            let base_url = serve_once(response);
+            let source = CString::new(serde_json::json!({
+                "bookSourceUrl": base_url,
+                "searchUrl": "/search?keyword={{key}}&page={{page}}",
+                "ruleSearch": {
+                    "bookList":"$.result.records[*]", "name":"$.name",
+                    "bookUrl":"/api/changkan/portal/novel/queryById?id={{$.id}}", "intro":intro
+                },
+                "ruleBookInfo":{"init":"$.result","name":"$.name","intro":intro}
+            }).to_string()).unwrap();
+            let request = CString::new(serde_json::json!({"api":2,"op":op,"params":params}).to_string()).unwrap();
+            let output = reader_execute(
+                char_p::Ref::try_from(source.as_c_str()).unwrap(),
+                char_p::Ref::try_from(request.as_c_str()).unwrap(),
+            );
+            let result = serde_json::from_str::<serde_json::Value>(output.to_str());
+            reader_free_string(Some(output));
+            let result = result.unwrap();
+            assert_eq!(result["ok"], true, "{op}: {result}");
+            let book = if op == "search" { &result["data"][0] } else { &result["data"] };
+            assert_eq!(book["name"], "甲书", "{op}: {result}");
+            assert_eq!(book["intro"], "<br>甲<br>乙<br>丙", "{op}: {result}");
+        }
+    }
+
+    #[test]
+    fn p657_qidian_original_search_kind_replacement_only_js_stage() {
+        use crate::ffi::{reader_execute, reader_free_string};
+        use safer_ffi::prelude::char_p;
+        use std::ffi::CString;
+
+        // 7003.json: original search/explore kind, from ABI v2 through HTTP
+        // and the parser to the serialized result. No external requests.
+        let rules = serde_json::json!({
+            "bookList": "$.data[*]", "name": "$.name", "bookUrl": "$.url",
+            "kind": r#"{{$.ActionStatusString||$.BookStatus##完本##完结}}
+{{(java.getString("$.WordsCount")/10000).toFixed(1)+"万"}}
+{{$.CategoryName}}|{{$.SubCategoryName}}
+<js>##(?m)\|$</js>"#
+        });
+        for (op, params) in [
+            ("search", serde_json::json!({"key":"测试","page":1})),
+            ("explore", serde_json::json!({"url":"/explore","page":1})),
+        ] {
+            let base_url = serve_once(r#"{"data":[
+                {"name":"甲书","url":"/a","ActionStatusString":"完本","WordsCount":123000,"CategoryName":"玄幻","SubCategoryName":""},
+                {"name":"乙书","url":"/b","BookStatus":"连载","WordsCount":20000,"CategoryName":"科幻","SubCategoryName":"未来"},
+                {"name":"丙书","url":"/c","BookStatus":"完本","WordsCount":0,"CategoryName":"历史"}
+            ]}"#);
+            let source = CString::new(serde_json::json!({
+                "bookSourceUrl": base_url,
+                "searchUrl": "/search?keyword={{key}}&page={{page}}",
+                "ruleSearch": rules, "ruleExplore": rules
+            }).to_string()).unwrap();
+            let request = CString::new(serde_json::json!({"api":2,"op":op,"params":params}).to_string()).unwrap();
+            let output = reader_execute(
+                char_p::Ref::try_from(source.as_c_str()).unwrap(),
+                char_p::Ref::try_from(request.as_c_str()).unwrap(),
+            );
+            let result = serde_json::from_str::<serde_json::Value>(output.to_str());
+            reader_free_string(Some(output));
+            let result = result.unwrap();
+            assert_eq!(result["ok"], true, "{op}: {result}");
+            let books = result["data"].as_array().unwrap();
+            assert_eq!(books.len(), 3, "{op}: {result}");
+            assert_eq!(books[0]["kind"], "完结,12.3万,玄幻", "{op}: {result}");
+            assert_eq!(books[1]["kind"], "连载,2.0万,科幻|未来", "{op}: {result}");
+            assert_eq!(books[2]["kind"], "完结,0.0万,历史", "{op}: {result}");
+            assert_eq!(books[1]["bookUrl"], format!("{base_url}/b"));
+        }
+    }
+
+    #[test]
     fn execute_search_fetches_and_parses_in_the_so() {
         let base_url = serve_once(
             r#"{"data":[{"name":"Rust 搜索结果","author":"测试作者","url":"/book/1"}]}"#,

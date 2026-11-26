@@ -2707,7 +2707,7 @@ fn eval_search_field_js(
     if !ctx.capture_search_fields {
         return eval_js_with_bindings(script, input, base_url, bindings);
     }
-    let (text, fields) = eval_js_with_book_fields(script, input, base_url, bindings)?;
+    let (text, fields) = eval_js_with_book_fields(script, input, base_url, bindings, false)?;
     for (key, value) in fields {
         ctx.set_book_field(&key, &value);
     }
@@ -2721,7 +2721,7 @@ fn eval_book_init(
     ctx: &mut RuleVariableContext,
 ) -> Option<String> {
     let (result, fields) =
-        eval_js_with_book_fields(script, input, base_url, &ctx.js_bindings()).ok()?;
+        eval_js_with_book_fields(script, input, base_url, &ctx.js_bindings(), false).ok()?;
     for (key, value) in fields {
         ctx.set_book_field(&key, &value);
     }
@@ -2864,14 +2864,25 @@ pub(crate) fn select_css_list_doc(doc: &scraper::Html, rule: &str) -> Vec<String
 
 // BookInfo.kind uses getStringList rather than the scalar getString used
 // by other fields. Keep complex/JS rules on their existing evaluation path.
-fn book_info_css_kind(rule: &str, doc: &scraper::Html) -> Option<String> {
+fn book_info_css_kind(
+    rule: &str,
+    doc: &scraper::Html,
+    base_url: &str,
+    ctx: &RuleVariableContext,
+) -> Option<String> {
     let mut source = SourceRule::compile(rule, ParseMode::Css, false);
     if source.mode != ParseMode::Css
         || !source.put_entries.is_empty()
         || rule.contains("{{")
         || rule.contains("@get:")
-        || extract_js(rule).1.is_some()
     {
+        return None;
+    }
+    if let Some((selector, regex, script)) = split_kind_list_js(rule) {
+        let values = select_css_list_doc(doc, &selector);
+        return eval_kind_list_js(values, regex, script, &doc.html(), base_url, ctx);
+    }
+    if extract_js(rule).1.is_some() {
         return None;
     }
     let expanded = source.rule.clone();
@@ -2907,12 +2918,97 @@ fn book_info_list_values(
     (!values.is_empty()).then_some(values)
 }
 
+// 7840.json: kind uses getStringList, with per-item cleanup before
+// the trailing JavaScript array traversal. Leave scalar JS on its old path.
+fn split_kind_list_js(rule: &str) -> Option<(String, &str, &str)> {
+    let boundary = content_js_boundary(rule)?;
+    let script = strip_prefix_ascii_case(&rule[boundary..], "@js:")?;
+    let (selector, regex) = split_legado_regex(&rule[..boundary]);
+    if !script.contains("result.forEach(") || selector.contains("{{") || rule.contains("@put:") {
+        return None;
+    }
+    Some((selector, regex?, script))
+}
+
+fn xpath_kind_list_js(
+    rule: &str,
+    input: FieldInput<'_>,
+    base_url: &str,
+    ctx: &mut RuleVariableContext,
+) -> Option<String> {
+    if classify_rule_mode(rule, input.fallback(), false).0 != ParseMode::XPath {
+        return None;
+    }
+    let (selector, regex, script) = split_kind_list_js(rule)?;
+    let split = rule_analyzer::split_top_level(&selector, &["&&", "||", "%%"]);
+    if split.delimiter.as_deref() != Some("&&") {
+        return None;
+    }
+    let package;
+    let (node, html_mode) = match input {
+        FieldInput::XPath(node, mode) => (node, mode),
+        FieldInput::Html(el) => {
+            let parsed = html::parse_xpath_package_with_mode(&el.html()).ok()?;
+            package = parsed.0;
+            (sxd_xpath::nodeset::Node::Root(package.as_document().root()), parsed.1)
+        }
+        FieldInput::Json(_) => return None,
+    };
+    let values = split.parts.iter()
+        .flat_map(|part| {
+            let pure = strip_mode_prefix(part.trim());
+            // Leading // is relative to the current item, not its siblings.
+            let scoped = if !matches!(node, sxd_xpath::nodeset::Node::Root(_)) && pure.starts_with("//") {
+                Cow::Owned(format!(".{pure}"))
+            } else {
+                Cow::Borrowed(pure)
+            };
+            html::xpath_eval_strings_in_mode(node, scoped.as_ref(), html_mode)
+        })
+        .collect();
+    eval_kind_list_js(values, regex, script, &xpath_js_input(node, html_mode), base_url, ctx)
+}
+
+fn eval_kind_list_js(
+    values: Vec<String>,
+    regex: &str,
+    script: &str,
+    input: &str,
+    base_url: &str,
+    ctx: &RuleVariableContext,
+) -> Option<String> {
+    let values = values.into_iter()
+        .map(|item| Value::String(apply_legado_regex(&item, regex)))
+        .collect();
+    let mut stage = SourceRule::compile("", ParseMode::Js, false);
+    stage.make_up_rule(script);
+    let output = eval_list_js_checked_with_source(
+        values, &stage.rule, base_url, ctx, input,
+    ).ok()?;
+    let items = match output {
+        Value::Array(items) => items,
+        Value::String(text) => text.split('\n').map(|item| Value::String(item.to_owned())).collect(),
+        _ => return None,
+    };
+    let text = items.iter()
+        .filter_map(jsonpath::value_to_string)
+        .map(|item| stage.apply_replacement(&item))
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>().join(",");
+    (!text.is_empty()).then_some(text)
+}
+
 fn book_info_rule_kind(
     rule: &str,
     input: FieldInput<'_>,
     base_url: &str,
     ctx: &mut RuleVariableContext,
 ) -> Option<String> {
+    if matches!(input, FieldInput::XPath(_, _)) {
+        if let Some(text) = xpath_kind_list_js(rule, input, base_url, ctx) {
+            return Some(text);
+        }
+    }
     // JSON BookInfo.kind can use the original Java Map result.get() and
     // return a list. Reuse the existing explicitly tagged Map adapter.
     if let FieldInput::Json(value) = input {
@@ -2968,6 +3064,28 @@ fn search_book_css_kind(
     ctx: &mut RuleVariableContext,
 ) -> Option<String> {
     let source = SourceRule::compile(rule, ParseMode::Css, false);
+    // 1148#99: a standalone classification JS stage returns a Java List.
+    // Preserve scalar strings, book mutations and the original row context.
+    if source.mode == ParseMode::Js && !rule.contains("{{") && !rule.contains("##")
+        && !rule.contains("@get:") && source.put_entries.is_empty()
+    {
+        let script = strip_prefix_ascii_case(rule.trim(), "@js:").or_else(|| {
+            let (script, tail) = rule.trim().strip_prefix("<js>")?.split_once("</js>")?;
+            tail.trim().is_empty().then_some(script)
+        });
+        if let Some(script) = script.filter(|script| script.contains("java.getStringList(")) {
+            let (text, fields) = eval_js_with_book_fields(
+                script, &item.html(), base_url, &ctx.js_bindings(), true,
+            ).ok()?;
+            for (key, value) in fields {
+                ctx.set_book_field(&key, &value);
+            }
+            return Some(text);
+        }
+    }
+    if source.mode == ParseMode::XPath {
+        return xpath_kind_list_js(rule, FieldInput::Html(item), base_url, ctx);
+    }
     if source.mode == ParseMode::Css && rule.contains("##") {
         if let Some(result) = FieldInput::Html(item).combined(rule, base_url, ctx, true) {
             return result;
@@ -3159,7 +3277,7 @@ fn parse_book_info_html(
         rule.kind
             .as_deref()
             .and_then(|rule| {
-                book_info_css_kind(rule, &doc)
+                book_info_css_kind(rule, &doc, base_url, ctx)
                     .or_else(|| book_info_html_kind_xpath(rule, &doc, &serialized, base_url, ctx))
             })
             .or_else(|| eval_field(rule.kind.as_ref(), ctx)),
@@ -4676,7 +4794,9 @@ fn eval_collection_with_context(
             Vec::new()
         } else {
             match mode {
-                ParseMode::Css => strings(html::select_text_list(
+                // Collection stages must keep every descendant of a
+                // multi-step CSS selector, not the scalar first match.
+                ParseMode::Css => strings(select_css_list_doc(
                     &html::parse_document(input),
                     &expanded,
                 )),
@@ -5047,13 +5167,13 @@ fn apply_xpath_list_js<'a>(
             result
                 .into_iter()
                 .filter_map(|item| {
-                    // Hitomi's literal [result] can wrap a singleton
-                    // XPath list; do not unwrap arbitrary nested JS arrays.
+                    // Hitomi's literal [result] wraps the XPath node list into
+                    // a single chapter item; do not unwrap arbitrary nested JS arrays.
                     let item = match item {
-                        Value::Array(mut nodes)
-                            if script.trim() == "[result]" && nodes.len() == 1 =>
+                        Value::Array(nodes)
+                            if script.trim() == "[result]" && !nodes.is_empty() =>
                         {
-                            nodes.pop()?
+                            nodes.into_iter().next()?
                         }
                         other => other,
                     };
@@ -5340,6 +5460,12 @@ impl FieldInput<'_> {
             };
             let mut bindings = ctx.js_bindings();
             let input = match self {
+                Self::Json(value) if !list_result => {
+                    // As in a single JSON field, only result changes.
+                    // Nested Java queries and src still read the current item.
+                    bindings.insert("result".to_string(), json!(text));
+                    serde_json::to_string(value).unwrap_or_default()
+                }
                 Self::Html(el) if ctx.capture_search_fields && !list_result => {
                     // A combined selector changes JS result, not the current
                     // SearchBook element used by nested java.getString().
@@ -5650,11 +5776,12 @@ fn eval_field_html_with_cached_text(
     let expanded = interpolate_templates(&source_rule.rule, template_input, base_url, ctx, None, Some(*el));
     let had_templates = expanded != source_rule.rule;
     if source_rule.mode == ParseMode::Css {
-        if let Some((selector, regex, script)) = split_css_regex_at_js(&expanded) {
+        if let Some((selector, regex, stage)) = split_css_regex_at_js(&expanded, rule) {
             if let Some(selected) = html::select_text_from_element(el, &selector) {
                 let cleaned = apply_legado_regex(&selected, regex);
                 let bindings = ctx.js_bindings();
-                let text = eval_search_field_js(script, &cleaned, base_url, ctx, &bindings).ok()?;
+                let text = eval_search_field_js(&stage.rule, &cleaned, base_url, ctx, &bindings).ok()?;
+                let text = stage.apply_replacement(&text);
                 return (!text.is_empty()).then_some(text);
             }
         }
@@ -5957,11 +6084,12 @@ fn eval_field_html_doc_with_cached_input(
         }
     }
     if source_rule.mode == ParseMode::Css {
-        if let Some((selector, regex, script)) = split_css_regex_at_js(&expanded) {
+        if let Some((selector, regex, stage)) = split_css_regex_at_js(&expanded, rule) {
             if let Some(selected) = html::select_text(doc, &selector) {
                 let cleaned = apply_legado_regex(&selected, regex);
                 let text =
-                    eval_js_with_bindings(script, &cleaned, base_url, &ctx.js_bindings()).ok()?;
+                    eval_js_with_bindings(&stage.rule, &cleaned, base_url, &ctx.js_bindings()).ok()?;
+                let text = stage.apply_replacement(&text);
                 return (!text.is_empty()).then_some(text);
             }
         }
@@ -6255,17 +6383,35 @@ fn select_xpath_scope<'a>(
         .unwrap_or(node)
 }
 
+// A JS block can contain only a replacement rule (7003.json, 6083.json).
+fn split_replacement_only_js(suffix: &str) -> Option<(&str, &str)> {
+    let (script, tail) = suffix.trim().strip_prefix("<js>")?.split_once("</js>")?;
+    let script = script.trim_start();
+    script.starts_with("##").then_some((script, tail.trim()))
+}
+
 fn eval_field_json_kind_with_ctx(
     rule: &str,
     value: &Value,
     base_url: &str,
     ctx: &mut RuleVariableContext,
 ) -> Option<String> {
-    // 1148#113/#926: JSON kind rules using Java List get/set/size
-    // need a mutable list, not the first JSONPath scalar. Apply ## per item
-    // before the JS stage when present (1148#926 detail).
-    if let Some(boundary) = content_js_boundary(rule) {
-        let (selector, regex) = split_legado_regex(&rule[..boundary]);
+    let js_boundary = content_js_boundary(rule);
+    if let Some(boundary) = js_boundary {
+        let (prefix, suffix) = rule.split_at(boundary);
+        // 7003.json: a literal template followed by a replacement-only JS
+        // stage keeps the previous string, then getStringList splits its lines.
+        if prefix.trim_start().starts_with("{{")
+            && !rule.contains("@put:")
+            && split_replacement_only_js(suffix).is_some_and(|(_, tail)| tail.is_empty())
+        {
+            return eval_field_json_with_ctx(rule, value, base_url, ctx)
+                .map(|text| text.replace('\n', ","));
+        }
+        // 1148#113/#926: JSON kind rules using Java List get/set/size
+        // need a mutable list, not the first JSONPath scalar. Apply ## per item
+        // before the JS stage when present (1148#926 detail).
+        let (selector, regex) = split_legado_regex(prefix);
         if let Some(script) = strip_prefix_ascii_case(rule[boundary..].trim(), "@js:") {
             let list_script = ["result.size(", "result.get(", "result.set(", "result.add("]
                 .iter()
@@ -6310,7 +6456,17 @@ fn eval_field_json_kind_with_ctx(
     if let Some(result) = FieldInput::Json(value).combined(rule, base_url, ctx, true) {
         return result;
     }
-    eval_field_json_with_ctx(rule, value, base_url, ctx)
+    let text = eval_field_json_with_ctx(rule, value, base_url, ctx);
+    // 1148#1066: literal multiline templates return a string; Legado
+    // getStringList splits it on newlines before joining the kind with commas.
+    if js_boundary.is_none()
+        && rule.trim_start().starts_with("{{")
+        && rule.contains('\n')
+        && !rule.contains("@put:")
+    {
+        return text.map(|text| text.replace('\n', ","));
+    }
+    text
 }
 
 fn eval_field_json_with_ctx(
@@ -6338,12 +6494,18 @@ fn eval_field_json_with_ctx(
             .as_ref()
             .is_none_or(|scope| scope.outer_html != outer_html)
         {
-            let document = if prefix.is_empty() {
+            // A full HTML root is not a fragment: fragment parsing drops
+            // the document wrapper and would scope fields to its first child.
+            let document = if tag == "html" {
+                scraper::Html::parse_document(outer_html)
+            } else if prefix.is_empty() {
                 scraper::Html::parse_fragment(outer_html)
             } else {
                 scraper::Html::parse_fragment(&format!("{prefix}{outer_html}{suffix}"))
             };
-            let root = if prefix.is_empty() {
+            let root = if tag == "html" {
+                document.root_element().id()
+            } else if prefix.is_empty() {
                 document.root_element().child_elements().next()?.id()
             } else {
                 document
@@ -6403,25 +6565,61 @@ fn eval_field_json_with_ctx(
         let value = serde_json::from_str(&output).unwrap_or(Value::String(output));
         return eval_field_json_with_ctx(remainder, &value, base_url, ctx);
     }
-    // Process consecutive JSON field JS stages before the normal &&/||
-    // combination handler; each JS sees the preceding result, but nested
-    // java.getString() still reads the original JSON item (1148#19 / aoaostar#713).
+    // Process explicit JSON field stages before the normal &&/|| handler.
+    // Each JS sees the preceding result; nested queries read the original item.
     if let Some((selector, first_block)) = rule.split_once("<js>") {
+        // 6083.json: an empty JS stage with a regex is not a script.
+        // Apply its replacement, then the optional independent trailing regex.
+        if let Some((script, tail)) = split_replacement_only_js(&rule[selector.len()..]) {
+            if !selector.trim().is_empty()
+                && !rule.contains("@put:")
+                && content_js_boundary(rule) == Some(selector.len())
+                && (tail.is_empty() || (tail.starts_with("##") && content_js_boundary(tail).is_none()))
+                && SourceRule::compile(rule, ParseMode::JsonPath, true).mode == ParseMode::JsonPath
+            {
+                let mut text = eval_field_json_with_ctx(selector.trim(), v, base_url, ctx)
+                    .unwrap_or_default();
+                for regex in [script, tail].into_iter().filter(|part| !part.is_empty()) {
+                    let mut stage = SourceRule::compile("", ParseMode::Js, false);
+                    stage.make_up_rule(&interpolate_json_templates(regex, v, base_url, ctx));
+                    text = stage.apply_replacement(&text);
+                }
+                return (!text.is_empty()).then_some(text);
+            }
+        }
+        let regex_then_js = content_js_boundary(rule) == Some(selector.len())
+            && split_legado_regex(selector).1.is_some()
+            && first_block.split_once("</js>").is_some_and(|(script, tail)| {
+                tail.trim().is_empty() && split_legado_regex(script).1.is_none()
+            });
         if !selector.trim().is_empty()
-            && has_following_js_stage(first_block)
+            && (has_following_js_stage(first_block) || regex_then_js)
             && !rule.contains("@put:")
             && SourceRule::compile(rule, ParseMode::JsonPath, true).mode == ParseMode::JsonPath
         {
-            let expanded = interpolate_json_templates(rule, v, base_url, ctx);
-            let (selector, first_block) = expanded.split_once("<js>")?;
-            let mut text = eval_field_json_with_ctx(selector.trim(), v, base_url, ctx)?;
+            let expanded;
+            let (mut text, mut rest) = if regex_then_js {
+                // Evaluate the original prefix so template literals retain
+                // their identity, rather than being re-parsed as JSON paths.
+                let selected = eval_field_json_with_ctx(selector.trim(), v, base_url, ctx)
+                    .unwrap_or_default();
+                expanded = interpolate_json_templates(first_block, v, base_url, ctx);
+                (selected, expanded.as_str())
+            } else {
+                expanded = interpolate_json_templates(rule, v, base_url, ctx);
+                let (selector, first_block) = expanded.split_once("<js>")?;
+                (eval_field_json_with_ctx(selector.trim(), v, base_url, ctx)?, first_block)
+            };
             let input = serde_json::to_string(v).ok()?;
-            let mut rest = first_block;
             loop {
                 let (script, tail) = rest.split_once("</js>")?;
                 let mut bindings = ctx.js_bindings();
                 bindings.insert("result".to_string(), json!(text));
-                text = eval_js_with_bindings(script, &input, base_url, &bindings).ok()?;
+                text = if regex_then_js {
+                    eval_search_field_js(script, &input, base_url, ctx, &bindings).ok()?
+                } else {
+                    eval_js_with_bindings(script, &input, base_url, &bindings).ok()?
+                };
                 let tail = tail.trim();
                 if tail.is_empty() {
                     return (!text.is_empty()).then_some(text);
@@ -6729,7 +6927,7 @@ fn split_replacement_post_stages(rule: &str) -> Option<(&str, &str)> {
 
 // The @js: stage after CSS ##replacement is not part of the
 // replacement string (1148.json#82 玄幻文学).
-fn split_css_regex_at_js(rule: &str) -> Option<(String, &str, &str)> {
+fn split_css_regex_at_js<'a>(rule: &'a str, original: &str) -> Option<(String, &'a str, SourceRule)> {
     let boundary = content_js_boundary(rule)?;
     let (prefix, suffix) = rule.split_at(boundary);
     let script = strip_prefix_ascii_case(suffix, "@js:")?;
@@ -6737,7 +6935,12 @@ fn split_css_regex_at_js(rule: &str) -> Option<(String, &str, &str)> {
     if selector.trim().is_empty() || regex.is_none() || script.trim().is_empty() {
         return None;
     }
-    Some((selector.trim().to_string(), regex?, script))
+    // The @js: stage has its own ## replacement. Preserve literal trailing
+    // regex whitespace lost when compiling the outer selector (7843.json).
+    let script = format!("{script}{}", &original[original.trim_end().len()..]);
+    let mut stage = SourceRule::compile("", ParseMode::Js, false);
+    stage.make_up_rule(&script);
+    Some((selector.trim().to_string(), regex?, stage))
 }
 
 fn eval_replacement_then_js(
@@ -6878,11 +7081,19 @@ fn eval_json_content_stages(
                 text
             }
         } else {
-            let Some(selected) = eval_field_json_with_ctx(selection, &value, base_url, context)
-            else {
-                return String::new();
-            };
-            selected
+            match eval_field_json_with_ctx(selection, &value, base_url, context) {
+                Some(selected) => selected,
+                // A plain JSON field can yield an empty string. Legado still
+                // runs the following JS (e.g. NetEase's paywall placeholder).
+                // Do not turn failures of compound rules into empty inputs.
+                None if boundary < remaining.len()
+                    && value.is_object()
+                    && selection == selector
+                    && selector.split('.').all(|part| {
+                        !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    }) => String::new(),
+                None => return String::new(),
+            }
         };
         current = selected;
         remaining = remaining[boundary..].trim();
